@@ -26,6 +26,7 @@ import { RemoteShellManager } from "./remote-shell-manager";
 import { RemoteWorkspaces, RemoteWorkspaceStore } from "./remote-workspaces";
 import { remoteDirectoryRequest } from "../shared/remote-workspaces";
 import { ProjectTools } from "./project-tools";
+import { defaultBackend, readBackendSelection, readRuntimeSwitch, recordBackendRollback, runtimeBinaryAvailable, runtimeSwitchPath, saveBackendPreference } from "./runtime-switch";
 
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const ORCHESTRATION_METHODS = new Set([
@@ -48,9 +49,33 @@ const ACCOUNT_METHODS = new Set([
 ]);
 const SMOKE_TEST = process.argv.includes("--smoke-test");
 const SELF_CHECK = process.argv.includes("--self-check");
+const REQUIRE_RUST_BACKEND = process.argv.includes("--require-rust-backend");
 const START_HIDDEN = process.argv.includes("--background") || SMOKE_TEST;
-const RUST_BACKEND = process.env["PROSPERO_BACKEND"] === "rust";
+const RUST_BINARY = resolve(process.env["PROSPERO_RUST_BINARY"] || resolve(app.isPackaged ? resolve(process.resourcesPath, "runtime") : resolve(app.getAppPath(), "../../target/release"), process.platform === "win32" ? "prosperod-rs.exe" : "prosperod-rs"));
+const RUNTIME_SWITCH_PATH = resolve(process.env["PROSPERO_RUNTIME_SWITCH_FILE"] || runtimeSwitchPath(app.getPath("appData")));
+let backendSelection = readBackendSelection(RUNTIME_SWITCH_PATH, app.isPackaged);
+if (backendSelection.backend === "rust" && !runtimeBinaryAvailable(RUST_BINARY) && !backendSelection.forced && !REQUIRE_RUST_BACKEND) {
+  recordBackendRollback(RUNTIME_SWITCH_PATH, "rust", `Rust daemon binary is missing: ${RUST_BINARY}`);
+  backendSelection = readBackendSelection(RUNTIME_SWITCH_PATH, app.isPackaged);
+}
+const RUST_BACKEND = backendSelection.backend === "rust";
 const rustHome = resolve(process.env["PROSPERO_RUST_HOME"] || resolve(app.getPath("appData"), "Prospero Rust"));
+const legacyHome = resolve(process.env["PROSPERO_HOME"] || resolve(app.getPath("home"), ".prospero"));
+const rustDesktopHome = resolve(rustHome, "desktop");
+if (RUST_BACKEND) {
+  const source = resolve(legacyHome, "desktop.json");
+  const target = resolve(rustDesktopHome, "desktop.json");
+  if (!existsSync(target) && existsSync(source)) {
+    try {
+      mkdirSync(rustDesktopHome, { recursive: true });
+      const raw = readFileSync(source, "utf8");
+      JSON.parse(raw);
+      writeFileSync(target, raw, { encoding: "utf8", mode: 0o600 });
+    } catch {}
+  }
+}
+const RUNTIME_NODE = resolveNodeExecutable();
+const RUNTIME_PATH = loginPath(RUNTIME_NODE);
 if (RUST_BACKEND) {
   const userData = resolve(rustHome, "electron");
   mkdirSync(userData, { recursive: true });
@@ -68,7 +93,7 @@ let lastBroadcastSnapshot: ReturnType<StateStore["snapshot"]> | undefined;
 let lastBroadcastWindowId: number | undefined;
 let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
 let accountActionTail: Promise<void> = Promise.resolve();
-const store = RUST_BACKEND ? new StateStore(resolve(rustHome, "desktop"), "api") : new StateStore();
+const store = RUST_BACKEND ? new StateStore(resolve(rustHome, "desktop"), "api", { daemonBackend: backendSelection.backend }) : new StateStore(undefined, "files", { daemonBackend: backendSelection.backend });
 const remoteHostStore = new RemoteHostStore(resolve(app.getPath("userData"), "remote-hosts.json"));
 const remoteShellManager = new RemoteShellManager(remoteHostStore, (event) => {
   mainWindow?.webContents.send("remote-shell:event", event);
@@ -76,9 +101,37 @@ const remoteShellManager = new RemoteShellManager(remoteHostStore, (event) => {
 const remoteWorkspaces = new RemoteWorkspaces(new RemoteWorkspaceStore(resolve(app.getPath("userData"), "remote-workspaces.json")), remoteHostStore, remoteShellManager);
 const publishRemoteWorkspaces = (): void => { mainWindow?.webContents.send("remote-workspace:changed", remoteWorkspaces.list()); };
 const runtime = RUST_BACKEND ? new RustRuntime(store,
-  resolve(process.env["PROSPERO_RUST_BINARY"] || resolve(app.isPackaged ? resolve(process.resourcesPath, "runtime") : resolve(app.getAppPath(), "../../target/release"), process.platform === "win32" ? "prosperod-rs.exe" : "prosperod-rs")),
+  RUST_BINARY,
   resolve(rustHome, "daemon"),
+  {
+    ...(RUNTIME_NODE ? { PROSPERO_NODE: RUNTIME_NODE } : {}),
+    PROSPERO_LEGACY_HOME: legacyHome,
+    ...(RUNTIME_PATH ? { PATH: RUNTIME_PATH } : {}),
+  },
 ) : new DaemonRuntime(store);
+let daemonStartRequest: Promise<{ ok: boolean; error?: string }> | undefined;
+function publishRuntimeSwitch(): void {
+  store.setRuntimeSwitch(readRuntimeSwitch(RUNTIME_SWITCH_PATH, RUST_BACKEND ? "rust" : "legacy", backendSelection, {
+    rustBinary: RUST_BINARY,
+    rustAvailable: runtimeBinaryAvailable(RUST_BINARY),
+    legacyAvailable: true,
+    defaultBackend: defaultBackend(app.isPackaged),
+  }));
+}
+publishRuntimeSwitch();
+
+function switchBackend(next: "rust" | "legacy", previous: ReturnType<StateStore["snapshot"]>): void {
+  if (backendSelection.forced) throw new Error("当前后端由 PROSPERO_BACKEND 环境变量指定，不能在应用内切换");
+  if (next === "rust" && !runtimeBinaryAvailable(RUST_BINARY)) throw new Error(`Rust daemon 二进制不存在：${RUST_BINARY}`);
+  if (next === previous.daemon.runtime?.backend) return;
+  saveBackendPreference(RUNTIME_SWITCH_PATH, next);
+  store.updateSettings({ daemonBackend: next });
+  store.appendLog(`[desktop] switching daemon backend to ${next}; relaunch required\n`);
+  store.flushLogs();
+  app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--require-rust-backend") });
+  quitting = true;
+  app.exit(0);
+}
 const legacyProjection = new LegacyOrchestrationProjection(
   store.home,
   () => broadcastSnapshot(),
@@ -164,6 +217,12 @@ function requireSelection(value: unknown, label: string, max: number): string {
 function requireObject(value: unknown): JsonObject {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("参数格式无效");
   return value as JsonObject;
+}
+
+function isMissingSessionError(error: unknown): boolean {
+  return /(?:^|\b)(?:session_not_found|no such session)\b/i.test(
+    error instanceof Error ? error.message : String(error),
+  );
 }
 
 function boundedNonNegativeInteger(value: unknown, fallback = 0): number {
@@ -368,6 +427,19 @@ function showMainWindow(): void {
   };
   if (window.webContents.isLoading()) window.once("ready-to-show", reveal);
   else reveal();
+  void ensureDaemonStarted();
+}
+
+async function ensureDaemonStarted(): Promise<{ ok: boolean; error?: string }> {
+  if (!store.settingsSnapshot().startDaemonOnLaunch) return { ok: true };
+  if (store.snapshot().daemon.running || runtime.managed) return { ok: true };
+  daemonStartRequest ??= runtime.start().then((result) => {
+    if (result.ok) void refreshAccounts();
+    return result;
+  }).finally(() => {
+    daemonStartRequest = undefined;
+  });
+  return daemonStartRequest;
 }
 
 function createTray(): void {
@@ -465,6 +537,11 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
   await new Promise((done) => setTimeout(done, 600));
   const bridgeReady = await window.webContents.executeJavaScript("typeof window.prospero?.getSnapshot === 'function'") as boolean;
   if (!bridgeReady) throw new Error("preload bridge is unavailable");
+  if (smoke && REQUIRE_RUST_BACKEND) {
+    const runtimeState = await window.webContents.executeJavaScript(`window.prospero.getSnapshot().then(snapshot => snapshot.daemon.runtime)`) as { backend?: string } | undefined;
+    if (runtimeState?.backend !== "rust") throw new Error(`desktop smoke expected Rust backend: ${JSON.stringify(runtimeState)}`);
+    process.stdout.write(`Prospero runtime backend: ${JSON.stringify(runtimeState)}\n`);
+  }
   if (screenshotArg) {
     const screenshotView = process.argv.find((argument) => argument.startsWith("--screenshot-view="))?.slice("--screenshot-view=".length);
     if (screenshotView === "settings") {
@@ -897,14 +974,15 @@ function installIpc(): void {
   ipcMain.handle("session:pin", (_event, rawId: unknown, pinned: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof pinned !== "boolean") throw new Error("置顶状态无效");
-    if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
     return store.setSessionPinned(sessionId, pinned);
   });
   ipcMain.handle("session:unread", (_event, rawId: unknown, unread: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof unread !== "boolean") throw new Error("会话未读状态无效");
-    if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
     return store.setSessionUnread(sessionId, unread);
+  });
+  ipcMain.handle("session:missing", (_event, rawId: unknown) => {
+    return store.forgetMissingSession(requireId(rawId, "会话"));
   });
   ipcMain.handle("skills:list", async (_event, rawCwd: unknown) => {
     if (typeof rawCwd !== "string") throw new Error("工作区路径无效");
@@ -1102,6 +1180,7 @@ function installIpc(): void {
       return await runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/view${params.size ? `?${params}` : ""}`, { signal: controller.signal });
     } catch (error) {
       if (controller.signal.aborted) return null;
+      if (isMissingSessionError(error)) store.forgetMissingSession(sessionId);
       throw error;
     } finally {
       if (sessionViewControllers.get(key) === controller) sessionViewControllers.delete(key);
@@ -1336,6 +1415,10 @@ function installIpc(): void {
   ipcMain.handle("settings:update", async (_event, raw: unknown) => {
     const patch = desktopSettingsPatch(requireObject(raw), process.platform);
     const previous = store.snapshot();
+    if (patch.daemonBackend !== undefined && patch.daemonBackend !== previous.settings.daemonBackend) {
+      switchBackend(patch.daemonBackend, previous);
+      return { settings: store.settingsSnapshot() };
+    }
     if (patch.fullAccessPermission !== undefined && patch.fullAccessPermission !== previous.settings.fullAccessPermission && previous.daemon.running && !previous.daemon.managed) {
       throw new Error("当前 daemon 由外部进程管理，请先在原启动位置停止它再修改完整访问权限");
     }
@@ -1376,25 +1459,31 @@ app.on("activate", () => {
 function runSelfCheck(): void {
   const daemonEntry = runtime.describeRuntime();
   const snapshot = store.snapshot();
+  const runtimeSwitch = snapshot.daemon.runtime;
   const lines = [
     "Prospero 桌面端自检",
     `  平台:     ${process.platform} ${process.arch}`,
     `  打包:     ${app.isPackaged ? "已打包" : "开发模式"}`,
-    `  node:     ${resolveNodeExecutable() ?? "❌ 找不到"}`,
+    `  后端:     ${runtimeSwitch?.backend ?? (RUST_BACKEND ? "rust" : "legacy")} (${runtimeSwitch?.selectionReason ?? backendSelection.reason})`,
+    `  强制:     ${runtimeSwitch?.forced ? "是" : "否"}`,
+    `  Rust:     ${runtimeSwitch?.rustAvailable ? "可用" : "不可用"} ${runtimeSwitch?.rustBinary ?? RUST_BINARY}`,
+    `  node:     ${RUNTIME_NODE ?? "❌ 找不到"}`,
     `  daemon:   ${daemonEntry ?? "❌ 找不到 dist/cli.js"}`,
-    `  PATH:     ${loginPath(resolveNodeExecutable()) ?? process.env["PATH"] ?? ""}`,
+    `  PATH:     ${RUNTIME_PATH ?? process.env["PATH"] ?? ""}`,
     `  home:     ${store.home}`,
     `  端口:     ${String(snapshot.daemon.port)}`,
     `  监听:     ${snapshot.settings.daemonBind === "0.0.0.0" ? "全部网卡" : snapshot.settings.daemonBind}`,
     `  运行中:   ${snapshot.daemon.running ? `是(pid ${String(snapshot.daemon.pid ?? 0)})` : "否"}`,
     `  会话:     ${String(snapshot.daemon.sessions.length)} 个`,
     `  已配对:   ${String(snapshot.devices.length)} 台`,
+    ...(runtimeSwitch?.lastRollbackReason ? [`  最近回滚: ${runtimeSwitch.lastRollbackReason}`] : []),
   ];
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
 void app.whenReady().then(async () => {
   if (!primaryInstance) return;
+  if (REQUIRE_RUST_BACKEND && !RUST_BACKEND) throw new Error("Rust backend is required for this run");
   if (SELF_CHECK) {
     runSelfCheck();
     quitting = true;
@@ -1411,8 +1500,8 @@ void app.whenReady().then(async () => {
   store.on("changed", broadcastSnapshot);
   if (!RUST_BACKEND) setInterval(() => broadcastSnapshot(store.snapshot()), 1_000).unref();
   if (process.argv.includes("--background")) mainWindow.hide();
-  if (store.settingsSnapshot().startDaemonOnLaunch) {
-    const started = await runtime.start();
+  {
+    const started = await ensureDaemonStarted();
     // daemon 一就绪就把账号列表灌进 store。以前它只在"账号"页被打开时才填充
     // (setAccounts 的唯一调用点在 account:action 的响应里),于是冷启动后直接去
     // 新建会话,账号下拉框是空的、只有一行"没有可用账号"。
@@ -1421,6 +1510,16 @@ void app.whenReady().then(async () => {
     // 跳过启动的话它只验证了一个空壳 UI。daemon 起不来必须让进程非零退出,
     // 由 CI 的退出码来兜;runtime.start() 是等到 /control/health 应答才返回的,
     // 所以"返回 ok"本身就是打包产物里 daemon 可用的证据。
+    if (!started.ok && RUST_BACKEND && !backendSelection.forced && !REQUIRE_RUST_BACKEND) {
+      const reason = started.error ?? "Rust backend failed to start";
+      store.appendLog(`[desktop] Rust backend failed; rolling back to legacy: ${reason}\n`);
+      store.flushLogs();
+      recordBackendRollback(RUNTIME_SWITCH_PATH, "rust", reason);
+      app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--require-rust-backend") });
+      quitting = true;
+      app.exit(0);
+      return;
+    }
     if (SMOKE_TEST) {
       if (!started.ok) throw new Error(`bundled daemon failed to start: ${started.error ?? "unknown error"}`);
       process.stdout.write("Prospero bundled daemon ready\n");

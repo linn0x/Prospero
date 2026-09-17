@@ -44,6 +44,8 @@
 .settings-status { display: flex; align-items: center; gap: 8px; font-size: var(--ui-text-small); }
 .settings-status .status-dot { flex: none; }
 .settings-action-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.settings-runtime-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; color: var(--muted); font-size: var(--ui-text-caption); }
+.settings-runtime-summary span { max-width: 100%; overflow-wrap: anywhere; border: 1px solid var(--border); border-radius: var(--ui-radius-control); padding: 4px 7px; background: var(--surface-2); }
 .settings-terminal-preview { margin-top: 18px; min-width: 0; overflow: auto; background: var(--surface-sunken); color: var(--text); padding: 16px; border: 1px solid var(--border); border-radius: var(--ui-radius-panel); white-space: pre; }
 .settings-detail-note { margin: 14px 0 0; color: var(--muted); font-size: var(--ui-text-caption); line-height: 1.6; }
 .settings-font-control { display: flex; align-items: center; gap: 14px; min-width: 0; }

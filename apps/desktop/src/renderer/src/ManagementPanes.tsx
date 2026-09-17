@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Link2, MonitorSmartphone, Plus, Trash2 } from "lucide-react";
+import { Check, Copy, Link2, MonitorSmartphone, Plus, Server, Trash2 } from "lucide-react";
 import type { DesktopSnapshot, DeviceInfo } from "../../shared/types";
 import { reportError } from "./state";
 import { useLocale } from "./locale";
@@ -234,6 +234,16 @@ export function LogsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const busyRef = useRef(false);
+  const runtime = snapshot.daemon.runtime;
+  const capabilities = new Set(snapshot.daemon.capabilities ?? []);
+  const runtimeChecks = [
+    { label: "Rust HTTP", ok: runtime?.backend === "rust" && snapshot.daemon.running },
+    { label: "Structured sessions", ok: snapshot.daemon.persistence.structured },
+    { label: "PTY terminal", ok: capabilities.has("terminal.pty") },
+    { label: "Windows ConPTY", ok: window.prospero.platform === "win32" ? capabilities.has("terminal.windows.conpty") : true },
+    { label: "Session Host", ok: window.prospero.platform === "win32" ? capabilities.has("terminal.windows.session-host") : true },
+    { label: "Relay host", ok: capabilities.has("relay.host.v1") },
+  ];
   const clear = async (): Promise<void> => {
     if (busyRef.current || !snapshot.logs) return;
     busyRef.current = true;
@@ -252,5 +262,10 @@ export function LogsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       setBusy(false);
     }
   };
-  return <div className="page logs-page"><header className="page-header"><div><span className="eyebrow">{t("结构化日志", "STRUCTURED LOGS")}</span><h1>{t("诊断", "Diagnostics")}</h1><p>{t("按需检查 daemon、relay 与 terminal 日志；敏感令牌会在写入前遮盖。", "Inspect daemon, relay, and terminal logs when needed. Sensitive tokens are redacted before writing.")}</p>{error && <div className="inline-error" role="alert">{error}</div>}{notice && <p className="security-note" role="status" aria-live="polite">{notice}</p>}</div><button aria-busy={busy} disabled={busy || !snapshot.logs} onClick={() => void clear()}><Trash2 size={14} aria-hidden="true" />{busy ? t("清空中", "Clearing") : t("清空", "Clear")}</button></header><pre className="log-view">{snapshot.logs || t("暂无日志。启动 daemon 后，运行信息会出现在这里。", "No logs yet. Runtime details will appear here after the daemon starts.")}</pre></div>;
+  return <div className="page logs-page"><header className="page-header"><div><span className="eyebrow">{t("结构化日志", "STRUCTURED LOGS")}</span><h1>{t("诊断", "Diagnostics")}</h1><p>{t("按需检查 daemon、relay 与 terminal 日志；敏感令牌会在写入前遮盖。", "Inspect daemon, relay, and terminal logs when needed. Sensitive tokens are redacted before writing.")}</p>{error && <div className="inline-error" role="alert">{error}</div>}{notice && <p className="security-note" role="status" aria-live="polite">{notice}</p>}</div><button aria-busy={busy} disabled={busy || !snapshot.logs} onClick={() => void clear()}><Trash2 size={14} aria-hidden="true" />{busy ? t("清空中", "Clearing") : t("清空", "Clear")}</button></header><section className="diagnostics-runtime" aria-label={t("运行时验收状态", "Runtime acceptance status")}>
+    <div><Server size={16} aria-hidden="true" /><strong>{runtime ? `${runtime.backend === "rust" ? "Rust" : "Legacy"} backend` : t("本地 daemon", "Local daemon")}</strong></div>
+    {runtime && <p>{t("选择来源", "Selection")}: {runtime.selectionReason}{runtime.forced ? ` · ${t("环境变量强制", "environment override")}` : ""}</p>}
+    {runtime?.lastRollbackReason && <p>{t("最近回滚", "Last rollback")}: {runtime.lastRollbackReason}</p>}
+    <div className="diagnostics-checks">{runtimeChecks.map(item => <span key={item.label} className={item.ok ? "is-ok" : "is-missing"}><Check size={12} aria-hidden="true" />{item.label}</span>)}</div>
+  </section><pre className="log-view">{snapshot.logs || t("暂无日志。启动 daemon 后，运行信息会出现在这里。", "No logs yet. Runtime details will appear here after the daemon starts.")}</pre></div>;
 }

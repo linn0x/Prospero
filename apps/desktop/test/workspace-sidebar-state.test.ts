@@ -10,6 +10,7 @@ import {
   parseExpandedProjects,
   projectForSession,
   restoredSessionIds,
+  sidebarProjectSessions,
   sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
@@ -228,6 +229,16 @@ describe("workspace sidebar state", () => {
     expect(filterSessionsByQuery(sessions, "", 1).map((item) => item.id)).toEqual([
       "build",
     ]);
+  });
+
+  it("hides archived sessions from project lists even when selected", () => {
+    const sessions = [
+      session("active", "/repo", 10),
+      session("other", "/repo", 20),
+    ];
+
+    expect(sidebarProjectSessions(sessions, ["active"], "").map((item) => item.id)).toEqual(["other"]);
+    expect(sidebarProjectSessions(sessions, ["active"], "active").map((item) => item.id)).toEqual(["active"]);
   });
 
   it("orders recent workspaces by their latest session activity", () => {

@@ -30,6 +30,25 @@ describe("RustRuntime CLI bridge", () => {
     }));
   });
 
+  it("starts the Rust daemon with runtime helper executables on PATH", async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 102, exitCode: null as number | null, signalCode: null as string | null, stdout: new PassThrough(), stderr: new PassThrough() });
+    mocks.spawn.mockReturnValue(child);
+    const directory = mkdtempSync(resolve(tmpdir(), "prospero-rust-process-"));
+    mkdirSync(resolve(directory, "daemon"), { recursive: true });
+    const processHost = new RustProcess("/opt/prospero/runtime/prosperod-rs", resolve(directory, "daemon"), () => undefined, { PROSPERO_NODE: "/opt/prospero/runtime/node/node", PATH: "/usr/bin" });
+    const started = processHost.start().catch(() => undefined);
+    await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalled());
+    const [, , options] = mocks.spawn.mock.calls[0]!;
+    expect(options).toMatchObject({
+      env: expect.objectContaining({
+        PROSPERO_NODE: "/opt/prospero/runtime/node/node",
+        PATH: expect.stringContaining("/opt/prospero/runtime"),
+      }),
+    });
+    child.emit("exit", 1);
+    await started;
+  });
+
   it("attaches to an already running Rust daemon without spawning a child", async () => {
     const directory = mkdtempSync(resolve(tmpdir(), "prospero-rust-process-"));
     mkdirSync(resolve(directory, "daemon"), { recursive: true });
@@ -68,24 +87,50 @@ describe("RustRuntime CLI bridge", () => {
       token: "b".repeat(64),
     }));
     chmodSync(connectionFile, 0o600);
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      apiVersion: 1,
-      backend: "rust",
-      activeRuntimeSessions: 0,
-      databaseQueueCapacity: 128,
-      capabilities: [],
-      persistence: { pty: true, structured: true },
-    })));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/v1/health")) return new Response(JSON.stringify({
+        apiVersion: 1,
+        backend: "rust",
+        activeRuntimeSessions: 0,
+        databaseQueueCapacity: 128,
+        capabilities: [],
+        persistence: { pty: true, structured: true },
+      }));
+      if (url.includes("/v1/events?")) return new Response(JSON.stringify({ latestSeq: 0, events: [], resyncRequired: false }));
+      if (url.includes("/v1/session-summary")) return new Response(JSON.stringify({ total: 0, active: 0, archived: 0, attention: 0, latestSeq: 0 }));
+      if (url.includes("/v1/sessions?")) return new Response(JSON.stringify({ items: [], total: 0, latestSeq: 0 }));
+      if (url.includes("/v1/workspaces?")) return new Response(JSON.stringify({ items: [], latestSeq: 0 }));
+      if (url.includes("/v1/schedules")) return new Response(JSON.stringify([]));
+      if (url.includes("/v1/agent-sessions/queues")) return new Response(JSON.stringify({ queues: [] }));
+      if (url.includes("/v1/agent-sessions/controls")) return new Response(JSON.stringify({ controls: [] }));
+      return new Response("{}", { status: 404 });
+    });
     const store = {
       backend: "api",
       setStartupProgress: vi.fn(),
       setManagedState: vi.fn(),
       setApiState: vi.fn(),
+      appendLog: vi.fn(),
     } as unknown as StateStore;
     const runtime = new RustRuntime(store, "/opt/prosperod-rs", resolve(directory, "daemon"));
     (runtime as unknown as { refresh: () => Promise<void> }).refresh = async () => undefined;
     await expect(runtime.start()).resolves.toEqual({ ok: true });
     expect(mocks.spawn).not.toHaveBeenCalled();
     expect(store.setManagedState).toHaveBeenLastCalledWith(undefined, false);
+  });
+
+  it("passes the legacy home to the Rust daemon for first-run migration", async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 103, exitCode: null as number | null, signalCode: null as string | null, stdout: new PassThrough(), stderr: new PassThrough() });
+    mocks.spawn.mockReturnValue(child);
+    const directory = mkdtempSync(resolve(tmpdir(), "prospero-rust-process-"));
+    mkdirSync(resolve(directory, "daemon"), { recursive: true });
+    const processHost = new RustProcess("/opt/prospero/runtime/prosperod-rs", resolve(directory, "daemon"), () => undefined, { PROSPERO_LEGACY_HOME: "/Users/example/.prospero" });
+    const started = processHost.start().catch(() => undefined);
+    await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalled());
+    const [, , options] = mocks.spawn.mock.calls[0]!;
+    expect(options).toMatchObject({ env: expect.objectContaining({ PROSPERO_LEGACY_HOME: "/Users/example/.prospero" }) });
+    child.emit("exit", 1);
+    await started;
   });
 });

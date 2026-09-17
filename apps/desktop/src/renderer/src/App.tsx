@@ -74,7 +74,7 @@ import {
   loadAccountUsage,
   prefetchAccountUsage,
 } from "./account-usage-cache";
-import { reportError, shortPath, text } from "./state";
+import { isMissingSessionError, reportError, shortPath, text } from "./state";
 import { installLiquidGlass } from "./liquid-glass";
 import { useLocale, type Language } from "./locale";
 import {
@@ -91,6 +91,7 @@ import {
   parseExpandedProjects,
   projectForSession,
   restoredSessionIds,
+  sidebarProjectSessions,
   sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
@@ -222,7 +223,7 @@ import { RemoteWorkspaceList } from "./remote-workspaces/RemoteWorkspaceList";
 import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
 import { SourceSelector } from "./model-sources/SourceSelector";
 import { useModelSources, runModelSourceAction } from "./model-sources/use-model-sources";
-import { rememberSourceSelection, rememberedSourceSelection, selectedSourceRoute, sourceRouteAgent, type SourceSelection } from "./model-sources/source-state";
+import { defaultSourceSelection, rememberSourceSelection, rememberedSourceSelection, selectedSourceRoute, type SourceRuntimeAgent, type SourceSelection } from "./model-sources/source-state";
 import { sessionLabel, SessionAgentIcon, StatusMark } from "./workspace/session-presentation";
 import { useSessionUnread } from "./workspace/use-session-unread";
 
@@ -459,7 +460,7 @@ const PinnedSessionRow = memo(function PinnedSessionRow({
       >
         <SessionAgentIcon agent={session.agent} />
         <span className="workspace-session-copy"><strong>{sessionLabel(session)}</strong></span>
-        <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} />
+        <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} />
       </SidebarMenuButton>
       <SidebarMenuAction
         showOnHover
@@ -523,7 +524,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
           <span className="workspace-session-copy">
             <strong>{sessionLabel(session)}</strong>
           </span>
-          <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} />
+          <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} />
         </ContextMenuTrigger>
         <ContextMenuContent>
           <ContextMenuGroup>
@@ -1271,20 +1272,12 @@ function ShellSidebar({
     const managedWorkspace = managedLayout.byPath.get(project)?.workspace;
     const childGroups = managedLayout.groups.filter((group) => group.project === project);
     const sessions = sessionsByProject.get(project) ?? [];
-    const countFor = (path: string): number => workspacePaging ? snapshot.daemon.workspaceCounts?.[path]?.total ?? workspaceTotals[path] ?? (sessionsByProject.get(path)?.length ?? 0) : sessionsByProject.get(path)?.length ?? 0;
-    const projectSessionCount = countFor(project) + childGroups.reduce((total, group) => total + group.workspaces.reduce(
-      (count, workspace) => count + countFor(workspace.path), 0,
-    ), 0);
     // 归档的会话从主列表收起。搜索时不过滤 —— 明确搜某个东西的人
     // 是想找到它,而不是被"你把它归档过"挡回来。
-    const matchingSessions = filterSessionsByQuery(
-      normalizedSessionQuery
-        ? sessions
-        : sessions.filter(
-            (item) => item.id === activeId || !snapshot.archivedSessionIds.includes(item.id),
-          ),
-      normalizedSessionQuery,
-    );
+    const matchingSessions = sidebarProjectSessions(sessions, snapshot.archivedSessionIds, normalizedSessionQuery);
+    const projectSessionCount = matchingSessions.length + childGroups.reduce((total, group) => total + group.workspaces.reduce(
+      (count, workspace) => count + sidebarProjectSessions(sessionsByProject.get(workspace.path) ?? [], snapshot.archivedSessionIds, normalizedSessionQuery).length, 0,
+    ), 0);
     if (normalizedSessionQuery && matchingSessions.length === 0)
       return null;
     const fallback =
@@ -1396,7 +1389,7 @@ function ShellSidebar({
             <SidebarMenuSub>
               {workspacePaging ? <WorkspaceHistory workspace={project} name={name} enabled={projectOpen && workspaceOpen && snapshot.daemon.running}
                 revision={snapshot.daemon.workspaceCounts?.[project] ? `${snapshot.daemon.pid}:${snapshot.daemon.workspaceCounts[project].revision}` : snapshot.daemon.metadataRevision} preview={matchingSessions} activeId={activeId} pinned={snapshot.pinnedSessionIds}
-                unread={snapshot.unreadSessionIds} archived={snapshot.archivedSessionIds} onTotal={updateWorkspaceTotal} renderRow={renderSession}
+                unread={snapshot.unreadSessionIds} archived={snapshot.archivedSessionIds} query={normalizedSessionQuery} onTotal={updateWorkspaceTotal} renderRow={renderSession}
               /> : <>
               {visibleSessions.map(renderSession)}
               {matchingSessions.length >
@@ -2218,7 +2211,7 @@ function OverviewPane({
                       {sessionLabel(session)}
                     </strong>
                     <small>
-                      <StatusMark status={session.status} />
+                      <StatusMark status={session.status} busySince={session.busySince} />
                       {session.agent} · {status(session.status)} ·{" "}
                       {shortPath(session.cwd)}
                     </small>
@@ -2820,7 +2813,7 @@ function AgentsPane({
                       key={session.id}
                       onClick={() => onOpenSession(session.id)}
                     >
-                      <StatusMark status={session.status} />
+                      <StatusMark status={session.status} busySince={session.busySince} />
                       <span className="truncate">{sessionLabel(session)}</span>
                       <ChevronRight />
                     </button>
@@ -2895,7 +2888,7 @@ function ProjectRenameDialog({
   };
   return (
     <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
-      <DialogContent className="sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
+      <DialogContent className="rename-dialog sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>
             {t("编辑工作区名称", "Edit workspace name")}
@@ -2985,7 +2978,7 @@ function SessionRenameDialog({
   };
   return (
     <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
-      <DialogContent className="sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
+      <DialogContent className="rename-dialog sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>{t("编辑会话名称", "Rename session")}</DialogTitle>
           <DialogDescription>
@@ -3063,17 +3056,29 @@ function NewSessionDialog({
   const [tab, setTab] = useState(initialTab);
   const independentAccounts = useMemo(() => snapshot.accounts.filter(account => !account.modelSource), [snapshot.accounts]);
   const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
-  const [useSource, setUseSource] = useState(() => sourceSupported && Boolean(initialSource || rememberedSourceSelection()));
-  const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialSource);
+  const rememberedSource = useMemo(() => rememberedSourceSelection(), []);
+  const [useSource, setUseSource] = useState(() => sourceSupported && Boolean(initialSource || rememberedSource));
+  const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialSource ?? (rememberedSource ? { ...rememberedSource, revision: 0 } : undefined));
   const sourceState = useModelSources(sourceSupported && useSource);
-  const sourceChoice = selectedSourceRoute(sourceState.sources, sourceSelection);
   const [input, setInput] = useState<SessionCreateInput>({
     cwd: project || snapshot.projects[0] || "",
-    agent: "codex",
+    agent: initialSource?.agent ?? rememberedSource?.agent ?? "codex",
     kind: "structured",
     approvalPolicy: "standard",
-    accountId: defaultSessionLaunchAccountId(independentAccounts, "codex"),
+    accountId: defaultSessionLaunchAccountId(independentAccounts, initialSource?.agent ?? rememberedSource?.agent ?? "codex"),
   });
+  const sourceRuntimeAgent: SourceRuntimeAgent = input.agent === "claude" || input.agent === "opencode" ? input.agent : "codex";
+  const sourceChoice = selectedSourceRoute(sourceState.sources, sourceSelection, sourceRuntimeAgent);
+  const setSourceRuntimeAgent = (agent: SourceRuntimeAgent): void => {
+    setInput((current) => ({
+      ...current,
+      agent,
+      accountId: defaultSessionLaunchAccountId(independentAccounts, agent),
+      model: undefined,
+      effort: undefined,
+      kind: "structured",
+    }));
+  };
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [choosingWorkspace, setChoosingWorkspace] = useState(false);
@@ -3124,14 +3129,16 @@ function NewSessionDialog({
         : workspacePaths.has(current.cwd)
           ? current.cwd
           : launchWorkspaces[0]?.path ?? "";
-      const accounts = sessionLaunchAccounts(independentAccounts, current.agent);
-      const accountId = accounts.some((account) => account.id === current.accountId)
-        ? current.accountId
-        : defaultSessionLaunchAccountId(independentAccounts, current.agent);
+      const accounts = useSource ? [] : sessionLaunchAccounts(independentAccounts, current.agent);
+      const accountId = useSource
+        ? undefined
+        : accounts.some((account) => account.id === current.accountId)
+          ? current.accountId
+          : defaultSessionLaunchAccountId(independentAccounts, current.agent);
       if (cwd === current.cwd && accountId === current.accountId) return current;
       return { ...current, cwd, accountId, model: undefined, effort: undefined };
     });
-  }, [launchWorkspaces, open, project, independentAccounts]);
+  }, [launchWorkspaces, open, project, independentAccounts, useSource]);
   const supportsStructured = [
     "codex",
     "claude",
@@ -3150,6 +3157,10 @@ function NewSessionDialog({
     if (!requiresStructured) return;
     setInput((current) => current.kind === "structured" ? current : { ...current, kind: "structured" });
   }, [requiresStructured]);
+  useEffect(() => {
+    if (!useSource) return;
+    setSourceSelection((current) => selectedSourceRoute(sourceState.sources, current, sourceRuntimeAgent) ? current : defaultSourceSelection(sourceState.sources, current, sourceRuntimeAgent));
+  }, [sourceRuntimeAgent, sourceState.sources, useSource]);
   useEffect(() => {
     if (!open || !supportsLaunchModels) {
       launchCatalogKey.current = undefined;
@@ -3221,13 +3232,10 @@ function NewSessionDialog({
     try {
       if (useSource) {
         if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
-        const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceSelection.sourceId, routeId: sourceSelection.routeId, revision: sourceSelection.revision });
+        const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceSelection.sourceId, routeId: sourceSelection.routeId, revision: sourceSelection.revision, agent: sourceRuntimeAgent });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
-        const accounts = Array.isArray(bound.accounts) ? bound.accounts : snapshot.accounts;
-        const account = accounts.find(candidate => candidate.id === bound.accountId);
-        const agent = account?.agent === "opencode" || account?.agent === "claude" || account?.agent === "codex" ? account.agent : sourceRouteAgent(sourceChoice.route);
-        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: input.approvalPolicy }));
-        rememberSourceSelection(sourceSelection);
+        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: input.approvalPolicy }));
+        rememberSourceSelection({ ...sourceSelection, agent: sourceRuntimeAgent });
       } else {
         onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
         rememberSourceSelection(undefined);
@@ -3323,7 +3331,7 @@ function NewSessionDialog({
           </Field>
           {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
           <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("CLI / 独立 Profile", "CLI / independent profile")}</Button></div>
-          {useSource ? <><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></> : <>
+          {useSource ? <><Field><FieldLabel htmlFor="source-runtime-agent">Code Agent</FieldLabel><NativeSelect id="source-runtime-agent" value={sourceRuntimeAgent} disabled={busy} onChange={event => setSourceRuntimeAgent(event.target.value as SourceRuntimeAgent)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect><FieldDescription>{t("执行引擎独立于模型；例如 DeepSeek 的 Anthropic 兼容模型可由 Claude Code 驱动。", "The runtime is separate from the model; for example, a DeepSeek Anthropic-compatible model can run through Claude Code.")}</FieldDescription></Field><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></> : <>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field>
               <FieldLabel htmlFor="session-agent">Agent</FieldLabel>
@@ -3960,6 +3968,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           ...snapshotRef.current.daemon.sessions.map((session) => session.id),
           ...page.items.map((session) => session.id),
         ]);
+        for (const id of missingIds) {
+          if (!available.has(id)) void window.prospero.forgetMissingSession(id).catch(() => undefined);
+        }
         const restored = new Set(ids);
         setOpenIds((current) =>
           current.filter((id) => !restored.has(id) || available.has(id)),
@@ -4117,6 +4128,13 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setOpenIds(next);
     if (activeId === id) setActiveId(next[Math.max(0, index - 1)]);
   };
+  const forgetMissingSession = useCallback((id: string): void => {
+    setHydratedSessions((current) => current.filter((session) => session.id !== id));
+    setOpenIds((current) => current.filter((item) => item !== id));
+    setActiveId((current) => current === id ? undefined : current);
+    setEditingSession((current) => current === id ? undefined : current);
+    void window.prospero.forgetMissingSession(id).catch(() => undefined);
+  }, []);
   const openNewSession = useCallback((project?: string): void => {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
     setNewSessionProject(project);
@@ -4124,20 +4142,20 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setCreateTab("session"); setNewSessionOpen(true);
   }, [activeRemote, view]);
   const toggleArchive = useCallback((id: string): void => {
-    void window.prospero.setSessionArchived(
-      id,
-      !snapshotRef.current.archivedSessionIds.includes(id),
-    );
-  }, []);
+    void window.prospero
+      .setSessionArchived(id, !snapshotRef.current.archivedSessionIds.includes(id))
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+  }, [forgetMissingSession]);
   const togglePin = useCallback((id: string): void => {
-    void window.prospero.setSessionPinned(
-      id,
-      !snapshotRef.current.pinnedSessionIds.includes(id),
-    );
-  }, []);
+    void window.prospero
+      .setSessionPinned(id, !snapshotRef.current.pinnedSessionIds.includes(id))
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+  }, [forgetMissingSession]);
   const setUnread = useCallback((id: string, unread: boolean): void => {
-    void window.prospero.setSessionUnread(id, unread);
-  }, []);
+    void window.prospero
+      .setSessionUnread(id, unread)
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+  }, [forgetMissingSession]);
   const [focus, setFocus] = useState(() => {
     try {
       return localStorage.getItem(FOCUS_STORAGE_KEY) === "true";
@@ -4324,6 +4342,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onTogglePin={togglePin}
                 onToggleFocus={() => setFocus((current) => !current)}
                 onAddWorkspace={openAddWorkspace}
+                onMissingSession={forgetMissingSession}
               /></div>
             ) : view === "runs" ? (
               <OrchestrationPane

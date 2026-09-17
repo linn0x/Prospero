@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, resolve } from "node:path";
 import { RustClient } from "./rust-client";
 
 export type RustConnection = { client: RustClient; pid: number; baseUrl: string };
@@ -19,7 +19,12 @@ export class RustProcess {
   private startup: AbortController | undefined;
   private connection: RustConnection | undefined;
 
-  constructor(readonly binary: string, readonly directory: string, private readonly onExit: () => void = () => {}) {
+  constructor(
+    readonly binary: string,
+    readonly directory: string,
+    private readonly onExit: () => void = () => {},
+    private readonly env?: Record<string, string>,
+  ) {
     if (!isAbsolute(binary) || !isAbsolute(directory)) throw new Error("Rust runtime paths must be absolute");
   }
 
@@ -48,7 +53,14 @@ export class RustProcess {
   private async launch(): Promise<RustConnection> {
     const startup = new AbortController();
     this.startup = startup;
-    const child = spawn(this.binary, ["serve", "--data-dir", this.directory], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const binaryDir = dirname(this.binary);
+    const suppliedPath = this.env?.PATH ?? process.env.PATH ?? "";
+    const childEnv = {
+      ...process.env,
+      ...(this.env ?? {}),
+      PATH: suppliedPath.split(delimiter).includes(binaryDir) ? suppliedPath : [binaryDir, suppliedPath].filter(Boolean).join(delimiter),
+    };
+    const child = spawn(this.binary, ["serve", "--data-dir", this.directory], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: childEnv });
     this.child = child;
     child.on("error", () => {});
     this.exited = new Promise(done => child.once("close", () => {
@@ -56,7 +68,7 @@ export class RustProcess {
       done();
     }));
     child.stderr?.resume();
-    const timer = setTimeout(() => startup.abort(), 10000);
+    const timer = setTimeout(() => startup.abort(), 120000);
     try {
       const ready = await new Promise<{ pid: number; baseUrl: string }>((done, fail) => {
         let output = "";
