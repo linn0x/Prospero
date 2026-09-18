@@ -54,6 +54,30 @@ async fn health(api: &Api) -> (StatusCode, Value) {
     (status, body)
 }
 
+async fn api_request(api: &Api, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = api
+        .router()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (status, value)
+}
+
 fn key_b64(key: &[u8; 32]) -> String {
     use base64::Engine;
     use base64::prelude::BASE64_STANDARD;
@@ -188,6 +212,141 @@ async fn health_prefers_live_relay_supervisor_status() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["relay"]["state"], "online");
     assert_eq!(body["relay"]["devices"]["ready"], 1);
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn device_pairing_routes_are_authenticated_and_never_list_secrets() {
+    use base64::Engine;
+    use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+
+    let (directory, api) = fixture().await;
+    let host_secret = prosperod_rs::relay::generate_relay_host_secret();
+    prosperod_rs::relay::save_relay_config_raw(
+        directory.path(),
+        true,
+        Some("wss://relay.example.com".into()),
+        Some(host_secret.clone()),
+    )
+    .unwrap();
+
+    let response = api
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/devices")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let (status, paired) = api_request(
+        &api,
+        "POST",
+        "/v1/pairings",
+        json!({
+            "name": "iPhone",
+            "allowShell": true,
+            "allowOrchestration": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(paired["device"]["name"], "iPhone");
+    assert_eq!(paired["device"]["relayReady"], true);
+    let serialized = paired.to_string();
+    assert!(!serialized.contains(&host_secret));
+    for forbidden in ["clientPubKey", "relayToken", "relayDeviceId"] {
+        assert!(!serialized.contains(forbidden));
+    }
+    let uri = paired["uri"].as_str().unwrap();
+    let payload = uri.strip_prefix("prospero://pair?d=").unwrap();
+    let decoded: Value =
+        serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+    assert_eq!(decoded["v"], 7);
+    assert_eq!(decoded["relay"]["url"], "wss://relay.example.com");
+    assert!(decoded["token"].as_str().unwrap().len() >= 32);
+    assert!(decoded["relay"]["token"].as_str().unwrap().len() >= 32);
+
+    let (status, devices) = api_request(&api, "GET", "/v1/devices", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(devices["items"].as_array().unwrap().len(), 1);
+    assert_eq!(devices["items"][0]["relayReady"], true);
+    let listed = devices.to_string();
+    for forbidden in ["token", "clientPubKey", "relayDeviceId", "relayToken"] {
+        assert!(!listed.contains(forbidden));
+    }
+
+    let id = devices["items"][0]["id"].as_str().unwrap();
+    let (status, revoked) =
+        api_request(&api, "DELETE", &format!("/v1/devices/{id}"), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(revoked["ok"], true);
+    assert!(
+        prosperod_rs::pairing::load_devices(directory.path())
+            .unwrap()
+            .is_empty()
+    );
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_routes_prefer_live_status_and_rotate_without_exposing_secret() {
+    let (directory, api) = fixture().await;
+    let host_secret = prosperod_rs::relay::generate_relay_host_secret();
+    prosperod_rs::relay::save_relay_config_raw(
+        directory.path(),
+        true,
+        Some("wss://relay.example.com".into()),
+        Some(host_secret.clone()),
+    )
+    .unwrap();
+    let device =
+        prosperod_rs::pairing::mint_device(directory.path(), "phone".into(), true, true).unwrap();
+    let issued = prosperod_rs::pairing::issue_relay_credentials(&device);
+    prosperod_rs::pairing::persist_relay_credentials(directory.path(), &issued).unwrap();
+    api.relay_status
+        .set(prosperod_rs::relay::RelayRuntimeStatus {
+            enabled: true,
+            state: prosperod_rs::relay::RelayConnectionState::Online,
+            url: Some("wss://relay.example.com".into()),
+            route_id: Some("CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk".into()),
+            updated_at: 2,
+            last_connected_at: Some(1),
+            last_error: None,
+            devices: prosperod_rs::relay::RelayRuntimeDeviceStatus {
+                total: 1,
+                ready: 1,
+                needs_re_pair: 0,
+            },
+            active_streams: 2,
+            stream_failures: 1,
+            last_stream_error: Some("closed".into()),
+        });
+
+    let (status, relay) = api_request(&api, "GET", "/v1/relay", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(relay["runtime"]["state"], "online");
+    assert_eq!(relay["runtime"]["activeStreams"], 2);
+    assert!(!relay.to_string().contains(&host_secret));
+
+    let (status, relay) = api_request(&api, "PATCH", "/v1/relay", json!({"rotateKey": true})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(relay["rePairRequired"], true);
+    assert_ne!(
+        prosperod_rs::relay::load_daemon_relay_config(directory.path())
+            .unwrap()
+            .relay
+            .unwrap()
+            .host_secret
+            .unwrap(),
+        host_secret
+    );
+    let devices = prosperod_rs::pairing::load_devices(directory.path()).unwrap();
+    assert!(prosperod_rs::relay::device_relay_credentials(&devices[0]).is_none());
+    assert!(!relay.to_string().contains("hostSecret"));
     api.database.shutdown().await.unwrap();
 }
 

@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
-use ts_rs::TS;
 
 use crate::error::{Error, Result};
 
@@ -17,91 +15,16 @@ const PAGE_BYTES: usize = 64 * 1024;
 const ACTIVITY_IDLE_MS: i64 = 30_000;
 const ACTIVITY_TAIL_LINES: usize = 10;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[serde(deny_unknown_fields)]
-pub struct TerminalSize {
-    pub cols: u16,
-    pub rows: u16,
-}
+pub use prospero_protocol_rs::{
+    CreateTerminal, TerminalEvent, TerminalInput, TerminalPage, TerminalQuery, TerminalSize,
+    TerminalSnapshot,
+};
 
-impl TerminalSize {
-    pub fn validate(self) -> Result<Self> {
-        if !(20..=500).contains(&self.cols) || !(5..=300).contains(&self.rows) {
-            return Err(Error::Invalid("invalid terminal dimensions".into()));
-        }
-        Ok(self)
+pub fn validate_size(size: TerminalSize) -> Result<TerminalSize> {
+    if !size.is_valid() {
+        return Err(Error::Invalid("invalid terminal dimensions".into()));
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CreateTerminal {
-    pub title: String,
-    pub workspace: String,
-    pub size: TerminalSize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<crate::protocol::AgentKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(
-    tag = "type",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum TerminalEvent {
-    Output { data_b64: String },
-    Resize { size: TerminalSize },
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TerminalQuery {
-    #[ts(type = "number | null")]
-    pub after_seq: Option<i64>,
-    pub wait_ms: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalPage {
-    pub initial_size: TerminalSize,
-    #[ts(type = "number")]
-    pub base_seq: i64,
-    #[ts(type = "number")]
-    pub next_seq: i64,
-    #[ts(type = "number")]
-    pub latest_seq: i64,
-    #[ts(type = "number")]
-    pub floor_seq: i64,
-    pub events: Vec<TerminalEvent>,
-    pub resync_required: bool,
-    pub exited: bool,
-    pub exit_code: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TerminalInput {
-    pub data_b64: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalSnapshot {
-    #[ts(type = "number")]
-    pub seq: i64,
-    pub size: TerminalSize,
-    pub data_b64: String,
+    Ok(size)
 }
 
 pub mod screen;
@@ -505,7 +428,7 @@ impl Terminal {
     }
 
     pub async fn resize(&self, size: TerminalSize) -> Result<()> {
-        let size = size.validate()?;
+        let size = validate_size(size)?;
         self.control(|reply| Control::Resize(size, reply)).await
     }
 
@@ -522,7 +445,10 @@ impl Terminal {
             mpsc::error::TrySendError::Closed(_) => Error::Closed,
         })?;
         self.0.wake();
-        receiver.await.map_err(|_| Error::Closed)?
+        tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Closed)?
     }
 
     pub fn stop(&self) {

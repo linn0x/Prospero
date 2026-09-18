@@ -281,7 +281,7 @@ impl Store {
     /// `agentControls` projection in the session list.
     pub(crate) fn agent_controls(&self) -> Result<Vec<crate::agent::SessionAgentControls>> {
         let mut statement = self.connection.prepare(
-            "SELECT ar.session_id,ar.agent,ar.permission_mode,ar.model,ar.effort,
+            "SELECT ar.session_id,ar.agent,ar.permission_mode,ar.model,ar.effort,ar.approval_policy,
                     ma.api_profile IS NOT NULL
              FROM agent_runs ar
              LEFT JOIN managed_accounts ma ON ma.id = ar.account_id
@@ -290,9 +290,10 @@ impl Store {
         let rows = statement.query_map([], |row| {
             let agent: String = row.get(1)?;
             let mode: String = row.get(2)?;
-            let profile_bound: bool = row.get(5)?;
+            let profile_bound: bool = row.get(6)?;
             Ok(crate::agent::SessionAgentControls {
                 session_id: row.get(0)?,
+                approval_policy: row.get(5)?,
                 compact: agent == "claude"
                     || agent == "codex"
                     || agent == "deepseek"
