@@ -139,7 +139,7 @@ struct FakeState {
 fn sse(events: &[Value]) -> axum::response::Response {
     let body = events
         .iter()
-        .map(|event| format!("data: {}\n\n", event))
+        .map(|event| format!("data: {event}\n\n"))
         .collect::<String>();
     (
         StatusCode::OK,
@@ -510,6 +510,7 @@ async fn profile_create_validates_connection_fields_and_persists_an_isolated_key
     let codex_id = codex_created["accountId"].as_str().unwrap();
     let codex_row = account(&codex_created, codex_id).unwrap();
     assert_eq!(codex_row["agent"], "codex");
+    assert_eq!(codex_row["engine"], "codex");
     assert_eq!(codex_row["apiProfile"]["provider"], "openai_compatible");
     assert_eq!(codex_row["apiProfile"]["protocol"], "openai_responses");
     assert_eq!(codex_row["apiProfile"]["baseUrl"], server.base_url);
@@ -674,6 +675,79 @@ async fn engine_probe_records_pass_and_renders_separately() {
     assert_eq!(row["apiValidation"], Value::Null);
     assert_eq!(row["apiEngineValidation"]["status"], "passed");
     assert!(!listed.to_string().contains(SECRET));
+}
+
+#[tokio::test]
+async fn codex_engine_probe_uses_codex_runtime_and_drops_stale_engine_result() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = FakeServer::new(ProbeMode::Success, vec![]);
+
+    let (status, created) = harness
+        .post(control(
+            "agent.account.api.create",
+            obj(json!({"agent":"codex",
+                "name":"Codex Profile","baseUrl":format!("{}/responses", server.base_url),
+                "model":"gpt-test","apiKey":SECRET})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["accountId"].as_str().unwrap().to_owned();
+
+    let (status, result) = harness
+        .post(control(
+            "agent.account.api.test",
+            obj(json!({"accountId": id, "scope": "engine"})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["engineValidation"]["engine"], "codex");
+    assert_eq!(result["engineValidation"]["status"], "failed");
+    assert_eq!(
+        result["engineValidation"]["code"],
+        "engine_probe_not_implemented"
+    );
+    assert_eq!(result["engineValidation"]["checks"]["runtime"], "passed");
+    assert_eq!(
+        result["engineValidation"]["checks"]["configuration"],
+        "passed"
+    );
+    assert_eq!(
+        result["engineValidation"]["checks"]["streaming"],
+        "not_tested"
+    );
+    assert_eq!(result["engineValidation"]["checks"]["tools"], "not_tested");
+
+    let connection =
+        rusqlite::Connection::open(harness.directory.path().join("daemon/prospero.sqlite"))
+            .unwrap();
+    connection
+        .execute(
+            "UPDATE managed_accounts SET api_validation=json_set(api_engine_validation,'$.engine','claude'),api_validation_revision=api_engine_validation_revision,api_engine_validation=json_set(api_engine_validation,'$.engine','claude') WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let (_, listed) = harness
+        .post(control("agent.accounts.list", serde_json::Map::new()))
+        .await;
+    let row = account(&listed, &id).unwrap();
+    assert_eq!(row["engine"], "codex");
+    assert!(row["apiEngineValidation"].is_null());
+    assert!(row["apiValidation"].is_null());
+
+    let (status, result) = harness
+        .post(control(
+            "agent.account.api.test",
+            obj(json!({"accountId": id})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["validation"]["engine"], "codex");
+    assert_eq!(result["validation"]["status"], "failed");
+    assert_eq!(
+        result["validation"]["code"],
+        "protocol_probe_not_implemented"
+    );
 }
 
 #[tokio::test]

@@ -148,11 +148,9 @@ enum Driver {
 }
 
 fn engine_agent(agent: AgentKind, profile: Option<&crate::accounts::ApiProfile>) -> AgentKind {
-    if profile.is_some_and(|profile| profile.protocol() == "openai_chat_completions") {
-        AgentKind::Opencode
-    } else {
-        agent
-    }
+    profile
+        .map(crate::accounts::profile::agent_kind)
+        .unwrap_or(agent)
 }
 
 fn account_agent_matches(
@@ -529,6 +527,7 @@ impl Agents {
                             if !account_agent_matches(create.agent, &record) {
                                 return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
                             }
+                            create.agent = engine_agent(record.agent, Some(profile));
                             if profile
                                 .model_capabilities
                                 .as_ref()
