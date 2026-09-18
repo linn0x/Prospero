@@ -1,0 +1,42 @@
+[package]
+name = "prospero-desktop"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iced = { version = "0.14.0", features = ["advanced-shaping", "highlighter", "image", "markdown", "qr_code", "svg", "tokio"] }
+futures-util = "0.3.32"
+base64 = "0.22.1"
+crypto_box = "0.9.1"
+libc = "0.2"
+prospero-client = { path = "../../crates/prospero-client" }
+prospero-protocol-rs = { path = "../../crates/prospero-protocol" }
+prospero-terminal-view = { path = "../../crates/prospero-terminal-view" }
+png = "0.18.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+semver = "1.0.27"
+sha2 = "0.11.0"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "stream", "json"] }
+rfd = "0.15.4"
+subtle = "2.6.1"
+tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1.20.0", features = ["v4"] }
+window-vibrancy = "0.8.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-async-persistent", "tokio", "crypto-rust"] }
+
+[dev-dependencies]
+axum = { version = "0.8.8", features = ["tokio"] }
+prosperod-rs = { path = "../daemon-rs" }
+tempfile = "3.24.0"

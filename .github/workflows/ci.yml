@@ -15,6 +15,71 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-native-desktop:
+    name: Rust Native Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: linux-x64
+          - os: windows-latest
+            artifact: windows-x64
+          - os: windows-11-arm
+            artifact: windows-arm64
+          - os: macos-13
+            artifact: mac-x64
+          - os: macos-14
+            artifact: mac-arm64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev pkg-config
+      - name: Check native workspace
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+      - name: Accept Linux native daemon and PTY
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        run: cargo build --release --workspace --locked && node tools/perf/rust-daemon-acceptance.mjs --release --seconds 20 --sessions 8 --output target/prospero-acceptance/linux-native.json
+      - name: Accept Windows native daemon and ConPTY
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        shell: pwsh
+        run: cargo build --release --workspace --locked; node tools/perf/rust-daemon-acceptance.mjs --release --seconds 20 --sessions 8 --output target/prospero-acceptance/windows-native.json
+      - name: Package Linux Native Desktop
+        if: runner.os == 'Linux'
+        run: apps/desktop-rs/scripts/package-linux.sh
+      - name: Package macOS Native Desktop
+        if: runner.os == 'macOS'
+        run: apps/desktop-rs/scripts/package-macos.sh
+      - name: Package Windows Native Desktop
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./apps/desktop-rs/scripts/package-windows.ps1
+      - name: Audit package for Electron and Node
+        shell: bash
+        run: |
+          if find target/package target/Prospero.app -type f \( -name node -o -name '*.asar' -o -name 'electron*' \) -print 2>/dev/null | grep -q .; then
+            echo 'native package contains forbidden Electron or Node runtime files'
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prospero-native-${{ matrix.artifact }}
+          path: |
+            target/package/Prospero-*
+            target/Prospero.app
+          if-no-files-found: error
+
   node:
     name: Node checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -1,0 +1,10 @@
+[package]
+name = "prospero-terminal-view"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+prospero-protocol-rs = { path = "../prospero-protocol" }
