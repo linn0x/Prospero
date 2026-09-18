@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { dirname } from "node:path";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, platform, arch, release, cpus, totalmem } from "node:os";
 import path from "node:path";
@@ -130,12 +131,19 @@ async function terminalSmoke(connection, index) {
   }
   const final = await request(connection, `/v1/terminals/${head.id}/output?afterSeq=${cursor}&waitMs=0`);
   assert.equal(final.exited, true);
-  const lookup = await request(connection, "/v1/sessions/lookup", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ids: [head.id] }),
-  });
-  assert.equal(lookup.items[0]?.lifecycle, "archived");
+  let lifecycle;
+  const finalizedBy = Date.now() + 10000;
+  do {
+    const lookup = await request(connection, "/v1/sessions/lookup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: [head.id] }),
+    });
+    lifecycle = lookup.items[0]?.lifecycle;
+    if (lifecycle === "archived") break;
+    await new Promise(resolveWait => setTimeout(resolveWait, 20));
+  } while (Date.now() < finalizedBy);
+  assert.equal(lifecycle, "archived");
   marks.push({ id: head.id, marker, seq: cursor });
   userFlows.push({
     name: "terminal-round-trip",
@@ -202,7 +210,10 @@ try {
     rssMiB: restartedRssMiB,
   };
   const text = `${JSON.stringify(report, null, 2)}\n`;
-  if (outputPath) writeFileSync(outputPath, text);
+  if (outputPath) {
+    mkdirSync(dirname(outputPath), { recursive: true });
+    writeFileSync(outputPath, text);
+  }
   else process.stdout.write(text);
 } finally {
   if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");

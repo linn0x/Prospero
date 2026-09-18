@@ -1,5 +1,11 @@
 [workspace]
-members = ["apps/daemon-rs"]
+members = [
+  "apps/daemon-rs",
+  "apps/desktop-rs",
+  "crates/prospero-client",
+  "crates/prospero-protocol",
+  "crates/prospero-terminal-view",
+]
 resolver = "3"
 
 [workspace.package]
