@@ -7,6 +7,7 @@
 //! still driven by the TS CLI until the remaining remote stack is ported.
 
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
 use base64::Engine;
@@ -138,6 +139,103 @@ pub fn random_b64url(bytes: usize) -> String {
     }
     out.truncate(bytes);
     BASE64_URL_SAFE_NO_PAD.encode(out)
+}
+
+pub fn host_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Prospero".into())
+}
+
+pub fn pairing_addrs(bind: Option<&str>) -> Result<Vec<String>> {
+    let Some(bind) = bind.filter(|value| *value != "0.0.0.0" && *value != "::") else {
+        return Ok(candidate_addrs());
+    };
+    let ip = if let Ok(ip) = bind.parse::<IpAddr>() {
+        ip
+    } else {
+        named_interface_addr(bind).map(IpAddr::V4).ok_or_else(|| {
+            Error::Invalid(format!("unknown network address or interface: {bind}"))
+        })?
+    };
+    if ip.is_unspecified() {
+        Ok(candidate_addrs())
+    } else {
+        Ok(vec![ip.to_string()])
+    }
+}
+
+fn candidate_addrs() -> Vec<String> {
+    let mut en = Vec::new();
+    let mut utun = Vec::new();
+    let mut other = Vec::new();
+    for (name, ip) in interface_addrs() {
+        if unusable_addr(&ip) {
+            continue;
+        }
+        let value = ip.to_string();
+        if en.contains(&value) || utun.contains(&value) || other.contains(&value) {
+            continue;
+        }
+        if name.starts_with("en") {
+            en.push(value);
+        } else if name.starts_with("utun") {
+            utun.push(value);
+        } else {
+            other.push(value);
+        }
+    }
+    en.into_iter().chain(utun).chain(other).collect()
+}
+
+fn named_interface_addr(name: &str) -> Option<Ipv4Addr> {
+    interface_addrs()
+        .into_iter()
+        .find_map(|(candidate, ip)| (candidate == name).then_some(ip))
+}
+
+fn unusable_addr(addr: &Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 169 && octets[1] == 254)
+        || octets[3] == 0
+}
+
+#[cfg(unix)]
+fn interface_addrs() -> Vec<(String, Ipv4Addr)> {
+    use std::ffi::CStr;
+    let mut head = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        let item = unsafe { &*cursor };
+        if !item.ifa_addr.is_null()
+            && unsafe { (*item.ifa_addr).sa_family as i32 } == libc::AF_INET
+            && (item.ifa_flags & libc::IFF_LOOPBACK as u32) == 0
+        {
+            let name = unsafe { CStr::from_ptr(item.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            let addr = unsafe { &*(item.ifa_addr as *const libc::sockaddr_in) };
+            out.push((name, Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes())));
+        }
+        cursor = item.ifa_next;
+    }
+    unsafe {
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn interface_addrs() -> Vec<(String, Ipv4Addr)> {
+    Vec::new()
 }
 
 pub fn mint_device(

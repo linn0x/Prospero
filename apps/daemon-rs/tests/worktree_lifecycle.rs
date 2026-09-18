@@ -191,6 +191,7 @@ async fn safety_matrix_blocks_dirty_and_unmerged_then_allows_equivalent_cleanup(
     assert!(path.exists(), "refused cleanup never removes the tree");
 
     // Untracked file means dirty — also refused even after the branch lands.
+    commit_in(&repo, "master-only.txt", "master context\n");
     git(&repo, &["cherry-pick", &worker_commit]);
     std::fs::write(path.join("scratch.txt"), "leftover\n").unwrap();
     let inspection = inspect_worktree(&database, &asset.id, Some("master".into()))

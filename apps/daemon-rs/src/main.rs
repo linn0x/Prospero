@@ -1427,7 +1427,7 @@ async fn serve(
     token.publish(&directory, &base_url)?;
     let current_exe = std::env::current_exe()?;
     let cli_dir = current_exe.parent().map(Path::to_path_buf);
-    let api = Api::with_guard(database.clone(), token, Some(current_exe));
+    let api = Api::with_guard(database.clone(), token, Some(current_exe)).with_dev_mode(dev_mode);
     let control_token_path = directory.join("control.token");
     std::fs::write(&control_token_path, &control_token)?;
     #[cfg(unix)]

@@ -31,12 +31,7 @@ export type FileDiff = { path: string, patch: string, additions: number, deletio
 export type QuestionOption = { label: string, description: string | null, preview: string | null, };
 export type AgentQuestion = { id: string, header: string, question: string, options: Array<QuestionOption>, multiSelect: boolean, allowOther: boolean, };
 export type MessageAttachment = { id: string, mimeType: string, name: string | null, };
-export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, attachments?: Array<MessageAttachment>, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, diff?: FileDiff | null, hasMore?: boolean, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean,
-/**
- * Set when the approval belongs to a Task-tool subagent; the event
- * still shows on the main timeline so it can be answered there.
- */
-subagent: string | null, } | { "kind": "question", requestId: string, questions: Array<AgentQuestion>, resolved: boolean, subagent: string | null, } | { "kind": "turn_end", finish: string, diffs?: Array<FileDiff>, } | { "kind": "subagent", subagentId: string, name: string, role: string | null, task: string | null, status: string, canMessage: boolean, summary: string, createdAt: number, updatedAt: number, } | { "kind": "error" };
+export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, attachments?: Array<MessageAttachment>, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, diff?: FileDiff | null, hasMore?: boolean, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, subagent: string | null, } | { "kind": "question", requestId: string, questions: Array<AgentQuestion>, resolved: boolean, subagent: string | null, } | { "kind": "turn_end", finish: string, diffs?: Array<FileDiff>, } | { "kind": "subagent", subagentId: string, name: string, role: string | null, task: string | null, status: string, canMessage: boolean, summary: string, createdAt: number, updatedAt: number, } | { "kind": "error" };
 export type TimelineRecord = { id: string, turnId: string, position: number, revision: number, body: TimelineBody, preview: string, bytes: number, generation: number, truncated: boolean, };
 export type TimelineWrite = { id: string, turnId: string, expectedRevision: number, body: TimelineBody, text: string, replace: boolean, };
 export type TimelineQuery = { before: number | null, after: number | null, limit: number | null, };
@@ -89,15 +84,10 @@ export type AgentControlResult = { type: string, sid: string, requestId: string,
 export type AgentCompactRequest = { requestId: string, };
 export type ApprovalPolicySelection = { policy: string, };
 export type AgentModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, currentEffort: string | null, };
-export type SessionAgentControls = { sessionId: string, compact: boolean, model: boolean, mode: boolean, currentModel: string | null, currentEffort: string | null, currentMode: string | null, };
+export type SessionAgentControls = { sessionId: string, approvalPolicy: string, compact: boolean, model: boolean, mode: boolean, currentModel: string | null, currentEffort: string | null, currentMode: string | null, };
 export type AgentControlsProjection = { controls: Array<SessionAgentControls>, };
 export type AttachmentInput = { mimeType: string, dataB64: string, name?: string | null, };
-export type AgentSend = { text: string,
-/**
- * `steer` tries to guide the running turn live and falls back to the
- * front of the queue; anything else enqueues normally (FIFO).
- */
-delivery: string | null, attachments: Array<AttachmentInput>, };
+export type AgentSend = { text: string, delivery: string | null, attachments: Array<AttachmentInput>, };
 export type QueuedMessage = { id: string, text: string,
 /**
  * `guide` rows jump the front of the queue ("现在引导").
@@ -132,12 +122,7 @@ export type AutomationWorkspace = "run" | "current";
 export type RunAutomation = { state: AutomationState, agent: AgentKind, accountId?: string | undefined, approvalPolicy: string, workspace: AutomationWorkspace, cwd: string, workspacePath: string, branch: string | null, startedAt: number, updatedAt: number, lastError: string | null, };
 export type Run = { id: string, objective: string, status: RunStatus, coordinatorSessionId: string | null, automation: RunAutomation | null, graphRevision: number, createdAt: number, updatedAt: number, };
 export type Task = { id: string, runId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, status: TaskStatus, result: string | null, createdAt: number, updatedAt: number, };
-export type Dispatch = { id: string, runId: string, taskId: string, sessionId: string, state: DispatchState, outcome: string | null, startedAt: number, settledAt: number | null,
-/**
- * Working directory of the worker; for an isolated worker this is the
- * registered worktree path.
- */
-worktreePath: string | null, };
+export type Dispatch = { id: string, runId: string, taskId: string, sessionId: string, state: DispatchState, outcome: string | null, startedAt: number, settledAt: number | null, worktreePath: string | null, };
 export type Gate = { id: string, runId: string, taskId: string | null, question: string, options: Array<string>, status: GateStatus, decision: string | null, createdAt: number, resolvedAt: number | null, };
 export type OrchMessage = { id: string, runId: string, from: string, to: string, type: MessageType, subject: string, body: string, threadId: string | null, taskId: string | null, createdAt: number, readAt: number | null, answeredAt: number | null, };
 export type RunSnapshot = { run: Run, tasks: Array<Task>, ready: Array<string>, dispatches: Array<Dispatch>, gates: Array<Gate>, };

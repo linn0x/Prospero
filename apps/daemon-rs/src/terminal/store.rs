@@ -16,7 +16,7 @@ impl Store {
         input: CreateTerminal,
         account_id: Option<String>,
     ) -> Result<SessionHead> {
-        let size = input.size.validate()?;
+        let size = validate_size(input.size)?;
         self.create_session_with(
             CreateSession {
                 agent: input.agent.unwrap_or(AgentKind::Shell),

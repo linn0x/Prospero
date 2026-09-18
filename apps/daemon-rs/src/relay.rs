@@ -16,7 +16,6 @@ use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ts_rs::TS;
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -332,62 +331,11 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub enum RelayConnectionState {
-    Disabled,
-    Offline,
-    Connecting,
-    Syncing,
-    Online,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct RelayRuntimeDeviceStatus {
-    #[ts(type = "number")]
-    pub total: usize,
-    #[ts(type = "number")]
-    pub ready: usize,
-    #[ts(type = "number")]
-    pub needs_re_pair: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct RelayRuntimeStatus {
-    pub enabled: bool,
-    pub state: RelayConnectionState,
-    pub url: Option<String>,
-    pub route_id: Option<String>,
-    #[ts(type = "number")]
-    pub updated_at: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "number | undefined")]
-    pub last_connected_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    pub devices: RelayRuntimeDeviceStatus,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
-    #[ts(type = "number | undefined")]
-    pub active_streams: usize,
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    #[ts(type = "number | undefined")]
-    pub stream_failures: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_stream_error: Option<String>,
-}
+pub use prospero_protocol_rs::{
+    RelayConnectionState, RelayRuntimeDeviceStatus, RelayRuntimeStatus,
+};
 
 pub type RelayHostSessionStatus = RelayRuntimeStatus;
-
-fn is_zero_usize(value: &usize) -> bool {
-    *value == 0
-}
-
-fn is_zero_u64(value: &u64) -> bool {
-    *value == 0
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -25,94 +25,11 @@ pub use gitops::{
 pub use store::{RecoveryReport, SettleOutcome};
 pub use workers::{cleanup_worktree, inspect_worktree, start_worker, stop_worker};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Active,
-    Completed,
-    Abandoned,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pending,
-    Dispatched,
-    Blocked,
-    Done,
-    Failed,
-    Cancelled,
-}
-
-impl TaskStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            TaskStatus::Pending => "pending",
-            TaskStatus::Dispatched => "dispatched",
-            TaskStatus::Blocked => "blocked",
-            TaskStatus::Done => "done",
-            TaskStatus::Failed => "failed",
-            TaskStatus::Cancelled => "cancelled",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "pending" => TaskStatus::Pending,
-            "dispatched" => TaskStatus::Dispatched,
-            "blocked" => TaskStatus::Blocked,
-            "done" => TaskStatus::Done,
-            "failed" => TaskStatus::Failed,
-            "cancelled" => TaskStatus::Cancelled,
-            _ => return None,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum DispatchState {
-    Starting,
-    Running,
-    Succeeded,
-    Failed,
-    Abandoned,
-}
-
-impl DispatchState {
-    fn label(self) -> &'static str {
-        match self {
-            DispatchState::Starting => "starting",
-            DispatchState::Running => "running",
-            DispatchState::Succeeded => "succeeded",
-            DispatchState::Failed => "failed",
-            DispatchState::Abandoned => "abandoned",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "starting" => DispatchState::Starting,
-            "running" => DispatchState::Running,
-            "succeeded" => DispatchState::Succeeded,
-            "failed" => DispatchState::Failed,
-            "abandoned" => DispatchState::Abandoned,
-            _ => return None,
-        })
-    }
-
-    pub fn active(self) -> bool {
-        matches!(self, DispatchState::Starting | DispatchState::Running)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum GateStatus {
-    Pending,
-    Resolved,
-    Cancelled,
-}
+pub use prospero_protocol_rs::{
+    AutomationState, AutomationWorkspace, CancelTask, Dispatch, DispatchState, Gate, GateStatus,
+    ResolveGate, Run, RunAutomation, RunSnapshot, RunStatus, Task, TaskStatus, WorktreeAsset,
+    WorktreeAssetKind, WorktreeAssetState, WorktreeCleanup, WorktreeInspection,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -123,179 +40,6 @@ pub enum MessageType {
     Report,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum AutomationState {
-    Running,
-    Paused,
-    Completed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum AutomationWorkspace {
-    Run,
-    Current,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct RunAutomation {
-    pub state: AutomationState,
-    pub agent: crate::protocol::AgentKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(type = "string | undefined")]
-    pub account_id: Option<String>,
-    pub approval_policy: String,
-    pub workspace: AutomationWorkspace,
-    pub cwd: String,
-    pub workspace_path: String,
-    #[ts(type = "string | null")]
-    pub branch: Option<String>,
-    #[ts(type = "number")]
-    pub started_at: i64,
-    #[ts(type = "number")]
-    pub updated_at: i64,
-    #[ts(type = "string | null")]
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct Run {
-    pub id: String,
-    pub objective: String,
-    pub status: RunStatus,
-    pub coordinator_session_id: Option<String>,
-    #[ts(type = "RunAutomation | null")]
-    pub automation: Option<RunAutomation>,
-    #[ts(type = "number")]
-    pub graph_revision: i64,
-    #[ts(type = "number")]
-    pub created_at: i64,
-    #[ts(type = "number")]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct Task {
-    pub id: String,
-    pub run_id: String,
-    pub title: String,
-    pub spec: String,
-    pub skills: Vec<String>,
-    pub deps: Vec<String>,
-    pub parent_id: Option<String>,
-    pub status: TaskStatus,
-    pub result: Option<String>,
-    #[ts(type = "number")]
-    pub created_at: i64,
-    #[ts(type = "number")]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct Dispatch {
-    pub id: String,
-    pub run_id: String,
-    pub task_id: String,
-    pub session_id: String,
-    pub state: DispatchState,
-    pub outcome: Option<String>,
-    #[ts(type = "number")]
-    pub started_at: i64,
-    #[ts(type = "number | null")]
-    pub settled_at: Option<i64>,
-    /// Working directory of the worker; for an isolated worker this is the
-    /// registered worktree path.
-    #[ts(type = "string | null")]
-    pub worktree_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum WorktreeAssetKind {
-    Run,
-    Worker,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum WorktreeAssetState {
-    Active,
-    Preserved,
-    Missing,
-    Dirty,
-    Unmerged,
-    Equivalent,
-    SafeToClean,
-    Cleaned,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct WorktreeInspection {
-    pub state: WorktreeAssetState,
-    pub target_ref: String,
-    #[ts(type = "number")]
-    pub checked_at: i64,
-    pub path_exists: bool,
-    #[ts(type = "boolean | null")]
-    pub registered: Option<bool>,
-    #[ts(type = "boolean | null")]
-    pub dirty: Option<bool>,
-    #[ts(type = "string | null")]
-    pub branch: Option<String>,
-    #[ts(type = "number | null")]
-    pub ahead_commit_count: Option<i64>,
-    #[ts(type = "number | null")]
-    pub equivalent_commit_count: Option<i64>,
-    #[ts(type = "string | null")]
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct WorktreeCleanup {
-    #[ts(type = "number")]
-    pub removed_at: i64,
-    pub branch_deleted: bool,
-    #[ts(type = "string | null")]
-    pub warning: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct WorktreeAsset {
-    pub id: String,
-    pub kind: WorktreeAssetKind,
-    pub run_id: String,
-    #[ts(type = "string | null")]
-    pub task_id: Option<String>,
-    #[ts(type = "string | null")]
-    pub dispatch_id: Option<String>,
-    pub repo: String,
-    pub path: String,
-    #[ts(type = "string | null")]
-    pub branch: Option<String>,
-    pub state: WorktreeAssetState,
-    #[ts(type = "number")]
-    pub created_at: i64,
-    #[ts(type = "number")]
-    pub updated_at: i64,
-    #[ts(type = "number | null")]
-    pub run_deleted_at: Option<i64>,
-    #[ts(type = "WorktreeInspection | null")]
-    pub last_inspection: Option<WorktreeInspection>,
-    #[ts(type = "WorktreeCleanup | null")]
-    pub cleanup: Option<WorktreeCleanup>,
-    #[ts(type = "string | null")]
-    pub last_error: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeCleanupResult {
@@ -304,22 +48,6 @@ pub struct WorktreeCleanupResult {
     pub branch_deleted: bool,
     #[ts(type = "string | null")]
     pub warning: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct Gate {
-    pub id: String,
-    pub run_id: String,
-    pub task_id: Option<String>,
-    pub question: String,
-    pub options: Vec<String>,
-    pub status: GateStatus,
-    pub decision: Option<String>,
-    #[ts(type = "number")]
-    pub created_at: i64,
-    #[ts(type = "number | null")]
-    pub resolved_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -345,16 +73,6 @@ pub struct OrchMessage {
 
 /// Everything the canvas needs for one run; queries are scoped to a run rather
 /// than shipping the graph of every run.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct RunSnapshot {
-    pub run: Run,
-    pub tasks: Vec<Task>,
-    pub ready: Vec<String>,
-    pub dispatches: Vec<Dispatch>,
-    pub gates: Vec<Gate>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GraphNodeInput {
@@ -582,25 +300,12 @@ pub struct AbandonRun {
 
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CancelTask {
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateGate {
     #[serde(default)]
     pub task_id: Option<String>,
     pub question: String,
     #[serde(default)]
     pub options: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResolveGate {
-    pub decision: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
