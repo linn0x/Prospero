@@ -46,9 +46,10 @@ fn main() -> iced::Result {
     {
         return self_check();
     }
-    iced::daemon(Desktop::boot, Desktop::update, Desktop::window_view)
+    iced::application(Desktop::boot, Desktop::update, Desktop::view)
         .title("Prospero")
-        .theme(Desktop::window_theme)
+        .window(window_settings())
+        .theme(Desktop::theme)
         .style(Desktop::style)
         .subscription(Desktop::subscription)
         .run()
@@ -58,8 +59,8 @@ fn window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(1280.0, 860.0),
         min_size: Some(Size::new(700.0, 600.0)),
-        transparent: cfg!(target_os = "macos"),
-        blur: cfg!(any(target_os = "macos", target_os = "linux")),
+        transparent: false,
+        blur: cfg!(target_os = "linux"),
         #[cfg(target_os = "macos")]
         platform_specific: window::settings::PlatformSpecific {
             title_hidden: true,
@@ -157,7 +158,6 @@ struct Desktop {
     timeline: Vec<TimelineEntry>,
     timeline_loading: bool,
     timeline_error: Option<String>,
-    window_open_requested: bool,
     material: platform::MaterialStatus,
     theme_override: bool,
     terminal: Option<TerminalState>,
@@ -593,12 +593,10 @@ enum Message {
     Loaded(Box<Result<(Health, SessionPage), String>>),
     Reload,
     ToggleTheme,
-    WindowOpened(window::Id),
-    OpenWindow,
     MaterialApplied(platform::MaterialStatus),
     WindowClosed,
-    Capture(window::Id),
-    Captured(window::Screenshot),
+    Capture,
+    CapturedMaybe(Option<window::Screenshot>),
     ScreenshotSaved(Result<String, String>),
     SelectSession(String),
     TimelineLoaded(Box<Result<(String, Vec<TimelineEntry>), String>>),
@@ -924,14 +922,6 @@ struct OperationsSnapshot {
 }
 
 impl Desktop {
-    fn window_theme(&self, _window: window::Id) -> Theme {
-        self.theme()
-    }
-
-    fn window_view(&self, _window: window::Id) -> Element<'_, Message> {
-        self.view()
-    }
-
     fn boot() -> (Self, Task<Message>) {
         let preferences = preferences::Preferences::load();
         (
@@ -944,7 +934,6 @@ impl Desktop {
                 timeline: Vec::new(),
                 timeline_loading: false,
                 timeline_error: None,
-                window_open_requested: false,
                 material: platform::MaterialStatus::Fallback,
                 theme_override: false,
                 terminal: None,
@@ -975,6 +964,7 @@ impl Desktop {
                 iced::system::theme().map(Message::SystemThemeChanged),
                 Task::perform(load(), |result| Message::Loaded(Box::new(result))),
                 Task::perform(check_update(), Message::UpdateChecked),
+                Task::perform(capture_after_startup(), |_| Message::Capture),
             ]),
         )
     }
@@ -1005,35 +995,23 @@ impl Desktop {
                     .and_then(move |id| platform::install_material(id, dark))
                     .map(Message::MaterialApplied);
             }
-            Message::WindowOpened(id) => {
-                let material = platform::install_material(id, self.mode == Mode::Dark)
-                    .map(Message::MaterialApplied);
-                if std::env::var_os("PROSPERO_NATIVE_SCREENSHOT").is_some() {
-                    return Task::batch([
-                        material,
-                        Task::perform(
-                            async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-                                id
-                            },
-                            Message::Capture,
-                        ),
-                    ]);
-                }
-                return material;
-            }
-            Message::OpenWindow => {
-                if self.window_open_requested {
-                    return Task::none();
-                }
-                self.window_open_requested = true;
-                let (_id, open) = window::open(window_settings());
-                return open.map(Message::WindowOpened);
-            }
             Message::MaterialApplied(status) => self.material = status,
             Message::WindowClosed => return iced::exit(),
-            Message::Capture(id) => return window::screenshot(id).map(Message::Captured),
-            Message::Captured(screenshot) => {
+            Message::Capture => {
+                if std::env::var_os("PROSPERO_NATIVE_SCREENSHOT").is_some() {
+                    return window::latest()
+                        .then(|id| match id {
+                            Some(id) => window::screenshot(id).map(Some),
+                            None => Task::done(None),
+                        })
+                        .map(Message::CapturedMaybe);
+                }
+            }
+            Message::CapturedMaybe(screenshot) => {
+                let Some(screenshot) = screenshot else {
+                    eprintln!("native screenshot failed: no window");
+                    return iced::exit();
+                };
                 return Task::perform(save_screenshot(screenshot), Message::ScreenshotSaved);
             }
             Message::ScreenshotSaved(result) => match result {
@@ -3232,22 +3210,18 @@ impl Desktop {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        if self.window_open_requested {
-            let mut subscriptions = vec![
-                window::close_events().map(|_| Message::WindowClosed),
-                iced::system::theme_changes().map(Message::SystemThemeChanged),
-                Subscription::run(remote::subscription).map(Message::RemoteEvent),
-            ];
-            if self.selected_session.is_some() && self.terminal.is_none() {
-                subscriptions.push(
-                    iced::time::every(std::time::Duration::from_millis(750))
-                        .map(|_| Message::RefreshTimeline),
-                );
-            }
-            Subscription::batch(subscriptions)
-        } else {
-            iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::OpenWindow)
+        let mut subscriptions = vec![
+            window::close_events().map(|_| Message::WindowClosed),
+            iced::system::theme_changes().map(Message::SystemThemeChanged),
+            Subscription::run(remote::subscription).map(Message::RemoteEvent),
+        ];
+        if self.selected_session.is_some() && self.terminal.is_none() {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_millis(750))
+                    .map(|_| Message::RefreshTimeline),
+            );
         }
+        Subscription::batch(subscriptions)
     }
 
     fn theme(&self) -> Theme {
@@ -5677,6 +5651,10 @@ async fn save_screenshot(screenshot: window::Screenshot) -> Result<String, Strin
         .map_err(|error| error.to_string())?;
     writer.finish().map_err(|error| error.to_string())?;
     Ok(path.display().to_string())
+}
+
+async fn capture_after_startup() {
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 }
 
 async fn load() -> Result<(Health, SessionPage), String> {
