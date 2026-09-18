@@ -1,9 +1,49 @@
 import { describe, expect, it } from "vitest";
 import { RustRuntime } from "../src/main/rust-runtime";
-import { orchestrationAction } from "../src/main/rust-orchestration";
+import { orchestrationAction, readOrchestrationWindow } from "../src/main/rust-orchestration";
 import type { StateStore } from "../src/main/state-store";
 
 describe("Rust desktop control routes", () => {
+  it("reads orchestration projection through run-scoped bounded pages", async () => {
+    const calls: unknown[] = [];
+    const runs = Array.from({ length: 105 }, (_, index) => ({
+      id: `run-${String(index).padStart(3, "0")}`,
+      objective: `Run ${index}`,
+      status: index < 102 ? "active" : "completed",
+      graphRevision: 1,
+      createdAt: index,
+      updatedAt: index,
+    }));
+    const client = {
+      listRuns: async () => runs,
+      listTasks: async (runId?: string) => {
+        calls.push({ listTasks: runId });
+        if (!runId) throw new Error("unbounded tasks request");
+        return [{ id: `task-${runId}`, runId, title: "Task", spec: "Spec", status: "pending", deps: [], skills: [], createdAt: 1, updatedAt: 1 }];
+      },
+      listDispatches: async (runId?: string) => {
+        calls.push({ listDispatches: runId });
+        if (!runId) throw new Error("unbounded dispatches request");
+        return [];
+      },
+      listGates: async (runId?: string) => {
+        calls.push({ listGates: runId });
+        if (!runId) throw new Error("unbounded gates request");
+        return [];
+      },
+      listWorktreeAssets: async (runId?: string) => {
+        calls.push({ listWorktreeAssets: runId });
+        if (!runId) throw new Error("unbounded worktrees request");
+        return [];
+      },
+    };
+    const projection = await readOrchestrationWindow(client as never, AbortSignal.timeout(1000), 9);
+    expect((projection["runs"] as unknown[])).toHaveLength(100);
+    expect((projection["tasks"] as unknown[])).toHaveLength(100);
+    expect(calls).not.toContainEqual({ listTasks: undefined });
+    expect(calls.filter(call => "listTasks" in (call as object))).toHaveLength(100);
+  });
+
   it("passes non-Claude worker agents through to the Rust daemon", async () => {
     const calls: unknown[] = [];
     const client = {
