@@ -108,4 +108,24 @@ describe("Rust desktop control routes", () => {
       { updateSchedule: "daily-check", input: expect.objectContaining({ id: "daily-check", model: null }) },
     ]);
   });
+
+  it("passes Codex PTY API Profile account selection to Rust", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      createTerminal: async (input: unknown) => {
+        calls.push(input);
+        return { id: "session-1", agent: "codex", kind: "pty", title: "Codex", workspace: process.cwd(), status: "running", createdAt: 1 };
+      },
+    };
+    const store = { backend: "api", setManagedState: () => undefined, setApiState: () => undefined } as unknown as StateStore;
+    const runtime = new RustRuntime(store, "/opt/prosperod-rs", "/tmp/prospero-rust/daemon");
+    (runtime as unknown as { connection: unknown }).connection = { client, pid: 10, baseUrl: "http://127.0.0.1:7423" };
+    (runtime as unknown as { refresh: () => Promise<void> }).refresh = async () => undefined;
+
+    await expect(runtime.request("/_prospero/control/session/create", {
+      method: "POST",
+      body: { kind: "pty", agent: "codex", cwd: process.cwd(), accountId: "work-codex", cols: 120, rows: 40 },
+    })).resolves.toMatchObject({ id: "session-1" });
+    expect(calls[0]).toMatchObject({ agent: "codex", accountId: "work-codex" });
+  });
 });
