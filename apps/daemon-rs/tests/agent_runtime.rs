@@ -679,6 +679,7 @@ async fn codex_api_profile_passes_provider_args_and_secret_environment() {
     );
     let app = api.router();
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -711,11 +712,64 @@ async fn codex_api_profile_passes_provider_args_and_secret_environment() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let account_id = value["accountId"].as_str().unwrap().to_owned();
+    let codex_root = harness
+        ._data
+        .path()
+        .join("agent-accounts/codex")
+        .join(&account_id);
+    let claude_root = harness
+        ._data
+        .path()
+        .join("agent-accounts/claude")
+        .join(&account_id);
+    std::fs::create_dir_all(claude_root.parent().unwrap()).unwrap();
+    std::fs::rename(codex_root, &claude_root).unwrap();
+    rusqlite::Connection::open(harness._data.path().join("prospero.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE managed_accounts SET agent='claude' WHERE id=?1",
+            [&account_id],
+        )
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/accounts")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type":"agent.accounts.list",
+                        "requestId":"mismatched-profile",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let account = value["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|account| account["id"] == account_id)
+        .unwrap();
+    assert_eq!(account["agent"], "claude");
+    assert_eq!(account["engine"], "codex");
 
     let head = harness
         .agents
         .create(CreateAgentSession {
-            agent: prosperod_rs::protocol::AgentKind::Codex,
+            agent: prosperod_rs::protocol::AgentKind::Claude,
             title: "Codex profile".into(),
             workspace: harness.workspace.path().to_str().unwrap().into(),
             auto_approve: false,
@@ -728,6 +782,7 @@ async fn codex_api_profile_passes_provider_args_and_secret_environment() {
         })
         .await
         .unwrap();
+    assert_eq!(head.agent, prosperod_rs::protocol::AgentKind::Codex);
     harness
         .agents
         .send(&head.id, "use profile".into(), None, Vec::new())
@@ -2905,7 +2960,7 @@ async fn queued_image_message_keeps_attachment_count_then_frame() {
             None,
             vec![prosperod_rs::agent::AttachmentInput {
                 mime_type: "image/webp".into(),
-                data_b64: "UklGRh4A".into(),
+                data_b64: "UklGRgAAAABXRUJQ".into(),
                 name: Some("shot.webp".into()),
             }],
         )

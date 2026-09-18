@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .take(1024 * 1024)
         .read_to_string(&mut input)?;
     let fixture: Fixture = serde_json::from_str(&input)?;
-    fixture.size.validate()?;
+    prosperod_rs::terminal::validate_size(fixture.size)?;
     let mut screen = Screen::new(fixture.size);
     for chunk in fixture.chunks {
         screen.process(&STANDARD.decode(chunk)?);

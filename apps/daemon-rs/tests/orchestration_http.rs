@@ -13,6 +13,44 @@ use tower::ServiceExt;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 static CODEX_HOME_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static AUTOMATION_CLI_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const FAKE_AUTOMATION_CLI: &str = r#"#!/usr/bin/env python3
+import json, sys, time
+sys.stdout.write(json.dumps({"type": "system", "subtype": "init", "session_id": "fake-automation-worker"}) + "\n")
+sys.stdout.flush()
+sys.stdin.readline()
+while True:
+    time.sleep(1)
+"#;
+
+struct ClaudeBinGuard(Option<std::ffi::OsString>);
+
+impl Drop for ClaudeBinGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(value) => std::env::set_var("PROSPERO_CLAUDE_BIN", value),
+                None => std::env::remove_var("PROSPERO_CLAUDE_BIN"),
+            }
+        }
+    }
+}
+
+fn install_fake_automation_cli(directory: &TempDir) -> ClaudeBinGuard {
+    let cli = directory.path().join("fake-automation-claude.py");
+    std::fs::write(&cli, FAKE_AUTOMATION_CLI).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let previous = std::env::var_os("PROSPERO_CLAUDE_BIN");
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", cli);
+    }
+    ClaudeBinGuard(previous)
+}
 
 async fn fixture() -> (TempDir, Api) {
     let directory = TempDir::new().unwrap();
@@ -528,7 +566,9 @@ async fn recovery_route_reports_settled_and_resumed_dispatches() {
 
 #[tokio::test]
 async fn automation_current_dispatches_and_advances_chain() {
+    let _serial = AUTOMATION_CLI_SERIAL.lock().await;
     let (directory, api) = fixture().await;
+    let _cli = install_fake_automation_cli(&directory);
     let workspace = directory.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
@@ -588,7 +628,9 @@ async fn automation_current_dispatches_and_advances_chain() {
 
 #[tokio::test]
 async fn automation_pause_prevents_next_dispatch() {
+    let _serial = AUTOMATION_CLI_SERIAL.lock().await;
     let (directory, api) = fixture().await;
+    let _cli = install_fake_automation_cli(&directory);
     let workspace = directory.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
@@ -711,7 +753,9 @@ async fn automation_run_workspace_registers_shared_worktree_asset() {
 
 #[tokio::test]
 async fn running_automation_rejects_graph_edits_and_manual_dispatch() {
+    let _serial = AUTOMATION_CLI_SERIAL.lock().await;
     let (directory, api) = fixture().await;
+    let _cli = install_fake_automation_cli(&directory);
     let workspace = directory.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;

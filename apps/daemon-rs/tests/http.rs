@@ -483,9 +483,22 @@ async fn project_fs_routes_are_session_scoped_and_bounded() {
 async fn project_git_routes_report_diff_and_mutate_index() {
     let workspace = TempDir::new().unwrap();
     Command::new("git")
-        .args(["init", "-b", "main"])
+        .arg("init")
         .current_dir(workspace.path())
         .output()
+        .unwrap()
+        .status
+        .success()
+        .then_some(())
+        .unwrap();
+    Command::new("git")
+        .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap()
+        .status
+        .success()
+        .then_some(())
         .unwrap();
     std::fs::write(workspace.path().join("file.txt"), "one\n").unwrap();
     Command::new("git")

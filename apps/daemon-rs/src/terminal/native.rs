@@ -26,10 +26,12 @@ fn pty_size(size: TerminalSize) -> PtySize {
 }
 
 pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
-    size.validate()?;
+    validate_size(size)?;
     let pair = native_pty_system()
         .openpty(pty_size(size))
         .map_err(|_| Error::Invalid("cannot allocate terminal".into()))?;
+    #[cfg(unix)]
+    set_nonblocking(pair.master.as_ref())?;
     let mut reader = pair.master.try_clone_reader().map_err(|_| Error::Closed)?;
     let mut writer = pair.master.take_writer().map_err(|_| Error::Closed)?;
     let wake = Wake;
@@ -63,7 +65,14 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                             return;
                         }
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                     Err(_) => break,
                 }
             }
@@ -257,6 +266,16 @@ fn terminate(master: &dyn MasterPty, pid: u32) {
 
 #[cfg(windows)]
 fn terminate(_master: &dyn MasterPty, _pid: u32) {}
+
+#[cfg(unix)]
+fn set_nonblocking(master: &dyn MasterPty) -> Result<()> {
+    let fd = master.as_raw_fd().ok_or(Error::Closed)?;
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 pub(super) fn terminate_session(session: i32, keep: Option<i32>) {

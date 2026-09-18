@@ -14,10 +14,10 @@ use axum::response::{
 };
 use axum::{
     Json, Router,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
+use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use futures_util::{Stream, stream};
 use reqwest::Client;
 use serde::Deserialize;
@@ -59,6 +59,9 @@ use crate::terminal::{
     TerminalSnapshot, runtime::Terminals,
 };
 use crate::worker::Database;
+use prospero_protocol_rs::{
+    DeviceList, DeviceRevoked, DeviceView, PairingCreate, PairingCreated, RelayUpdate, RelayView,
+};
 
 #[derive(Clone)]
 pub struct Api {
@@ -79,6 +82,8 @@ pub struct Api {
     api_tests: Arc<Semaphore>,
     api_testing: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     api_features: Arc<Semaphore>,
+    remote_config: Arc<tokio::sync::Mutex<()>>,
+    dev_mode: bool,
     remote_ws_handshake_timeout: Duration,
 }
 
@@ -132,6 +137,8 @@ impl Api {
             api_tests: Arc::new(Semaphore::new(4)),
             api_testing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             api_features: Arc::new(Semaphore::new(4)),
+            remote_config: Arc::new(tokio::sync::Mutex::new(())),
+            dev_mode: false,
             remote_ws_handshake_timeout: REMOTE_WS_HANDSHAKE_TIMEOUT,
         };
         let agent_api = shared_api.clone();
@@ -154,9 +161,18 @@ impl Api {
         self
     }
 
+    pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
+        self.dev_mode = dev_mode;
+        self
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/health", get(health))
+            .route("/v1/devices", get(device_list))
+            .route("/v1/devices/{id}", delete(device_revoke))
+            .route("/v1/pairings", post(pairing_create))
+            .route("/v1/relay", get(relay_get).patch(relay_update))
             .route("/ws", get(remote_ws))
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
@@ -637,7 +653,11 @@ async fn handle_remote_ws(
         .get("clientPubKey")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    let device = match pairing::authenticate(&home, token, client_pub_key) {
+    let authenticated = {
+        let _guard = api.remote_config.lock().await;
+        pairing::authenticate(&home, token, client_pub_key)
+    };
+    let device = match authenticated {
         Ok(Ok(device)) => device,
         Ok(Err(AuthFailure::UnknownToken | AuthFailure::KeyMismatch)) => {
             let mut channel = accepted.channel;
@@ -830,21 +850,25 @@ async fn send_hello_ok(
 }
 
 fn remote_host_info(protocol_version: u8) -> JsonValue {
+    let mut capabilities = vec![
+        "session.create-result.v1",
+        "conversation.search.v1",
+        "chat.attachment-previews.v1",
+        "agent.deepseek-harness.v1",
+        "model.sources.v1",
+        "orchestration.automation.v1",
+        "scheduled-agents.v1",
+    ];
+    if cfg!(windows) {
+        capabilities.push("workspace.roots-mkdir.v1");
+    }
     json!({
         "name": std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into()),
         "daemonVersion": env!("CARGO_PKG_VERSION"),
         "protocolVersion": remote_crypto::PROTOCOL_VERSION,
         "minimumProtocolVersion": remote_crypto::MIN_PROTOCOL_VERSION,
         "negotiatedProtocolVersion": protocol_version,
-        "capabilities": [
-            "session.create-result.v1",
-            "conversation.search.v1",
-            "chat.attachment-previews.v1",
-            "agent.deepseek-harness.v1",
-            "model.sources.v1",
-            "orchestration.automation.v1",
-            "scheduled-agents.v1",
-        ],
+        "capabilities": capabilities,
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "daemonStartedAt": SystemTime::now()
@@ -893,6 +917,12 @@ async fn route_remote_ws_message(
         }
         "session.create" => remote_session_create(api, socket, channel, device, message).await,
         "session.attach" => remote_session_attach(api, socket, channel, state, message).await,
+        "session.detach" => {
+            let sid = require_str(&message, "sid")?;
+            state.pty_attachments.remove(sid);
+            state.chat_attachments.remove(sid);
+            Ok(())
+        }
         "agent.accounts.list"
         | "agent.account.create"
         | "agent.account.api.create"
@@ -1047,7 +1077,7 @@ async fn route_remote_ws_message(
             let cols = require_u16(&message, "cols")?;
             let rows = require_u16(&message, "rows")?;
             api.terminals
-                .resize(sid, TerminalSize { cols, rows }.validate()?)
+                .resize(sid, crate::terminal::validate_size(TerminalSize { cols, rows })?)
                 .await
         }
         "term.ack" => {
@@ -1972,8 +2002,12 @@ async fn remote_workspace_list(
     });
     let root = match requested_root.as_str() {
         "home" => home_dir()?,
+        "computer" if cfg!(windows) => {
+            out["entries"] = serde_json::to_value(windows_workspace_drives())?;
+            return send_remote_json(socket, channel, &out).await;
+        }
         "computer" => {
-            out["error"] = json!("computer root is not supported by this daemon build");
+            out["error"] = json!("computer root is only available on Windows");
             return send_remote_json(socket, channel, &out).await;
         }
         other if cfg!(windows) && other.len() == 2 && other.ends_with(':') => {
@@ -2004,6 +2038,22 @@ async fn remote_workspace_list(
         Err(error) => out["error"] = json!(error.to_string()),
     }
     send_remote_json(socket, channel, &out).await
+}
+
+fn windows_workspace_drives() -> Vec<FsEntry> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    (b'A'..=b'Z')
+        .map(|letter| format!("{}:", char::from(letter)))
+        .filter(|drive| std::path::Path::new(&format!("{drive}\\")).exists())
+        .map(|name| FsEntry {
+            name,
+            kind: "dir".into(),
+            size: 0,
+            mtime: 0,
+        })
+        .collect()
 }
 
 async fn remote_workspace_summary(
@@ -2441,7 +2491,7 @@ async fn remote_session_create(
                 .create(CreateTerminal {
                     title,
                     workspace: cwd,
-                    size: TerminalSize { cols, rows }.validate()?,
+                    size: crate::terminal::validate_size(TerminalSize { cols, rows })?,
                     agent: Some(agent),
                     command: message
                         .get("command")
@@ -2635,7 +2685,7 @@ async fn send_terminal_snapshot(
             .terminals
             .read(sid.to_owned(), TerminalQuery::default())
             .await?;
-        let data_b64 = terminal_page_output_b64(&page);
+        let data_b64 = terminal_page_output_b64(&page)?;
         send_remote_json(
             socket,
             channel,
@@ -2663,7 +2713,7 @@ async fn send_terminal_page(
     sid: &str,
     page: &TerminalPage,
 ) -> Result<()> {
-    let data_b64 = terminal_page_output_b64(page);
+    let data_b64 = terminal_page_output_b64(page)?;
     if !data_b64.is_empty() {
         send_remote_json(
             socket,
@@ -2675,14 +2725,18 @@ async fn send_terminal_page(
     Ok(())
 }
 
-fn terminal_page_output_b64(page: &TerminalPage) -> String {
-    page.events
-        .iter()
-        .filter_map(|event| match event {
-            TerminalEvent::Output { data_b64 } => Some(data_b64.as_str()),
-            TerminalEvent::Resize { .. } => None,
-        })
-        .collect::<String>()
+fn terminal_page_output_b64(page: &TerminalPage) -> Result<String> {
+    let mut bytes = Vec::new();
+    for event in &page.events {
+        if let TerminalEvent::Output { data_b64 } = event {
+            bytes.extend(
+                BASE64_STANDARD
+                    .decode(data_b64)
+                    .map_err(|_| Error::Invalid("terminal output encoding is invalid".into()))?,
+            );
+        }
+    }
+    Ok(BASE64_STANDARD.encode(bytes))
 }
 
 fn timeline_text_or_preview(store: &mut Store, sid: &str, record: &TimelineRecord) -> String {
@@ -3112,6 +3166,267 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
         },
         relay,
     }))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingPayload {
+    v: u8,
+    name: String,
+    addrs: Vec<String>,
+    port: u16,
+    token: String,
+    #[serde(rename = "pubKey")]
+    pub_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay: Option<PairingRelay>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingRelay {
+    v: u8,
+    url: String,
+    route_id: String,
+    device_id: String,
+    token: String,
+}
+
+fn device_view(device: &DeviceRecord) -> DeviceView {
+    DeviceView {
+        id: pairing::device_id(device),
+        name: device.name.clone(),
+        allow_shell: device.allow_shell,
+        allow_orchestration: device.can_orchestrate(),
+        bound: device.client_pub_key.is_some(),
+        relay_ready: crate::relay::device_relay_credentials(device).is_some(),
+        created_at: device.created_at,
+        last_seen_at: device.last_seen_at,
+    }
+}
+
+async fn device_list(State(api): State<Api>) -> std::result::Result<Json<DeviceList>, ApiError> {
+    let _guard = api.remote_config.lock().await;
+    let items = pairing::load_devices(api.database.directory())?
+        .iter()
+        .map(device_view)
+        .collect();
+    Ok(Json(DeviceList { items }))
+}
+
+async fn device_revoke(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<DeviceRevoked>, ApiError> {
+    if !valid_remote_id(&id) {
+        return Err(ApiError(Error::Invalid("invalid device id".into())));
+    }
+    let _guard = api.remote_config.lock().await;
+    if pairing::revoke_device(api.database.directory(), &id)?.is_none() {
+        return Err(ApiError(Error::NotFound));
+    }
+    api.publish();
+    Ok(Json(DeviceRevoked { ok: true, id }))
+}
+
+async fn pairing_create(
+    State(api): State<Api>,
+    Json(input): Json<PairingCreate>,
+) -> std::result::Result<Json<PairingCreated>, ApiError> {
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+        return Err(ApiError(Error::Invalid("invalid device name".into())));
+    }
+    if input.allow_orchestration && !input.allow_shell {
+        return Err(ApiError(Error::Invalid(
+            "orchestration requires shell access".into(),
+        )));
+    }
+    let _guard = api.remote_config.lock().await;
+    let home = api.database.directory();
+    let identity = pairing::load_or_create_identity(home)?;
+    let config = crate::relay::load_daemon_relay_config(home)?;
+    let port = config.port.unwrap_or(7423);
+    if port == 0 {
+        return Err(ApiError(Error::Invalid("daemon port is invalid".into())));
+    }
+    let relay_enabled = config.relay.as_ref().is_some_and(|relay| relay.enabled);
+    if relay_enabled {
+        let url = crate::relay::effective_relay_url(&config)
+            .ok_or_else(|| ApiError(Error::Invalid("relay configuration incomplete".into())))?;
+        let secret = config
+            .relay
+            .as_ref()
+            .and_then(|relay| relay.host_secret.as_deref())
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(|| ApiError(Error::Invalid("relay configuration incomplete".into())))?;
+        crate::relay::validate_relay_url(&url, api.dev_mode)?;
+        crate::relay::derive_relay_route_id(secret)?;
+    }
+    let addrs = pairing::pairing_addrs(config.bind.as_deref())?;
+    let device = pairing::mint_device(
+        home,
+        name.to_owned(),
+        input.allow_shell,
+        input.allow_orchestration,
+    )?;
+    let issued = if relay_enabled {
+        pairing::issue_relay_credentials(&device)
+    } else {
+        device.clone()
+    };
+    let relay = pairing_relay(&config, &issued, api.dev_mode)?;
+    if addrs.is_empty() && relay.is_none() {
+        let _ = pairing::revoke_device(home, &pairing::device_id(&device));
+        return Err(ApiError(Error::Invalid(
+            "at least one direct address or relay is required".into(),
+        )));
+    }
+    let payload = PairingPayload {
+        v: 7,
+        name: pairing::host_name(),
+        addrs,
+        port,
+        token: issued.token.clone(),
+        pub_key: identity.public_key,
+        relay,
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(Error::from)?;
+    let uri = format!("prospero://pair?d={}", BASE64_URL_SAFE_NO_PAD.encode(bytes));
+    if payload.relay.is_some()
+        && let Err(error) = pairing::persist_relay_credentials(home, &issued)
+    {
+        let _ = pairing::revoke_device(home, &pairing::device_id(&device));
+        return Err(ApiError(error));
+    }
+    api.publish();
+    Ok(Json(PairingCreated {
+        device: device_view(&issued),
+        uri,
+    }))
+}
+
+fn pairing_relay(
+    config: &crate::relay::DaemonRelayConfig,
+    device: &DeviceRecord,
+    dev_mode: bool,
+) -> Result<Option<PairingRelay>> {
+    let Some(relay) = config.relay.as_ref().filter(|relay| relay.enabled) else {
+        return Ok(None);
+    };
+    let Some(host_secret) = relay
+        .host_secret
+        .as_deref()
+        .filter(|secret| !secret.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(url) = crate::relay::effective_relay_url(config) else {
+        return Ok(None);
+    };
+    let (Some(device_id), Some(token)) =
+        (device.relay_device_id.clone(), device.relay_token.clone())
+    else {
+        return Ok(None);
+    };
+    crate::relay::validate_relay_url(&url, dev_mode)?;
+    Ok(Some(PairingRelay {
+        v: crate::relay::RELAY_PROTOCOL_VERSION,
+        url,
+        route_id: crate::relay::derive_relay_route_id(host_secret)?,
+        device_id,
+        token,
+    }))
+}
+
+async fn relay_get(State(api): State<Api>) -> std::result::Result<Json<RelayView>, ApiError> {
+    let _guard = api.remote_config.lock().await;
+    Ok(Json(relay_view(&api)?))
+}
+
+async fn relay_update(
+    State(api): State<Api>,
+    Json(input): Json<RelayUpdate>,
+) -> std::result::Result<Json<RelayView>, ApiError> {
+    if input.enabled.is_none() && input.url.is_none() && !input.rotate_key {
+        return Err(ApiError(Error::Invalid("empty relay update".into())));
+    }
+    let _guard = api.remote_config.lock().await;
+    let home = api.database.directory();
+    let config = crate::relay::load_daemon_relay_config(home)?;
+    let previous = config.relay.as_ref();
+    let enabled = input
+        .enabled
+        .unwrap_or_else(|| previous.is_some_and(|relay| relay.enabled));
+    let configured_url = match input.url.as_deref() {
+        Some(url) => {
+            let url = url.trim();
+            (!url.is_empty()).then(|| url.to_owned())
+        }
+        None => previous.and_then(|relay| relay.url.clone()),
+    };
+    let effective_url = configured_url.clone().or_else(|| {
+        std::env::var("PROSPERO_DEFAULT_RELAY_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+    });
+    if enabled {
+        crate::relay::validate_relay_url(
+            effective_url
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("relay configuration incomplete".into()))?,
+            api.dev_mode,
+        )?;
+    }
+    let host_secret = if input.rotate_key {
+        pairing::clear_relay_credentials(home)?;
+        Some(crate::relay::generate_relay_host_secret())
+    } else {
+        previous
+            .and_then(|relay| relay.host_secret.clone())
+            .filter(|secret| !secret.is_empty())
+            .or_else(|| enabled.then(crate::relay::generate_relay_host_secret))
+    };
+    crate::relay::save_relay_config_raw(home, enabled, configured_url, host_secret)?;
+    let saved = crate::relay::load_daemon_relay_config(home)?;
+    let devices = pairing::load_devices(home)?;
+    api.relay_status.set(crate::relay::relay_status_from_config(
+        &saved,
+        &devices,
+        api.dev_mode,
+    ));
+    api.publish();
+    Ok(Json(relay_view(&api)?))
+}
+
+fn relay_view(api: &Api) -> Result<RelayView> {
+    let home = api.database.directory();
+    let config = crate::relay::load_daemon_relay_config(home)?;
+    let devices = pairing::load_devices(home)?;
+    let mut runtime = api
+        .relay_status
+        .get()
+        .unwrap_or_else(|| crate::relay::relay_status_from_config(&config, &devices, api.dev_mode));
+    let credential_ready = devices
+        .iter()
+        .filter(|device| crate::relay::device_relay_credentials(device).is_some())
+        .count();
+    runtime.devices.total = devices.len();
+    runtime.devices.ready = runtime.devices.ready.min(credential_ready);
+    runtime.devices.needs_re_pair = devices.len().saturating_sub(credential_ready);
+    Ok(RelayView {
+        configured_url: config.relay.as_ref().and_then(|relay| relay.url.clone()),
+        effective_url: crate::relay::effective_relay_url(&config),
+        re_pair_required: runtime.devices.needs_re_pair > 0,
+        runtime,
+    })
+}
+
+fn valid_remote_id(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn health_capabilities() -> Vec<String> {
@@ -4139,7 +4454,7 @@ async fn account_control_result(
                 cols: *cols,
                 rows: *rows,
             };
-            let size = match size.validate() {
+            let size = match crate::terminal::validate_size(size) {
                 Ok(size) => size,
                 Err(error) => return ApiError(error).into_response(),
             };
@@ -6039,4 +6354,57 @@ async fn mark_message_answered(
         .await?;
     api.publish();
     Ok(Json(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_page_output_reencodes_each_event() {
+        let page = TerminalPage {
+            initial_size: TerminalSize { cols: 80, rows: 24 },
+            base_seq: 0,
+            next_seq: 2,
+            latest_seq: 2,
+            floor_seq: 0,
+            events: vec![
+                TerminalEvent::Output {
+                    data_b64: BASE64_STANDARD.encode(b"a"),
+                },
+                TerminalEvent::Resize {
+                    size: TerminalSize {
+                        cols: 100,
+                        rows: 30,
+                    },
+                },
+                TerminalEvent::Output {
+                    data_b64: BASE64_STANDARD.encode(b"bc"),
+                },
+            ],
+            resync_required: false,
+            exited: false,
+            exit_code: None,
+        };
+        let encoded = terminal_page_output_b64(&page).unwrap();
+        assert_eq!(BASE64_STANDARD.decode(encoded).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn terminal_page_output_rejects_invalid_event_data() {
+        let page = TerminalPage {
+            initial_size: TerminalSize { cols: 80, rows: 24 },
+            base_seq: 0,
+            next_seq: 1,
+            latest_seq: 1,
+            floor_seq: 0,
+            events: vec![TerminalEvent::Output {
+                data_b64: "not base64".into(),
+            }],
+            resync_required: false,
+            exited: false,
+            exit_code: None,
+        };
+        assert!(terminal_page_output_b64(&page).is_err());
+    }
 }

@@ -7,6 +7,7 @@ mod runtime;
 mod store;
 mod usage;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -107,15 +108,9 @@ pub struct AgentPresetInfo {
 /// One inbound image attachment. Desktop validation mirrors the legacy
 /// AttachmentSchema (at most 6 per message, the four browser image types,
 /// base64 payload <= 8 MiB per image).
-#[derive(Debug, Clone, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-#[ts(rename_all = "camelCase")]
-pub struct AttachmentInput {
-    pub mime_type: String,
-    pub data_b64: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
+pub use prospero_protocol_rs::{
+    AgentSend, AttachmentInput, PermissionDecision, QuestionAnswer, QuestionDecision,
+};
 
 /// Resumable native conversation metadata discovered from provider-owned local history.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -152,18 +147,6 @@ pub struct AttachmentChunk {
     #[ts(type = "number")]
     pub total: i64,
     pub eof: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AgentSend {
-    pub text: String,
-    /// `steer` tries to guide the running turn live and falls back to the
-    /// front of the queue; anything else enqueues normally (FIFO).
-    #[serde(default)]
-    pub delivery: Option<String>,
-    #[serde(default)]
-    pub attachments: Vec<AttachmentInput>,
 }
 
 pub(crate) const MAX_ATTACHMENTS: usize = 6;
@@ -279,6 +262,12 @@ pub(crate) fn validate_message(text: &str, attachments: &[AttachmentInput]) -> R
         {
             return Err(Error::Invalid("图片数据无效".into()));
         }
+        let bytes = STANDARD
+            .decode(data)
+            .map_err(|_| Error::Invalid("图片数据无效".into()))?;
+        if image_mime(&bytes) != Some(attachment.mime_type.as_str()) {
+            return Err(Error::Invalid("图片内容与类型不匹配".into()));
+        }
         if attachment
             .name
             .as_deref()
@@ -299,6 +288,20 @@ pub(crate) fn validate_message(text: &str, attachments: &[AttachmentInput]) -> R
         return Err(Error::Invalid("invalid message".into()));
     }
     Ok(())
+}
+
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 /// One message waiting for the current turn to finish.
@@ -331,30 +334,6 @@ pub struct AgentQueue {
 #[ts(rename_all = "camelCase")]
 pub struct AgentQueues {
     pub queues: Vec<AgentQueue>,
-}
-
-#[derive(Debug, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PermissionDecision {
-    pub request_id: String,
-    pub allow: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct QuestionAnswer {
-    pub question_id: String,
-    pub values: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct QuestionDecision {
-    pub request_id: String,
-    #[serde(default)]
-    pub answers: Vec<QuestionAnswer>,
-    #[serde(default)]
-    pub cancelled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -422,6 +401,7 @@ pub struct AgentModelCatalog {
 #[ts(rename_all = "camelCase")]
 pub struct SessionAgentControls {
     pub session_id: String,
+    pub approval_policy: String,
     pub compact: bool,
     pub model: bool,
     pub mode: bool,

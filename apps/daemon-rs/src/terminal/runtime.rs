@@ -134,7 +134,7 @@ impl Terminals {
         input: CreateTerminal,
         spec: Option<ProgramSpec>,
     ) -> Result<SessionHead> {
-        input.size.validate()?;
+        validate_size(input.size)?;
         crate::database::validate_text(&input.title, 512, false)?;
         crate::database::validate_text(&input.workspace, 4096, false)?;
         if !Path::new(&input.workspace).is_absolute() {
@@ -309,7 +309,12 @@ impl Terminals {
                 .call(move |store| store.checkpoint_terminal(&id, archive))
                 .await
             {
-                Ok(()) => seq = next,
+                Ok(()) => {
+                    seq = next;
+                    self.0
+                        .changed
+                        .send_modify(|value| *value = value.wrapping_add(1));
+                }
                 Err(Error::Busy) => {}
                 Err(error) => return Err(error),
             }

@@ -293,7 +293,7 @@ fn describe_window(mins: f64) -> String {
     } else if rounded > 0 && rounded % 60 == 0 {
         format!("{} 小时", rounded / 60)
     } else {
-        format!("{} 分钟", rounded)
+        format!("{rounded} 分钟")
     }
 }
 
