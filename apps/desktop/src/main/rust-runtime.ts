@@ -979,8 +979,7 @@ export class RustRuntime {
         if (rawAccountId !== undefined && rawAccountId !== null && `${rawAccountId}`.trim()) {
           if (agent === "claude") accountId = rawAccountId === NATIVE_CLAUDE_ACCOUNT ? NATIVE_CLAUDE_ACCOUNT : requireManagedAccountId(rawAccountId);
           else if (agent === "codex") {
-            if (rawAccountId !== NATIVE_CODEX_ACCOUNT) throw new Error("Rust Codex PTY 当前仅支持本机默认账号");
-            accountId = NATIVE_CODEX_ACCOUNT;
+            accountId = rawAccountId === NATIVE_CODEX_ACCOUNT ? NATIVE_CODEX_ACCOUNT : requireManagedAccountId(rawAccountId);
           } else throw new Error("此 Agent 的账号选择尚未接入 Rust daemon");
         }
         if ((model || effort) && agent !== "claude" && agent !== "codex") throw new Error("此 Agent 的模型参数尚未接入 Rust daemon");
