@@ -636,3 +636,44 @@ fn prepare_claude_config(root: &std::path::Path) {
         let _ = file.write_all(&body);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(protocol: Option<&str>) -> ApiProfile {
+        ApiProfile {
+            provider: if protocol == Some("anthropic") || protocol.is_none() {
+                "anthropic_compatible"
+            } else {
+                "openai_compatible"
+            }
+            .into(),
+            protocol: protocol.map(str::to_owned),
+            base_url: "https://gateway.example/v1".into(),
+            model: "test".into(),
+            model_capabilities: None,
+            headers: None,
+        }
+    }
+
+    #[test]
+    fn profile_protocol_selects_execution_engine() {
+        assert_eq!(
+            agent_kind(&profile(None)),
+            crate::protocol::AgentKind::Claude
+        );
+        assert_eq!(
+            agent_kind(&profile(Some("anthropic"))),
+            crate::protocol::AgentKind::Claude
+        );
+        assert_eq!(
+            agent_kind(&profile(Some("openai_responses"))),
+            crate::protocol::AgentKind::Codex
+        );
+        assert_eq!(
+            agent_kind(&profile(Some("openai_chat_completions"))),
+            crate::protocol::AgentKind::Opencode
+        );
+    }
+}

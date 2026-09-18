@@ -238,9 +238,8 @@ pub(crate) fn profile_secret_for_agent(
     data: &Path,
     id: &str,
     agent: AgentKind,
-    profile: &ApiProfile,
+    _profile: &ApiProfile,
 ) -> Result<Option<String>> {
-    validate_profile_agent(agent, profile)?;
     let root = profile_account_root_for_agent(data, id, agent)?;
     profile_secret_from_root(&root)
 }
@@ -409,9 +408,12 @@ fn decode_record(
 ) -> ManagedRecord {
     let api_profile = profile_raw.and_then(|raw| super::profile::parse_profile_json(&raw));
     let agent = agent_from_storage(agent_raw.as_deref(), api_profile.as_ref());
+    let engine_label = profile_engine_label(agent, api_profile.as_ref());
     let api_validation = match (api_profile.as_ref(), validation_raw, validation_revision) {
         (Some(_), Some(raw), Some(stored)) if Some(stored.as_str()) == current_revision => {
-            serde_json::from_str::<ApiValidation>(&raw).ok()
+            serde_json::from_str::<ApiValidation>(&raw)
+                .ok()
+                .filter(|validation| validation.engine == engine_label)
         }
         _ => None,
     };
@@ -421,7 +423,9 @@ fn decode_record(
         engine_validation_revision,
     ) {
         (Some(_), Some(raw), Some(stored)) if Some(stored.as_str()) == current_revision => {
-            serde_json::from_str::<ApiEngineValidation>(&raw).ok()
+            serde_json::from_str::<ApiEngineValidation>(&raw)
+                .ok()
+                .filter(|validation| validation.engine == engine_label)
         }
         _ => None,
     };
@@ -447,6 +451,18 @@ fn agent_from_storage(raw: Option<&str>, profile: Option<&ApiProfile>) -> AgentK
             .map(super::profile::agent_kind)
             .unwrap_or(AgentKind::Claude),
     }
+}
+
+fn agent_label_value(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Codex => "codex",
+        AgentKind::Opencode => "opencode",
+        _ => "claude",
+    }
+}
+
+fn profile_engine_label(agent: AgentKind, profile: Option<&ApiProfile>) -> &'static str {
+    agent_label_value(profile.map(super::profile::agent_kind).unwrap_or(agent))
 }
 
 fn agent_label(agent: AgentKind) -> Result<&'static str> {
@@ -729,15 +745,20 @@ impl crate::database::Store {
         let mut record = self.managed_account(id)?;
         record.agent = agent;
         record.api_profile = profile;
+        let engine_label = profile_engine_label(record.agent, record.api_profile.as_ref());
         record.api_validation = match (validation_raw, validation_revision) {
             (Some(raw), Some(stored)) if current.as_deref() == Some(stored.as_str()) => {
-                serde_json::from_str::<ApiValidation>(&raw).ok()
+                serde_json::from_str::<ApiValidation>(&raw)
+                    .ok()
+                    .filter(|validation| validation.engine == engine_label)
             }
             _ => None,
         };
         record.api_engine_validation = match (engine_validation_raw, engine_validation_revision) {
             (Some(raw), Some(stored)) if current.as_deref() == Some(stored.as_str()) => {
-                serde_json::from_str::<ApiEngineValidation>(&raw).ok()
+                serde_json::from_str::<ApiEngineValidation>(&raw)
+                    .ok()
+                    .filter(|validation| validation.engine == engine_label)
             }
             _ => None,
         };
@@ -1222,6 +1243,72 @@ mod tests {
             .unwrap()
             .as_deref(),
             Some("legacy-secret")
+        );
+    }
+
+    #[test]
+    fn legacy_mismatched_profile_keeps_credential_accessible_to_protocol_engine() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let profile = ApiProfile {
+            provider: "openai_compatible".into(),
+            protocol: Some("openai_responses".into()),
+            base_url: "https://gateway.example/v1".into(),
+            model: "model-a".into(),
+            model_capabilities: None,
+            headers: None,
+        };
+        store
+            .connection
+            .execute(
+                "INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at,api_profile) VALUES(?1,'claude','Legacy mismatch',0,1,1,?2)",
+                rusqlite::params!["mismatch", serde_json::to_string(&profile).unwrap()],
+            )
+            .unwrap();
+        write_credential(
+            &profile_account_root_for_agent(directory.path(), "mismatch", AgentKind::Claude)
+                .unwrap(),
+            &Credential {
+                kind: CredentialKind::ApiKey,
+                secret: "legacy-secret".into(),
+            },
+        )
+        .unwrap();
+        let record = store
+            .managed_snapshot_row(directory.path(), "mismatch")
+            .unwrap();
+        assert_eq!(record.agent, AgentKind::Claude);
+        assert_eq!(
+            super::super::profile::agent_kind(&profile),
+            AgentKind::Codex
+        );
+        assert_eq!(
+            profile_secret_for_agent(
+                directory.path(),
+                "mismatch",
+                record.agent,
+                record.api_profile.as_ref().unwrap(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("legacy-secret")
+        );
+        let environment = profile_account_environment(
+            directory.path(),
+            "mismatch",
+            record.agent,
+            record.api_profile.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            environment
+                .iter()
+                .any(|(key, value)| key == "OPENAI_API_KEY" && value == "legacy-secret")
+        );
+        assert!(
+            environment
+                .iter()
+                .all(|(key, _)| key != "ANTHROPIC_API_KEY")
         );
     }
 }
