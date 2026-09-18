@@ -116,12 +116,29 @@ fn codex_binary() -> String {
 }
 
 async fn runtime_version() -> std::result::Result<Option<String>, ProbeFailure> {
+    command_version(
+        "claude",
+        binary(),
+        &[
+            ("CLAUDE_CONFIG_DIR", "config"),
+            ("CODEX_HOME", "config"),
+            ("CODEX_SQLITE_HOME", "config"),
+        ],
+    )
+    .await
+}
+
+async fn command_version(
+    label: &'static str,
+    binary: String,
+    directory_env: &[(&str, &str)],
+) -> std::result::Result<Option<String>, ProbeFailure> {
     let root =
         tempfile::tempdir().map_err(|_| fail("runtime_unavailable", "无法创建隔离运行目录。"))?;
     let config = root.path().join("config");
     std::fs::create_dir_all(&config)
         .map_err(|_| fail("runtime_unavailable", "无法创建隔离运行目录。"))?;
-    let mut command = tokio::process::Command::new(binary());
+    let mut command = tokio::process::Command::new(binary);
     command
         .arg("--version")
         .current_dir(root.path())
@@ -134,22 +151,21 @@ async fn runtime_version() -> std::result::Result<Option<String>, ProbeFailure> 
             command.env(key, value);
         }
     }
-    command
-        .env("HOME", root.path())
-        .env("CLAUDE_CONFIG_DIR", &config)
-        .env("CODEX_HOME", &config)
-        .env("CODEX_SQLITE_HOME", &config);
+    command.env("HOME", root.path());
+    for (key, directory) in directory_env {
+        command.env(key, root.path().join(directory));
+    }
     let output = tokio::time::timeout(Duration::from_secs(5), command.output())
         .await
-        .map_err(|_| fail("runtime_unavailable", "Claude CLI 启动超时。"))?
-        .map_err(|_| fail("runtime_unavailable", "无法启动 Claude CLI。"))?;
+        .map_err(|_| fail("runtime_unavailable", "Agent CLI 启动超时。"))?
+        .map_err(|_| fail("runtime_unavailable", "无法启动 Agent CLI。"))?;
     if !output.status.success() {
-        return Err(fail("runtime_unavailable", "Claude CLI 不可用。"));
+        return Err(fail("runtime_unavailable", "Agent CLI 不可用。"));
     }
     let raw = String::from_utf8_lossy(&output.stdout);
     let version = raw
         .split_whitespace()
-        .find(|part| part.chars().any(|c| c.is_ascii_digit()))
+        .find(|part| *part != label && part.chars().any(|c| c.is_ascii_digit()))
         .map(|value| value.chars().take(100).collect::<String>());
     Ok(version)
 }
@@ -178,6 +194,34 @@ pub(crate) async fn codex_runtime_available() -> bool {
         &[("CODEX_HOME", "config"), ("CODEX_SQLITE_HOME", "config")],
     )
     .await
+}
+
+async fn engine_runtime_version(
+    engine: crate::protocol::AgentKind,
+) -> std::result::Result<Option<String>, ProbeFailure> {
+    match engine {
+        crate::protocol::AgentKind::Claude => runtime_version().await,
+        crate::protocol::AgentKind::Codex => {
+            command_version(
+                "codex",
+                codex_binary(),
+                &[("CODEX_HOME", "config"), ("CODEX_SQLITE_HOME", "config")],
+            )
+            .await
+        }
+        crate::protocol::AgentKind::Opencode => {
+            command_version("opencode", opencode_binary(), &[]).await
+        }
+        _ => Err(fail("runtime_unavailable", "Agent CLI 不可用。")),
+    }
+}
+
+fn engine_label(engine: crate::protocol::AgentKind) -> &'static str {
+    match engine {
+        crate::protocol::AgentKind::Codex => "codex",
+        crate::protocol::AgentKind::Opencode => "opencode",
+        _ => "claude",
+    }
 }
 
 async fn command_available(binary: String, directory_env: &[(&str, &str)]) -> bool {
@@ -287,7 +331,6 @@ struct Budget {
     events: usize,
 }
 
-/// Parses one Anthropic SSE stream to completion, enforcing byte/event bounds.
 async fn collect_stream(
     response: reqwest::Response,
 ) -> std::result::Result<StreamResult, ProbeFailure> {
@@ -583,36 +626,67 @@ fn client() -> std::result::Result<reqwest::Client, ProbeFailure> {
 pub(crate) async fn probe(profile: &ApiProfile, secret: &str) -> ApiValidation {
     let started = std::time::Instant::now();
     let checked_at = crate::database::now();
+    let engine = super::profile::agent_kind(profile);
+    let engine_label = engine_label(engine);
     let mut checks = ValidationChecks {
         runtime: Check::NotTested,
         streaming: Check::NotTested,
         tools: Check::NotTested,
     };
+    if profile
+        .model_capabilities
+        .as_ref()
+        .and_then(|caps| caps.tools)
+        == Some(false)
+    {
+        return ApiValidation {
+            status: "failed".into(),
+            checked_at,
+            engine: engine_label.into(),
+            checks,
+            code: Some("tools_disabled".into()),
+            detail: "该 Profile 已声明不支持工具调用，无法验证 Agent 工具往返。".into(),
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+        };
+    }
+    if secret.is_empty() || secret.contains(['\r', '\n', '\0']) {
+        return ApiValidation {
+            status: "failed".into(),
+            checked_at,
+            engine: engine_label.into(),
+            checks,
+            code: Some("credential_missing".into()),
+            detail: "API Profile 尚未配置有效的 Key。".into(),
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+        };
+    }
+    if engine_runtime_version(engine).await.is_err() {
+        checks.runtime = Check::Failed;
+        return ApiValidation {
+            status: "failed".into(),
+            checked_at,
+            engine: engine_label.into(),
+            checks,
+            code: Some("runtime_unavailable".into()),
+            detail: "所需 Agent CLI 未安装或无法启动。".into(),
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+        };
+    }
+    checks.runtime = Check::Passed;
+    if engine != crate::protocol::AgentKind::Claude {
+        return ApiValidation {
+            status: "failed".into(),
+            checked_at,
+            engine: engine_label.into(),
+            checks,
+            code: Some("protocol_probe_not_implemented".into()),
+            detail: format!(
+                "{engine_label} CLI 可启动；Rust 当前尚未实现该 API 协议的无副作用连接测试。"
+            ),
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+        };
+    }
     let run = async {
-        if profile
-            .model_capabilities
-            .as_ref()
-            .and_then(|caps| caps.tools)
-            == Some(false)
-        {
-            return Err(fail(
-                "tools_disabled",
-                "该 Profile 已声明不支持工具调用，无法验证 Agent 工具往返。",
-            ));
-        }
-        if secret.is_empty() || secret.contains(['\r', '\n', '\0']) {
-            return Err(fail(
-                "credential_missing",
-                "API Profile 尚未配置有效的 Key。",
-            ));
-        }
-        if !runtime_available().await {
-            return Err(fail(
-                "runtime_unavailable",
-                "所需 Agent CLI 未安装或无法启动。",
-            ));
-        }
-        checks.runtime = Check::Passed;
         let http = client()?;
         let url = endpoint(profile, "/v1/messages")
             .map_err(|_| fail("invalid_profile", "此账号没有有效的 API Profile。"))?;
@@ -720,7 +794,7 @@ pub(crate) async fn probe(profile: &ApiProfile, secret: &str) -> ApiValidation {
             return ApiValidation {
                 status: "passed".into(),
                 checked_at,
-                engine: "claude".into(),
+                engine: engine_label.into(),
                 checks,
                 code: None,
                 detail: SCOPE.into(),
@@ -742,7 +816,7 @@ pub(crate) async fn probe(profile: &ApiProfile, secret: &str) -> ApiValidation {
     ApiValidation {
         status: "failed".into(),
         checked_at,
-        engine: "claude".into(),
+        engine: engine_label.into(),
         checks,
         code: Some(failure.code.into()),
         detail: format!("{} {}", failure.message, SCOPE),
@@ -760,13 +834,15 @@ pub(crate) async fn probe(profile: &ApiProfile, secret: &str) -> ApiValidation {
 /// configuration step without changing the wire contract.
 pub(crate) async fn probe_engine(profile: &ApiProfile, secret: &str) -> ApiEngineValidation {
     let started = crate::database::now();
+    let engine = super::profile::agent_kind(profile);
+    let engine_label = engine_label(engine);
     let mut checks = EngineValidationChecks {
         runtime: Check::NotTested,
         configuration: Check::NotTested,
         streaming: Check::NotTested,
         tools: Check::NotTested,
     };
-    match runtime_version().await {
+    match engine_runtime_version(engine).await {
         Ok(cli_version) => {
             checks.runtime = Check::Passed;
             if secret.trim().is_empty() {
@@ -774,11 +850,26 @@ pub(crate) async fn probe_engine(profile: &ApiProfile, secret: &str) -> ApiEngin
                 return ApiEngineValidation {
                     status: "failed".into(),
                     checked_at: crate::database::now(),
-                    engine: "claude".into(),
+                    engine: engine_label.into(),
                     cli_version,
                     checks,
                     code: Some("credential_missing".into()),
                     detail: "API Profile 尚未配置 Key。".into(),
+                    latency_ms: Some(crate::database::now() - started),
+                };
+            }
+            if engine != crate::protocol::AgentKind::Claude {
+                checks.configuration = Check::Passed;
+                return ApiEngineValidation {
+                    status: "failed".into(),
+                    checked_at: crate::database::now(),
+                    engine: engine_label.into(),
+                    cli_version,
+                    checks,
+                    code: Some("engine_probe_not_implemented".into()),
+                    detail: format!(
+                        "{engine_label} CLI 可启动且 Profile Key 已加载；Rust 当前尚未实现该引擎的完整流式响应与工具往返验证。"
+                    ),
                     latency_ms: Some(crate::database::now() - started),
                 };
             }
@@ -794,7 +885,7 @@ pub(crate) async fn probe_engine(profile: &ApiProfile, secret: &str) -> ApiEngin
                 return ApiEngineValidation {
                     status: "passed".into(),
                     checked_at: crate::database::now(),
-                    engine: "claude".into(),
+                    engine: engine_label.into(),
                     cli_version,
                     checks,
                     code: None,
@@ -805,7 +896,7 @@ pub(crate) async fn probe_engine(profile: &ApiProfile, secret: &str) -> ApiEngin
             ApiEngineValidation {
                 status: "failed".into(),
                 checked_at: crate::database::now(),
-                engine: "claude".into(),
+                engine: engine_label.into(),
                 cli_version,
                 checks,
                 code: validation.code,
@@ -818,7 +909,7 @@ pub(crate) async fn probe_engine(profile: &ApiProfile, secret: &str) -> ApiEngin
             ApiEngineValidation {
                 status: "failed".into(),
                 checked_at: crate::database::now(),
-                engine: "claude".into(),
+                engine: engine_label.into(),
                 cli_version: None,
                 checks,
                 code: Some(error.code.into()),

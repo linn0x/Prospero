@@ -615,7 +615,7 @@ async fn profile_row(
     })
     .await
     .map_err(|_| crate::error::Error::Closed)??;
-    let engine_agent = engine_agent(record.agent, profile);
+    let engine_agent = profile::agent_kind(profile);
     let runtime_ok = match engine_agent {
         crate::protocol::AgentKind::Opencode => opencode_runtime_ok,
         crate::protocol::AgentKind::Codex => codex_runtime_ok,
@@ -697,17 +697,6 @@ async fn profile_row(
         updated_at: record.updated_at,
         active_sessions,
     })
-}
-
-fn engine_agent(
-    agent: crate::protocol::AgentKind,
-    profile: &ApiProfile,
-) -> crate::protocol::AgentKind {
-    if profile.protocol() == "openai_chat_completions" {
-        crate::protocol::AgentKind::Opencode
-    } else {
-        agent
-    }
 }
 
 /// The native row plus every managed row, status freshly probed.

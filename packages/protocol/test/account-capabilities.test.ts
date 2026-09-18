@@ -34,6 +34,12 @@ describe("API Profile capabilities and validation protocol", () => {
       baseUrl: "https://gateway.example/v1", model: "coder",
     } };
     expect(getAgentAccountEngine(account)).toBe("opencode");
+    expect(getAgentAccountEngine({ ...account, agent: "claude", apiProfile: {
+      ...account.apiProfile, protocol: "openai_responses",
+    } })).toBe("codex");
+    expect(getAgentAccountEngine({ ...account, agent: "codex", apiProfile: {
+      ...account.apiProfile, protocol: "anthropic", provider: "anthropic_compatible",
+    } })).toBe("claude");
     expect(getAgentAccountCapabilities(account)).toEqual({
       sessionKinds: ["structured"], plan: false, resume: false, modelSelection: false, reasoningEffort: false,
     });
