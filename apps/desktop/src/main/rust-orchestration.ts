@@ -6,6 +6,12 @@ import type { RustClient } from "./rust-client";
 import { createLegacyDesktopProjection } from "./orchestration-projection";
 import type { JsonObject } from "../shared/types";
 
+const PROJECTED_RUN_LIMIT = 100;
+const PROJECTED_TASK_LIMIT = 2_000;
+const PROJECTED_DISPATCH_LIMIT = 2_000;
+const PROJECTED_GATE_LIMIT = 1_000;
+const PROJECTED_WORKTREE_LIMIT = 1_000;
+
 function record(value: unknown): JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as JsonObject
@@ -25,8 +31,35 @@ function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.map(text).filter((item) => item.length) : [];
 }
 
+function timestamp(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function prioritizedRuns<T extends { id: string; status: string; createdAt: number; updatedAt: number }>(runs: T[]): T[] {
+  return [...runs].sort((left, right) => {
+    const active = Number(right.status === "active") - Number(left.status === "active");
+    if (active !== 0) return active;
+    const updated = timestamp(right.updatedAt ?? right.createdAt) - timestamp(left.updatedAt ?? left.createdAt);
+    return updated || left.id.localeCompare(right.id);
+  });
+}
+
+async function appendRunItems<T>(
+  output: T[],
+  limit: number,
+  runId: string,
+  load: (runId: string) => Promise<T[]>,
+): Promise<void> {
+  if (output.length >= limit) return;
+  const items = await load(runId).catch((): T[] => []);
+  output.push(...items.slice(0, Math.max(0, limit - output.length)));
+}
+
 /**
- * Fetch every orchestration collection and fold it into the legacy desktop
+ * Fetch a bounded orchestration window and fold it into the legacy desktop
  * projection shape (320/400 truncation, `automation: null`, `worktreePath`).
  * `eventSeq` is the orchestration event-stream head at read time, purely for
  * the projection's revision field.
@@ -36,15 +69,23 @@ export async function readOrchestrationWindow(
   signal: AbortSignal,
   eventSeq: number,
 ): Promise<JsonObject> {
-  const [runs, tasks, dispatches, gates, worktreeAssets] = await Promise.all([
-    client.listRuns(signal),
-    client.listTasks(undefined, signal),
-    client.listDispatches(undefined, signal),
-    client.listGates(undefined, signal),
-    client.listWorktreeAssets(undefined, signal),
-  ]);
+  const runs = await client.listRuns(signal);
+  const projectedRuns = prioritizedRuns(runs).slice(0, PROJECTED_RUN_LIMIT);
+  const tasks: Awaited<ReturnType<RustClient["listTasks"]>> = [];
+  const dispatches: Awaited<ReturnType<RustClient["listDispatches"]>> = [];
+  const gates: Awaited<ReturnType<RustClient["listGates"]>> = [];
+  const worktreeAssets: Awaited<ReturnType<RustClient["listWorktreeAssets"]>> = [];
+  for (const run of projectedRuns) {
+    signal.throwIfAborted();
+    await Promise.all([
+      appendRunItems(tasks, PROJECTED_TASK_LIMIT, run.id, runId => client.listTasks(runId, signal)),
+      appendRunItems(dispatches, PROJECTED_DISPATCH_LIMIT, run.id, runId => client.listDispatches(runId, signal)),
+      appendRunItems(gates, PROJECTED_GATE_LIMIT, run.id, runId => client.listGates(runId, signal)),
+      appendRunItems(worktreeAssets, PROJECTED_WORKTREE_LIMIT, run.id, runId => client.listWorktreeAssets(runId, signal)),
+    ]);
+  }
   return createLegacyDesktopProjection(
-    { eventSeq, runs, tasks, dispatches, gates, worktreeAssets },
+    { eventSeq, runs: projectedRuns, tasks, dispatches, gates, worktreeAssets },
   );
 }
 
