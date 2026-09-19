@@ -144,6 +144,10 @@ export type DaemonSnapshot = {
   bind: string;
   state: string;
   lastError?: string;
+  daemonVersion?: string;
+  buildId?: string;
+  expectedBuildId?: string;
+  updatePending?: boolean;
   persistence: { pty: boolean; structured: boolean };
   capabilities?: string[];
   relay: JsonObject;

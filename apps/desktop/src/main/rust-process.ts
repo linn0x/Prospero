@@ -1,14 +1,27 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, resolve } from "node:path";
 import { RustClient } from "./rust-client";
 
-export type RustConnection = { client: RustClient; pid: number; baseUrl: string };
+export type RustConnection = {
+  client: RustClient;
+  pid: number;
+  baseUrl: string;
+  buildId?: string;
+  expectedBuildId?: string;
+  upgradeDeferred?: boolean;
+  upgradeBlocked?: boolean;
+};
 
 async function exitedWithin(exited: Promise<void>, milliseconds: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([exited.then(() => true), new Promise<false>(done => { timer = setTimeout(() => done(false), milliseconds); })]); }
   finally { clearTimeout(timer); }
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
 export class RustProcess {
@@ -18,6 +31,7 @@ export class RustProcess {
   private stopping: Promise<void> | undefined;
   private startup: AbortController | undefined;
   private connection: RustConnection | undefined;
+  private readonly expectedBuildId: string | undefined;
 
   constructor(
     readonly binary: string,
@@ -26,9 +40,11 @@ export class RustProcess {
     private readonly env?: Record<string, string>,
   ) {
     if (!isAbsolute(binary) || !isAbsolute(directory)) throw new Error("Rust runtime paths must be absolute");
+    try { this.expectedBuildId = createHash("sha256").update(readFileSync(binary)).digest("hex"); } catch { this.expectedBuildId = undefined; }
   }
 
   get managed(): boolean { return Boolean(this.child && this.child.exitCode === null && this.child.signalCode === null); }
+  get upgradePending(): boolean { return this.connection?.upgradeDeferred === true && this.connection.upgradeBlocked !== true; }
 
   async attach(timeoutMs = 2500): Promise<RustConnection | undefined> {
     if (this.connection && this.managed) return this.connection;
@@ -36,8 +52,10 @@ export class RustProcess {
       const connection = this.readConnectionFile();
       const health = await connection.client.health(AbortSignal.timeout(timeoutMs));
       if (health.apiVersion !== 1 || health.backend !== "rust") return undefined;
-      this.connection = connection;
-      return connection;
+      if (!this.expectedBuildId || health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
+      if (health.activeRuntimeSessions !== 0) return this.accept(connection, health.buildId, true);
+      try { await connection.client.shutdown(AbortSignal.timeout(700), health.buildId); } catch { return this.accept(connection, health.buildId, true, true); }
+      return await this.waitForReplacement(connection.pid, Math.max(timeoutMs, 20_000));
     } catch {
       return undefined;
     }
@@ -95,8 +113,8 @@ export class RustProcess {
       const connection = this.readConnectionFile(ready);
       const client = connection.client;
       const health = await client.health(startup.signal);
-      if (health.apiVersion !== 1 || health.backend !== "rust" || startup.signal.aborted || !this.managed) throw new Error("Rust health check failed");
-      this.connection = connection;
+      if (health.apiVersion !== 1 || health.backend !== "rust" || (this.expectedBuildId && health.buildId !== this.expectedBuildId) || startup.signal.aborted || !this.managed) throw new Error("Rust health check failed");
+      this.connection = { ...connection, buildId: health.buildId, ...(this.expectedBuildId ? { expectedBuildId: this.expectedBuildId } : {}) };
       return this.connection;
     } catch (error) {
       await this.stop();
@@ -119,6 +137,48 @@ export class RustProcess {
     if (expected && (pid !== expected.pid || baseUrl !== expected.baseUrl)) throw new Error("Rust connection does not match the owned process");
     try { process.kill(Number(pid), 0); } catch { throw new Error("Rust daemon is not running"); }
     return { client: new RustClient(baseUrl, token), pid: Number(pid), baseUrl };
+  }
+
+  private accept(connection: RustConnection, buildId: string | undefined, upgradeDeferred = false, upgradeBlocked = false): RustConnection {
+    const base: RustConnection = { client: connection.client, pid: connection.pid, baseUrl: connection.baseUrl };
+    this.connection = {
+      ...base,
+      ...(buildId ? { buildId } : {}),
+      ...(this.expectedBuildId ? { expectedBuildId: this.expectedBuildId } : {}),
+      ...(upgradeDeferred ? { upgradeDeferred: true } : {}),
+      ...(upgradeBlocked ? { upgradeBlocked: true } : {}),
+    };
+    return this.connection;
+  }
+
+  private async waitForReplacement(previousPid: number, timeoutMs: number): Promise<RustConnection | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await delay(100);
+      try {
+        const connection = this.readConnectionFile();
+        const health = await connection.client.health(AbortSignal.timeout(1000));
+        if (health.apiVersion !== 1 || health.backend !== "rust") continue;
+        if (health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
+        if (connection.pid !== previousPid) return this.accept(connection, health.buildId, true, true);
+      } catch {}
+    }
+    this.connection = undefined;
+    return undefined;
+  }
+
+  async completeDeferredUpgrade(timeoutMs = 20_000): Promise<RustConnection | undefined> {
+    const connection = this.connection;
+    if (!connection?.upgradeDeferred || !this.expectedBuildId) return connection;
+    try {
+      const health = await connection.client.health(AbortSignal.timeout(1000));
+      if (health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
+      if (health.activeRuntimeSessions !== 0) return connection;
+      await connection.client.shutdown(AbortSignal.timeout(700), health.buildId);
+      return await this.waitForReplacement(connection.pid, timeoutMs);
+    } catch {
+      return connection;
+    }
   }
 
   stop(): Promise<void> {

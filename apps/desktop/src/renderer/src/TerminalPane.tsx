@@ -231,6 +231,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
   const [findText, setFindText] = useState("");
   const findInputRef = useRef<HTMLInputElement>(null);
   const noticeTimerRef = useRef<number | undefined>(undefined);
+  const historyNoticeRef = useRef(false);
   const queueInteraction = useCallback((message: TerminalInteraction, accepted = false): Promise<boolean> => {
     const result = interactionChain.current
       .then(async () => {
@@ -595,13 +596,19 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
           if (text(frame["kind"]) !== "pty") throw new Error(tRef.current("daemon 返回了错误的会话类型", "The daemon returned the wrong session type"));
           const mode = text(frame["mode"], "snapshot");
           const seq = number(frame["seq"]);
+          const historyTruncated = frame["historyTruncated"] === true;
+          if (historyTruncated && !historyNoticeRef.current) {
+            historyNoticeRef.current = true;
+            showNotice(tRef.current("更早的终端历史已被裁剪，已从当前保留位置恢复", "Earlier terminal history was truncated; restored from the retained output"));
+          }
           if (frame["exited"] === true) { exitedRef.current = true; readOnlyRef.current = true; }
           const bootstrapDelta = mode === "delta" && cursorRef.current === 0 && number(frame["baseSeq"], -1) === 0;
           if (mode === "events") {
-            if (number(frame["baseSeq"], -1) !== (cursorRef.current ?? 0)) { cursorRef.current = undefined; continue; }
+            if (!historyTruncated && number(frame["baseSeq"], -1) !== (cursorRef.current ?? 0)) { cursorRef.current = undefined; continue; }
+            if (historyTruncated) deleteTerminalSessionCache(session.id);
             const target = terminalRef.current;
             stableBufferRef.current = false;
-            const bootstrap = cursor === undefined;
+            const bootstrap = cursor === undefined || historyTruncated;
             writeChain.current = writeChain.current.then(async () => {
               if (!isCurrent() || !target || terminalRef.current !== target) return;
               if (bootstrap) { replayingRef.current = true; target.reset(); target.resize(number(frame["cols"], 120), number(frame["rows"], 40)); }

@@ -256,6 +256,10 @@ fn is_zero_u64(value: &u64) -> bool {
 pub struct Health {
     pub api_version: u32,
     pub backend: String,
+    #[serde(default)]
+    pub daemon_version: String,
+    #[serde(default)]
+    pub build_id: String,
     pub active_runtime_sessions: usize,
     pub database_queue_capacity: usize,
     pub capabilities: Vec<String>,
