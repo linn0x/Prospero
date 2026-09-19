@@ -71,6 +71,7 @@ pub struct Api {
     pub relay_status: crate::relay::RelayStatusHandle,
     pub schedules: Schedules,
     pub plugin_services: PluginServiceSupervisor,
+    build_id: Arc<str>,
     token: Token,
     projection: Arc<Mutex<ProjectionState>>,
     changes: watch::Sender<u64>,
@@ -111,6 +112,21 @@ impl Api {
     }
 
     pub fn with_guard(database: Database, token: Token, guard: Option<std::path::PathBuf>) -> Self {
+        let build_id: String = guard
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|bytes| {
+                use sha2::{Digest, Sha256};
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let digest = Sha256::digest(bytes);
+                let mut encoded = String::with_capacity(digest.len() * 2);
+                for byte in digest {
+                    encoded.push(HEX[(byte >> 4) as usize] as char);
+                    encoded.push(HEX[(byte & 15) as usize] as char);
+                }
+                encoded
+            })
+            .unwrap_or_else(|| "development".into());
         let relay_status = crate::relay::RelayStatusHandle::new(database.directory());
         let terminals = Terminals::with_guard(database.clone(), guard);
         let changes = terminals.changes();
@@ -125,6 +141,7 @@ impl Api {
             relay_status: relay_status.clone(),
             schedules: schedules.clone(),
             plugin_services,
+            build_id: build_id.into(),
             database: database.clone(),
             token: token.clone(),
             projection: Arc::new(Mutex::new(ProjectionState::default())),
@@ -3157,6 +3174,8 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
     Ok(Json(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
+        daemon_version: env!("CARGO_PKG_VERSION").into(),
+        build_id: api.build_id.to_string(),
         active_runtime_sessions: api.terminals.count() + api.agents.count(),
         database_queue_capacity: DATABASE_QUEUE_CAPACITY,
         capabilities: health_capabilities(),
@@ -5392,9 +5411,25 @@ async fn terminal_close(
     Ok(Json(serde_json::json!({"ok":true})))
 }
 
-async fn shutdown(State(api): State<Api>) -> impl IntoResponse {
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShutdownQuery {
+    expected_build_id: Option<String>,
+}
+
+async fn shutdown(
+    State(api): State<Api>,
+    query: std::result::Result<Query<ShutdownQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid shutdown query".into()))?;
+    if query
+        .expected_build_id
+        .is_some_and(|expected| expected != api.build_id.as_ref())
+    {
+        return Err(Error::Conflict.into());
+    }
     api.stop();
-    (StatusCode::ACCEPTED, Json(serde_json::json!({"ok":true})))
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"ok":true}))))
 }
 
 async fn sessions(

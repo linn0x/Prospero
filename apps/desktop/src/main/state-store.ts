@@ -385,6 +385,10 @@ export class StateStore extends EventEmitter {
         port,
         bind,
         state: running ? "running" : this.starting ? "starting" : this.lastError ? "error" : "stopped",
+        daemonVersion: stringValue(status["daemonVersion"]),
+        buildId: stringValue(status["buildId"]),
+        expectedBuildId: stringValue(status["expectedBuildId"]),
+        updatePending: booleanValue(status["updatePending"]),
         persistence: {
           pty: booleanValue(persistence["pty"]),
           structured: booleanValue(persistence["structured"]),
