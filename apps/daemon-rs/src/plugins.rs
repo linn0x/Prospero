@@ -198,7 +198,7 @@ struct SupervisorState {
     store: PluginServiceStore,
     control: std::sync::Mutex<PluginServiceControl>,
     running: Mutex<HashMap<String, Arc<Runtime>>>,
-    operations: Mutex<()>,
+    operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 #[derive(Clone)]
@@ -222,6 +222,7 @@ struct PluginServiceStore {
     root: PathBuf,
     logs_root: PathBuf,
     state_file: PathBuf,
+    lock: Arc<std::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -242,7 +243,7 @@ impl PluginServiceSupervisor {
             }),
             home,
             running: Mutex::new(HashMap::new()),
-            operations: Mutex::new(()),
+            operations: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -329,23 +330,50 @@ impl PluginServiceSupervisor {
     pub async fn start(&self, plugin_id: &str, service_id: &str) -> Result<PluginServiceView> {
         validate_plugin_id(plugin_id, "pluginId")?;
         validate_plugin_id(service_id, "serviceId")?;
-        let _guard = self.0.operations.lock().await;
+        let operation = self.operation(plugin_id, service_id).await;
+        let _guard = operation.lock().await;
         self.start_unlocked(plugin_id, service_id).await
     }
 
     pub async fn stop(&self, plugin_id: &str, service_id: &str) -> Result<PluginServiceView> {
         validate_plugin_id(plugin_id, "pluginId")?;
         validate_plugin_id(service_id, "serviceId")?;
-        let _guard = self.0.operations.lock().await;
+        let operation = self.operation(plugin_id, service_id).await;
+        let _guard = operation.lock().await;
         self.stop_unlocked(plugin_id, service_id).await
     }
 
     pub async fn restart(&self, plugin_id: &str, service_id: &str) -> Result<PluginServiceView> {
         validate_plugin_id(plugin_id, "pluginId")?;
         validate_plugin_id(service_id, "serviceId")?;
-        let _guard = self.0.operations.lock().await;
-        let _ = self.stop_unlocked(plugin_id, service_id).await;
+        let operation = self.operation(plugin_id, service_id).await;
+        let _guard = operation.lock().await;
+        let key = plugin_service_key(plugin_id, service_id);
+        let runtime = { self.0.running.lock().await.remove(&key) };
+        if let Some(runtime) = runtime {
+            runtime.stopping.store(true, Ordering::Release);
+            kill_child(&runtime).await?;
+        } else if let Some((_, service)) = self.find_service(plugin_id, service_id)?
+            && let Some(pid) = self
+                .0
+                .store
+                .get(plugin_id, service_id)?
+                .and_then(|state| state.pid)
+            && process_matches_service(Some(pid), &service)
+        {
+            kill_pid(pid)?;
+        }
         self.start_unlocked(plugin_id, service_id).await
+    }
+
+    async fn operation(&self, plugin_id: &str, service_id: &str) -> Arc<Mutex<()>> {
+        self.0
+            .operations
+            .lock()
+            .await
+            .entry(plugin_service_key(plugin_id, service_id))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn check_health(
@@ -377,6 +405,12 @@ impl PluginServiceSupervisor {
             || state.port.is_none()
             || state.status != PluginServiceStatus::Running
         {
+            let operation = self.operation(plugin_id, service_id).await;
+            let _guard = operation.lock().await;
+            let current = self.status_for(&plugin, &service).await?;
+            if !same_service_instance(&state, &current) {
+                return Ok(view_for(&self.0.store, &plugin, &service, current));
+            }
             let next = state_now(PluginServiceState {
                 health: PluginServiceHealth::Unknown,
                 health_checked_at: Some(now()),
@@ -403,24 +437,30 @@ impl PluginServiceSupervisor {
             .get(url)
             .send()
             .await;
+        let operation = self.operation(plugin_id, service_id).await;
+        let _guard = operation.lock().await;
+        let current = self.status_for(&plugin, &service).await?;
+        if !same_service_instance(&state, &current) {
+            return Ok(view_for(&self.0.store, &plugin, &service, current));
+        }
         let next = match outcome {
             Ok(response) if response.status().is_success() => state_now(PluginServiceState {
                 health: PluginServiceHealth::Healthy,
                 health_checked_at: Some(checked),
                 health_error: None,
-                ..state
+                ..current
             }),
             Ok(response) => state_now(PluginServiceState {
                 health: PluginServiceHealth::Unhealthy,
                 health_checked_at: Some(checked),
                 health_error: Some(format!("status {}", response.status().as_u16())),
-                ..state
+                ..current
             }),
             Err(error) => state_now(PluginServiceState {
                 health: PluginServiceHealth::Unhealthy,
                 health_checked_at: Some(checked),
                 health_error: Some(error.to_string()),
-                ..state
+                ..current
             }),
         };
         self.0.store.update(&next)?;
@@ -428,51 +468,73 @@ impl PluginServiceSupervisor {
     }
 
     pub async fn stop_all(&self) {
-        let keys = self
+        let mut keys = self
             .0
             .running
             .lock()
             .await
             .keys()
             .cloned()
-            .collect::<Vec<_>>();
-        for key in keys {
-            let Some((plugin_id, service_id)) = key.split_once('/') else {
-                continue;
-            };
-            let _ = self.stop(plugin_id, service_id).await;
-        }
+            .collect::<HashSet<_>>();
         if let Ok(list) = self.list().await {
             for item in list.items {
                 if item.configured
                     && item.status == PluginServiceStatus::Running
                     && item.pid.is_some()
                 {
-                    let _ = self.stop(&item.plugin_id, &item.service_id).await;
+                    keys.insert(plugin_service_key(&item.plugin_id, &item.service_id));
                 }
             }
         }
+        futures_util::future::join_all(keys.into_iter().filter_map(|key| {
+            let (plugin_id, service_id) = key.split_once('/')?;
+            let supervisor = self.clone();
+            let plugin_id = plugin_id.to_owned();
+            let service_id = service_id.to_owned();
+            Some(async move {
+                let _ = supervisor.stop(&plugin_id, &service_id).await;
+            })
+        }))
+        .await;
     }
 
     async fn start_unlocked(&self, plugin_id: &str, service_id: &str) -> Result<PluginServiceView> {
         self.0.store.ensure()?;
         let (plugin, service) = self.require_service(plugin_id, service_id)?;
         let key = plugin_service_key(&plugin.name, &service.id);
-        if let Some(runtime) = self.0.running.lock().await.get(&key).cloned() {
-            if runtime.service.config_key == service.config_key
-                && runtime_exit(&runtime).await?.is_none()
-            {
-                let state = running_state(
+        let current = { self.0.running.lock().await.get(&key).cloned() };
+        if let Some(runtime) = current {
+            let exit = runtime_exit(&runtime).await?;
+            if runtime.service.config_key == service.config_key && exit.is_none() {
+                let state = running_state_with_previous(
                     &plugin,
                     &service,
                     Some(runtime.pid().await),
                     runtime.port,
                     runtime.started_at,
+                    self.0.store.get(&plugin.name, &service.id)?,
                 );
                 self.0.store.update(&state)?;
                 return Ok(view_for(&self.0.store, &plugin, &service, state));
             }
-            self.0.running.lock().await.remove(&key);
+            let removed = {
+                let mut running = self.0.running.lock().await;
+                if running
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &runtime))
+                {
+                    running.remove(&key);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed && exit.is_none() {
+                runtime.stopping.store(true, Ordering::Release);
+                tokio::spawn(async move {
+                    let _ = terminate_child(&runtime).await;
+                });
+            }
         }
         let existing = status_from_state(
             self.0.store.get(&plugin.name, &service.id)?,
@@ -481,9 +543,9 @@ impl PluginServiceSupervisor {
         );
         if existing.status == PluginServiceStatus::Running
             && process_matches_service(existing.pid, &service)
+            && let Some(pid) = existing.pid
         {
-            self.0.store.update(&existing)?;
-            return Ok(view_for(&self.0.store, &plugin, &service, existing));
+            kill_pid(pid)?;
         }
         let port = loopback_port()?;
         let started_at = now();
@@ -543,84 +605,75 @@ impl PluginServiceSupervisor {
         let running = running_state(&plugin, &service, Some(pid), port, started_at);
         self.0.store.update(&running)?;
         self.watch_runtime_exit(key.clone(), runtime.clone());
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        if let Some(exit) = runtime_exit(&runtime).await? {
-            self.0.running.lock().await.remove(&key);
-            let state = state_now(PluginServiceState {
-                plugin_id: plugin.name.clone(),
-                service_id: service.id.clone(),
-                mode: service.mode,
-                status: PluginServiceStatus::Exited,
-                pid: None,
-                port: None,
-                started_at: Some(started_at),
-                updated_at: 0,
-                last_exit: Some(exit),
-                last_error: None,
-                health: PluginServiceHealth::Unknown,
-                health_checked_at: None,
-                health_error: None,
-                config_key: service.config_key.clone(),
-            });
-            self.0.store.update(&state)?;
-            return Ok(view_for(&self.0.store, &plugin, &service, state));
-        }
         if service.health_path.is_some() {
-            let supervisor = self.clone();
-            let plugin_id = plugin.name.clone();
-            let service_id = service.id.clone();
-            tokio::spawn(async move {
-                let _ = supervisor.check_health(&plugin_id, &service_id).await;
-            });
+            self.watch_health(plugin.name.clone(), service.id.clone());
         }
         Ok(view_for(&self.0.store, &plugin, &service, running))
+    }
+
+    fn watch_health(&self, plugin_id: String, service_id: String) {
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            for delay in [0, 100, 250, 500, 1000, 2000] {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                match supervisor.check_health(&plugin_id, &service_id).await {
+                    Ok(view) if view.health == PluginServiceHealth::Healthy => return,
+                    Ok(view) if view.status != PluginServiceStatus::Running => return,
+                    Ok(_) | Err(_) => {}
+                }
+            }
+        });
     }
 
     fn watch_runtime_exit(&self, key: String, runtime: Arc<Runtime>) {
         let supervisor = self.clone();
         tokio::spawn(async move {
-            let exit = loop {
+            let result = loop {
                 match runtime_exit(&runtime).await {
-                    Ok(Some(exit)) => break Some(exit),
+                    Ok(Some(exit)) => break Ok(exit),
                     Ok(None) => tokio::time::sleep(Duration::from_millis(250)).await,
-                    Err(error) => {
-                        let state = state_now(PluginServiceState {
-                            plugin_id: runtime.plugin.name.clone(),
-                            service_id: runtime.service.id.clone(),
-                            mode: runtime.service.mode,
-                            status: PluginServiceStatus::Failed,
-                            pid: None,
-                            port: None,
-                            started_at: Some(runtime.started_at),
-                            updated_at: 0,
-                            last_exit: None,
-                            last_error: Some(error.to_string()),
-                            health: PluginServiceHealth::Unknown,
-                            health_checked_at: None,
-                            health_error: None,
-                            config_key: runtime.service.config_key.clone(),
-                        });
-                        let _ = supervisor.0.store.update(&state);
-                        supervisor.0.running.lock().await.remove(&key);
-                        return;
-                    }
+                    Err(error) => break Err(error),
                 }
             };
-            supervisor.0.running.lock().await.remove(&key);
+            let operation = supervisor
+                .operation(&runtime.plugin.name, &runtime.service.id)
+                .await;
+            let _guard = operation.lock().await;
+            let mut running = supervisor.0.running.lock().await;
+            if !running
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &runtime))
+            {
+                return;
+            }
+            running.remove(&key);
+            drop(running);
             let previous = supervisor
                 .0
                 .store
                 .get(&runtime.plugin.name, &runtime.service.id)
                 .unwrap_or_default();
+            let (status, last_exit, last_error) = match result {
+                Ok(exit) => (
+                    if runtime.stopping.load(Ordering::Acquire) {
+                        PluginServiceStatus::Stopped
+                    } else {
+                        PluginServiceStatus::Exited
+                    },
+                    Some(exit),
+                    if runtime.stopping.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        previous.as_ref().and_then(|state| state.last_error.clone())
+                    },
+                ),
+                Err(error) => (PluginServiceStatus::Failed, None, Some(error.to_string())),
+            };
             let state = state_now(PluginServiceState {
                 plugin_id: runtime.plugin.name.clone(),
                 service_id: runtime.service.id.clone(),
                 mode: runtime.service.mode,
-                status: if runtime.stopping.load(Ordering::Acquire) {
-                    PluginServiceStatus::Stopped
-                } else {
-                    PluginServiceStatus::Exited
-                },
+                status,
                 pid: None,
                 port: None,
                 started_at: previous
@@ -628,12 +681,8 @@ impl PluginServiceSupervisor {
                     .and_then(|state| state.started_at)
                     .or(Some(runtime.started_at)),
                 updated_at: 0,
-                last_exit: exit,
-                last_error: if runtime.stopping.load(Ordering::Acquire) {
-                    None
-                } else {
-                    previous.and_then(|state| state.last_error)
-                },
+                last_exit,
+                last_error,
                 health: PluginServiceHealth::Unknown,
                 health_checked_at: None,
                 health_error: None,
@@ -645,7 +694,8 @@ impl PluginServiceSupervisor {
 
     async fn stop_unlocked(&self, plugin_id: &str, service_id: &str) -> Result<PluginServiceView> {
         let key = plugin_service_key(plugin_id, service_id);
-        if let Some(runtime) = self.0.running.lock().await.remove(&key) {
+        let runtime = { self.0.running.lock().await.remove(&key) };
+        if let Some(runtime) = runtime {
             return self.stop_runtime(runtime).await;
         }
         let found = self.find_service(plugin_id, service_id)?;
@@ -743,8 +793,9 @@ impl PluginServiceSupervisor {
         service: &PluginServiceManifest,
     ) -> Result<PluginServiceState> {
         let key = plugin_service_key(&plugin.name, &service.id);
-        if let Some(runtime) = self.0.running.lock().await.get(&key).cloned()
-            && runtime.service.config_key == service.config_key
+        let current = { self.0.running.lock().await.get(&key).cloned() };
+        if let Some(runtime) =
+            current.filter(|runtime| runtime.service.config_key == service.config_key)
         {
             if let Some(exit) = runtime_exit(&runtime).await? {
                 self.0.running.lock().await.remove(&key);
@@ -771,12 +822,13 @@ impl PluginServiceSupervisor {
                 self.0.store.update(&state)?;
                 return Ok(state);
             }
-            let state = running_state(
+            let state = running_state_with_previous(
                 plugin,
                 service,
                 Some(runtime.pid().await),
                 runtime.port,
                 runtime.started_at,
+                self.0.store.get(&plugin.name, &service.id)?,
             );
             self.0.store.update(&state)?;
             return Ok(state);
@@ -887,6 +939,7 @@ impl PluginServiceStore {
             logs_root: root.join("logs"),
             state_file: root.join("state.json"),
             root,
+            lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -896,18 +949,21 @@ impl PluginServiceStore {
     }
 
     fn list(&self) -> Result<Vec<PluginServiceState>> {
-        Ok(read_state(&self.state_file).items.into_values().collect())
+        let _guard = self.lock.lock().map_err(|_| Error::Closed)?;
+        Ok(read_state(&self.state_file)?.items.into_values().collect())
     }
 
     fn get(&self, plugin_id: &str, service_id: &str) -> Result<Option<PluginServiceState>> {
-        Ok(read_state(&self.state_file)
+        let _guard = self.lock.lock().map_err(|_| Error::Closed)?;
+        Ok(read_state(&self.state_file)?
             .items
             .remove(&plugin_service_key(plugin_id, service_id)))
     }
 
     fn update(&self, state: &PluginServiceState) -> Result<()> {
+        let _guard = self.lock.lock().map_err(|_| Error::Closed)?;
         self.ensure()?;
-        let mut file = read_state(&self.state_file);
+        let mut file = read_state(&self.state_file)?;
         file.items.insert(
             plugin_service_key(&state.plugin_id, &state.service_id),
             state.clone(),
@@ -1436,11 +1492,22 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn read_state(path: &Path) -> StateFile {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<StateFile>(&raw).ok())
-        .unwrap_or_default()
+fn read_state(path: &Path) -> Result<StateFile> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(StateFile::default()),
+        Err(error) => return Err(error.into()),
+    };
+    match serde_json::from_slice(&raw) {
+        Ok(state) => Ok(state),
+        Err(_) => {
+            let repaired = raw
+                .strip_suffix(b"\\n")
+                .ok_or_else(|| Error::Invalid("plugin service state is invalid".into()))?;
+            serde_json::from_slice(repaired)
+                .map_err(|_| Error::Invalid("plugin service state is invalid".into()))
+        }
+    }
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1450,7 +1517,7 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     private_dir(parent)?;
     let tmp = path.with_file_name(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
     let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(&tmp, [bytes, b"\\n".to_vec()].concat())?;
+    fs::write(&tmp, [bytes, b"\n".to_vec()].concat())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1539,6 +1606,27 @@ fn running_state(
     })
 }
 
+fn running_state_with_previous(
+    plugin: &ProsperoPluginManifest,
+    service: &PluginServiceManifest,
+    pid: Option<u32>,
+    port: u16,
+    started_at: i64,
+    previous: Option<PluginServiceState>,
+) -> PluginServiceState {
+    let mut state = running_state(plugin, service, pid, port, started_at);
+    if let Some(previous) = previous.filter(|previous| {
+        previous.config_key == service.config_key
+            && previous.pid == pid
+            && previous.started_at == Some(started_at)
+    }) {
+        state.health = previous.health;
+        state.health_checked_at = previous.health_checked_at;
+        state.health_error = previous.health_error;
+    }
+    state
+}
+
 fn status_from_state(
     state: Option<PluginServiceState>,
     plugin: &ProsperoPluginManifest,
@@ -1558,6 +1646,13 @@ fn status_from_state(
         return state;
     }
     stopped_state(plugin, service)
+}
+
+fn same_service_instance(left: &PluginServiceState, right: &PluginServiceState) -> bool {
+    left.config_key == right.config_key
+        && left.pid == right.pid
+        && left.port == right.port
+        && left.started_at == right.started_at
 }
 
 fn view_for(
@@ -1684,6 +1779,25 @@ async fn terminate_child(runtime: &Runtime) -> Result<Option<PluginServiceExit>>
     wait_child(runtime, Duration::from_secs(3)).await
 }
 
+async fn kill_child(runtime: &Runtime) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = runtime.child.lock().await.id();
+        unsafe {
+            if libc::kill(pid as i32, libc::SIGKILL) != 0
+                && std::io::Error::last_os_error().kind() != ErrorKind::NotFound
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        runtime.child.lock().await.kill().map_err(Into::into)
+    }
+}
+
 async fn wait_child(runtime: &Runtime, timeout: Duration) -> Result<Option<PluginServiceExit>> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -1790,5 +1904,287 @@ fn terminate_pid(pid: u32) -> Result<()> {
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output()?;
         Ok(())
+    }
+}
+
+fn kill_pid(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        unsafe {
+            if libc::kill(pid as i32, libc::SIGKILL) != 0
+                && std::io::Error::last_os_error().kind() != ErrorKind::NotFound
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn service(id: &str, command: Vec<String>, health_path: Option<&str>) -> JsonValue {
+        let mut value = json!({
+            "id": id,
+            "mode": "manual",
+            "command": command,
+            "cwd": "runtime",
+            "port_env": "PORT",
+        });
+        if let Some(path) = health_path {
+            value["health_path"] = json!(path);
+        }
+        value
+    }
+
+    fn plugin(home: &Path, services: Vec<JsonValue>) -> PathBuf {
+        let root = home.join("plugins/test-plugin");
+        fs::create_dir_all(root.join("runtime")).unwrap();
+        fs::write(
+            root.join("prospero-plugin.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": "prospero-plugin/v1",
+                "name": "test-plugin",
+                "services": services,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    fn script(root: &Path, name: &str, body: &str) -> String {
+        let path = root.join("runtime").join(name);
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn state_store_repairs_legacy_suffix_and_preserves_all_services() {
+        let directory = TempDir::new().unwrap();
+        let store = PluginServiceStore::new(directory.path());
+        let first = PluginServiceState {
+            plugin_id: "test-plugin".into(),
+            service_id: "first".into(),
+            mode: PluginServiceMode::Manual,
+            status: PluginServiceStatus::Running,
+            pid: Some(101),
+            port: Some(4101),
+            started_at: Some(1),
+            updated_at: 1,
+            last_exit: None,
+            last_error: None,
+            health: PluginServiceHealth::Unknown,
+            health_checked_at: None,
+            health_error: None,
+            config_key: "first".into(),
+        };
+        let mut file = StateFile::default();
+        file.items
+            .insert(plugin_service_key("test-plugin", "first"), first);
+        fs::create_dir_all(store.state_file.parent().unwrap()).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&file).unwrap();
+        bytes.extend_from_slice(b"\\n");
+        fs::write(&store.state_file, bytes).unwrap();
+        let second = PluginServiceState {
+            plugin_id: "test-plugin".into(),
+            service_id: "second".into(),
+            mode: PluginServiceMode::Manual,
+            status: PluginServiceStatus::Stopped,
+            pid: None,
+            port: None,
+            started_at: None,
+            updated_at: 2,
+            last_exit: None,
+            last_error: None,
+            health: PluginServiceHealth::Unknown,
+            health_checked_at: None,
+            health_error: None,
+            config_key: "second".into(),
+        };
+        store.update(&second).unwrap();
+        let parsed: StateFile =
+            serde_json::from_slice(&fs::read(&store.state_file).unwrap()).unwrap();
+        assert_eq!(parsed.items.len(), 2);
+        assert_eq!(fs::read(&store.state_file).unwrap().last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn invalid_state_is_not_silently_replaced() {
+        let directory = TempDir::new().unwrap();
+        let store = PluginServiceStore::new(directory.path());
+        fs::create_dir_all(store.state_file.parent().unwrap()).unwrap();
+        fs::write(&store.state_file, b"{broken").unwrap();
+        let state = stopped_state(
+            &ProsperoPluginManifest {
+                schema_version: "prospero-plugin/v1".into(),
+                name: "test-plugin".into(),
+                version: None,
+                root: directory.path().to_string_lossy().into_owned(),
+                manifest_path: String::new(),
+                skills_root: None,
+                agents_root: None,
+                runtime_root: None,
+                bootstrap: None,
+                services: Vec::new(),
+            },
+            &PluginServiceManifest {
+                id: "first".into(),
+                mode: PluginServiceMode::Manual,
+                command: vec!["true".into()],
+                cwd: directory.path().to_string_lossy().into_owned(),
+                env: BTreeMap::new(),
+                port_env: "PORT".into(),
+                health_path: None,
+                config_key: "first".into(),
+            },
+        );
+        assert!(store.update(&state).is_err());
+        assert_eq!(fs::read(&store.state_file).unwrap(), b"{broken");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_returns_after_spawn_without_waiting_for_health() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
+        let services = vec![service("slow-health", vec![command], Some("/health"))];
+        plugin(directory.path(), services);
+        let supervisor = PluginServiceSupervisor::new(directory.path());
+        let started = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.start("test-plugin", "slow-health"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(started.status, PluginServiceStatus::Running);
+        assert_eq!(started.health, PluginServiceHealth::Unknown);
+        supervisor.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_service_can_restart_after_supervisor_recreation() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
+        let services = vec![service("worker", vec![command], None)];
+        plugin(directory.path(), services);
+        let supervisor = PluginServiceSupervisor::new(directory.path());
+        let first = supervisor.start("test-plugin", "worker").await.unwrap();
+        let first_pid = first.pid.unwrap();
+        unsafe {
+            libc::kill(first_pid as i32, libc::SIGKILL);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = supervisor.list().await.unwrap().items.remove(0);
+            if state.status == PluginServiceStatus::Exited {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(supervisor);
+        let replacement = PluginServiceSupervisor::new(directory.path());
+        let second = replacement.start("test-plugin", "worker").await.unwrap();
+        assert_eq!(second.status, PluginServiceStatus::Running);
+        assert_ne!(second.pid, Some(first_pid));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let current = replacement.list().await.unwrap().items.remove(0);
+        assert_eq!(current.status, PluginServiceStatus::Running);
+        assert_eq!(current.pid, second.pid);
+        replacement.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_spawns_replacement_before_old_exit_completes() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(
+            &root,
+            "service.sh",
+            "#!/bin/sh\ntrap 'sleep 2; exit 0' TERM\nsleep 30\n",
+        );
+        let services = vec![service("worker", vec![command], None)];
+        plugin(directory.path(), services);
+        let supervisor = PluginServiceSupervisor::new(directory.path());
+        let first = supervisor.start("test-plugin", "worker").await.unwrap();
+        let restarted = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.restart("test-plugin", "worker"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(restarted.status, PluginServiceStatus::Running);
+        assert_ne!(restarted.pid, first.pid);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let current = supervisor.list().await.unwrap().items.remove(0);
+        assert_eq!(current.status, PluginServiceStatus::Running);
+        assert_eq!(current.pid, restarted.pid);
+        supervisor.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_stop_does_not_block_another_service_start() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let slow = script(
+            &root,
+            "slow.sh",
+            "#!/bin/sh\ntrap '' TERM\ntouch ready\nwhile :; do sleep 1; done\n",
+        );
+        let fast = script(&root, "fast.sh", "#!/bin/sh\nsleep 30\n");
+        plugin(
+            directory.path(),
+            vec![
+                service("slow", vec![slow], None),
+                service("fast", vec![fast], None),
+            ],
+        );
+        let supervisor = PluginServiceSupervisor::new(directory.path());
+        supervisor.start("test-plugin", "slow").await.unwrap();
+        let ready = root.join("runtime/ready");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stopping = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop("test-plugin", "slow").await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = tokio::time::timeout(
+            Duration::from_secs(4),
+            supervisor.start("test-plugin", "fast"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(started.status, PluginServiceStatus::Running);
+        assert!(!stopping.is_finished());
+        stopping.await.unwrap().unwrap();
+        supervisor.stop_all().await;
     }
 }
