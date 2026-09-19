@@ -251,7 +251,10 @@ export class RustClient {
     return this.json(`/v1/sessions/${id(value)}/git/commit`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify({ message }) });
   }
 
-  async shutdown(signal: AbortSignal | null = null): Promise<void> { await this.json("/v1/shutdown", { method: "POST", signal }); }
+  async shutdown(signal: AbortSignal | null = null, expectedBuildId?: string): Promise<void> {
+    const query = expectedBuildId ? `?expectedBuildId=${encodeURIComponent(expectedBuildId)}` : "";
+    await this.json(`/v1/shutdown${query}`, { method: "POST", signal });
+  }
   sessions(query: SessionQuery, signal: AbortSignal | null = null): Promise<SessionPage> {
     const params = new URLSearchParams();
     if (query.limit != null) params.set("limit", String(query.limit));

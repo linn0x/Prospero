@@ -284,6 +284,30 @@ export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[
   return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
 }
 
+type TerminalReader = Pick<RustConnection["client"], "terminalOutput" | "terminalSnapshot">;
+
+export async function rustTerminalView(client: TerminalReader, id: string, cursor: number | undefined, wait: number, signal: AbortSignal): Promise<JsonObject | null> {
+  if (cursor === undefined) {
+    const snapshot = await client.terminalSnapshot(id, signal);
+    if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
+  }
+  let page = await client.terminalOutput(id, { afterSeq: cursor ?? 0, waitMs: Math.min(wait, 5000) }, signal);
+  let historyTruncated = false;
+  if (page.resyncRequired) {
+    const snapshot = await client.terminalSnapshot(id, signal);
+    if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
+    historyTruncated = true;
+    for (let attempt = 0; attempt < 3 && page.resyncRequired; attempt += 1) {
+      page = await client.terminalOutput(id, { afterSeq: page.floorSeq, waitMs: 0 }, signal);
+    }
+  }
+  if (page.resyncRequired) {
+    return { kind: "pty", mode: "events", seq: page.floorSeq, baseSeq: page.floorSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: [], exited: page.exited, caughtUp: page.floorSeq === page.latestSeq, historyTruncated: true };
+  }
+  if (!page.events.length && cursor !== undefined && !page.exited && !historyTruncated) return null;
+  return { kind: "pty", mode: "events", seq: page.nextSeq, baseSeq: page.baseSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: page.events, exited: page.exited, caughtUp: page.nextSeq === page.latestSeq, ...(historyTruncated ? { historyTruncated: true } : {}) };
+}
+
 export class RustRuntime {
   private readonly process: RustProcess;
   private connection: RustConnection | undefined;
@@ -421,6 +445,10 @@ export class RustRuntime {
     this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
       persistence: health.persistence,
+      daemonVersion: health.daemonVersion,
+      buildId: health.buildId,
+      ...(this.connection?.expectedBuildId ? { expectedBuildId: this.connection.expectedBuildId } : {}),
+      updatePending: this.connection?.upgradeDeferred === true,
       ...(health.relay ? { relay: health.relay as unknown as JsonObject } : {}),
       metadataRevision: `${pid}:${this.sequence}`,
       workspaceCounts: Object.fromEntries(workspaces.items.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
@@ -439,6 +467,19 @@ export class RustRuntime {
   private async poll(): Promise<void> {
     let delay = 500;
     try {
+      if (this.process.upgradePending) {
+        const connection = await this.process.completeDeferredUpgrade();
+        if (connection && !connection.upgradeDeferred) {
+          this.connection = connection;
+          await this.refresh();
+          return;
+        }
+        if (!connection) {
+          this.connection = await this.process.start();
+          await this.refresh();
+          return;
+        }
+      }
       const { client } = this.current();
       const [sessions, orchestration] = await Promise.all([
         client.events({ scope: "sessions", afterSeq: this.sequence, limit: 100 }, this.controller.signal),
@@ -558,19 +599,7 @@ export class RustRuntime {
   }
 
   private async terminalView(id: string, cursor: number | undefined, wait: number, signal: AbortSignal): Promise<JsonObject | null> {
-    const { client } = this.current();
-    if (cursor === undefined) {
-      const snapshot = await client.terminalSnapshot(id, signal);
-      if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
-    }
-    const page = await client.terminalOutput(id, { afterSeq: cursor ?? 0, waitMs: Math.min(wait, 5000) }, signal);
-    if (page.resyncRequired) {
-      const snapshot = await client.terminalSnapshot(id, signal);
-      if (!snapshot) throw new Error("终端历史已超出保留窗口，当前内容尚不能完整恢复；请保留已打开的窗口");
-      return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
-    }
-    if (!page.events.length && cursor !== undefined && !page.exited) return null;
-    return { kind: "pty", mode: "events", seq: page.nextSeq, baseSeq: page.baseSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: page.events, exited: page.exited, caughtUp: page.nextSeq === page.latestSeq };
+    return rustTerminalView(this.current().client, id, cursor, wait, signal);
   }
 
   private async terminalWrite(id: string, data: string, signal: AbortSignal): Promise<void> {

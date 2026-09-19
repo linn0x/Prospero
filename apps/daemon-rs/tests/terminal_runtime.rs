@@ -131,6 +131,8 @@ async fn completed_terminal_is_archived_and_output_survives_restart() {
     settled(&runtime).await;
     runtime.shutdown().await.unwrap();
     database.shutdown().await.unwrap();
+    drop(runtime);
+    drop(database);
     let database = Database::open(directory.path().into()).await.unwrap();
     let runtime = Terminals::new(database.clone());
     let id = head.id.clone();

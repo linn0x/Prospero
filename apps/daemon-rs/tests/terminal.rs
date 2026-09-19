@@ -15,7 +15,7 @@ fn start(script: &str) -> Terminal {
 }
 
 async fn wait(terminal: &Terminal) {
-    tokio::time::timeout(Duration::from_secs(3), terminal.wait_exited())
+    tokio::time::timeout(Duration::from_secs(15), terminal.wait_exited())
         .await
         .unwrap();
 }

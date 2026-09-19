@@ -182,6 +182,8 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
           <span>{t("选择", "Selected")}: {backendLabel(runtimeSwitch.selected)}</span>
           <span>{t("默认", "Default")}: {backendLabel(runtimeSwitch.defaultBackend)}</span>
           <span>{t("Rust 二进制", "Rust binary")}: {runtimeSwitch.rustAvailable ? t("已找到", "Found") : t("缺失", "Missing")}</span>
+          {snapshot.daemon.daemonVersion && <span>Daemon: {snapshot.daemon.daemonVersion} · {snapshot.daemon.buildId?.slice(0, 12)}</span>}
+          {snapshot.daemon.updatePending && <span>{t("已有新 daemon，活动会话结束后安全切换", "A daemon update is pending until active sessions finish")}</span>}
           {snapshot.daemon.capabilities?.includes("terminal.windows.conpty") && <span>Windows ConPTY</span>}
           {runtimeSwitch.lastRollbackReason && <span>{t("最近回滚", "Last rollback")}: {runtimeSwitch.lastRollbackReason}</span>}
         </div>}

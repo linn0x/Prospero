@@ -127,6 +127,8 @@ async fn health_dto_reports_rust_http_contract() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["apiVersion"], json!(API_VERSION));
     assert_eq!(body["backend"], "rust");
+    assert_eq!(body["daemonVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["buildId"], "development");
     assert_eq!(body["activeRuntimeSessions"], 0);
     assert_eq!(
         body["databaseQueueCapacity"],
@@ -135,6 +137,23 @@ async fn health_dto_reports_rust_http_contract() {
     assert_eq!(body["persistence"]["structured"], true);
     assert_eq!(body["persistence"]["pty"], cfg!(unix));
     assert!(body["capabilities"].as_array().unwrap().len() > 5);
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_rejects_a_stale_build_identity() {
+    let (_directory, api) = fixture().await;
+    let (status, body) = api_request(
+        &api,
+        "POST",
+        "/v1/shutdown?expectedBuildId=stale",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "conflict");
+    let (status, _) = health(&api).await;
+    assert_eq!(status, StatusCode::OK);
     api.database.shutdown().await.unwrap();
 }
 
