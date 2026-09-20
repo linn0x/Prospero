@@ -319,7 +319,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
         cyan: "#7dcfff", brightCyan: "#7dcfff", white: "#a9b1d6", brightWhite: "#c0caf5",
       },
     });
-    if (session.terminalMode === "events") configureRustTerminalUnicode(terminal);
+    configureRustTerminalUnicode(terminal);
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     const search = new SearchAddon();
