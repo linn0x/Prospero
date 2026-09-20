@@ -459,6 +459,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       return true;
     });
     const osc52Disposable = terminal.parser.registerOscHandler(52, (data) => {
+      if (replayingRef.current || !connectedRef.current || !activeRef.current) return true;
       const separator = data.indexOf(";");
       if (separator < 0) return false;
       const payload = data.slice(separator + 1);
@@ -472,6 +473,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       return true;
     });
     const bellDisposable = terminal.onBell(() => {
+      if (replayingRef.current || !connectedRef.current || !activeRef.current) return;
       setBell(true);
       window.clearTimeout(bellTimer);
       bellTimer = window.setTimeout(() => setBell(false), 170);

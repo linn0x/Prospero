@@ -7,6 +7,7 @@ import type { QueuedMessage, SessionAgentControls } from "@prospero/protocol/rus
 import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import type { FilePreview, GitHistoryEntry, GitMutation, ProjectFile, ProjectGitStatus } from "../shared/project-tools";
 import { StateStore } from "./state-store";
+import { TerminalRecovery } from "./terminal-recovery";
 import { RustProcess, type RustConnection } from "./rust-process";
 import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } from "./rust-orchestration";
 
@@ -286,18 +287,25 @@ export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[
 
 type TerminalReader = Pick<RustConnection["client"], "terminalOutput" | "terminalSnapshot">;
 
-export async function rustTerminalView(client: TerminalReader, id: string, cursor: number | undefined, wait: number, signal: AbortSignal): Promise<JsonObject | null> {
+export async function rustTerminalView(client: TerminalReader, id: string, cursor: number | undefined, wait: number, signal: AbortSignal, recovery?: TerminalRecovery): Promise<JsonObject | null> {
+  await recovery?.load(id);
   if (cursor === undefined) {
     const snapshot = await client.terminalSnapshot(id, signal);
-    if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
+    if (snapshot) { recovery?.snapshot(id, snapshot); return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 }; }
   }
   const page = await client.terminalOutput(id, { afterSeq: cursor ?? 0, waitMs: Math.min(wait, 5000) }, signal);
+  const cached = recovery?.replay(id, cursor, page.floorSeq, page.latestSeq);
+  if (cached) return cached;
   if (page.resyncRequired) {
     const snapshot = await client.terminalSnapshot(id, signal);
-    if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
+    if (snapshot) { recovery?.snapshot(id, snapshot); return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 }; }
     // Retained bytes alone cannot reconstruct cursor, modes or screen contents.
     // Never treat a truncated suffix as a fresh terminal, even after catching up.
     throw new Error("终端历史已裁剪且暂无完整快照，无法可靠恢复画面。请保留已有终端窗口；重新加载不能还原已丢失的屏幕状态。");
+  }
+  if (recovery && !recovery.append(id, page)) {
+    const compact = await client.terminalSnapshot(id, signal);
+    if (compact) recovery.snapshot(id, compact);
   }
   if (!page.events.length && cursor !== undefined && !page.exited) return null;
   return { kind: "pty", mode: "events", seq: page.nextSeq, baseSeq: page.baseSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: page.events, exited: page.exited, caughtUp: page.nextSeq === page.latestSeq };
@@ -314,9 +322,12 @@ export class RustRuntime {
   private sequence = 0;
   private orchestrationSequence = 0;
   private ready = false;
+  private readonly terminalRecovery: TerminalRecovery;
+  flushTerminalRecovery(): Promise<void> { return this.terminalRecovery.flush(); }
   private terminalWrites = new Map<string, { count: number; bytes: number; failed: boolean; tail: Promise<void> }>();
 
   constructor(private readonly store: StateStore, binary: string, directory: string, env?: Record<string, string>) {
+    this.terminalRecovery = new TerminalRecovery(resolvePath(directory, "desktop-recovery"));
     if (store.backend !== "api") throw new Error("Rust requires API-only desktop state");
     this.process = new RustProcess(binary, directory, () => {
       this.controller.abort(); clearTimeout(this.timer); this.ready = false; this.connection = undefined;
@@ -594,7 +605,7 @@ export class RustRuntime {
   }
 
   private async terminalView(id: string, cursor: number | undefined, wait: number, signal: AbortSignal): Promise<JsonObject | null> {
-    return rustTerminalView(this.current().client, id, cursor, wait, signal);
+    return rustTerminalView(this.current().client, id, cursor, wait, signal, this.terminalRecovery);
   }
 
   private async terminalWrite(id: string, data: string, signal: AbortSignal): Promise<void> {

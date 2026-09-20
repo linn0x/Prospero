@@ -1,9 +1,10 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { TerminalRecovery } from "../src/main/terminal-recovery";
 import { RustProcess } from "../src/main/rust-process";
 import { RustRuntime, rustTerminalView } from "../src/main/rust-runtime";
 import type { StateStore } from "../src/main/state-store";
@@ -244,4 +245,20 @@ describe("Rust terminal recovery", () => {
     });
     expect(client.terminalOutput).toHaveBeenCalledOnce();
   });
+});
+
+
+it("restores a persisted complete prefix after desktop restart even when daemon history was pruned", async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), "prospero-recovery-route-"));
+  const recovery = new TerminalRecovery(dir);
+  const restarted = new TerminalRecovery(dir);
+  let pruned = false;
+  const events = [{ type: "output" as const, dataB64: Buffer.from("\x1b[31;").toString("base64") }, { type: "output" as const, dataB64: Buffer.from("1mred").toString("base64") }];
+  const client = { terminalSnapshot: vi.fn().mockResolvedValue(null), terminalOutput: vi.fn(async () => terminalPage({ baseSeq: 0, nextSeq: pruned ? 0 : 2, latestSeq: 2, floorSeq: pruned ? 2 : 0, resyncRequired: pruned, events: pruned ? [] : events })) };
+  try {
+    await rustTerminalView(client, "session", undefined, 0, AbortSignal.timeout(1000), recovery);
+    await recovery.flush(); pruned = true;
+    expect(await rustTerminalView(client, "session", undefined, 0, AbortSignal.timeout(1000), restarted)).toMatchObject({ mode: "snapshot", seq: 0, caughtUp: false });
+    expect(await rustTerminalView(client, "session", 0, 0, AbortSignal.timeout(1000), restarted)).toMatchObject({ mode: "events", baseSeq: 0, seq: 2, events, caughtUp: true });
+  } finally { await recovery.flush(); await restarted.flush(); rmSync(dir, { recursive: true, force: true }); }
 });
