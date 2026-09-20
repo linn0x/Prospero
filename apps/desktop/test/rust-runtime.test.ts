@@ -214,25 +214,18 @@ describe("RustRuntime CLI bridge", () => {
 });
 
 describe("Rust terminal recovery", () => {
-  it("replays retained events from floorSeq when history was truncated without a snapshot", async () => {
-    const output = vi.fn()
-      .mockResolvedValueOnce(terminalPage({ baseSeq: 2, nextSeq: 2, latestSeq: 12, floorSeq: 8, resyncRequired: true, exited: false, exitCode: null }))
-      .mockResolvedValueOnce(terminalPage({ baseSeq: 8, nextSeq: 10, latestSeq: 12, floorSeq: 8, events: [{ type: "output", dataB64: "b25l" }, { type: "output", dataB64: "dHdv" }], exited: false, exitCode: null }));
+  it.each([undefined, 2])("refuses truncated history without a snapshot (cursor %s)", async cursor => {
+    const output = vi.fn().mockResolvedValue(terminalPage({ baseSeq: 2, nextSeq: 2, latestSeq: 12, floorSeq: 8, resyncRequired: true, exited: false, exitCode: null }));
     const client = { terminalOutput: output, terminalSnapshot: vi.fn().mockResolvedValue(null) };
+    await expect(rustTerminalView(client, "session-1", cursor, 0, AbortSignal.timeout(1000))).rejects.toThrow("无法可靠恢复画面");
+    expect(output).toHaveBeenCalledOnce();
+    expect(output).toHaveBeenCalledWith("session-1", { afterSeq: cursor ?? 0, waitMs: 0 }, expect.any(AbortSignal));
+  });
 
-    await expect(rustTerminalView(client, "session-1", 2, 20_000, AbortSignal.timeout(1000))).resolves.toEqual({
-      kind: "pty",
-      mode: "events",
-      seq: 10,
-      baseSeq: 8,
-      cols: 120,
-      rows: 40,
-      events: [{ type: "output", dataB64: "b25l" }, { type: "output", dataB64: "dHdv" }],
-      exited: false,
-      caughtUp: false,
-      historyTruncated: true,
-    });
-    expect(output).toHaveBeenNthCalledWith(2, "session-1", { afterSeq: 8, waitMs: 0 }, expect.any(AbortSignal));
+  it("allows cold replay when the complete event history is retained", async () => {
+    const page = terminalPage({ baseSeq: 0, floorSeq: 0, nextSeq: 1, latestSeq: 1, events: [{ type: "output", dataB64: "b25l" }] });
+    const client = { terminalOutput: vi.fn().mockResolvedValue(page), terminalSnapshot: vi.fn().mockResolvedValue(null) };
+    await expect(rustTerminalView(client, "session-1", undefined, 0, AbortSignal.timeout(1000))).resolves.toMatchObject({ mode: "events", baseSeq: 0, seq: 1, caughtUp: true, events: page.events });
   });
 
   it("prefers a checkpoint when the requested cursor was truncated", async () => {
