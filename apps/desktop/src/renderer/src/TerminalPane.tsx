@@ -563,6 +563,8 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       const terminal = terminalRef.current;
       if (!terminal || !host.current?.getClientRects().length) return;
       fitToHost();
+      // Repaint retained canvas cells after making a background view visible.
+      terminal.refresh(0, terminal.rows - 1);
       terminal.focus();
     });
     return () => window.cancelAnimationFrame(frame);
@@ -595,17 +597,6 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
     let cachedOnce = false;
     const generation = ++pollGenerationRef.current;
     const isCurrent = (): boolean => active && pollGenerationRef.current === generation;
-    if (!activeRef.current) {
-      connectedRef.current = false;
-      replayingRef.current = false;
-      if (terminalRef.current) terminalRef.current.options.disableStdin = true;
-      setConnected(false);
-      setSyncing(false);
-      return () => {
-        active = false;
-        if (pollGenerationRef.current === generation) pollGenerationRef.current += 1;
-      };
-    }
     const scheduleCache = (): void => {
       if (session.terminalMode === "events") return;
       if (cacheTimer !== undefined) return;
@@ -762,7 +753,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       if (terminalRef.current) terminalRef.current.options.disableStdin = true;
       void window.prospero.cancelSessionView(session.id).catch(() => undefined);
     };
-  }, [active, onMissingSession, queueInteraction, session.id, fitToHost]);
+  }, [onMissingSession, queueInteraction, session.id, fitToHost]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();
@@ -806,7 +797,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       <button type="button" onClick={() => runFind(false)} aria-label={t("下一个", "Next")}>↓</button>
       <button type="button" onClick={closeFind} aria-label={t("关闭查找", "Close find")}>✕</button>
     </div>}
-    <div ref={host} className="terminal-host" style={{ visibility: syncing ? "hidden" : "visible" }} aria-busy={syncing} onContextMenu={event => {
+    <div ref={host} className="terminal-host" style={{ visibility: syncing ? "hidden" : undefined }} aria-busy={syncing} onContextMenu={event => {
       event.preventDefault();
       const terminal = terminalRef.current;
       if (terminal) void window.prospero.openTerminalContextMenu({ copy: terminal.hasSelection(), paste: connectedRef.current && !readOnlyRef.current && !replayingRef.current && !terminal.options.disableStdin }).catch(reason => setOperationError(reportError(reason)));
