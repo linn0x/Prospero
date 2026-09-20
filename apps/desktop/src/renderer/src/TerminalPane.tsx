@@ -195,6 +195,24 @@ export function terminalProposedSizeDiffers(
   return Boolean(next && (next.cols !== cols || next.rows !== rows));
 }
 
+export function fitTerminalViewport(
+  terminal: Pick<Terminal, "cols" | "rows">,
+  fit: Pick<FitAddon, "fit" | "proposeDimensions">,
+  state: { events: boolean; connected: boolean; readOnly: boolean; replaying: boolean; stable: boolean },
+  resize: (size: { cols: number; rows: number }) => void,
+): void {
+  if (state.replaying || !state.stable) return;
+  // Only daemon resize events may reflow an event-mode terminal.
+  if (state.events) {
+    if (!state.connected || state.readOnly) return;
+    const next = terminalNormalizeProposedSize(fit.proposeDimensions());
+    if (next && terminalProposedSizeDiffers(terminal.cols, terminal.rows, next)) resize(next);
+  } else {
+    fit.fit();
+    if (state.connected && !state.readOnly) resize({ cols: terminal.cols, rows: terminal.rows });
+  }
+}
+
 export function TerminalPane({ session, fontFamily, fontSize, active = true, onMissingSession }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const tRef = useRef(t);
@@ -221,10 +239,12 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
   const readOnly = terminalSessionIsReadOnly(session.status);
   const readOnlyRef = useRef(readOnly);
   readOnlyRef.current = readOnly || exitedRef.current;
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const [operationError, setOperationError] = useState<string>();
   const [connectionError, setConnectionError] = useState<string>();
   const [connected, setConnected] = useState(false);
-  const [syncing, setSyncing] = useState(false);
+  const [syncing, setSyncing] = useState(true);
   const [notice, setNotice] = useState<string>();
   const [bell, setBell] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
@@ -257,18 +277,12 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
   }, [onMissingSession, session.id]);
   const fitToHost = useCallback((): void => {
     const terminal = terminalRef.current; const fit = fitRef.current;
-    if (!terminal || !fit) return;
-    if (session.terminalMode === "events") {
-      if (!connectedRef.current || readOnlyRef.current) return;
-      const size = fit.proposeDimensions();
-      const next = terminalNormalizeProposedSize(size);
-      if (next && terminalProposedSizeDiffers(terminal.cols, terminal.rows, next)) {
-        void queueInteraction({ type: "term.resize", cols: next.cols, rows: next.rows });
-      }
-    } else {
-      fit.fit();
-      if (connectedRef.current && !readOnlyRef.current) void queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
-    }
+    const element = host.current;
+    if (!terminal || !fit || !activeRef.current || !element?.isConnected || element.clientWidth === 0 || element.clientHeight === 0) return;
+    fitTerminalViewport(terminal, fit, {
+      events: session.terminalMode === "events", connected: connectedRef.current,
+      readOnly: readOnlyRef.current, replaying: replayingRef.current, stable: stableBufferRef.current,
+    }, size => { void queueInteraction({ type: "term.resize", ...size }); });
   }, [queueInteraction, session.terminalMode]);
   /// 提示统一走这里:直接 setNotice 的话没有定时清除,那条提示会一直挂在屏幕上。
   const showNotice = useCallback((message: string): void => {
@@ -336,6 +350,14 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
     terminalRef.current = terminal;
     fitRef.current = fit;
     searchRef.current = search;
+    terminal.open(host.current);
+    const fitVisibleSoon = (): void => {
+      window.requestAnimationFrame(() => {
+        if (terminalRef.current !== terminal) return;
+        fitToHost();
+        if (host.current?.getClientRects().length && activeRef.current) terminal.focus();
+      });
+    };
     if (cached) {
       cursorRef.current = terminalBootstrapCursor(cached.cursor);
       replayingRef.current = true;
@@ -346,8 +368,8 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
             replayingRef.current = false;
             stableBufferRef.current = true;
             setSyncing(true);
-            fit.fit();
-            if (host.current?.getClientRects().length) terminal.focus();
+            fitToHost();
+            fitVisibleSoon();
           }
           done();
         });
@@ -358,22 +380,21 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       setSyncing(true);
       restoreReadyRef.current = Promise.resolve();
     }
-    terminal.open(host.current);
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => webgl.dispose());
       terminal.loadAddon(webgl);
     } catch { /* Canvas renderer remains available. */ }
     if (!cached) {
-      if (session.terminalMode !== "events") fit.fit();
-      if (host.current?.getClientRects().length) terminal.focus();
+      fitToHost();
+      fitVisibleSoon();
     }
 
     let input = "";
     let inputTimer: number | undefined;
     let bellTimer: number | undefined;
     const queueInputText = (value: string, accepted = false): Promise<boolean> => {
-      if (!value || !canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current, accepted)) return Promise.resolve(false);
+      if (!activeRef.current || !value || !canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current, accepted)) return Promise.resolve(false);
       return queueInteraction({ type: "term.input", dataB64: toBase64(value) }, true);
     };
     const flushInput = (accepted = false): Promise<boolean> | undefined => {
@@ -383,13 +404,13 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       return queueInputText(payload, accepted);
     };
     const inputDisposable = terminal.onData((value) => {
-      if (replayingRef.current || !connectedRef.current) return;
+      if (replayingRef.current || !activeRef.current || !connectedRef.current) return;
       if (terminalInputShouldScrollToBottom(value)) terminal.scrollToBottom();
       input += value;
       window.clearTimeout(inputTimer);
       inputTimer = window.setTimeout(() => { void flushInput(); }, 4);
     });
-    const canPaste = (): boolean => connectedRef.current && !readOnlyRef.current && !replayingRef.current && terminalRef.current === terminal && !terminal.options.disableStdin;
+    const canPaste = (): boolean => activeRef.current && connectedRef.current && !readOnlyRef.current && !replayingRef.current && terminalRef.current === terminal && !terminal.options.disableStdin;
     const pasteBlocked = (): void => showNotice(readOnlyRef.current
       ? t("会话已结束，终端为只读", "The session has ended; the terminal is read-only")
       : t("终端尚未就绪，请连接后再粘贴", "The terminal is not ready; paste after connecting"));
@@ -489,6 +510,15 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       }, 80);
     });
     resize.observe(host.current);
+    const refitOnFocus = (): void => {
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        if (terminalRef.current !== terminal || replayingRef.current) return;
+        fitToHost();
+      }, 80);
+    };
+    window.addEventListener("focus", refitOnFocus);
+    document.addEventListener("visibilitychange", refitOnFocus);
 
     return () => {
       window.clearTimeout(inputTimer);
@@ -503,6 +533,8 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       }
       if (connectedRef.current && !readOnlyRef.current) void flushInput(true);
       resize.disconnect();
+      window.removeEventListener("focus", refitOnFocus);
+      document.removeEventListener("visibilitychange", refitOnFocus);
       inputDisposable.dispose();
       disposePaste();
       osc52Disposable.dispose();
@@ -520,8 +552,21 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
 
   useEffect(() => {
     const terminal = terminalRef.current;
-    if (terminal) terminal.options.disableStdin = readOnlyRef.current || !connectedRef.current;
+    if (terminal) terminal.options.disableStdin = !activeRef.current || readOnlyRef.current || !connectedRef.current;
   }, [readOnly]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (terminal) terminal.options.disableStdin = !active || readOnlyRef.current || !connectedRef.current;
+    if (!active) return;
+    const frame = window.requestAnimationFrame(() => {
+      const terminal = terminalRef.current;
+      if (!terminal || !host.current?.getClientRects().length) return;
+      fitToHost();
+      terminal.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [active, fitToHost]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -550,6 +595,17 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
     let cachedOnce = false;
     const generation = ++pollGenerationRef.current;
     const isCurrent = (): boolean => active && pollGenerationRef.current === generation;
+    if (!activeRef.current) {
+      connectedRef.current = false;
+      replayingRef.current = false;
+      if (terminalRef.current) terminalRef.current.options.disableStdin = true;
+      setConnected(false);
+      setSyncing(false);
+      return () => {
+        active = false;
+        if (pollGenerationRef.current === generation) pollGenerationRef.current += 1;
+      };
+    }
     const scheduleCache = (): void => {
       if (session.terminalMode === "events") return;
       if (cacheTimer !== undefined) return;
@@ -567,12 +623,16 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
         try { cachedOnce = persistTerminalSession(session.id, terminal, serialize, cursor) || cachedOnce; } catch {}
       }, cachedOnce ? 2_000 : 150);
     };
-    writeChain.current = Promise.resolve();
     setOperationError(undefined);
     setConnectionError(undefined);
+    setSyncing(true);
     const poll = async (): Promise<void> => {
       await restoreReadyRef.current;
+      // A previous poll may still have an xterm write callback in flight.
+      // Drain it before a new snapshot can reset the same terminal.
+      await writeChain.current.catch(() => undefined);
       if (!isCurrent()) return;
+      writeChain.current = Promise.resolve();
       while (isCurrent()) {
         try {
           const startedAt = performance.now();
@@ -584,7 +644,8 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
             if (cursor !== undefined) {
               connectedRef.current = true;
               stableBufferRef.current = true;
-              if (terminalRef.current) terminalRef.current.options.disableStdin = readOnlyRef.current;
+              if (needsFitRef.current) { fitToHost(); needsFitRef.current = false; }
+              if (terminalRef.current) terminalRef.current.options.disableStdin = !activeRef.current || readOnlyRef.current;
               setConnected(true);
               setSyncing(false);
               setConnectionError(undefined);
@@ -661,7 +722,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
           connectedRef.current = frame["caughtUp"] !== false;
           const current = terminalRef.current;
           if (current) {
-            current.options.disableStdin = readOnlyRef.current || !connectedRef.current;
+            current.options.disableStdin = !activeRef.current || readOnlyRef.current || !connectedRef.current;
             if ((mode === "snapshot" || bootstrapDelta || needsFitRef.current) && connectedRef.current && host.current?.getClientRects().length) {
               fitToHost();
               needsFitRef.current = false;
@@ -690,6 +751,10 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
     void poll();
     return () => {
       active = false;
+      // The cursor commits only after a whole page. A partially applied page
+      // cannot be resumed from its old cursor without duplicating its prefix.
+      if (!stableBufferRef.current) cursorRef.current = undefined;
+      needsFitRef.current = true;
       if (cacheTimer !== undefined) window.clearTimeout(cacheTimer);
       if (pollGenerationRef.current === generation) pollGenerationRef.current += 1;
       connectedRef.current = false;
@@ -697,7 +762,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       if (terminalRef.current) terminalRef.current.options.disableStdin = true;
       void window.prospero.cancelSessionView(session.id).catch(() => undefined);
     };
-  }, [onMissingSession, queueInteraction, session.id, fitToHost]);
+  }, [active, onMissingSession, queueInteraction, session.id, fitToHost]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();
@@ -741,7 +806,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       <button type="button" onClick={() => runFind(false)} aria-label={t("下一个", "Next")}>↓</button>
       <button type="button" onClick={closeFind} aria-label={t("关闭查找", "Close find")}>✕</button>
     </div>}
-    <div ref={host} className="terminal-host" onContextMenu={event => {
+    <div ref={host} className="terminal-host" style={{ visibility: syncing ? "hidden" : "visible" }} aria-busy={syncing} onContextMenu={event => {
       event.preventDefault();
       const terminal = terminalRef.current;
       if (terminal) void window.prospero.openTerminalContextMenu({ copy: terminal.hasSelection(), paste: connectedRef.current && !readOnlyRef.current && !replayingRef.current && !terminal.options.disableStdin }).catch(reason => setOperationError(reportError(reason)));
