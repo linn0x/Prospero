@@ -393,18 +393,25 @@ impl Terminal {
             return Err(Error::Invalid("terminal wait exceeds limit".into()));
         }
         let mut changed = self.0.changed.clone();
-        changed.borrow_and_update();
-        let page = self
-            .0
-            .output
-            .lock()
-            .map_err(|_| Error::Closed)?
-            .page(after)?;
-        if page.next_seq != after || page.resync_required || page.exited || wait == 0 {
-            return Ok(page);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait.into());
+        loop {
+            changed.borrow_and_update();
+            let page = self
+                .0
+                .output
+                .lock()
+                .map_err(|_| Error::Closed)?
+                .page(after)?;
+            if page.next_seq != after || page.resync_required || page.exited || wait == 0 {
+                return Ok(page);
+            }
+            // Activity notifications are not output. Keep the same deadline
+            // rather than returning an empty page or extending the long poll.
+            match tokio::time::timeout_at(deadline, changed.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return self.0.output.lock().map_err(|_| Error::Closed)?.page(after),
+            }
         }
-        let _ = tokio::time::timeout(Duration::from_millis(wait.into()), changed.changed()).await;
-        self.0.output.lock().map_err(|_| Error::Closed)?.page(after)
     }
 
     pub async fn input(&self, input: TerminalInput) -> Result<()> {

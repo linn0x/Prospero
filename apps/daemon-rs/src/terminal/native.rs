@@ -5,13 +5,17 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use super::*;
 
-pub struct Wake;
+pub struct Wake(std::sync::mpsc::SyncSender<ReaderEvent>);
 
 impl Wake {
-    pub fn signal(&self) {}
+    pub fn signal(&self) {
+        // If full, output already wakes the consumer. Never block input here.
+        let _ = self.0.try_send(ReaderEvent::Wake);
+    }
 }
 
 enum ReaderEvent {
+    Wake,
     Output(Vec<u8>),
     Closed,
 }
@@ -34,9 +38,10 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
     set_nonblocking(pair.master.as_ref())?;
     let mut reader = pair.master.try_clone_reader().map_err(|_| Error::Closed)?;
     let mut writer = pair.master.take_writer().map_err(|_| Error::Closed)?;
-    let wake = Wake;
     let (sender, mut receiver) = mpsc::channel::<Control>(32);
-    let (output_sender, output_receiver) = std::sync::mpsc::channel::<ReaderEvent>();
+    // At most 1 MiB of reader chunks can await terminal parsing.
+    let (output_sender, output_receiver) = std::sync::mpsc::sync_channel::<ReaderEvent>(64);
+    let wake = Wake(output_sender.clone());
     let output = Arc::new(Mutex::new(Output::new(size)));
     let stop = Arc::new(AtomicBool::new(false));
     let (changed, updates) = watch::channel(0);
@@ -126,8 +131,11 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                     }
                 }
                 let mut read_any = false;
-                for event in output_receiver.try_iter().take(16) {
+                for event in output_receiver.try_iter().take(4) {
                     match event {
+                        ReaderEvent::Wake => {
+                            read_any = true;
+                        }
                         ReaderEvent::Output(bytes) => {
                             read_any = true;
                             accept_output(&output, &changed, writer.as_mut(), &stop, &bytes);
@@ -157,6 +165,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                 }
                 if !read_any {
                     match output_receiver.recv_timeout(Duration::from_millis(20)) {
+                        Ok(ReaderEvent::Wake) => {}
                         Ok(ReaderEvent::Output(bytes)) => {
                             accept_output(&output, &changed, writer.as_mut(), &stop, &bytes);
                         }
@@ -334,4 +343,70 @@ fn write_input(writer: &mut dyn Write, bytes: &[u8], stop: &AtomicBool) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> Terminal {
+        let (sender, _receiver) = mpsc::channel(32);
+        let (notifier, changed) = watch::channel(0);
+        let (wake_sender, _wake_receiver) = std::sync::mpsc::sync_channel(1);
+        Terminal(Arc::new(Inner {
+            sender,
+            output: Arc::new(Mutex::new(Output::new(TerminalSize { cols: 80, rows: 24 }))),
+            notifier,
+            changed,
+            stop: Arc::new(AtomicBool::new(false)),
+            wake: Wake(wake_sender),
+        }))
+    }
+
+    #[tokio::test]
+    async fn activity_wakeup_does_not_finish_an_output_long_poll() {
+        let terminal = fixture();
+        let read = terminal.read(TerminalQuery {
+            after_seq: Some(0),
+            wait_ms: Some(1000),
+        });
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        terminal.0.notifier.send_modify(|v| *v += 1);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        terminal.0.output.lock().unwrap().write(b"echo");
+        terminal.0.notifier.send_modify(|v| *v += 1);
+        let page = read.await.unwrap();
+        assert_eq!(page.next_seq, 1);
+        assert_eq!(page.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn activity_wakeup_preserves_the_original_timeout() {
+        let terminal = fixture();
+        let start = Instant::now();
+        let read = terminal.read(TerminalQuery {
+            after_seq: Some(0),
+            wait_ms: Some(30),
+        });
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        terminal.0.notifier.send_modify(|v| *v += 1);
+        let page = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(page.events.is_empty());
+        assert!(start.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn control_wakeup_is_immediate_and_never_blocks_on_a_full_output_queue() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let wake = Wake(sender);
+        wake.signal();
+        wake.signal();
+        assert!(matches!(receiver.try_recv(), Ok(ReaderEvent::Wake)));
+        assert!(receiver.try_recv().is_err());
+    }
 }

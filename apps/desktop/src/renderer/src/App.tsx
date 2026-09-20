@@ -4257,6 +4257,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     return () => window.removeEventListener("keydown", navigate);
   }, [navigation]);
   const workspaceFocus = focus && view === "workspaces";
+  const localWorkspaceVisible = view === "workspaces" && !activeRemote && !(activeRemoteId && !remote.ready);
+  const [localWorkspaceVisited, setLocalWorkspaceVisited] = useState(false);
+  if (localWorkspaceVisible && !localWorkspaceVisited) setLocalWorkspaceVisited(true);
   return (
     <TooltipProvider>
     <ProjectToolsProvider>
@@ -4297,7 +4300,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
 
-        <div className="main-viewport">
+        <div className="main-viewport" style={{ position: "relative" }}>
           {sessionActionError && !workspaceFocus && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
           <Suspense
             fallback={
@@ -4328,22 +4331,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             ) : view === "mobile" ? (
               <DevicesPane snapshot={sessionSnapshot} />
             ) : view === "workspaces" ? (
-              activeRemote ? <RemoteWorkspacePane key={activeRemote.id} workspace={activeRemote} settings={sessionSnapshot.settings} focus={focus} onToggleFocus={() => setFocus(current => !current)} newSessionRequest={remoteSessionRequest} /> : activeRemoteId && !remote.ready ? <div className="boot-screen"><p role={remote.error ? "alert" : "status"}>{remote.error ?? t("正在恢复远程工作区…", "Restoring remote workspace…")}</p>{remote.error && <Button onClick={() => void remote.refresh()}>{t("重试", "Retry")}</Button>}</div> : <div className="local-workspace-container">
-              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={openSession} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} />}
-              <WorkspacePane
-                focus={focus}
-                snapshot={sessionSnapshot}
-                activeId={activeId}
-                openIds={validOpenIds}
-                onActivate={(id) => openSession(id)}
-                onClose={closeSession}
-                onNewSession={openNewSession}
-                onOpenRun={openRun}
-                onTogglePin={togglePin}
-                onToggleFocus={() => setFocus((current) => !current)}
-                onAddWorkspace={openAddWorkspace}
-                onMissingSession={forgetMissingSession}
-              /></div>
+              activeRemote ? <RemoteWorkspacePane key={activeRemote.id} workspace={activeRemote} settings={sessionSnapshot.settings} focus={focus} onToggleFocus={() => setFocus(current => !current)} newSessionRequest={remoteSessionRequest} /> : activeRemoteId && !remote.ready ? <div className="boot-screen"><p role={remote.error ? "alert" : "status"}>{remote.error ?? t("正在恢复远程工作区…", "Restoring remote workspace…")}</p>{remote.error && <Button onClick={() => void remote.refresh()}>{t("重试", "Retry")}</Button>}</div> : null
             ) : view === "runs" ? (
               <OrchestrationPane
                 snapshot={sessionSnapshot}
@@ -4362,6 +4350,23 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <SettingsPane snapshot={sessionSnapshot} onOpenAccounts={() => selectView("providers")} />
             )}
           </Suspense>
+          {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
+              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={openSession} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} />}
+              <WorkspacePane
+                active={localWorkspaceVisible}
+                focus={focus}
+                snapshot={sessionSnapshot}
+                activeId={activeId}
+                openIds={validOpenIds}
+                onActivate={(id) => openSession(id)}
+                onClose={closeSession}
+                onNewSession={openNewSession}
+                onOpenRun={openRun}
+                onTogglePin={togglePin}
+                onToggleFocus={() => setFocus((current) => !current)}
+                onAddWorkspace={openAddWorkspace}
+                onMissingSession={forgetMissingSession}
+              /></div></Suspense>}
         </div>
       </SidebarInset>
       {newSessionOpen && (
