@@ -36,8 +36,65 @@ async fn blocking_database_jobs_do_not_block_the_async_executor() {
     database.shutdown().await.unwrap();
     assert!(matches!(
         database.call(|_| Ok(())).await,
-        Err(Error::Closed)
+        Err(Error::DatabaseUnavailable(_))
     ));
+}
+
+#[tokio::test]
+async fn database_health_reports_queue_depth_and_shutdown() {
+    let directory = TempDir::new().unwrap();
+    let database = Database::open(directory.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(database.health().alive);
+    assert_eq!(database.health().queue_depth, 0);
+    assert_eq!(database.health().last_error, None);
+    let (release, barrier) = std::sync::mpsc::channel();
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let clone = database.clone();
+    let blocker = tokio::spawn(async move {
+        clone
+            .call(move |_| {
+                let _ = started.send(());
+                barrier.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            })
+            .await
+    });
+    waiting.await.unwrap();
+    assert_eq!(database.health().queue_depth, 1);
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    assert_eq!(database.health().queue_depth, 0);
+    database.shutdown().await.unwrap();
+    assert!(!database.health().alive);
+    assert!(matches!(
+        database.call(|_| Ok(())).await,
+        Err(Error::DatabaseUnavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn database_operation_panic_is_isolated_and_reported() {
+    let directory = TempDir::new().unwrap();
+    let database = Database::open(directory.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(matches!(
+        database
+            .call::<(), _>(|_| panic!("synthetic database operation panic"))
+            .await,
+        Err(Error::DatabaseOperationFailed(_))
+    ));
+    let health = database.health();
+    assert!(health.alive);
+    assert_eq!(health.queue_depth, 0);
+    assert_eq!(
+        health.last_error.as_deref(),
+        Some("synthetic database operation panic")
+    );
+    database.call(|_| Ok(())).await.unwrap();
+    database.shutdown().await.unwrap();
 }
 
 #[tokio::test]
