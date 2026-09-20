@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   canDeliverTerminalInteraction,
+  fitTerminalViewport,
   getTerminalEmptyFrameDelay,
   terminalBootstrapCursor,
   terminalClipboardAction,
@@ -106,5 +107,29 @@ describe("terminal clipboard shortcuts", () => {
 
   it("keeps Shift+Insert paste available outside macOS", () => {
     expect(terminalShortcutAction(key({ shiftKey: true, code: "Insert" }), false)).toBe("paste");
+  });
+});
+
+describe("terminal viewport replay ordering", () => {
+  it("requests daemon resize without reflowing the local event terminal", () => {
+    const terminal = { cols: 120, rows: 40 };
+    const fit = { fit: vi.fn(), proposeDimensions: () => ({ cols: 80, rows: 24 }) };
+    const resize = vi.fn();
+    fitTerminalViewport(terminal, fit, { events: true, connected: true, readOnly: false, replaying: false, stable: true }, resize);
+    expect(resize).toHaveBeenCalledExactlyOnceWith({ cols: 80, rows: 24 });
+    expect(fit.fit).not.toHaveBeenCalled();
+    expect(terminal).toEqual({ cols: 120, rows: 40 });
+  });
+  it.each([
+    { connected: false, readOnly: false, replaying: false, stable: true },
+    { connected: true, readOnly: false, replaying: true, stable: true },
+    { connected: true, readOnly: false, replaying: false, stable: false },
+    { connected: true, readOnly: true, replaying: false, stable: true },
+  ])("does not change geometry while resuming or draining: %j", state => {
+    const fit = { fit: vi.fn(), proposeDimensions: vi.fn(() => ({ cols: 80, rows: 24 })) };
+    const resize = vi.fn();
+    fitTerminalViewport({ cols: 120, rows: 40 }, fit, { events: true, ...state }, resize);
+    expect(fit.fit).not.toHaveBeenCalled();
+    expect(resize).not.toHaveBeenCalled();
   });
 });
