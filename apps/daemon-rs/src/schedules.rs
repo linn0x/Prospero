@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
@@ -235,11 +235,72 @@ pub struct ScheduleRunResult {
 #[derive(Clone)]
 pub struct Schedules(Arc<State>);
 
+const PARSED_SCHEDULE_ENTRIES: usize = 512;
+const PARSED_SCHEDULE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileRevision {
+    bytes: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, i64, i64),
+}
+impl FileRevision {
+    fn new(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
+            },
+        }
+    }
+}
+struct ParsedSchedule {
+    revision: FileRevision,
+    value: Arc<TomlValue>,
+}
+#[derive(Default)]
+struct ParsedSchedules {
+    entries: HashMap<PathBuf, ParsedSchedule>,
+    order: VecDeque<PathBuf>,
+    bytes: usize,
+}
+impl ParsedSchedules {
+    fn remove(&mut self, path: &Path) {
+        if let Some(old) = self.entries.remove(path) {
+            self.bytes -= old.revision.bytes as usize;
+        }
+        self.order.retain(|item| item != path);
+    }
+    fn insert(&mut self, path: PathBuf, value: ParsedSchedule) {
+        self.remove(&path);
+        let bytes = value.revision.bytes as usize;
+        if bytes > PARSED_SCHEDULE_BYTES {
+            return;
+        }
+        while self.entries.len() >= PARSED_SCHEDULE_ENTRIES
+            || self.bytes + bytes > PARSED_SCHEDULE_BYTES
+        {
+            let Some(old) = self.order.front().cloned() else {
+                break;
+            };
+            self.remove(&old);
+        }
+        self.bytes += bytes;
+        self.order.push_back(path.clone());
+        self.entries.insert(path, value);
+    }
+}
+
 struct State {
     root: PathBuf,
     agents: Agents,
     closed: AtomicBool,
     inflight: Mutex<HashSet<String>>,
+    parsed: std::sync::Mutex<ParsedSchedules>,
     changed: watch::Sender<u64>,
 }
 
@@ -249,11 +310,16 @@ impl Schedules {
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().unwrap_or_else(|| home.to_owned()).join(".codex"))
             .join("automations");
+        Self::with_directory(root, agents)
+    }
+
+    pub fn with_directory(root: PathBuf, agents: Agents) -> Self {
         Self(Arc::new(State {
             root,
             agents,
             closed: AtomicBool::new(false),
             inflight: Mutex::new(HashSet::new()),
+            parsed: std::sync::Mutex::new(ParsedSchedules::default()),
             changed: watch::channel(0).0,
         }))
     }
@@ -307,6 +373,22 @@ impl Schedules {
         }
         items.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at).then(a.name.cmp(&b.name)));
         Ok(items)
+    }
+
+    pub async fn list_async(&self) -> Result<Vec<ScheduledAgentTask>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.list())
+            .await
+            .map_err(|_| Error::Closed)?
+    }
+
+    pub async fn status_list_async(&self) -> Result<Vec<StatusScheduledAgentTask>> {
+        Ok(self
+            .list_async()
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     pub fn status_list(&self) -> Result<Vec<StatusScheduledAgentTask>> {
@@ -449,6 +531,11 @@ impl Schedules {
 
     pub fn delete(&self, id: &str) -> Result<serde_json::Value> {
         let id = validate_schedule_id(id)?;
+        self.0
+            .parsed
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .remove(&self.file_for(id));
         let dir = self.0.root.join(id);
         let deleted = dir.exists();
         std::fs::remove_dir_all(dir).or_else(|error| {
@@ -469,7 +556,8 @@ impl Schedules {
 
     async fn tick(&self, timestamp: i64) -> Result<Vec<ScheduleRunResult>> {
         let due = self
-            .list()?
+            .list_async()
+            .await?
             .into_iter()
             .filter(|task| {
                 task.status == ScheduledAgentTaskStatus::Enabled && task.next_run_at <= timestamp
@@ -597,9 +685,35 @@ impl Schedules {
         if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 512 * 1024 {
             return Ok(None);
         }
-        let raw = std::fs::read_to_string(&file)?;
-        let parsed = toml::from_str::<TomlValue>(&raw)
-            .map_err(|error| Error::Invalid(format!("invalid schedule toml: {error}")))?;
+        let revision = FileRevision::new(&metadata);
+        let cached = self
+            .0
+            .parsed
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .entries
+            .get(&file)
+            .filter(|entry| entry.revision == revision)
+            .map(|entry| entry.value.clone());
+        let parsed = match cached {
+            Some(value) => value,
+            None => {
+                let raw = std::fs::read_to_string(&file)?;
+                let value =
+                    Arc::new(toml::from_str::<TomlValue>(&raw).map_err(|error| {
+                        Error::Invalid(format!("invalid schedule toml: {error}"))
+                    })?);
+                self.0.parsed.lock().map_err(|_| Error::Closed)?.insert(
+                    file.clone(),
+                    ParsedSchedule {
+                        revision,
+                        value: value.clone(),
+                    },
+                );
+                value
+            }
+        };
+        // Validation and time-dependent defaults still run on every read.
         Ok(Some(self.parse_toml_task(id, &file, &parsed)?))
     }
 
@@ -608,7 +722,14 @@ impl Schedules {
         let dir = self.0.root.join(&task.id);
         std::fs::create_dir_all(&dir)?;
         private_dir(&dir)?;
-        write_private_toml(&self.file_for(&task.id), task)
+        let file = self.file_for(&task.id);
+        let result = write_private_toml(&file, task);
+        self.0
+            .parsed
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .remove(&file);
+        result
     }
 
     fn file_for(&self, id: &str) -> PathBuf {
@@ -1129,5 +1250,68 @@ impl EmptyString for String {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+    use crate::worker::Database;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn parsed_cache_reuses_unchanged_files_and_observes_external_edits() {
+        let directory = TempDir::new().unwrap();
+        let database = Database::open(directory.path().join("db")).await.unwrap();
+        let schedules = Schedules::with_directory(
+            directory.path().join("schedules"),
+            Agents::new(database.clone()),
+        );
+        let path = schedules.file_for("sample");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = format!(
+            "id = \"sample\"\nname = \"first\"\nprompt = \"test\"\nrrule = \"FREQ=HOURLY;INTERVAL=1\"\nstatus = \"PAUSED\"\ncreated_at = 1000\nnext_run_at = 2000\ncwd = {:?}\n",
+            directory.path().to_str().unwrap()
+        );
+        std::fs::write(&path, &raw).unwrap();
+        assert_eq!(schedules.list_async().await.unwrap()[0].name, "first");
+        let parsed = schedules.0.parsed.lock().unwrap().entries[&path]
+            .value
+            .clone();
+        assert_eq!(schedules.list().unwrap()[0].name, "first");
+        assert!(Arc::ptr_eq(
+            &parsed,
+            &schedules.0.parsed.lock().unwrap().entries[&path].value
+        ));
+        std::fs::write(&path, raw.replace("first", "second")).unwrap();
+        assert_eq!(schedules.get("sample").unwrap().name, "second");
+        assert!(!Arc::ptr_eq(
+            &parsed,
+            &schedules.0.parsed.lock().unwrap().entries[&path].value
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert!(schedules.list().unwrap().is_empty());
+        database.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn parsed_cache_has_entry_and_source_byte_limits() {
+        let mut cache = ParsedSchedules::default();
+        for i in 0..PARSED_SCHEDULE_ENTRIES + 5 {
+            cache.insert(
+                PathBuf::from(format!("{i}.toml")),
+                ParsedSchedule {
+                    revision: FileRevision {
+                        bytes: 32768,
+                        modified: None,
+                        #[cfg(unix)]
+                        identity: (0, 0, 0),
+                    },
+                    value: Arc::new(TomlValue::Table(Default::default())),
+                },
+            );
+        }
+        assert!(cache.entries.len() <= PARSED_SCHEDULE_ENTRIES);
+        assert!(cache.bytes <= PARSED_SCHEDULE_BYTES);
     }
 }

@@ -91,8 +91,12 @@ impl Screen {
         let Some(terminal) = &self.terminal else {
             return String::new();
         };
-        let lines = terminal.view().map(|line| line.text()).collect::<Vec<_>>();
-        lines[lines.len().saturating_sub(limit)..].join("\n")
+        terminal
+            .view()
+            .skip(usize::from(self.size.rows).saturating_sub(limit))
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
