@@ -25,8 +25,12 @@ pub enum Error {
     ApiTestInFlight,
     #[error("database queue is full")]
     Busy,
-    #[error("database worker is unavailable")]
+    #[error("runtime worker is unavailable")]
     Closed,
+    #[error("database worker is unavailable: {0}")]
+    DatabaseUnavailable(String),
+    #[error("database operation failed: {0}")]
+    DatabaseOperationFailed(String),
     #[error("another daemon owns this data directory")]
     AlreadyRunning,
     #[error("unsupported or incomplete database schema")]
@@ -63,6 +67,8 @@ impl Error {
             Self::ApiTestBusy | Self::ApiTestInFlight => ("busy", false),
             Self::Busy => ("busy", true),
             Self::Closed => ("unavailable", true),
+            Self::DatabaseUnavailable(_) => ("unavailable", true),
+            Self::DatabaseOperationFailed(_) => ("database_operation_failed", true),
             Self::AlreadyRunning => ("already_running", false),
             Self::Schema => ("unsupported_schema", false),
             Self::Feature(code, _) => (code.as_str(), false),

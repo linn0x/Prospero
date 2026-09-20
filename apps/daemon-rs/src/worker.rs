@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
@@ -16,15 +17,56 @@ enum Job {
     Stop,
 }
 
+struct WorkerState {
+    alive: AtomicBool,
+    queue_depth: std::sync::atomic::AtomicUsize,
+    last_error: RwLock<Option<String>>,
+    stopping: AtomicBool,
+}
+
 struct Inner {
     directory: PathBuf,
     sender: mpsc::Sender<Job>,
     closed: AtomicBool,
+    state: Arc<WorkerState>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
 pub struct Database(Arc<Inner>);
+
+#[derive(Debug, Clone)]
+pub struct DatabaseHealth {
+    pub alive: bool,
+    pub queue_depth: usize,
+    pub last_error: Option<String>,
+}
+
+struct PendingJob {
+    state: Arc<WorkerState>,
+}
+
+struct WorkerAliveGuard(Arc<WorkerState>);
+
+impl Drop for PendingJob {
+    fn drop(&mut self) {
+        self.state.queue_depth.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for WorkerAliveGuard {
+    fn drop(&mut self) {
+        self.0.alive.store(false, Ordering::Release);
+    }
+}
+
+impl WorkerAliveGuard {
+    fn finish(&self, reason: &str) {
+        if let Ok(mut current) = self.0.last_error.write() {
+            *current = Some(reason.into());
+        }
+    }
+}
 
 impl Database {
     pub async fn open(directory: PathBuf) -> Result<Self> {
@@ -41,6 +83,13 @@ impl Database {
     ) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel(DATABASE_QUEUE_CAPACITY);
         let (ready, initialized) = oneshot::channel();
+        let state = Arc::new(WorkerState {
+            alive: AtomicBool::new(false),
+            queue_depth: std::sync::atomic::AtomicUsize::new(0),
+            last_error: RwLock::new(None),
+            stopping: AtomicBool::new(false),
+        });
+        let worker_state = state.clone();
         let worker_directory = directory.clone();
         let legacy_marker = worker_directory.join("legacy-orchestration-import.json");
         let import_legacy = !legacy_marker.exists();
@@ -50,12 +99,18 @@ impl Database {
                 let mut store = match Store::open(&worker_directory) {
                     Ok(store) => store,
                     Err(error) => {
+                        if let Ok(mut current) = worker_state.last_error.write() {
+                            *current = Some(error.to_string());
+                        }
                         let _ = ready.send(Err(error));
                         return;
                     }
                 };
                 if let Some(legacy_home) = legacy_home {
                     if let Err(error) = import_legacy_files(&worker_directory, &legacy_home) {
+                        if let Ok(mut current) = worker_state.last_error.write() {
+                            *current = Some(error.to_string());
+                        }
                         let _ = ready.send(Err(error));
                         return;
                     }
@@ -71,25 +126,58 @@ impl Database {
                                         "createdAt": crate::database::now(),
                                     }),
                                 ) {
+                                    if let Ok(mut current) = worker_state.last_error.write() {
+                                        *current = Some(error.to_string());
+                                    }
                                     let _ = ready.send(Err(error));
                                     return;
                                 }
                             }
                             Err(error) => {
+                                if let Ok(mut current) = worker_state.last_error.write() {
+                                    *current = Some(error.to_string());
+                                }
                                 let _ = ready.send(Err(error));
                                 return;
                             }
                         }
                     }
                 }
+                worker_state.alive.store(true, Ordering::Release);
                 if ready.send(Ok(())).is_err() {
+                    worker_state.alive.store(false, Ordering::Release);
                     return;
                 }
-                while let Some(job) = receiver.blocking_recv() {
-                    match job {
-                        Job::Execute(operation) => operation(&mut store),
-                        Job::Stop => break,
+                let _alive = WorkerAliveGuard(worker_state.clone());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Some(job) = receiver.blocking_recv() {
+                        match job {
+                            Job::Execute(operation) => {
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        operation(&mut store);
+                                    }));
+                                if let Err(payload) = result {
+                                    let message = panic_message(payload);
+                                    if let Ok(mut current) = worker_state.last_error.write() {
+                                        *current = Some(message);
+                                    }
+                                }
+                            }
+                            Job::Stop => break,
+                        }
                     }
+                }));
+                match result {
+                    Err(payload) => {
+                        if let Ok(mut current) = worker_state.last_error.write() {
+                            *current = Some(panic_message(payload));
+                        }
+                    }
+                    Ok(()) if !worker_state.stopping.load(Ordering::Acquire) => {
+                        _alive.finish("database actor stopped")
+                    }
+                    Ok(()) => {}
                 }
             })?;
         initialized.await.map_err(|_| Error::Closed)??;
@@ -97,6 +185,7 @@ impl Database {
             directory,
             sender,
             closed: AtomicBool::new(false),
+            state,
             thread: Mutex::new(Some(thread)),
         })))
     }
@@ -111,28 +200,75 @@ impl Database {
         T: Send + 'static,
         F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
     {
-        if self.0.closed.load(Ordering::Acquire) {
-            return Err(Error::Closed);
+        if self.0.closed.load(Ordering::Acquire) || self.0.sender.is_closed() {
+            return Err(self.unavailable());
         }
         let (sender, receiver) = oneshot::channel();
+        let pending = PendingJob {
+            state: self.0.state.clone(),
+        };
+        let operation_state = self.0.state.clone();
         let job = Job::Execute(Box::new(move |store| {
+            let _pending = pending;
             if sender.is_closed() {
                 return;
             }
-            let result = operation(store);
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(store)))
+                    .unwrap_or_else(|payload| {
+                        let message = panic_message(payload);
+                        if let Ok(mut current) = operation_state.last_error.write() {
+                            *current = Some(message.clone());
+                        }
+                        Err(Error::DatabaseOperationFailed(message))
+                    });
             let _ = sender.send(result);
         }));
+        self.0.state.queue_depth.fetch_add(1, Ordering::AcqRel);
         self.0.sender.try_send(job).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => Error::Busy,
-            mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            mpsc::error::TrySendError::Closed(_) => self.unavailable(),
         })?;
-        receiver.await.map_err(|_| Error::Closed)?
+        receiver.await.map_err(|_| {
+            if let Ok(mut current) = self.0.state.last_error.write() {
+                if let Some(message) = current.clone() {
+                    return Error::DatabaseOperationFailed(message);
+                }
+                *current = Some("database operation did not return a result".into());
+            }
+            Error::DatabaseOperationFailed("database operation did not return a result".into())
+        })?
+    }
+
+    pub fn health(&self) -> DatabaseHealth {
+        DatabaseHealth {
+            alive: self.0.state.alive.load(Ordering::Acquire)
+                && !self.0.closed.load(Ordering::Acquire)
+                && !self.0.sender.is_closed(),
+            queue_depth: self.0.state.queue_depth.load(Ordering::Acquire),
+            last_error: self
+                .0
+                .state
+                .last_error
+                .read()
+                .ok()
+                .and_then(|value| value.clone()),
+        }
+    }
+
+    fn unavailable(&self) -> Error {
+        Error::DatabaseUnavailable(
+            self.health()
+                .last_error
+                .unwrap_or_else(|| "database actor channel is closed".into()),
+        )
     }
 
     pub async fn shutdown(&self) -> Result<()> {
         if self.0.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.0.state.stopping.store(true, Ordering::Release);
         let _ = self.0.sender.send(Job::Stop).await;
         if let Some(thread) = self.0.thread.lock().await.take() {
             tokio::task::spawn_blocking(move || thread.join())
@@ -142,6 +278,14 @@ impl Database {
         }
         Ok(())
     }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "database operation panicked".into())
 }
 
 fn import_legacy_state(store: &mut Store, directory: &Path, legacy_home: &Path) -> Result<usize> {

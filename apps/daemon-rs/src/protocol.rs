@@ -2,8 +2,8 @@ use ts_rs::TS;
 
 pub use prospero_protocol_rs::{
     API_VERSION, AgentKind, CONTENT_CHUNK_BYTES, ChangeEvent, CreateSession,
-    DATABASE_QUEUE_CAPACITY, EVENT_RETENTION, EventPage, EventQuery, Health, HealthPersistence,
-    MAX_EVENT_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, RelayConnectionState,
+    DATABASE_QUEUE_CAPACITY, DatabaseHealth, EVENT_RETENTION, EventPage, EventQuery, Health,
+    HealthPersistence, MAX_EVENT_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, RelayConnectionState,
     RelayRuntimeDeviceStatus, RelayRuntimeStatus, RenameSession, ResyncRequired, SessionHead,
     SessionKind, SessionLifecycle, SessionLookup, SessionLookupResult, SessionPage, SessionQuery,
     SessionStatus, SessionSummary, UpdateSession, WorkspaceHead, WorkspacePage, WorkspaceQuery,
@@ -47,6 +47,7 @@ pub fn typescript() -> String {
         crate::relay::RelayConnectionState::decl(&config),
         crate::relay::RelayRuntimeDeviceStatus::decl(&config),
         crate::relay::RelayRuntimeStatus::decl(&config),
+        DatabaseHealth::decl(&config),
         HealthPersistence::decl(&config),
         Health::decl(&config),
         RenameSession::decl(&config),

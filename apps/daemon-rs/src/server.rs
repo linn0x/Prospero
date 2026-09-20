@@ -544,8 +544,11 @@ impl IntoResponse for ApiError {
             | Error::InUse
             | Error::ApiTestBusy
             | Error::ApiTestInFlight => StatusCode::CONFLICT,
-            Error::Busy | Error::Closed => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Busy | Error::Closed | Error::DatabaseUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Error::DatabaseOperationFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(self.0.public())).into_response()
@@ -3163,9 +3166,9 @@ fn remote_error_code(error: &Error) -> &'static str {
 }
 
 async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, ApiError> {
-    api.call(|_| Ok(())).await?;
     api.terminals.check()?;
     api.agents.check()?;
+    let database = api.database.health();
     let relay = api
         .relay_status
         .get()
@@ -3178,6 +3181,11 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
         build_id: api.build_id.to_string(),
         active_runtime_sessions: api.terminals.count() + api.agents.count(),
         database_queue_capacity: DATABASE_QUEUE_CAPACITY,
+        database: DatabaseHealth {
+            alive: database.alive,
+            queue_depth: database.queue_depth,
+            last_error: database.last_error,
+        },
         capabilities: health_capabilities(),
         persistence: HealthPersistence {
             pty: cfg!(unix),
@@ -6154,9 +6162,21 @@ async fn start_worker_route(
     body: std::result::Result<Json<StartWorker>, axum::extract::rejection::JsonRejection>,
 ) -> JsonResult<orchestration::WorkerStartOutcome> {
     let Json(input) = body.map_err(|_| Error::Invalid("invalid worker start request".into()))?;
-    let outcome = orchestration::start_worker(&api.database, &api.agents, input).await?;
+    let outcome = orchestration::start_worker(&api.database, &api.agents, input)
+        .await
+        .map_err(worker_start_error)?;
     api.publish();
     Ok(Json(outcome))
+}
+
+fn worker_start_error(error: Error) -> Error {
+    match error {
+        Error::Closed => Error::Feature(
+            "worker_runtime_unavailable".into(),
+            "worker runtime channel is unavailable".into(),
+        ),
+        other => other,
+    }
 }
 
 async fn stop_worker_route(
@@ -6394,6 +6414,13 @@ async fn mark_message_answered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_start_runtime_failures_are_not_mislabeled_as_database_failures() {
+        let body = worker_start_error(Error::Closed).public();
+        assert_eq!(body.code, "worker_runtime_unavailable");
+        assert!(!body.message.contains("database worker"));
+    }
 
     #[test]
     fn terminal_page_output_reencodes_each_event() {
