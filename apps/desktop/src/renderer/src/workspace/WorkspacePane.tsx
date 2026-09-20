@@ -162,7 +162,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   </div>;
 }
 
-export function WorkspacePane({ snapshot, activeId, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, focus }: { snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onActivate: (id: string) => void; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; onMissingSession: (id: string) => void; focus: boolean }) {
+export function WorkspacePane({ active = true, snapshot, activeId, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, focus }: { active?: boolean; snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onActivate: (id: string) => void; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; onMissingSession: (id: string) => void; focus: boolean }) {
   const { t } = useLocale();
   const session = snapshot.daemon.sessions.find((item) => item.id === activeId);
   const [recentTerminals, setRecentTerminals] = useState<string[]>([]);
@@ -170,9 +170,9 @@ export function WorkspacePane({ snapshot, activeId, onNewSession, onOpenRun, onT
   if (retained !== recentTerminals) setRecentTerminals(retained);
   const terminalSessions = retained.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty")).filter((item): item is SessionInfo => Boolean(item));
   return <div className="workspace-view workspace-view-single" style={{ position: "relative" }}>
-    {terminalSessions.map(item => <div key={item.id} inert={item.id !== activeId} aria-hidden={item.id !== activeId} style={{ position: "absolute", inset: 0, visibility: item.id === activeId ? "visible" : "hidden", minHeight: 0 }}>
-      <WorkspaceSession session={item} active={item.id === activeId} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} />
+    {terminalSessions.map(item => <div key={item.id} inert={!active || item.id !== activeId} aria-hidden={!active || item.id !== activeId} style={{ position: "absolute", inset: 0, visibility: active && item.id === activeId ? "visible" : "hidden", minHeight: 0 }}>
+      <WorkspaceSession session={item} active={active && item.id === activeId} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} />
     </div>)}
-    {session?.kind !== "pty" && <WorkspaceSession key={session?.id ?? "empty"} session={session} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} />}
+    {session?.kind !== "pty" && <WorkspaceSession key={session?.id ?? "empty"} active={active} session={session} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} />}
   </div>;
 }
