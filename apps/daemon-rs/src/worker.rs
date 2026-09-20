@@ -225,10 +225,11 @@ impl Database {
             let _ = sender.send(result);
         }));
         self.0.state.queue_depth.fetch_add(1, Ordering::AcqRel);
-        self.0.sender.try_send(job).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => Error::Busy,
-            mpsc::error::TrySendError::Closed(_) => self.unavailable(),
-        })?;
+        self.0
+            .sender
+            .send(job)
+            .await
+            .map_err(|_| self.unavailable())?;
         receiver.await.map_err(|_| {
             if let Ok(mut current) = self.0.state.last_error.write() {
                 if let Some(message) = current.clone() {
