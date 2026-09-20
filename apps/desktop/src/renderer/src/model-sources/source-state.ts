@@ -1,7 +1,7 @@
 import type { AgentApiCatalogModel, ModelSource, ModelSourceRoute, ModelSourceAction } from "../../../shared/types";
 import { ApiHeadersSchema } from "@prospero/protocol";
 import type { AgentModelCapabilities, AgentReasoningEffort } from "@prospero/protocol";
-import { accountReasoningEfforts, modelCapabilityDraft, parseModelCapabilities, type ModelCapabilityDraft } from "../account-profile-form";
+import { accountApiEngineLabel, accountReasoningEfforts, modelCapabilityDraft, parseModelCapabilities, type ModelCapabilityDraft } from "../account-profile-form";
 
 export type SourceSelection = { sourceId: string; routeId: string; revision: number; agent?: SourceRuntimeAgent };
 export type SourceRuntimeAgent = "codex" | "claude" | "opencode";
@@ -97,4 +97,13 @@ export function rememberedSourceSelection(): Pick<SourceSelection, "sourceId" | 
 }
 export function rememberSourceSelection(selection: SourceSelection | undefined): void {
   try { if (selection) localStorage.setItem(PREFERENCE_KEY, JSON.stringify({ sourceId: selection.sourceId, routeId: selection.routeId, ...(selection.agent ? { agent: selection.agent } : {}) })); else localStorage.removeItem(PREFERENCE_KEY); } catch {}
+}
+
+
+export function sourceRouteLabel(route: Pick<ModelSourceRoute, "name" | "protocol">): string {
+  const name = route.name.trim();
+  const engine = accountApiEngineLabel(route.protocol);
+  const suffix = name.split(/\s*·\s*/).at(-1)?.toLowerCase();
+  const aliases = engine === "Claude" ? ["claude", "claude code"] : [engine.toLowerCase()];
+  return aliases.includes(suffix ?? "") ? name : `${name} · ${engine}`;
 }

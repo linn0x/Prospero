@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DesktopSnapshot, JsonObject } from "../src/shared/types";
 import {
   defaultSessionLaunchAccountId,
+  sessionLaunchProject,
   duplicateSessionAccountState,
   isSessionLaunchWorkspace,
   sessionLaunchAccounts,
@@ -103,5 +104,28 @@ describe("session launch options", () => {
     expect(duplicateSessionAccountState(accounts, { accountId: "profile-ready" })).toBe("ready");
     expect(duplicateSessionAccountState(accounts, { accountId: "profile-offline" })).toBe("unavailable");
     expect(duplicateSessionAccountState(accounts, { accountId: "deleted" })).toBe("missing");
+  });
+});
+
+
+describe("contextual new-session workspace", () => {
+  it("prefers the active session's workspace over the first project", () => {
+    const value = snapshot([]); value.projects = ["/other", "/repo"];
+    value.daemon.sessions = [{ id: "active", agent: "claude", kind: "pty", cwd: "/repo", status: "running" }];
+    expect(sessionLaunchProject(value, undefined, "active")).toBe("/repo");
+    expect(sessionLaunchProject(value, "/other", "active")).toBe("/other");
+  });
+  it("chooses the nearest registered root and preserves worktree context", () => {
+    const value = snapshot([{ path: "/worktree", state: "active" }]); value.projects = ["/repo", "/repo/nested"];
+    value.daemon.sessions = [{ id: "active", agent: "claude", kind: "pty", cwd: "/repo/nested/src", status: "running" }];
+    expect(sessionLaunchProject(value, undefined, "active")).toBe("/repo/nested");
+    value.daemon.sessions[0]!.cwd = "/worktree";
+    expect(sessionLaunchProject(value, undefined, "active")).toBe("/worktree");
+  });
+  it("does not pick a similarly prefixed or unknown directory", () => {
+    const value = snapshot([]);
+    value.daemon.sessions = [{ id: "active", agent: "claude", kind: "pty", cwd: "/repo-other", status: "running" }];
+    expect(sessionLaunchProject(value, undefined, "active")).toBeUndefined();
+    expect(sessionLaunchProject(value, undefined, "missing")).toBeUndefined();
   });
 });

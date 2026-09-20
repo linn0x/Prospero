@@ -106,6 +106,7 @@ import {
 } from "./managed-workspaces";
 import {
   defaultSessionLaunchAccountId,
+  sessionLaunchProject,
   duplicateSessionAccountState,
   sessionLaunchAccounts,
   sessionLaunchRequiresStructured,
@@ -3326,12 +3327,12 @@ function NewSessionDialog({
                 ? t("选择一个本地项目后即可在此创建会话。", "Choose a local project to create a session here.")
                 : selectedWorkspace?.kind === "worktree"
                 ? t("编排 worktree · 会话会直接在隔离分支中运行。", "Orchestration worktree · the session runs directly on the isolated branch.")
-                : t("项目根目录与持久上下文。", "Project root and persistent context.")}
+                : selectedWorkspace?.detail ?? input.cwd}
             </FieldDescription>
           </Field>
           {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
-          <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("CLI / 独立 Profile", "CLI / independent profile")}</Button></div>
-          {useSource ? <><Field><FieldLabel htmlFor="source-runtime-agent">Code Agent</FieldLabel><NativeSelect id="source-runtime-agent" value={sourceRuntimeAgent} disabled={busy} onChange={event => setSourceRuntimeAgent(event.target.value as SourceRuntimeAgent)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect><FieldDescription>{t("执行引擎独立于模型；例如 DeepSeek 的 Anthropic 兼容模型可由 Claude Code 驱动。", "The runtime is separate from the model; for example, a DeepSeek Anthropic-compatible model can run through Claude Code.")}</FieldDescription></Field><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></> : <>
+          <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("本机账号 / API 配置", "Local account / API profile")}</Button></div>
+          {useSource ? <><div className="grid gap-4 sm:grid-cols-2"><Field><FieldLabel htmlFor="source-runtime-agent">Agent</FieldLabel><NativeSelect id="source-runtime-agent" value={sourceRuntimeAgent} disabled={busy} onChange={event => setSourceRuntimeAgent(event.target.value as SourceRuntimeAgent)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect><FieldDescription>{t("选择负责执行代码和工具操作的 Agent。", "Choose the agent that runs code and tools.")}</FieldDescription></Field><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></div><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /></> : <>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field>
               <FieldLabel htmlFor="session-agent">Agent</FieldLabel>
@@ -3373,7 +3374,7 @@ function NewSessionDialog({
             </Field>
             <Field>
               <FieldLabel htmlFor="session-kind">
-                {t("Pane 类型", "Pane type")}
+                {t("会话类型", "Session type")}
               </FieldLabel>
               <NativeSelect
                 id="session-kind"
@@ -3405,7 +3406,7 @@ function NewSessionDialog({
           {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode") && (
             <Field>
               <FieldLabel htmlFor="session-account">
-                {t("账号环境", "Account")}
+                {t("账号", "Account")}
               </FieldLabel>
               <NativeSelect
                 id="session-account"
@@ -3433,7 +3434,7 @@ function NewSessionDialog({
               </NativeSelect>
               <FieldDescription>
                 {selectedAccount
-                  ? selectedAccount.apiProfileError ?? `${selectedAccount.engine ?? input.agent} · ${selectedAccount.apiProfile ? `${t("使用 Profile 模型", "Profile model")} · ${text(selectedAccount.apiProfile["model"])}` : status(selectedAccount.status) + " · CLI"}`
+                  ? selectedAccount.apiProfileError ?? (selectedAccount.apiProfile ? `${t("模型", "Model")} · ${text(selectedAccount.apiProfile["model"])}` : status(selectedAccount.status))
                   : t("在 Agents 与账号页面添加或登录账号。", "Add or sign in to an account from Agents & accounts.")}
               </FieldDescription>
             </Field>
@@ -3518,7 +3519,7 @@ function NewSessionDialog({
           </>}
           <Field>
             <FieldLabel htmlFor="session-approval">
-              {t("权限配置", "Permission profile")}
+              {t("操作确认", "Action approval")}
             </FieldLabel>
             <NativeSelect
               id="session-approval"
@@ -3531,9 +3532,9 @@ function NewSessionDialog({
                 })
               }
             >
-              <NativeSelectOption value="strict">Strict</NativeSelectOption>
-              <NativeSelectOption value="standard">Standard</NativeSelectOption>
-              <NativeSelectOption value="yolo">YOLO</NativeSelectOption>
+              <NativeSelectOption value="strict">{t("严格确认", "Strict")}</NativeSelectOption>
+              <NativeSelectOption value="standard">{t("标准确认", "Standard")}</NativeSelectOption>
+              <NativeSelectOption value="yolo">{t("自动批准（高风险）", "Auto-approve (high risk)")}</NativeSelectOption>
             </NativeSelect>
             <FieldDescription>
               {input.approvalPolicy === "strict"
@@ -4137,10 +4138,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, []);
   const openNewSession = useCallback((project?: string): void => {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
-    setNewSessionProject(project);
+    setNewSessionProject(sessionLaunchProject(sessionSnapshot, project, activeRemoteId ? undefined : activeId));
     setNewSessionSource(undefined);
     setCreateTab("session"); setNewSessionOpen(true);
-  }, [activeRemote, view]);
+  }, [activeId, activeRemote, activeRemoteId, sessionSnapshot, view]);
   const toggleArchive = useCallback((id: string): void => {
     void window.prospero
       .setSessionArchived(id, !snapshotRef.current.archivedSessionIds.includes(id))
