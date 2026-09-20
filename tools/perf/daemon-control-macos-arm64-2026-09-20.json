@@ -1,0 +1,180 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-09-20T12:13:02.802385+00:00",
+  "scope": "Synthetic loopback HTTP requests including JSON decoding; three independent trials per scenario and implementation. No real agents or user schedules. Machine load was not controlled; not a production SLA.",
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "os": "25.5.0",
+    "cpu": "Apple M3 Pro",
+    "node": "v22.22.2"
+  },
+  "baselineBinarySha256": "c810614a6578d555f9f92ed29faf02857128dcd75e2c3889ed45112ddda27744",
+  "optimizedBinarySha256": "77768d2691fd864a7b89b473157c25042d5a8f81b3b6c1712f2527267acbace2",
+  "workloads": {
+    "schedules": {
+      "count": 300,
+      "before": [
+        {
+          "startupMs": 145.33,
+          "query": {
+            "samples": 20,
+            "p50Ms": 25.71,
+            "p95Ms": 28.1,
+            "maxMs": 28.1
+          },
+          "healthDuringSixConcurrentLists": {
+            "samples": 12,
+            "p50Ms": 25.43,
+            "p95Ms": 50.21,
+            "maxMs": 50.21
+          }
+        },
+        {
+          "startupMs": 120.06,
+          "query": {
+            "samples": 20,
+            "p50Ms": 28.29,
+            "p95Ms": 29.48,
+            "maxMs": 29.48
+          },
+          "healthDuringSixConcurrentLists": {
+            "samples": 12,
+            "p50Ms": 26.1,
+            "p95Ms": 55.87,
+            "maxMs": 55.87
+          }
+        },
+        {
+          "startupMs": 191.4,
+          "query": {
+            "samples": 20,
+            "p50Ms": 26.27,
+            "p95Ms": 27.99,
+            "maxMs": 27.99
+          },
+          "healthDuringSixConcurrentLists": {
+            "samples": 12,
+            "p50Ms": 25.58,
+            "p95Ms": 51.82,
+            "maxMs": 51.82
+          }
+        }
+      ],
+      "after": [
+        {
+          "startupMs": 209.82,
+          "query": {
+            "samples": 20,
+            "p50Ms": 16.62,
+            "p95Ms": 32.3,
+            "maxMs": 32.3
+          },
+          "healthDuringSixConcurrentLists": {
+            "samples": 12,
+            "p50Ms": 1.5,
+            "p95Ms": 6.11,
+            "maxMs": 6.11
+          }
+        },
+        {
+          "startupMs": 120.3,
+          "query": {
+            "samples": 20,
+            "p50Ms": 15.57,
+            "p95Ms": 17.57,
+            "maxMs": 17.57
+          },
+          "healthDuringSixConcurrentLists": {
+            "samples": 12,
+            "p50Ms": 0.84,
+            "p95Ms": 4.2,
+            "maxMs": 4.2
+          }
+        },
+        {
+          "startupMs": 184.81,
+          "query": {
+            "samples": 20,
+            "p50Ms": 15.49,
+            "p95Ms": 16.97,
+            "maxMs": 16.97
+          },
+          "healthDuringSixConcurrentLists": {
+            "samples": 12,
+            "p50Ms": 0.53,
+            "p95Ms": 9.81,
+            "maxMs": 9.81
+          }
+        }
+      ]
+    },
+    "plugins": {
+      "count": 20,
+      "before": [
+        {
+          "startupMs": 37.52,
+          "query": {
+            "samples": 20,
+            "p50Ms": 21.24,
+            "p95Ms": 31.54,
+            "maxMs": 31.54
+          },
+          "requestsThatRewroteState": 20
+        },
+        {
+          "startupMs": 38.28,
+          "query": {
+            "samples": 20,
+            "p50Ms": 22.06,
+            "p95Ms": 36.84,
+            "maxMs": 36.84
+          },
+          "requestsThatRewroteState": 20
+        },
+        {
+          "startupMs": 44.29,
+          "query": {
+            "samples": 20,
+            "p50Ms": 23.58,
+            "p95Ms": 41.87,
+            "maxMs": 41.87
+          },
+          "requestsThatRewroteState": 20
+        }
+      ],
+      "after": [
+        {
+          "startupMs": 40.81,
+          "query": {
+            "samples": 20,
+            "p50Ms": 1.34,
+            "p95Ms": 1.52,
+            "maxMs": 1.52
+          },
+          "requestsThatRewroteState": 0
+        },
+        {
+          "startupMs": 38.95,
+          "query": {
+            "samples": 20,
+            "p50Ms": 1.24,
+            "p95Ms": 1.64,
+            "maxMs": 1.64
+          },
+          "requestsThatRewroteState": 0
+        },
+        {
+          "startupMs": 38.76,
+          "query": {
+            "samples": 20,
+            "p50Ms": 1.33,
+            "p95Ms": 1.5,
+            "maxMs": 1.5
+          },
+          "requestsThatRewroteState": 0
+        }
+      ]
+    }
+  }
+}

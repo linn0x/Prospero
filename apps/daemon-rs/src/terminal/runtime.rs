@@ -270,22 +270,16 @@ impl Terminals {
 
     async fn persist_live(&self, id: &str, terminal: &Terminal) -> Result<()> {
         let mut seq = 0;
-        let mut waiting = false;
         loop {
-            if waiting {
-                tokio::select! {
-                    _ = terminal.wait_exited() => return Ok(()),
-                    _ = terminal.wait_output(seq) => {
-                        waiting = false;
-                        continue;
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-                }
-            } else {
-                tokio::select! {
-                    _ = terminal.wait_exited() => return Ok(()),
-                    _ = terminal.wait_output(seq) => waiting = true,
-                }
+            tokio::select! {
+                _ = terminal.wait_exited() => return Ok(()),
+                _ = terminal.wait_output(seq) => {},
+            }
+            // A fixed window from the first change batches a burst without
+            // postponing persistence indefinitely under continuous output.
+            tokio::select! {
+                _ = terminal.wait_exited() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
             }
             let permit = tokio::select! {
                 _ = terminal.wait_exited() => return Ok(()),

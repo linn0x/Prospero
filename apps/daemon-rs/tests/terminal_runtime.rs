@@ -848,3 +848,66 @@ async fn live_checkpoints_stop_writing_when_idle_and_fail_closed_on_storage_erro
         .unwrap();
     database.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn live_checkpoints_batch_continuous_output_with_a_bounded_delay() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let runtime = Terminals::new(database.clone());
+    let mut request = input(&workspace);
+    request.agent = Some(prosperod_rs::protocol::AgentKind::Custom);
+    request.command = Some("read gate; i=0; while [ $i -lt 60 ]; do printf 'burst-%s\\n' $i; i=$((i+1)); sleep 0.01; done; printf 'BATCH_DONE\\n'; read finish".into());
+    let head = runtime.create(request).await.unwrap();
+    let connection = rusqlite::Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    connection.execute_batch("CREATE TABLE batch_checkpoints(seq INTEGER); CREATE TRIGGER count_batch AFTER UPDATE OF latest_seq ON terminal_runs BEGIN INSERT INTO batch_checkpoints VALUES(NEW.latest_seq); END;").unwrap();
+    let start = std::time::Instant::now();
+    runtime
+        .input(
+            &head.id,
+            TerminalInput {
+                data_b64: STANDARD.encode("go\n"),
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut cursor = 0;
+        let mut text = String::new();
+        while !text.contains("BATCH_DONE") {
+            let page = runtime
+                .read(
+                    head.id.clone(),
+                    TerminalQuery {
+                        after_seq: Some(cursor),
+                        wait_ms: Some(1000),
+                    },
+                )
+                .await
+                .unwrap();
+            cursor = page.next_seq;
+            for event in page.events {
+                if let TerminalEvent::Output { data_b64 } = event {
+                    text.push_str(&String::from_utf8_lossy(
+                        &STANDARD.decode(data_b64).unwrap(),
+                    ));
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let writes: i64 = connection
+        .query_row("SELECT count(*) FROM batch_checkpoints", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(writes >= 1);
+    assert!(
+        writes <= (start.elapsed().as_millis() / 250 + 2) as i64,
+        "too many checkpoints: {writes}"
+    );
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}

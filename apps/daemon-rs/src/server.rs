@@ -74,6 +74,7 @@ pub struct Api {
     build_id: Arc<str>,
     token: Token,
     projection: Arc<Mutex<ProjectionState>>,
+    projection_writer: Arc<tokio::sync::Mutex<()>>,
     changes: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
     requests: Arc<Semaphore>,
@@ -92,6 +93,7 @@ pub struct Api {
 struct ProjectionState {
     initialized: bool,
     attention: i64,
+    sessions: Option<(SessionSummary, Vec<SessionHead>)>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +147,7 @@ impl Api {
             database: database.clone(),
             token: token.clone(),
             projection: Arc::new(Mutex::new(ProjectionState::default())),
+            projection_writer: Arc::new(tokio::sync::Mutex::new(())),
             changes: changes.clone(),
             stopping: watch::channel(false).0,
             requests: Arc::new(Semaphore::new(32)),
@@ -377,7 +380,10 @@ impl Api {
         mut stopping: watch::Receiver<bool>,
     ) {
         let mut changes = self.changes.subscribe();
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         if let Err(error) = self
             .write_status_projection(port, bind.clone(), control_token.clone())
@@ -385,6 +391,7 @@ impl Api {
         {
             eprintln!("status projection failed: {error}");
         }
+        let mut next_write = tokio::time::Instant::now() + Duration::from_millis(100);
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
@@ -399,12 +406,22 @@ impl Api {
                     }
                 }
             }
+            // Coalesce notifications while keeping the one-second heartbeat.
+            tokio::select! {
+                _ = tokio::time::sleep_until(next_write) => {},
+                changed = stopping.changed() => {
+                    if changed.is_err() || *stopping.borrow() { return; }
+                    continue;
+                },
+            }
+            changes.borrow_and_update();
             if let Err(error) = self
                 .write_status_projection(port, bind.clone(), control_token.clone())
                 .await
             {
                 eprintln!("status projection failed: {error}");
             }
+            next_write = tokio::time::Instant::now() + Duration::from_millis(100);
         }
     }
 
@@ -414,10 +431,22 @@ impl Api {
         bind: Option<String>,
         control_token: String,
     ) -> Result<()> {
+        let _writer = self.projection_writer.lock().await;
+        let cached = self
+            .projection
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .sessions
+            .clone();
         let (summary, sessions) = self
             .database
-            .call(|store| {
+            .call(move |store| {
                 let summary = store.session_summary(None)?;
+                if let Some((previous, sessions)) = cached
+                    && previous == summary
+                {
+                    return Ok((summary, sessions));
+                }
                 let active = store.sessions(SessionQuery {
                     cursor: None,
                     limit: Some(100),
@@ -437,10 +466,13 @@ impl Api {
                 Ok((summary, sessions))
             })
             .await?;
+        self.projection.lock().map_err(|_| Error::Closed)?.sessions =
+            Some((summary.clone(), sessions.clone()));
         let attention = summary.attention;
-        let schedules = self.schedules.status_list().unwrap_or_default();
-        self.relay_status
-            .write_minimal_status(crate::relay::RustDaemonStatusInput {
+        let schedules = self.schedules.status_list_async().await.unwrap_or_default();
+        let relay_status = self.relay_status.clone();
+        tokio::task::spawn_blocking(move || {
+            relay_status.write_minimal_status(crate::relay::RustDaemonStatusInput {
                 port,
                 bind,
                 control_token,
@@ -448,7 +480,11 @@ impl Api {
                 session_summary: summary,
                 sessions,
                 schedules,
-            })?;
+            })
+        })
+        .await
+        .map_err(|_| Error::Closed)??;
+        drop(_writer);
         self.notify_attention(attention).await;
         Ok(())
     }
@@ -1544,7 +1580,7 @@ async fn remote_usage(
 }
 
 async fn load_orchestration_snapshot(api: &Api) -> Result<JsonValue> {
-    let schedules = api.schedules.status_list()?;
+    let schedules = api.schedules.status_list_async().await?;
     api.call(move |store| {
         Ok(json!({
             "runs": store.list_runs()?,
@@ -1596,7 +1632,7 @@ async fn remote_schedule_control(
     let kind = require_str(&message, "type")?.to_owned();
     let mut result = match kind.as_str() {
         "schedule.list" => {
-            let schedules = api.schedules.status_list()?;
+            let schedules = api.schedules.status_list_async().await?;
             json!({"type":"schedule.result","ok":true,"schedules":schedules})
         }
         "schedule.get" => {
@@ -3169,11 +3205,19 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
     api.terminals.check()?;
     api.agents.check()?;
     let database = api.database.health();
-    let relay = api
+    let relay = match api
         .relay_status
         .get()
         .filter(|status| status.state != crate::relay::RelayConnectionState::Disabled)
-        .or_else(|| crate::relay::relay_status_from_home(api.database.directory(), false));
+    {
+        Some(status) => Some(status),
+        None => {
+            let home = api.database.directory().to_owned();
+            tokio::task::spawn_blocking(move || crate::relay::relay_status_from_home(&home, false))
+                .await
+                .map_err(|_| ApiError(Error::Closed))?
+        }
+    };
     Ok(Json(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
@@ -5734,7 +5778,7 @@ async fn list_runs(State(api): State<Api>) -> JsonResult<Vec<orchestration::Run>
 }
 
 async fn schedule_list(State(api): State<Api>) -> JsonResult<Vec<ScheduledAgentTask>> {
-    Ok(Json(api.schedules.list()?))
+    Ok(Json(api.schedules.list_async().await?))
 }
 
 async fn schedule_get(
@@ -5806,7 +5850,12 @@ async fn schedule_run(
 }
 
 async fn plugin_list(State(api): State<Api>) -> JsonResult<PublicPluginDiscoveryResult> {
-    Ok(Json(api.plugin_services.plugins()))
+    let services = api.plugin_services.clone();
+    Ok(Json(
+        tokio::task::spawn_blocking(move || services.plugins())
+            .await
+            .map_err(|_| Error::Closed)?,
+    ))
 }
 
 async fn plugin_service_status(State(api): State<Api>) -> JsonResult<PluginServiceList> {
@@ -6414,6 +6463,102 @@ async fn mark_message_answered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn projection_cache_invalidates_on_session_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = Database::open(dir.path().into()).await.unwrap();
+        let mut api = Api::new(
+            database.clone(),
+            Token::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+                .unwrap(),
+        );
+        api.schedules = Schedules::with_directory(dir.path().join("schedules"), api.agents.clone());
+        let head = database
+            .call(|store| {
+                store.create_session(CreateSession {
+                    agent: AgentKind::Claude,
+                    kind: SessionKind::Structured,
+                    title: "before".into(),
+                    workspace: "/synthetic".into(),
+                })
+            })
+            .await
+            .unwrap();
+        api.write_status_projection(7000, None, "token".into())
+            .await
+            .unwrap();
+        api.write_status_projection(7000, None, "token".into())
+            .await
+            .unwrap();
+        let id = head.id.clone();
+        database
+            .call(move |store| {
+                store.update_session(
+                    &id,
+                    UpdateSession {
+                        revision: head.revision,
+                        title: Some("after".into()),
+                        lifecycle: None,
+                        status: None,
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        api.write_status_projection(7000, None, "token".into())
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["sessions"][0]["title"], "after");
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn projection_coalesces_bursts_but_keeps_heartbeat() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = Database::open(dir.path().into()).await.unwrap();
+        let mut api = Api::new(
+            database.clone(),
+            Token::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+                .unwrap(),
+        );
+        api.schedules = Schedules::with_directory(dir.path().join("schedules"), api.agents.clone());
+        let (stop, stopping) = watch::channel(false);
+        let worker = api.clone();
+        let task = tokio::spawn(async move {
+            worker
+                .run_status_projection(7000, None, "token".into(), stopping)
+                .await;
+        });
+        let path = dir.path().join("status.json");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut times = std::collections::HashSet::new();
+        for _ in 0..40 {
+            api.publish();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            times.insert(status["builtAt"].as_i64().unwrap());
+        }
+        assert!(times.len() <= 6, "burst wrote too often: {}", times.len());
+        let before = *times.iter().max().unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(status["builtAt"].as_i64().unwrap() > before);
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        database.shutdown().await.unwrap();
+    }
 
     #[test]
     fn worker_start_runtime_failures_are_not_mislabeled_as_database_failures() {
