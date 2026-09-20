@@ -291,21 +291,16 @@ export async function rustTerminalView(client: TerminalReader, id: string, curso
     const snapshot = await client.terminalSnapshot(id, signal);
     if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
   }
-  let page = await client.terminalOutput(id, { afterSeq: cursor ?? 0, waitMs: Math.min(wait, 5000) }, signal);
-  let historyTruncated = false;
+  const page = await client.terminalOutput(id, { afterSeq: cursor ?? 0, waitMs: Math.min(wait, 5000) }, signal);
   if (page.resyncRequired) {
     const snapshot = await client.terminalSnapshot(id, signal);
     if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
-    historyTruncated = true;
-    for (let attempt = 0; attempt < 3 && page.resyncRequired; attempt += 1) {
-      page = await client.terminalOutput(id, { afterSeq: page.floorSeq, waitMs: 0 }, signal);
-    }
+    // Retained bytes alone cannot reconstruct cursor, modes or screen contents.
+    // Never treat a truncated suffix as a fresh terminal, even after catching up.
+    throw new Error("终端历史已裁剪且暂无完整快照，无法可靠恢复画面。请保留已有终端窗口；重新加载不能还原已丢失的屏幕状态。");
   }
-  if (page.resyncRequired) {
-    return { kind: "pty", mode: "events", seq: page.floorSeq, baseSeq: page.floorSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: [], exited: page.exited, caughtUp: page.floorSeq === page.latestSeq, historyTruncated: true };
-  }
-  if (!page.events.length && cursor !== undefined && !page.exited && !historyTruncated) return null;
-  return { kind: "pty", mode: "events", seq: page.nextSeq, baseSeq: page.baseSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: page.events, exited: page.exited, caughtUp: page.nextSeq === page.latestSeq, ...(historyTruncated ? { historyTruncated: true } : {}) };
+  if (!page.events.length && cursor !== undefined && !page.exited) return null;
+  return { kind: "pty", mode: "events", seq: page.nextSeq, baseSeq: page.baseSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: page.events, exited: page.exited, caughtUp: page.nextSeq === page.latestSeq };
 }
 
 export class RustRuntime {
