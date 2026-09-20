@@ -138,6 +138,14 @@ pub struct PluginServiceState {
     #[ts(type = "number | null")]
     pub health_checked_at: Option<i64>,
     pub health_error: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub next_restart_at: Option<i64>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub restart_window_started_at: Option<i64>,
     pub config_key: String,
 }
 
@@ -167,6 +175,9 @@ pub struct PluginServiceView {
     #[ts(type = "number | null")]
     pub health_checked_at: Option<i64>,
     pub health_error: Option<String>,
+    pub restart_count: u32,
+    #[ts(type = "number | null")]
+    pub next_restart_at: Option<i64>,
     pub config_key: String,
     pub configured: bool,
     pub plugin_root: Option<String>,
@@ -199,6 +210,8 @@ struct SupervisorState {
     control: std::sync::Mutex<PluginServiceControl>,
     running: Mutex<HashMap<String, Arc<Runtime>>>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    shutdown: AtomicBool,
+    policy: SupervisorPolicy,
 }
 
 #[derive(Clone)]
@@ -210,11 +223,22 @@ struct PluginServiceControl {
 
 struct Runtime {
     child: Mutex<Child>,
+    process_tree: ProcessTree,
     plugin: ProsperoPluginManifest,
     service: PluginServiceManifest,
     port: u16,
     started_at: i64,
     stopping: AtomicBool,
+}
+
+#[cfg(unix)]
+struct ProcessTree {
+    group: i32,
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: isize,
 }
 
 #[derive(Clone)]
@@ -231,9 +255,41 @@ struct StateFile {
     items: BTreeMap<String, PluginServiceState>,
 }
 
+#[derive(Clone)]
+struct SupervisorPolicy {
+    health_interval: Duration,
+    health_failure_limit: u32,
+    restart_window: Duration,
+    restart_limit: u32,
+    restart_delays: Arc<[Duration]>,
+}
+
+impl Default for SupervisorPolicy {
+    fn default() -> Self {
+        Self {
+            health_interval: Duration::from_secs(10),
+            health_failure_limit: 6,
+            restart_window: Duration::from_secs(300),
+            restart_limit: 8,
+            restart_delays: [
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+            ]
+            .into(),
+        }
+    }
+}
+
 impl PluginServiceSupervisor {
     pub fn new(home: impl Into<PathBuf>) -> Self {
-        let home = home.into();
+        Self::with_policy(home.into(), SupervisorPolicy::default())
+    }
+
+    fn with_policy(home: PathBuf, policy: SupervisorPolicy) -> Self {
         Self(Arc::new(SupervisorState {
             store: PluginServiceStore::new(&home),
             control: std::sync::Mutex::new(PluginServiceControl {
@@ -244,6 +300,8 @@ impl PluginServiceSupervisor {
             home,
             running: Mutex::new(HashMap::new()),
             operations: Mutex::new(HashMap::new()),
+            shutdown: AtomicBool::new(false),
+            policy,
         }))
     }
 
@@ -298,14 +356,27 @@ impl PluginServiceSupervisor {
     }
 
     pub async fn start_auto(&self) {
+        self.0.shutdown.store(false, Ordering::Release);
         let discovered = discover_prospero_plugins(&self.0.home);
         for plugin in discovered.plugins {
             for service in plugin.services {
                 if service.mode != PluginServiceMode::Auto {
                     continue;
                 }
+                if let Ok(Some(state)) = self.0.store.get(&plugin.name, &service.id)
+                    && state.config_key == service.config_key
+                    && state.status == PluginServiceStatus::Exited
+                {
+                    if state.next_restart_at.is_some() {
+                        self.schedule_restart(plugin.name.clone(), service.id.clone(), state);
+                        continue;
+                    }
+                    if state.restart_count > self.0.policy.restart_limit {
+                        continue;
+                    }
+                }
                 if let Err(error) = self.start(&plugin.name, &service.id).await {
-                    let state = state_now(PluginServiceState {
+                    let base = PluginServiceState {
                         plugin_id: plugin.name.clone(),
                         service_id: service.id.clone(),
                         mode: service.mode,
@@ -319,9 +390,21 @@ impl PluginServiceSupervisor {
                         health: PluginServiceHealth::Unknown,
                         health_checked_at: None,
                         health_error: None,
+                        restart_count: 0,
+                        next_restart_at: None,
+                        restart_window_started_at: None,
                         config_key: service.config_key.clone(),
+                    };
+                    let restart = restart_schedule(&base, &self.0.policy);
+                    let state = state_now(PluginServiceState {
+                        status: PluginServiceStatus::Exited,
+                        restart_count: restart.0,
+                        next_restart_at: restart.1,
+                        restart_window_started_at: restart.2,
+                        ..base
                     });
                     let _ = self.0.store.update(&state);
+                    self.schedule_restart(plugin.name.clone(), service.id.clone(), state);
                 }
             }
         }
@@ -332,7 +415,7 @@ impl PluginServiceSupervisor {
         validate_plugin_id(service_id, "serviceId")?;
         let operation = self.operation(plugin_id, service_id).await;
         let _guard = operation.lock().await;
-        self.start_unlocked(plugin_id, service_id).await
+        self.start_unlocked(plugin_id, service_id, true).await
     }
 
     pub async fn stop(&self, plugin_id: &str, service_id: &str) -> Result<PluginServiceView> {
@@ -363,7 +446,7 @@ impl PluginServiceSupervisor {
         {
             kill_pid(pid)?;
         }
-        self.start_unlocked(plugin_id, service_id).await
+        self.start_unlocked(plugin_id, service_id, true).await
     }
 
     async fn operation(&self, plugin_id: &str, service_id: &str) -> Arc<Mutex<()>> {
@@ -468,6 +551,7 @@ impl PluginServiceSupervisor {
     }
 
     pub async fn stop_all(&self) {
+        self.0.shutdown.store(true, Ordering::Release);
         let mut keys = self
             .0
             .running
@@ -498,7 +582,12 @@ impl PluginServiceSupervisor {
         .await;
     }
 
-    async fn start_unlocked(&self, plugin_id: &str, service_id: &str) -> Result<PluginServiceView> {
+    async fn start_unlocked(
+        &self,
+        plugin_id: &str,
+        service_id: &str,
+        reset_restart: bool,
+    ) -> Result<PluginServiceView> {
         self.0.store.ensure()?;
         let (plugin, service) = self.require_service(plugin_id, service_id)?;
         let key = plugin_service_key(&plugin.name, &service.id);
@@ -541,6 +630,16 @@ impl PluginServiceSupervisor {
             &plugin,
             &service,
         );
+        let restart_count = if reset_restart {
+            0
+        } else {
+            existing.restart_count
+        };
+        let restart_window_started_at = if reset_restart {
+            None
+        } else {
+            existing.restart_window_started_at
+        };
         if existing.status == PluginServiceStatus::Running
             && process_matches_service(existing.pid, &service)
             && let Some(pid) = existing.pid
@@ -563,9 +662,12 @@ impl PluginServiceSupervisor {
             health: PluginServiceHealth::Unknown,
             health_checked_at: None,
             health_error: None,
+            restart_count,
+            next_restart_at: None,
+            restart_window_started_at,
             config_key: service.config_key.clone(),
         }))?;
-        let child = match self.spawn_child(&plugin, &service, port) {
+        let mut child = match self.spawn_child(&plugin, &service, port) {
             Ok(child) => child,
             Err(error) => {
                 let state = state_now(PluginServiceState {
@@ -582,6 +684,9 @@ impl PluginServiceSupervisor {
                     health: PluginServiceHealth::Unknown,
                     health_checked_at: None,
                     health_error: None,
+                    restart_count,
+                    next_restart_at: None,
+                    restart_window_started_at,
                     config_key: service.config_key.clone(),
                 });
                 self.0.store.update(&state)?;
@@ -589,8 +694,16 @@ impl PluginServiceSupervisor {
             }
         };
         let pid = child.id();
+        let process_tree = match ProcessTree::new(&child) {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
         let runtime = Arc::new(Runtime {
             child: Mutex::new(child),
+            process_tree,
             plugin: plugin.clone(),
             service: service.clone(),
             port,
@@ -603,26 +716,110 @@ impl PluginServiceSupervisor {
             .await
             .insert(key.clone(), runtime.clone());
         let running = running_state(&plugin, &service, Some(pid), port, started_at);
+        let running = PluginServiceState {
+            restart_count,
+            restart_window_started_at,
+            ..running
+        };
         self.0.store.update(&running)?;
         self.watch_runtime_exit(key.clone(), runtime.clone());
+        self.watch_stability(runtime.clone());
         if service.health_path.is_some() {
-            self.watch_health(plugin.name.clone(), service.id.clone());
+            self.watch_health(plugin.name.clone(), service.id.clone(), runtime.clone());
         }
         Ok(view_for(&self.0.store, &plugin, &service, running))
     }
 
-    fn watch_health(&self, plugin_id: String, service_id: String) {
+    fn watch_stability(&self, runtime: Arc<Runtime>) {
         let supervisor = self.clone();
         tokio::spawn(async move {
-            for delay in [0, 100, 250, 500, 1000, 2000] {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-                match supervisor.check_health(&plugin_id, &service_id).await {
-                    Ok(view) if view.health == PluginServiceHealth::Healthy => return,
-                    Ok(view) if view.status != PluginServiceStatus::Running => return,
-                    Ok(_) | Err(_) => {}
-                }
+            tokio::time::sleep(supervisor.0.policy.restart_window).await;
+            if supervisor.0.shutdown.load(Ordering::Acquire)
+                || runtime.stopping.load(Ordering::Acquire)
+                || !supervisor
+                    .runtime_is_current(&runtime.plugin.name, &runtime.service.id, &runtime)
+                    .await
+            {
+                return;
+            }
+            let operation = supervisor
+                .operation(&runtime.plugin.name, &runtime.service.id)
+                .await;
+            let _guard = operation.lock().await;
+            let Ok(Some(current)) = supervisor
+                .0
+                .store
+                .get(&runtime.plugin.name, &runtime.service.id)
+            else {
+                return;
+            };
+            if same_runtime(&current, &runtime) {
+                let stable = state_now(PluginServiceState {
+                    restart_count: 0,
+                    next_restart_at: None,
+                    restart_window_started_at: None,
+                    ..current
+                });
+                let _ = supervisor.0.store.update(&stable);
             }
         });
+    }
+
+    fn watch_health(&self, plugin_id: String, service_id: String, runtime: Arc<Runtime>) {
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            let mut failures = 0;
+            loop {
+                if supervisor.0.shutdown.load(Ordering::Acquire)
+                    || runtime.stopping.load(Ordering::Acquire)
+                    || !supervisor
+                        .runtime_is_current(&plugin_id, &service_id, &runtime)
+                        .await
+                {
+                    return;
+                }
+                match supervisor.check_health(&plugin_id, &service_id).await {
+                    Ok(view) if view.health == PluginServiceHealth::Healthy => failures = 0,
+                    Ok(view) if view.status != PluginServiceStatus::Running => return,
+                    Ok(_) | Err(_) => failures += 1,
+                }
+                if failures >= supervisor.0.policy.health_failure_limit
+                    && runtime.service.mode == PluginServiceMode::Auto
+                {
+                    supervisor.replace_unhealthy(runtime.clone()).await;
+                    return;
+                }
+                tokio::time::sleep(supervisor.0.policy.health_interval).await;
+            }
+        });
+    }
+
+    async fn runtime_is_current(
+        &self,
+        plugin_id: &str,
+        service_id: &str,
+        runtime: &Arc<Runtime>,
+    ) -> bool {
+        self.0
+            .running
+            .lock()
+            .await
+            .get(&plugin_service_key(plugin_id, service_id))
+            .is_some_and(|current| Arc::ptr_eq(current, runtime))
+    }
+
+    async fn replace_unhealthy(&self, runtime: Arc<Runtime>) {
+        let operation = self
+            .operation(&runtime.plugin.name, &runtime.service.id)
+            .await;
+        let _guard = operation.lock().await;
+        if !self
+            .runtime_is_current(&runtime.plugin.name, &runtime.service.id, &runtime)
+            .await
+        {
+            return;
+        }
+        let _ = kill_child(&runtime).await;
     }
 
     fn watch_runtime_exit(&self, key: String, runtime: Arc<Runtime>) {
@@ -653,15 +850,37 @@ impl PluginServiceSupervisor {
                 .store
                 .get(&runtime.plugin.name, &runtime.service.id)
                 .unwrap_or_default();
+            let automatic = runtime.service.mode == PluginServiceMode::Auto
+                && !supervisor.0.shutdown.load(Ordering::Acquire)
+                && !runtime.stopping.load(Ordering::Acquire);
+            let restart = if automatic {
+                previous
+                    .as_ref()
+                    .map(|state| restart_schedule(state, &supervisor.0.policy))
+                    .unwrap_or_else(|| {
+                        restart_schedule(
+                            &running_state(
+                                &runtime.plugin,
+                                &runtime.service,
+                                None,
+                                runtime.port,
+                                runtime.started_at,
+                            ),
+                            &supervisor.0.policy,
+                        )
+                    })
+            } else {
+                (0, None, None)
+            };
             let (status, last_exit, last_error) = match result {
                 Ok(exit) => (
-                    if runtime.stopping.load(Ordering::Acquire) {
+                    if runtime.stopping.load(Ordering::Acquire) && !automatic {
                         PluginServiceStatus::Stopped
                     } else {
                         PluginServiceStatus::Exited
                     },
                     Some(exit),
-                    if runtime.stopping.load(Ordering::Acquire) {
+                    if runtime.stopping.load(Ordering::Acquire) && !automatic {
                         None
                     } else {
                         previous.as_ref().and_then(|state| state.last_error.clone())
@@ -686,9 +905,66 @@ impl PluginServiceSupervisor {
                 health: PluginServiceHealth::Unknown,
                 health_checked_at: None,
                 health_error: None,
+                restart_count: restart.0,
+                next_restart_at: restart.1,
+                restart_window_started_at: restart.2,
                 config_key: runtime.service.config_key.clone(),
             });
             let _ = supervisor.0.store.update(&state);
+            if automatic {
+                supervisor.schedule_restart(
+                    runtime.plugin.name.clone(),
+                    runtime.service.id.clone(),
+                    state,
+                );
+            }
+        });
+    }
+
+    fn schedule_restart(&self, plugin_id: String, service_id: String, state: PluginServiceState) {
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            let Some(next) = state.next_restart_at else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_millis(
+                next.saturating_sub(now()).max(0) as u64
+            ))
+            .await;
+            if supervisor.0.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let operation = supervisor.operation(&plugin_id, &service_id).await;
+            let _guard = operation.lock().await;
+            if supervisor.0.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let current = match supervisor.0.store.get(&plugin_id, &service_id) {
+                Ok(Some(current)) => current,
+                _ => return,
+            };
+            if current.mode != PluginServiceMode::Auto
+                || current.status != PluginServiceStatus::Exited
+                || current.next_restart_at != Some(next)
+            {
+                return;
+            }
+            if let Err(error) = supervisor
+                .start_unlocked(&plugin_id, &service_id, false)
+                .await
+            {
+                let restart = restart_schedule(&current, &supervisor.0.policy);
+                let failed = state_now(PluginServiceState {
+                    status: PluginServiceStatus::Exited,
+                    last_error: Some(error.to_string()),
+                    restart_count: restart.0,
+                    next_restart_at: restart.1,
+                    restart_window_started_at: restart.2,
+                    ..current
+                });
+                let _ = supervisor.0.store.update(&failed);
+                supervisor.schedule_restart(plugin_id, service_id, failed);
+            }
         });
     }
 
@@ -714,7 +990,7 @@ impl PluginServiceSupervisor {
             && let Some(pid) = state.pid
             && process_matches_service(Some(pid), service)
         {
-            terminate_pid(pid)?;
+            terminate_tree(pid)?;
         }
         let stopped = state_now(PluginServiceState {
             plugin_id: plugin_id.to_owned(),
@@ -741,6 +1017,9 @@ impl PluginServiceSupervisor {
             health: PluginServiceHealth::Unknown,
             health_checked_at: None,
             health_error: None,
+            restart_count: 0,
+            next_restart_at: None,
+            restart_window_started_at: None,
             config_key: found
                 .as_ref()
                 .map(|(_, service)| service.config_key.clone())
@@ -776,6 +1055,9 @@ impl PluginServiceSupervisor {
             health: PluginServiceHealth::Unknown,
             health_checked_at: None,
             health_error: None,
+            restart_count: 0,
+            next_restart_at: None,
+            restart_window_started_at: None,
             config_key: runtime.service.config_key.clone(),
         });
         self.0.store.update(&state)?;
@@ -797,31 +1079,6 @@ impl PluginServiceSupervisor {
         if let Some(runtime) =
             current.filter(|runtime| runtime.service.config_key == service.config_key)
         {
-            if let Some(exit) = runtime_exit(&runtime).await? {
-                self.0.running.lock().await.remove(&key);
-                let state = state_now(PluginServiceState {
-                    plugin_id: plugin.name.clone(),
-                    service_id: service.id.clone(),
-                    mode: service.mode,
-                    status: if runtime.stopping.load(Ordering::Acquire) {
-                        PluginServiceStatus::Stopped
-                    } else {
-                        PluginServiceStatus::Exited
-                    },
-                    pid: None,
-                    port: None,
-                    started_at: Some(runtime.started_at),
-                    updated_at: 0,
-                    last_exit: Some(exit),
-                    last_error: None,
-                    health: PluginServiceHealth::Unknown,
-                    health_checked_at: None,
-                    health_error: None,
-                    config_key: service.config_key.clone(),
-                });
-                self.0.store.update(&state)?;
-                return Ok(state);
-            }
             let state = running_state_with_previous(
                 plugin,
                 service,
@@ -884,10 +1141,20 @@ impl PluginServiceSupervisor {
         child.stdin(Stdio::null());
         child.stdout(Stdio::from(stdout));
         child.stderr(Stdio::from(stderr));
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            child.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            child.creation_flags(0x08000000);
+            child.creation_flags(0x08000000 | 0x00000200);
         }
         child.spawn().map_err(Into::into)
     }
@@ -929,6 +1196,80 @@ impl PluginServiceSupervisor {
 impl Runtime {
     async fn pid(&self) -> u32 {
         self.child.lock().await.id()
+    }
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn new(child: &Child) -> Result<Self> {
+        Ok(Self {
+            group: child.id() as i32,
+        })
+    }
+
+    fn signal(&self, signal: i32) -> Result<()> {
+        let result = unsafe { libc::kill(-self.group, signal) };
+        if result != 0 && std::io::Error::last_os_error().kind() != ErrorKind::NotFound {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn new(child: &Child) -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() || job == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                std::mem::size_of_val(&limits) as u32,
+            ) == 0
+            {
+                CloseHandle(job);
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let assigned = AssignProcessToJobObject(job, child.as_raw_handle() as _);
+            if assigned == 0 {
+                CloseHandle(job);
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(Self { job: job as isize })
+        }
+    }
+
+    fn terminate(&self) -> Result<()> {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        if unsafe { TerminateJobObject(self.job as HANDLE, 1) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(
+                self.job as windows_sys::Win32::Foundation::HANDLE,
+            );
+        }
     }
 }
 
@@ -1559,6 +1900,40 @@ fn state_now(mut state: PluginServiceState) -> PluginServiceState {
     state
 }
 
+fn restart_schedule(
+    state: &PluginServiceState,
+    policy: &SupervisorPolicy,
+) -> (u32, Option<i64>, Option<i64>) {
+    let current = now();
+    let window_ms = policy.restart_window.as_millis() as i64;
+    let active_window = state
+        .restart_window_started_at
+        .is_some_and(|started| current.saturating_sub(started) <= window_ms);
+    let window = if active_window {
+        state.restart_window_started_at.unwrap_or(current)
+    } else {
+        current
+    };
+    let count = if active_window {
+        state.restart_count.saturating_add(1)
+    } else {
+        1
+    };
+    if count > policy.restart_limit {
+        return (count, None, Some(window));
+    }
+    let delay = policy
+        .restart_delays
+        .get(count.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or_else(|| *policy.restart_delays.last().unwrap());
+    (
+        count,
+        Some(current.saturating_add(delay.as_millis() as i64)),
+        Some(window),
+    )
+}
+
 fn stopped_state(
     plugin: &ProsperoPluginManifest,
     service: &PluginServiceManifest,
@@ -1577,6 +1952,9 @@ fn stopped_state(
         health: PluginServiceHealth::Unknown,
         health_checked_at: None,
         health_error: None,
+        restart_count: 0,
+        next_restart_at: None,
+        restart_window_started_at: None,
         config_key: service.config_key.clone(),
     })
 }
@@ -1602,6 +1980,9 @@ fn running_state(
         health: PluginServiceHealth::Unknown,
         health_checked_at: None,
         health_error: None,
+        restart_count: 0,
+        next_restart_at: None,
+        restart_window_started_at: None,
         config_key: service.config_key.clone(),
     })
 }
@@ -1623,6 +2004,9 @@ fn running_state_with_previous(
         state.health = previous.health;
         state.health_checked_at = previous.health_checked_at;
         state.health_error = previous.health_error;
+        state.restart_count = previous.restart_count;
+        state.next_restart_at = previous.next_restart_at;
+        state.restart_window_started_at = previous.restart_window_started_at;
     }
     state
 }
@@ -1655,6 +2039,13 @@ fn same_service_instance(left: &PluginServiceState, right: &PluginServiceState) 
         && left.started_at == right.started_at
 }
 
+fn same_runtime(state: &PluginServiceState, runtime: &Runtime) -> bool {
+    state.config_key == runtime.service.config_key
+        && state.port == Some(runtime.port)
+        && state.started_at == Some(runtime.started_at)
+        && state.status == PluginServiceStatus::Running
+}
+
 fn view_for(
     store: &PluginServiceStore,
     plugin: &ProsperoPluginManifest,
@@ -1675,6 +2066,8 @@ fn view_for(
         health: state.health,
         health_checked_at: state.health_checked_at,
         health_error: state.health_error,
+        restart_count: state.restart_count,
+        next_restart_at: state.next_restart_at,
         config_key: state.config_key,
         configured: true,
         plugin_root: Some(plugin.root.clone()),
@@ -1700,6 +2093,8 @@ fn orphan_view(store: &PluginServiceStore, state: PluginServiceState) -> PluginS
         health: state.health,
         health_checked_at: state.health_checked_at,
         health_error: state.health_error,
+        restart_count: state.restart_count,
+        next_restart_at: state.next_restart_at,
         config_key: state.config_key,
         configured: false,
         plugin_root: None,
@@ -1761,40 +2156,28 @@ async fn runtime_exit(runtime: &Runtime) -> Result<Option<PluginServiceExit>> {
 }
 
 async fn terminate_child(runtime: &Runtime) -> Result<Option<PluginServiceExit>> {
-    let pid = runtime.child.lock().await.id();
     #[cfg(unix)]
-    {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-    }
+    runtime.process_tree.signal(libc::SIGTERM)?;
     #[cfg(not(unix))]
-    {
-        let _ = runtime.child.lock().await.kill();
-    }
+    runtime.process_tree.terminate()?;
     if let Some(exit) = wait_child(runtime, Duration::from_secs(5)).await? {
         return Ok(Some(exit));
     }
-    let _ = runtime.child.lock().await.kill();
+    #[cfg(unix)]
+    runtime.process_tree.signal(libc::SIGKILL)?;
+    #[cfg(not(unix))]
+    runtime.process_tree.terminate()?;
     wait_child(runtime, Duration::from_secs(3)).await
 }
 
 async fn kill_child(runtime: &Runtime) -> Result<()> {
     #[cfg(unix)]
     {
-        let pid = runtime.child.lock().await.id();
-        unsafe {
-            if libc::kill(pid as i32, libc::SIGKILL) != 0
-                && std::io::Error::last_os_error().kind() != ErrorKind::NotFound
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        Ok(())
+        runtime.process_tree.signal(libc::SIGKILL)
     }
     #[cfg(not(unix))]
     {
-        runtime.child.lock().await.kill().map_err(Into::into)
+        runtime.process_tree.terminate()
     }
 }
 
@@ -1886,17 +2269,10 @@ fn process_matches_service(pid: Option<u32>, service: &PluginServiceManifest) ->
         .any(|part| command.contains(part))
 }
 
-fn terminate_pid(pid: u32) -> Result<()> {
+fn terminate_tree(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        unsafe {
-            if libc::kill(pid as i32, libc::SIGTERM) != 0
-                && std::io::Error::last_os_error().kind() != ErrorKind::NotFound
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        Ok(())
+        signal_tree(pid, libc::SIGTERM)
     }
     #[cfg(windows)]
     {
@@ -1910,14 +2286,7 @@ fn terminate_pid(pid: u32) -> Result<()> {
 fn kill_pid(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        unsafe {
-            if libc::kill(pid as i32, libc::SIGKILL) != 0
-                && std::io::Error::last_os_error().kind() != ErrorKind::NotFound
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        Ok(())
+        signal_tree(pid, libc::SIGKILL)
     }
     #[cfg(windows)]
     {
@@ -1928,15 +2297,37 @@ fn kill_pid(pid: u32) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn signal_tree(pid: u32, signal: i32) -> Result<()> {
+    let group = unsafe { libc::kill(-(pid as i32), signal) };
+    if group == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ESRCH) {
+        return Err(error.into());
+    }
+    let process = unsafe { libc::kill(pid as i32, signal) };
+    if process != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn service(id: &str, command: Vec<String>, health_path: Option<&str>) -> JsonValue {
+    fn service_mode(
+        id: &str,
+        mode: PluginServiceMode,
+        command: Vec<String>,
+        health_path: Option<&str>,
+    ) -> JsonValue {
         let mut value = json!({
             "id": id,
-            "mode": "manual",
+            "mode": mode,
             "command": command,
             "cwd": "runtime",
             "port_env": "PORT",
@@ -1945,6 +2336,25 @@ mod tests {
             value["health_path"] = json!(path);
         }
         value
+    }
+
+    fn service(id: &str, command: Vec<String>, health_path: Option<&str>) -> JsonValue {
+        service_mode(id, PluginServiceMode::Manual, command, health_path)
+    }
+
+    fn policy() -> SupervisorPolicy {
+        SupervisorPolicy {
+            health_interval: Duration::from_millis(25),
+            health_failure_limit: 2,
+            restart_window: Duration::from_secs(5),
+            restart_limit: 3,
+            restart_delays: [
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            ]
+            .into(),
+        }
     }
 
     fn plugin(home: &Path, services: Vec<JsonValue>) -> PathBuf {
@@ -1992,6 +2402,9 @@ mod tests {
             health: PluginServiceHealth::Unknown,
             health_checked_at: None,
             health_error: None,
+            restart_count: 0,
+            next_restart_at: None,
+            restart_window_started_at: None,
             config_key: "first".into(),
         };
         let mut file = StateFile::default();
@@ -2015,6 +2428,9 @@ mod tests {
             health: PluginServiceHealth::Unknown,
             health_checked_at: None,
             health_error: None,
+            restart_count: 0,
+            next_restart_at: None,
+            restart_window_started_at: None,
             config_key: "second".into(),
         };
         store.update(&second).unwrap();
@@ -2186,5 +2602,172 @@ mod tests {
         assert!(!stopping.is_finished());
         stopping.await.unwrap().unwrap();
         supervisor.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_service_respawns_with_persisted_backoff() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
+        plugin(
+            directory.path(),
+            vec![service_mode(
+                "worker",
+                PluginServiceMode::Auto,
+                vec![command],
+                None,
+            )],
+        );
+        let supervisor =
+            PluginServiceSupervisor::with_policy(directory.path().to_path_buf(), policy());
+        let first = supervisor.start("test-plugin", "worker").await.unwrap();
+        unsafe {
+            libc::kill(first.pid.unwrap() as i32, libc::SIGKILL);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let second = loop {
+            let current = supervisor.list().await.unwrap().items.remove(0);
+            if current.status == PluginServiceStatus::Running && current.pid != first.pid {
+                break current;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(second.restart_count, 1);
+        assert_eq!(second.next_restart_at, None);
+        let persisted = supervisor
+            .0
+            .store
+            .get("test-plugin", "worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.restart_count, 1);
+        supervisor.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_restart_backoff_is_bounded() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "service.sh", "#!/bin/sh\nexit 1\n");
+        plugin(
+            directory.path(),
+            vec![service_mode(
+                "worker",
+                PluginServiceMode::Auto,
+                vec![command],
+                None,
+            )],
+        );
+        let supervisor =
+            PluginServiceSupervisor::with_policy(directory.path().to_path_buf(), policy());
+        supervisor.start("test-plugin", "worker").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = supervisor
+                .0
+                .store
+                .get("test-plugin", "worker")
+                .unwrap()
+                .unwrap();
+            if state.restart_count > supervisor.0.policy.restart_limit {
+                assert_eq!(state.status, PluginServiceStatus::Exited);
+                assert_eq!(state.next_restart_at, None);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        supervisor.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manual_service_does_not_auto_respawn() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
+        plugin(
+            directory.path(),
+            vec![service("worker", vec![command], None)],
+        );
+        let supervisor =
+            PluginServiceSupervisor::with_policy(directory.path().to_path_buf(), policy());
+        let first = supervisor.start("test-plugin", "worker").await.unwrap();
+        unsafe {
+            libc::kill(first.pid.unwrap() as i32, libc::SIGKILL);
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let current = supervisor.list().await.unwrap().items.remove(0);
+        assert_eq!(current.status, PluginServiceStatus::Exited);
+        assert_eq!(current.pid, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_failures_restart_only_auto_services() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
+        plugin(
+            directory.path(),
+            vec![service_mode(
+                "worker",
+                PluginServiceMode::Auto,
+                vec![command],
+                Some("/health"),
+            )],
+        );
+        let supervisor =
+            PluginServiceSupervisor::with_policy(directory.path().to_path_buf(), policy());
+        let first = supervisor.start("test-plugin", "worker").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let current = supervisor.list().await.unwrap().items.remove(0);
+            if current.status == PluginServiceStatus::Running && current.pid != first.pid {
+                assert_eq!(current.restart_count, 1);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        supervisor.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_terminates_the_complete_process_group() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(
+            &root,
+            "service.sh",
+            "#!/bin/sh\nsleep 30 & echo $! > grandchild.pid\nwait\n",
+        );
+        plugin(
+            directory.path(),
+            vec![service("worker", vec![command], None)],
+        );
+        let supervisor = PluginServiceSupervisor::new(directory.path());
+        supervisor.start("test-plugin", "worker").await.unwrap();
+        let pid_file = root.join("runtime/grandchild.pid");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !pid_file.exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let grandchild = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        supervisor.stop("test-plugin", "worker").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while process_alive(Some(grandchild)) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
