@@ -222,6 +222,7 @@ struct PluginServiceControl {
 }
 
 struct Runtime {
+    pid: u32,
     child: Mutex<Child>,
     process_tree: ProcessTree,
     plugin: ProsperoPluginManifest,
@@ -327,24 +328,69 @@ impl PluginServiceSupervisor {
     }
 
     pub async fn list(&self) -> Result<PluginServiceList> {
+        let running = self.0.running.lock().await.clone();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.list_snapshot(running))
+            .await
+            .map_err(|_| Error::Closed)?
+    }
+
+    fn list_snapshot(&self, running: HashMap<String, Arc<Runtime>>) -> Result<PluginServiceList> {
         self.0.store.ensure()?;
         let discovered = discover_prospero_plugins(&self.0.home);
-        let mut configured = HashSet::new();
+        let mut previous: BTreeMap<_, _> = self
+            .0
+            .store
+            .list()?
+            .into_iter()
+            .map(|state| {
+                (
+                    plugin_service_key(&state.plugin_id, &state.service_id),
+                    state,
+                )
+            })
+            .collect();
         let mut items = Vec::new();
+        let mut updates = Vec::new();
         for plugin in &discovered.plugins {
             for service in &plugin.services {
                 let key = plugin_service_key(&plugin.name, &service.id);
-                configured.insert(key.clone());
-                let state = self.status_for(plugin, service).await?;
+                let old = previous.remove(&key);
+                let runtime = running
+                    .get(&key)
+                    .filter(|runtime| runtime.service.config_key == service.config_key);
+                let mut state = match runtime {
+                    Some(runtime) => running_state_with_previous(
+                        plugin,
+                        service,
+                        Some(runtime.pid),
+                        runtime.port,
+                        runtime.started_at,
+                        old.clone(),
+                    ),
+                    None => status_from_state(old.clone(), plugin, service),
+                };
+                if let Some(old) = &old {
+                    let mut same = state.clone();
+                    same.updated_at = old.updated_at;
+                    if same == *old {
+                        state.updated_at = old.updated_at;
+                    }
+                }
+                if (runtime.is_some() || state.status == PluginServiceStatus::Exited)
+                    && old.as_ref() != Some(&state)
+                {
+                    updates.push((old, state.clone()));
+                }
                 items.push(view_for(&self.0.store, plugin, service, state));
             }
         }
-        for state in self.0.store.list()? {
-            if configured.contains(&plugin_service_key(&state.plugin_id, &state.service_id)) {
-                continue;
-            }
-            items.push(orphan_view(&self.0.store, state));
-        }
+        self.0.store.update_observed(updates)?;
+        items.extend(
+            previous
+                .into_values()
+                .map(|state| orphan_view(&self.0.store, state)),
+        );
         items.sort_by(|a, b| {
             plugin_service_key(&a.plugin_id, &a.service_id)
                 .cmp(&plugin_service_key(&b.plugin_id, &b.service_id))
@@ -702,6 +748,7 @@ impl PluginServiceSupervisor {
             }
         };
         let runtime = Arc::new(Runtime {
+            pid,
             child: Mutex::new(child),
             process_tree,
             plugin: plugin.clone(),
@@ -1195,7 +1242,7 @@ impl PluginServiceSupervisor {
 
 impl Runtime {
     async fn pid(&self) -> u32 {
-        self.child.lock().await.id()
+        self.pid
     }
 }
 
@@ -1310,6 +1357,31 @@ impl PluginServiceStore {
             state.clone(),
         );
         write_private_json(&self.state_file, &file)
+    }
+
+    // A list request reconciles changed rows in one transaction-like file update.
+    // Do not overwrite health/restart changes made after the list snapshot.
+    fn update_observed(
+        &self,
+        updates: Vec<(Option<PluginServiceState>, PluginServiceState)>,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock.lock().map_err(|_| Error::Closed)?;
+        let mut file = read_state(&self.state_file)?;
+        let mut changed = false;
+        for (previous, state) in updates {
+            let key = plugin_service_key(&state.plugin_id, &state.service_id);
+            if file.items.get(&key) == previous.as_ref() {
+                file.items.insert(key, state);
+                changed = true;
+            }
+        }
+        if changed {
+            write_private_json(&self.state_file, &file)?;
+        }
+        Ok(())
     }
 
     fn log_files(&self, plugin_id: &str, service_id: &str) -> PluginServiceLogFiles {
@@ -2382,6 +2454,61 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_unchanged_services_does_not_rewrite_state() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "fixture.sh", "#!/bin/sh\nexit 0\n");
+        plugin(
+            directory.path(),
+            (0..8)
+                .map(|i| service(&format!("service-{i}"), vec![command.clone()], None))
+                .collect(),
+        );
+        let supervisor = PluginServiceSupervisor::new(directory.path());
+        let discovered = discover_prospero_plugins(directory.path());
+        let manifest = &discovered.plugins[0];
+        for service in &manifest.services {
+            let mut state = stopped_state(manifest, service);
+            state.status = PluginServiceStatus::Exited;
+            state.updated_at = 123;
+            supervisor.0.store.update(&state).unwrap();
+        }
+        let path = &supervisor.0.store.state_file;
+        let before = fs::metadata(path).unwrap();
+        assert_eq!(supervisor.list().await.unwrap().items.len(), 8);
+        assert_eq!(supervisor.list().await.unwrap().items.len(), 8);
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+
+    #[test]
+    fn batched_list_reconciliation_preserves_concurrent_health_changes() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "fixture.sh", "#!/bin/sh\nexit 0\n");
+        plugin(
+            directory.path(),
+            vec![service("worker", vec![command], None)],
+        );
+        let discovered = discover_prospero_plugins(directory.path());
+        let manifest = &discovered.plugins[0];
+        let store = PluginServiceStore::new(directory.path());
+        let before = stopped_state(manifest, &manifest.services[0]);
+        store.update(&before).unwrap();
+        let mut newer = before.clone();
+        newer.health_checked_at = Some(1234);
+        newer.updated_at += 1;
+        store.update(&newer).unwrap();
+        let mut stale = before.clone();
+        stale.status = PluginServiceStatus::Exited;
+        store.update_observed(vec![(Some(before), stale)]).unwrap();
+        assert_eq!(store.get("test-plugin", "worker").unwrap().unwrap(), newer);
     }
 
     #[test]
