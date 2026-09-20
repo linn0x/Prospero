@@ -262,10 +262,21 @@ pub struct Health {
     pub build_id: String,
     pub active_runtime_sessions: usize,
     pub database_queue_capacity: usize,
+    #[serde(default)]
+    pub database: DatabaseHealth,
     pub capabilities: Vec<String>,
     pub persistence: HealthPersistence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayRuntimeStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseHealth {
+    pub alive: bool,
+    pub queue_depth: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

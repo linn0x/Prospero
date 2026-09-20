@@ -134,6 +134,9 @@ async fn health_dto_reports_rust_http_contract() {
         body["databaseQueueCapacity"],
         json!(DATABASE_QUEUE_CAPACITY)
     );
+    assert_eq!(body["database"]["alive"], true);
+    assert_eq!(body["database"]["queueDepth"], 0);
+    assert!(body["database"]["lastError"].is_null());
     assert_eq!(body["persistence"]["structured"], true);
     assert_eq!(body["persistence"]["pty"], cfg!(unix));
     assert!(body["capabilities"].as_array().unwrap().len() > 5);
