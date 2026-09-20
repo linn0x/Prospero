@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { Terminal } from "@xterm/xterm";
+import { configureRustTerminalUnicode } from "../src/renderer/src/terminal-unicode";
 import { terminalFontFamilyWithFallbacks } from "../src/shared/terminal-typography";
 
 describe("terminal font fallbacks", () => {
@@ -26,4 +28,19 @@ describe("terminal font fallbacks", () => {
     expect(family.startsWith("Cascadia Mono, Consolas, ")).toBe(true);
     expect(family).toContain(", ui-monospace, monospace, \"PingFang SC\"");
   });
+});
+
+it("aligns CJK and emoji cells with the Rust terminal width provider", async () => {
+  const terminal = new Terminal({ cols: 20, rows: 4, allowProposedApi: true });
+  try {
+    configureRustTerminalUnicode(terminal);
+    await new Promise<void>(done => terminal.write("A中文🦀B", done));
+    const line = terminal.buffer.active.getLine(0)!;
+    expect(line.translateToString(true)).toBe("A中文🦀B");
+    expect(line.getCell(1)?.getWidth()).toBe(2);
+    expect(line.getCell(3)?.getWidth()).toBe(2);
+    expect(line.getCell(5)?.getWidth()).toBe(2);
+    expect(line.getCell(7)?.getChars()).toBe("B");
+    expect(terminal.buffer.active.cursorX).toBe(8);
+  } finally { terminal.dispose(); }
 });

@@ -8,6 +8,7 @@ import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
 import { reportError } from "../state";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "../terminal-clipboard";
+import { configureRustTerminalUnicode } from "../terminal-unicode";
 import { RemoteTerminalBuffer, remoteInputBase64, remoteTerminalTheme } from "./remote-terminal-state";
 import "./remote-workspaces.css";
 
@@ -38,12 +39,13 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     if (!container.current) return;
     const ownerId = crypto.randomUUID();
     const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const term = new Terminal({ cols: 120, rows: 36, scrollback: 3000, disableStdin: true,
+    const term = new Terminal({ cols: 120, rows: 36, scrollback: 3000, disableStdin: true, allowProposedApi: true,
       fontSize: settingsRef.current.terminalFontSize, fontFamily: terminalFontFamilyWithFallbacks(settingsRef.current.terminalFontFamily),
       cursorBlink: !motion.matches, cursorStyle: "bar", lineHeight: TERMINAL_LINE_HEIGHT, letterSpacing: 0, fontWeight: "400", fontWeightBold: "700", minimumContrastRatio: 4.5,
       rightClickSelectsWord: true, macOptionClickForcesSelection: window.prospero.platform === "darwin",
       theme: remoteTerminalTheme(getComputedStyle(document.documentElement)) });
     terminal.current = term;
+    configureRustTerminalUnicode(term);
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container.current);

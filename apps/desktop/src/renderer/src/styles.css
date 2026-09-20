@@ -1518,6 +1518,13 @@ label.check-row { display: flex; }
 .chat-markdown .hljs-number, .chat-markdown .hljs-attr, .chat-markdown .hljs-symbol { color: light-dark(#995522, #eeb576); }
 .chat-markdown .hljs-deletion { color: var(--destructive); }
 .chat-reasoning .chat-prose { font-size: max(14px, calc(var(--conversation-font-size, 16px) - 1px)); }
+.terminal-output-text {
+  font-family: var(--ui-font-mono);
+  white-space: pre-wrap;
+  tab-size: 2;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
 @media (prefers-reduced-motion: reduce) { .conversation-rail button span { transition: none; } }
 @media (max-width: 850px) { .titlebar-app-name { display: none; } }
 

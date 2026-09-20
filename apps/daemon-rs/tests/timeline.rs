@@ -319,3 +319,72 @@ fn lookups_and_writes_preserve_session_and_record_identity() {
         1
     );
 }
+
+#[test]
+fn previews_strip_terminal_controls_but_body_stays_lossless() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let id = session(&mut store);
+    for (index, (raw, expected)) in [
+        (
+            "\x1b[31m中文 🦀\x1b[0m\r\nok\x08x\x1b]0;title\x07",
+            "中文 🦀\nox",
+        ),
+        ("a\r\n\n\nb\x00\x07", "a\n\nb"),
+        ("one\r\ntwo\rthree", "one\ntwo\nthree"),
+        ("a🦀\x08x", "ax"),
+        ("中\x08文", "文"),
+        ("\x08\x08ok", "ok"),
+        (
+            "\x1b]8;;https://example.test\x1b\\链接\x1b]8;;\x1b\\",
+            "链接",
+        ),
+        ("a\x1bPignored payload\x1b\\b", "ab"),
+        ("ok\x1b[31", "ok"),
+        ("plain 中文 👩‍💻", "plain 中文 👩‍💻"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let record_id = format!("clean-{index}");
+        let record = store
+            .write_timeline(&id, write(&record_id, 0, raw))
+            .unwrap();
+        assert_eq!(record.preview, expected);
+        assert_eq!(
+            store.timeline_record(&id, &record_id).unwrap().preview,
+            expected
+        );
+        assert_eq!(
+            store
+                .timeline_text(&id, &record_id, TimelineTextQuery::default())
+                .unwrap()
+                .text,
+            raw
+        );
+    }
+}
+
+#[test]
+fn streamed_previews_preserve_spaces_and_split_escape_sequences() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let id = session(&mut store);
+    let fragments = ["Hello ", "world\x1b[", "31m中文\x1b[0m\r", "\nnext"];
+    for (revision, fragment) in fragments.iter().enumerate() {
+        store
+            .write_timeline(&id, write("stream", revision as i64, fragment))
+            .unwrap();
+    }
+    assert_eq!(
+        store.timeline_record(&id, "stream").unwrap().preview,
+        "Hello world中文\nnext"
+    );
+    assert_eq!(
+        store
+            .timeline_text(&id, "stream", TimelineTextQuery::default())
+            .unwrap()
+            .text,
+        fragments.concat()
+    );
+}
