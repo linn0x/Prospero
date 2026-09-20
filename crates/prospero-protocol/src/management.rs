@@ -418,6 +418,10 @@ pub struct PluginServiceView {
     pub health: PluginServiceHealth,
     pub health_checked_at: Option<i64>,
     pub health_error: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub next_restart_at: Option<i64>,
     pub config_key: String,
     pub configured: bool,
     pub plugin_root: Option<String>,
