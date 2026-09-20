@@ -187,7 +187,7 @@ describe("workspace sidebar state", () => {
     expect(parseExpandedProjects("not json", ["/repo"])).toBeUndefined();
   });
 
-  it("keeps the selected and attention sessions ahead of a long recent list", () => {
+  it("keeps attention sessions ahead of a long recent list without moving the selected row", () => {
     const sessions = [
       session("recent", "/repo", 100),
       session("unread", "/repo", 1),
@@ -199,7 +199,12 @@ describe("workspace sidebar state", () => {
       sortSidebarSessions(sessions, "selected", [], ["unread"]).map(
         (item) => item.id,
       ),
-    ).toEqual(["selected", "attention", "unread", "recent"]);
+    ).toEqual(["attention", "unread", "recent", "selected"]);
+    expect(
+      sortSidebarSessions(sessions, "recent", [], ["unread"]).map(
+        (item) => item.id,
+      ),
+    ).toEqual(["attention", "unread", "recent", "selected"]);
   });
 
   it("pages large session groups instead of mounting every session", () => {

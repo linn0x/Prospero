@@ -35,7 +35,95 @@ fn record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineRecord> {
     })
 }
 
-fn preview(mut text: String) -> String {
+pub(crate) fn terminal_plain_text(text: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Osc,
+        String,
+        StringEscape,
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut state = State::Ground;
+    for ch in text.replace("\r\n", "\n").chars() {
+        match state {
+            State::Ground => match ch {
+                '\u{1b}' => state = State::Escape,
+                '\r' => {
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                '\n' | '\t' => out.push(ch),
+                '\u{08}' => {
+                    out.pop();
+                }
+                _ if ch == '\u{0}' || ch.is_control() => {}
+                _ => out.push(ch),
+            },
+            State::Escape => {
+                state = match ch {
+                    '[' => State::Csi,
+                    ']' => State::Osc,
+                    'P' | 'X' | '^' | '_' => State::String,
+                    '\u{20}'..='\u{2f}' => State::Escape,
+                    '\u{30}'..='\u{7e}' => State::Ground,
+                    '\u{1b}' => State::Escape,
+                    _ => State::Ground,
+                };
+            }
+            State::Csi => {
+                if ('\u{40}'..='\u{7e}').contains(&ch) {
+                    state = State::Ground;
+                } else if ch == '\u{1b}' {
+                    state = State::Escape;
+                }
+            }
+            State::Osc => {
+                if ch == '\u{07}' {
+                    state = State::Ground;
+                } else if ch == '\u{1b}' {
+                    state = State::StringEscape;
+                }
+            }
+            State::String => {
+                if ch == '\u{1b}' {
+                    state = State::StringEscape;
+                } else if ch == '\u{07}' {
+                    state = State::Ground;
+                }
+            }
+            State::StringEscape => {
+                state = if ch == '\\' {
+                    State::Ground
+                } else {
+                    State::String
+                };
+            }
+        }
+    }
+    let mut compact = String::with_capacity(out.len());
+    let mut blank_run = 0usize;
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        compact.push_str(line);
+        compact.push('\n');
+    }
+    compact.trim().to_owned()
+}
+
+fn preview(text: String) -> String {
+    let mut text = terminal_plain_text(&text);
     let mut end = text.len().min(PREVIEW_BYTES);
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -363,7 +451,19 @@ impl Store {
         )?;
         let preview = match &previous {
             Some(previous) if !input.replace && previous.bytes < PREVIEW_BYTES as i64 => {
-                preview(format!("{}{}", previous.preview, input.text))
+                // Reparse the bounded raw prefix: a sanitized preview loses trailing
+                // spaces and parser state when an escape sequence spans writes.
+                let prefix: Vec<u8> = if previous.bytes == 0 {
+                    Vec::new()
+                } else {
+                    transaction.query_row(
+                        "SELECT substr(body, 1, ?3) FROM content_chunks WHERE session_id=?1 AND content_id=?2 AND offset=0",
+                        params![session_id, input.id, previous.bytes],
+                        |row| row.get(0),
+                    )?
+                };
+                let prefix = String::from_utf8(prefix).map_err(|_| Error::Schema)?;
+                preview(format!("{prefix}{}", input.text))
             }
             Some(previous) if !input.replace => previous.preview.clone(),
             _ => preview(input.text),

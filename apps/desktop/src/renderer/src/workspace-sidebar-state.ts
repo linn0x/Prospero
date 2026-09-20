@@ -300,11 +300,9 @@ const activeStatuses = new Set([
 
 function sessionPriority(
   session: SessionInfo,
-  activeId: string | undefined,
   pinnedSessionIds: Set<string>,
   unreadSessionIds: Set<string>,
 ): number {
-  if (session.id === activeId) return 5;
   if (
     (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0) > 0 ||
     session.status === "waiting_approval" ||
@@ -323,14 +321,18 @@ export function sortSidebarSessions(
   pinnedSessionIds: string[],
   unreadSessionIds: string[],
 ): SessionInfo[] {
+  // The active row is a visual state only. Do not include it in the sort key:
+  // selecting a session from the sidebar must not jump that session to the top
+  // of its project/folder and disturb the user's stable chronological order.
+  void activeId;
   const pinned = new Set(pinnedSessionIds);
   const unread = new Set(unreadSessionIds);
   return sessions
     .map((session, index) => ({ session, index }))
     .sort((left, right) => {
       const priorityDifference =
-        sessionPriority(right.session, activeId, pinned, unread) -
-        sessionPriority(left.session, activeId, pinned, unread);
+        sessionPriority(right.session, pinned, unread) -
+        sessionPriority(left.session, pinned, unread);
       return (
         priorityDifference ||
         (right.session.createdAt ?? 0) - (left.session.createdAt ?? 0) ||
