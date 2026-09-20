@@ -117,8 +117,10 @@ export function terminalClipboardAction(event: TerminalShortcutEvent, isMac: boo
   return action === "copy" || action === "paste" ? action : undefined;
 }
 
-export function getTerminalEmptyFrameDelay(elapsedMs: number): number {
-  return elapsedMs < 500 ? 650 : 0;
+export function getTerminalEmptyFrameDelay(elapsedMs: number, eventStream = false): number {
+  // Rust long polls also wake for input activity before echo bytes arrive.
+  // Retrying that stream immediately is essential for interactive latency.
+  return !eventStream && elapsedMs < 500 ? 650 : 0;
 }
 
 export function terminalSessionIsReadOnly(status: string): boolean {
@@ -641,7 +643,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
               setSyncing(false);
               setConnectionError(undefined);
             }
-            const delay = getTerminalEmptyFrameDelay(performance.now() - startedAt);
+            const delay = getTerminalEmptyFrameDelay(performance.now() - startedAt, session.terminalMode === "events");
             if (delay) await new Promise((wait) => window.setTimeout(wait, delay));
             continue;
           }
