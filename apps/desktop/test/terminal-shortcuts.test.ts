@@ -30,6 +30,13 @@ describe("terminal clipboard shortcuts", () => {
     expect(getTerminalEmptyFrameDelay(20_000)).toBe(0);
   });
 
+  it("immediately resumes a Rust output long poll after input activity wakes it without bytes", () => {
+    expect(getTerminalEmptyFrameDelay(5, true)).toBe(0);
+    expect(getTerminalEmptyFrameDelay(499, true)).toBe(0);
+    expect(getTerminalEmptyFrameDelay(5000, true)).toBe(0);
+    expect(getTerminalEmptyFrameDelay(5, false)).toBe(650);
+  });
+
   it("bootstraps a cache miss from the output ring", () => {
     expect(terminalBootstrapCursor()).toBe(0);
     expect(terminalBootstrapCursor(42)).toBe(42);
