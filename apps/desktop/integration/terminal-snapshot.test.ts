@@ -20,6 +20,7 @@ function state(terminal: Terminal) {
 
 describe("Rust terminal checkpoints restored into the existing xterm", () => {
   for (const [name, before, after] of [
+    ["Claude color-scheme notification mode", "\x1b[?2031h\x1b]10;?\x07\x1b]11;?\x1b\\\x1b[?2004h中文 shell", "\x1b[?2031l\r\nnext"],
     ["Unicode and color", "\x1b[31m中文 🦀\x1b[0m", " next"],
     ["alternate screen and saved primary cursor", "primary\x1b[?1049h\x1b[2;5Halternate", "\x1b[?1049l next"],
     ["scroll margins and origin", "first\x1b[2;6r\x1b[?6h\x1b[3;2Hmiddle", "\r\nnext\r\nlast"],

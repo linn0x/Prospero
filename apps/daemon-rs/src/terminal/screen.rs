@@ -198,7 +198,8 @@ impl Screen {
     fn input_modes(&mut self, sequence: &str) {
         if let Some(value) = sequence.strip_prefix("\x1b]") {
             let code = value.split(';').next().unwrap_or("");
-            if !["0", "1", "2", "7", "52", "133", "633"].contains(&code) {
+            let color_query = value.starts_with("10;?") || value.starts_with("11;?");
+            if !color_query && !["0", "1", "2", "7", "52", "133", "633"].contains(&code) {
                 self.compatible = false;
             }
         }
@@ -238,7 +239,7 @@ impl Screen {
                     } else {
                         self.modes.remove(&code);
                     }
-                } else if ![1, 6, 7, 12, 25, 47, 1047, 1048, 1049, 2026].contains(&code) {
+                } else if ![1, 6, 7, 12, 25, 47, 1047, 1048, 1049, 2026, 2031].contains(&code) {
                     self.compatible = false;
                 }
             }

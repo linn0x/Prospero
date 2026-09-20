@@ -1538,8 +1538,10 @@ void app.whenReady().then(async () => {
 app.on("will-quit", (event) => {
   sessionPageRequests.cancelAll();
   legacyProjection.stop();
-  if (runtime.managed) {
+  if (runtime.managed || runtime instanceof RustRuntime) {
     event.preventDefault();
-    void runtime.stop().finally(() => { quitting = true; app.exit(0); });
+    const flush = runtime instanceof RustRuntime ? runtime.flushTerminalRecovery() : Promise.resolve();
+    void flush.catch(() => undefined).then(() => runtime.managed ? runtime.stop() : undefined)
+      .finally(() => { quitting = true; app.exit(0); });
   }
 });
