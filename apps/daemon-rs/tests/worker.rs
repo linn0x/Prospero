@@ -138,7 +138,7 @@ async fn a_cancelled_queued_operation_is_not_executed() {
 }
 
 #[tokio::test]
-async fn overload_is_rejected_at_the_queue_limit() {
+async fn overload_waits_for_database_queue_capacity() {
     let directory = TempDir::new().unwrap();
     let database = Database::open(directory.path().to_path_buf())
         .await
@@ -162,12 +162,18 @@ async fn overload_is_rejected_at_the_queue_limit() {
         assert!(poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx).is_pending())).await);
         queued.push(call);
     }
-    assert!(matches!(database.call(|_| Ok(())).await, Err(Error::Busy)));
+    let mut overflow = Box::pin(database.call(|_| Ok(())));
+    assert!(poll_fn(|cx| Poll::Ready(overflow.as_mut().poll(cx).is_pending())).await);
+    assert!(
+        database.health().queue_depth >= DATABASE_QUEUE_CAPACITY,
+        "backlogged calls should be visible in health"
+    );
     release.send(()).unwrap();
     blocker.await.unwrap().unwrap();
     for call in queued {
         call.await.unwrap();
     }
+    overflow.await.unwrap();
     database.shutdown().await.unwrap();
 }
 
