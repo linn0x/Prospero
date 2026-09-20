@@ -34,7 +34,7 @@ describe("desktop shell structure", () => {
     expect(workspace).toContain('{chromeVisible && session && <SessionToolbar');
     expect(workspace).not.toContain('pane-tabbar-static');
     expect(workspace).not.toContain('workspace-tabbar');
-    expect(workspace).toContain('const visible = chromeVisible && dock.visible && available > 0;');
+    expect(workspace).toContain('const visible = active && chromeVisible && dock.visible && available > 0;');
     expect(workspace).toContain('<Sheet open={visible && overlay}');
     expect(tabs).toContain('<TabStrip');
   });

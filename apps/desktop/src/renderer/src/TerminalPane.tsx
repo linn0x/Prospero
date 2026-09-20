@@ -13,6 +13,7 @@ import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
 import { terminalBytes } from "./terminal-bytes";
 import { configureRustTerminalUnicode } from "./terminal-unicode";
+import { TerminalInputBuffer, TerminalInputQueue } from "./terminal-input-buffer";
 import { writeTerminalEvents } from "./terminal-events";
 import {
   deleteTerminalSessionCache,
@@ -231,7 +232,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
   const cursorRef = useRef<number | undefined>(undefined);
   const writeChain = useRef(Promise.resolve());
   const restoreReadyRef = useRef(Promise.resolve());
-  const interactionChain = useRef(Promise.resolve());
+  const interactionQueue = useRef(new TerminalInputQueue());
   const pollGenerationRef = useRef(0);
   const stableBufferRef = useRef(true);
   const replayingRef = useRef(false);
@@ -255,13 +256,13 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
   const noticeTimerRef = useRef<number | undefined>(undefined);
   const historyNoticeRef = useRef(false);
   const queueInteraction = useCallback((message: TerminalInteraction, accepted = false): Promise<boolean> => {
-    const result = interactionChain.current
-      .then(async () => {
+    const result = interactionQueue.current
+      .enqueue(async () => {
         if (!canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current, accepted)) return false;
         await window.prospero.interact(session.id, message);
         setOperationError(undefined);
         return true;
-      })
+      }, message.type === "term.input" ? Math.ceil(message.dataB64.length * 3 / 4) : 0)
       .catch((reason): false => {
         if (isMissingSessionError(reason)) {
           onMissingSession?.(session.id);
@@ -274,7 +275,6 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
         setOperationError(reportError(reason));
         return false;
       });
-    interactionChain.current = result.then(() => undefined);
     return result;
   }, [onMissingSession, session.id]);
   const fitToHost = useCallback((): void => {
@@ -392,25 +392,17 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       fitVisibleSoon();
     }
 
-    let input = "";
-    let inputTimer: number | undefined;
     let bellTimer: number | undefined;
-    const queueInputText = (value: string, accepted = false): Promise<boolean> => {
-      if (!activeRef.current || !value || !canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current, accepted)) return Promise.resolve(false);
+    const inputBuffer = new TerminalInputBuffer(value => queueInteraction({ type: "term.input", dataB64: toBase64(value) }, true));
+    const queueInputText = (value: string): Promise<boolean> => {
+      if (!activeRef.current || !canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current)) return Promise.resolve(false);
+      void inputBuffer.flush();
       return queueInteraction({ type: "term.input", dataB64: toBase64(value) }, true);
-    };
-    const flushInput = (accepted = false): Promise<boolean> | undefined => {
-      if (!input) return undefined;
-      const payload = input;
-      input = "";
-      return queueInputText(payload, accepted);
     };
     const inputDisposable = terminal.onData((value) => {
       if (replayingRef.current || !activeRef.current || !connectedRef.current) return;
       if (terminalInputShouldScrollToBottom(value)) terminal.scrollToBottom();
-      input += value;
-      window.clearTimeout(inputTimer);
-      inputTimer = window.setTimeout(() => { void flushInput(); }, 4);
+      inputBuffer.append(value);
     });
     const canPaste = (): boolean => activeRef.current && connectedRef.current && !readOnlyRef.current && !replayingRef.current && terminalRef.current === terminal && !terminal.options.disableStdin;
     const pasteBlocked = (): void => showNotice(readOnlyRef.current
@@ -418,8 +410,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       : t("终端尚未就绪，请连接后再粘贴", "The terminal is not ready; paste after connecting"));
     const disposePaste = bindTerminalPaste(host.current, terminal, canPaste, pasteBlocked, () => {
       setOperationError(undefined);
-      window.clearTimeout(inputTimer);
-      void flushInput();
+      void inputBuffer.flush();
     });
     terminal.attachCustomKeyEventHandler((event) => {
       const action = terminalShortcutAction(event, isMac);
@@ -523,7 +514,6 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
     document.addEventListener("visibilitychange", refitOnFocus);
 
     return () => {
-      window.clearTimeout(inputTimer);
       window.clearTimeout(resizeTimer);
       window.clearTimeout(noticeTimerRef.current);
       window.clearTimeout(bellTimer);
@@ -533,7 +523,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
           persistTerminalSession(session.id, terminal, serialize, cursor);
         } catch {}
       }
-      if (connectedRef.current && !readOnlyRef.current) void flushInput(true);
+      void inputBuffer.flush();
       resize.disconnect();
       window.removeEventListener("focus", refitOnFocus);
       document.removeEventListener("visibilitychange", refitOnFocus);
