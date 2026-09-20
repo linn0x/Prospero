@@ -135,3 +135,16 @@ export function duplicateSessionAccountState(
   if (!account) return "missing";
   return stringValue(account["status"]) === "unavailable" ? "unavailable" : "ready";
 }
+
+
+/** Prefer the current local workspace; explicit project actions always win. */
+export function sessionLaunchProject(snapshot: DesktopSnapshot, explicit?: string, activeId?: string): string | undefined {
+  if (explicit !== undefined) return explicit;
+  const active = snapshot.daemon.sessions.find(session => session.id === activeId);
+  if (!active) return undefined;
+  const key = (path: string): string => sessionLaunchPathKey(path.replace(/\\/g, "/"));
+  const cwd = key(active.cwd);
+  return sessionLaunchWorkspaces(snapshot)
+    .filter(workspace => { const path = key(workspace.path); return cwd === path || cwd.startsWith(path.endsWith("/") ? path : `${path}/`); })
+    .sort((a, b) => b.path.length - a.path.length)[0]?.path;
+}

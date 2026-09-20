@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { ModelSource } from "../src/shared/types";
 import { modelSourceRequest, modelSourceResult } from "../src/shared/model-sources";
-import { parseSourceHeaders, catalogRouteDraft, catalogRouteUpdates, defaultSourceSelection, hasPartialCatalogLimits, retainSourceRouteDrafts, selectedSourceRoute, sourceDraftRoutes, sourceRouteAgent, sourceRouteSupportsAgent } from "../src/renderer/src/model-sources/source-state";
+import { sourceRouteLabel, parseSourceHeaders, catalogRouteDraft, catalogRouteUpdates, defaultSourceSelection, hasPartialCatalogLimits, retainSourceRouteDrafts, selectedSourceRoute, sourceDraftRoutes, sourceRouteAgent, sourceRouteSupportsAgent } from "../src/renderer/src/model-sources/source-state";
 import { SourceSelector } from "../src/renderer/src/model-sources/SourceSelector";
 import { SourceOnboardingModels } from "../src/renderer/src/model-sources/SourceOnboardingModels";
 import { accountApiConnectionLocked } from "../src/renderer/src/account-profile-form";
@@ -139,7 +139,8 @@ describe("model source selection and IPC", () => {
     expect(html).toContain('id="session-model-source"');
     expect(html).toContain('id="session-source-route"');
     expect(html).toContain("Shared key");
-    expect(html).toContain("stays on this version");
+    expect(html).toContain("Source updates do not change existing sessions.");
+    expect(html).toContain("Connection details");
     expect(html).not.toContain('type="password"');
   });
 
@@ -167,4 +168,13 @@ describe("model source selection and IPC", () => {
     expect(() => modelSourceResult({ type: "model.source.result", requestId: "request", ok: true }, "request", "bind")).toThrow();
     expect(() => modelSourceResult({ type: "model.source.result", requestId: "request", ok: false }, "request")).toThrow();
   });
+});
+
+
+it("adds engine context once without rewriting the model's name", () => {
+  expect(sourceRouteLabel({ name: "Model A", protocol: "anthropic" })).toBe("Model A · Claude");
+  expect(sourceRouteLabel({ name: "Model A · Claude", protocol: "anthropic" })).toBe("Model A · Claude");
+  expect(sourceRouteLabel({ name: "Model A · Claude Code", protocol: "anthropic" })).toBe("Model A · Claude Code");
+  expect(sourceRouteLabel({ name: "MyClaude", protocol: "anthropic" })).toBe("MyClaude · Claude");
+  expect(sourceRouteLabel({ name: "Model A · Codex", protocol: "openai_responses" })).toBe("Model A · Codex");
 });

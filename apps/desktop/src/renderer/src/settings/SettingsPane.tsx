@@ -130,8 +130,8 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
     <SettingsNav active={active} onChange={setActive} />
     {settingsCategories.map((category) => <div key={category.id} className="settings-content" id={`settings-panel-${category.id}`} role="tabpanel" aria-labelledby={`settings-tab-${category.id}`} tabIndex={0} hidden={active !== category.id}>
       {category.id === "general" && <SettingsSection id="general" title={t("通用", "General")} description={t("启动行为与这台设备的界面语言。", "Startup behavior and language for this device.")}>
-        {toggle("start-daemon-on-launch", t("启动本地服务", "Start local service"), t("打开客户端时自动启动 daemon。", "Start the daemon when the client opens."), "startDaemonOnLaunch")}
-        {toggle("minimize-to-tray", t("在后台运行", "Keep running in background"), t("关闭主窗口后保留托盘进程。", "Keep the tray process running after the main window closes."), "minimizeToTray")}
+        {toggle("start-daemon-on-launch", t("启动本地服务", "Start local service"), t("打开 Prospero 时自动启动会话服务。", "Start the session service when Prospero opens."), "startDaemonOnLaunch")}
+        {toggle("minimize-to-tray", t("在后台运行", "Keep running in background"), t("关闭窗口后，Prospero 继续在后台运行。", "Keep Prospero running after you close its window."), "minimizeToTray")}
         {toggle("launch-at-login", t("开机启动", "Launch at sign-in"), t("登录系统后自动打开 Prospero。", "Open Prospero automatically after signing in."), "launchAtLogin")}
         <SettingRow id="interface-language" title={t("界面语言", "Interface language")} description={t("语言选择保存在这台设备上。", "Your language choice is saved on this device.")} {...rowFeedback("interface-language")}>
           <select id="interface-language" value={language} aria-describedby={description("interface-language")} onChange={(event) => {

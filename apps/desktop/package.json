@@ -24,7 +24,8 @@
     "prepare:runtime:mac": "node scripts/prepare-runtime.mjs",
     "install:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh install",
     "uninstall:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh uninstall",
-    "dist:mac": "npm run prepare:runtime:mac && npm run build && electron-builder --mac"
+    "dist:mac": "npm run prepare:runtime:mac && npm run build && electron-builder --mac",
+    "preview:ux": "npm run build && electron scripts/preview-ux.cjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
