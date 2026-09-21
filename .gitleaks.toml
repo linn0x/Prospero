@@ -13,3 +13,27 @@ paths = ['''^(apps/daemon/test/revoke\.test\.ts|apps/desktop/test/remote-shell-(
 [[allowlists]]
 description = "Generated xterm browser bundle; its source template is scanned separately"
 paths = ['''^apps/mobile/src/components/terminal-html\.ts$''']
+
+[[allowlists]]
+description = "Historical Rust pairing test fixtures use the public deterministic test token"
+condition = "AND"
+regexTarget = "secret"
+commits = ["506867e9edf317bdb291e4afdcf11dfb7bceb58e", "d77d84369cdba7f9692cbc99e403651c84c15746"]
+regexes = ['''^0123456789abcdef$''']
+paths = ['''^apps/(desktop-rs/src/remote\.rs|daemon-rs/src/remote_crypto\.rs)$''']
+
+[[allowlists]]
+description = "Historical RFC 6455 WebSocket handshake example nonce, not an API credential"
+condition = "AND"
+regexTarget = "secret"
+commits = ["aa5c8dab20cd5ef422da4748b467177e28f6dc84"]
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
+paths = ['''^apps/daemon-rs/tests/remote_contract\.rs$''']
+
+[[allowlists]]
+description = "Historical Cargo dependency name following crypto_secretbox, not a secret"
+condition = "AND"
+regexTarget = "secret"
+commits = ["d77d84369cdba7f9692cbc99e403651c84c15746"]
+regexes = ['''^curve25519-dalek$''']
+paths = ['''^Cargo\.lock$''']
