@@ -32,6 +32,9 @@ impl ControlEnvironment {
                 self.home.to_string_lossy().into_owned(),
             ),
             ("PROSPERO_CONTROL_HTTP".into(), self.base_url.clone()),
+            // A detached shell retains its environment across daemon restarts.
+            // Commands discover the current port/token on each invocation.
+            ("PROSPERO_CONTROL_DISCOVERY".into(), "home".into()),
             (
                 "PROSPERO_CONTROL_TOKEN_PATH".into(),
                 self.token_path.to_string_lossy().into_owned(),
@@ -103,6 +106,9 @@ impl ControlClient {
     }
 
     pub fn from_env_or_home(home: &Path) -> Result<Self> {
+        if std::env::var("PROSPERO_CONTROL_DISCOVERY").as_deref() == Ok("home") {
+            return Self::from_home(home);
+        }
         if let Some(base_url) = std::env::var("PROSPERO_CONTROL_HTTP")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -144,6 +150,8 @@ impl ControlClient {
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(self.timeout)
             .build()
             .map_err(|error| Error::Invalid(error.to_string()))?

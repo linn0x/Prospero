@@ -111,7 +111,8 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
             loop {
                 if ended.is_none() && stop.load(Ordering::Acquire) && !signalled {
                     terminate(pair.master.as_ref(), pid);
-                    #[cfg(windows)]
+                    // Always terminate the owned child as well as its process
+                    // group; group discovery can race with shell job control.
                     let _ = child.kill();
                     signalled = true;
                     ended = Some(Instant::now());
@@ -181,13 +182,19 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                     }
                 }
             }
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            // Release every master handle before reaping. On macOS a process
+            // can remain in tty teardown while a master reader is still open.
+            stop.store(true, Ordering::Release);
+            drop(output_receiver);
+            drop(writer);
+            drop(pair.master);
             let status = child.wait().ok();
             if exit_code.is_none() {
                 exit_code = status.map(|status| status.exit_code());
             }
-            drop(writer);
-            drop(pair.master);
-            stop.store(true, Ordering::Release);
             if let Ok(mut output) = output.lock() {
                 output.set_exited(exit_code);
             }

@@ -1,13 +1,14 @@
 //! Real connectivity probe for an Anthropic-compatible API profile.
 //!
-//! Port of the legacy `probeApiProfile`, narrowed to the only protocol the
-//! Rust daemon currently exposes (`anthropic`). The probe:
+//! Direct wire probes and an isolated CLI engine probe (in `engine`).
+//! The direct probe:
 //! 1. confirms `claude --version` starts in a scrubbed, credential-free env;
 //! 2. sends at most two SSE requests (never redirected, never retried);
 //! 3. forces a single synthetic tool call with a nonce, then a second turn
 //!    with the tool result and requires the exact receipt text back.
 //!
-//! No user files, shells, MCP servers or real tools are ever involved.
+//! Direct probes never involve project tools. Engine probes launch an isolated
+//! CLI behind a bounded gateway and expose only a synthetic receipt tool.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -147,7 +148,20 @@ async fn command_version(
         .stderr(Stdio::piped());
     command.env_clear();
     for (key, value) in std::env::vars() {
-        if ["PATH", "TMPDIR", "TMP", "TEMP"].contains(&key.as_str()) {
+        if [
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "ComSpec",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+        ]
+        .contains(&key.as_str())
+        {
             command.env(key, value);
         }
     }
@@ -155,10 +169,40 @@ async fn command_version(
     for (key, directory) in directory_env {
         command.env(key, root.path().join(directory));
     }
-    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
-        .await
-        .map_err(|_| fail("runtime_unavailable", "Agent CLI 启动超时。"))?
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
         .map_err(|_| fail("runtime_unavailable", "无法启动 Agent CLI。"))?;
+    let _group = engine::ProcessGroup::new(&child)
+        .map_err(|_| fail("runtime_unavailable", "无法建立 CLI 进程所有权。"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    async fn bounded(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        reader.take(65_537).read_to_end(&mut bytes).await?;
+        if bytes.len() > 65_536 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CLI version output exceeds limit",
+            ));
+        }
+        Ok(bytes)
+    }
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        let (stdout, stderr, status) =
+            tokio::try_join!(bounded(stdout), bounded(stderr), child.wait())?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .map_err(|_| fail("runtime_unavailable", "Agent CLI 启动超时。"))?
+    .map_err(|_| fail("runtime_unavailable", "无法读取有界的 Agent CLI 版本信息。"))?;
     if !output.status.success() {
         return Err(fail("runtime_unavailable", "Agent CLI 不可用。"));
     }
@@ -225,31 +269,7 @@ fn engine_label(engine: crate::protocol::AgentKind) -> &'static str {
 }
 
 async fn command_available(binary: String, directory_env: &[(&str, &str)]) -> bool {
-    let root = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(_) => return false,
-    };
-    let config = root.path().join("config");
-    let _ = std::fs::create_dir_all(&config);
-    let mut command = tokio::process::Command::new(binary);
-    command
-        .arg("--version")
-        .current_dir(root.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command.env_clear();
-    for (key, value) in std::env::vars() {
-        if ["PATH", "TMPDIR", "TMP", "TEMP"].contains(&key.as_str()) {
-            command.env(key, value);
-        }
-    }
-    command.env("HOME", root.path());
-    for (key, directory) in directory_env {
-        command.env(key, root.path().join(directory));
-    }
-    let spawned = tokio::time::timeout(Duration::from_secs(5), command.output()).await;
-    matches!(spawned, Ok(Ok(output)) if output.status.success())
+    command_version("", binary, directory_env).await.is_ok()
 }
 
 #[derive(Debug)]
@@ -832,90 +852,8 @@ pub(crate) async fn probe(profile: &ApiProfile, secret: &str) -> ApiValidation {
 /// synthetic tool round trip. It is persisted separately from the direct
 /// protocol probe so future native engine adapters can strengthen the
 /// configuration step without changing the wire contract.
+mod engine;
+
 pub(crate) async fn probe_engine(profile: &ApiProfile, secret: &str) -> ApiEngineValidation {
-    let started = crate::database::now();
-    let engine = super::profile::agent_kind(profile);
-    let engine_label = engine_label(engine);
-    let mut checks = EngineValidationChecks {
-        runtime: Check::NotTested,
-        configuration: Check::NotTested,
-        streaming: Check::NotTested,
-        tools: Check::NotTested,
-    };
-    match engine_runtime_version(engine).await {
-        Ok(cli_version) => {
-            checks.runtime = Check::Passed;
-            if secret.trim().is_empty() {
-                checks.configuration = Check::Failed;
-                return ApiEngineValidation {
-                    status: "failed".into(),
-                    checked_at: crate::database::now(),
-                    engine: engine_label.into(),
-                    cli_version,
-                    checks,
-                    code: Some("credential_missing".into()),
-                    detail: "API Profile 尚未配置 Key。".into(),
-                    latency_ms: Some(crate::database::now() - started),
-                };
-            }
-            if engine != crate::protocol::AgentKind::Claude {
-                checks.configuration = Check::Passed;
-                return ApiEngineValidation {
-                    status: "failed".into(),
-                    checked_at: crate::database::now(),
-                    engine: engine_label.into(),
-                    cli_version,
-                    checks,
-                    code: Some("engine_probe_not_implemented".into()),
-                    detail: format!(
-                        "{engine_label} CLI 可启动且 Profile Key 已加载；Rust 当前尚未实现该引擎的完整流式响应与工具往返验证。"
-                    ),
-                    latency_ms: Some(crate::database::now() - started),
-                };
-            }
-            let validation = probe(profile, secret).await;
-            checks.configuration = if validation.status == "passed" {
-                Check::Passed
-            } else {
-                Check::Failed
-            };
-            checks.streaming = validation.checks.streaming;
-            checks.tools = validation.checks.tools;
-            if validation.status == "passed" {
-                return ApiEngineValidation {
-                    status: "passed".into(),
-                    checked_at: crate::database::now(),
-                    engine: engine_label.into(),
-                    cli_version,
-                    checks,
-                    code: None,
-                    detail: "Claude CLI 可在隔离环境启动；Profile 的受控 API 连接完成流式响应与合成工具往返。".into(),
-                    latency_ms: Some(crate::database::now() - started),
-                };
-            }
-            ApiEngineValidation {
-                status: "failed".into(),
-                checked_at: crate::database::now(),
-                engine: engine_label.into(),
-                cli_version,
-                checks,
-                code: validation.code,
-                detail: format!("Agent 引擎验证未通过：{}", validation.detail),
-                latency_ms: Some(crate::database::now() - started),
-            }
-        }
-        Err(error) => {
-            checks.runtime = Check::Failed;
-            ApiEngineValidation {
-                status: "failed".into(),
-                checked_at: crate::database::now(),
-                engine: engine_label.into(),
-                cli_version: None,
-                checks,
-                code: Some(error.code.into()),
-                detail: error.message.into(),
-                latency_ms: Some(crate::database::now() - started),
-            }
-        }
-    }
+    engine::probe(profile, secret).await
 }

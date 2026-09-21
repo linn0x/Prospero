@@ -652,8 +652,8 @@ export class RustRuntime {
             : requireManagedAccountId(accountId);
         } else {
           if (input["protocol"] !== undefined) {
-            if (input["protocol"] !== "anthropic") throw new Error("Rust daemon 目前仅支持 Anthropic 协议");
-            modelsBody["protocol"] = "anthropic";
+            if (!["anthropic", "openai_responses", "openai_chat_completions"].includes(String(input["protocol"]))) throw new Error("模型协议不支持");
+            modelsBody["protocol"] = input["protocol"];
           }
           modelsBody["baseUrl"] = requireProfileEndpoint(input["baseUrl"]);
           modelsBody["apiKey"] = requireProfileKey(input["apiKey"], { allowBlank: false });
@@ -707,7 +707,8 @@ export class RustRuntime {
         if (caps !== undefined) body["modelCapabilities"] = caps;
       } else if (type === "agent.account.api.configure") {
         const accountId = requireManagedAccountId(input["accountId"]);
-        const account = this.store.snapshot().accounts.find((item) => item.id === accountId);
+        const accounts = await this.current().client.listAccounts(input["requestId"], signal);
+        const account = accounts.accounts?.find((item) => item.id === accountId);
         if (!account) throw new Error("账号不存在");
         const agent =
           input["protocol"] === "anthropic"
@@ -730,11 +731,9 @@ export class RustRuntime {
         if (input["modelCapabilities"] !== undefined) body["modelCapabilities"] = normalizeModelCapabilities(input["modelCapabilities"]);
       } else if (type === "agent.account.api.test") {
         body["accountId"] = requireManagedAccountId(input["accountId"]);
-        // Engine-scope validation belongs to a later slice.
         if (input["scope"] !== undefined) {
-          if (input["scope"] === "engine") throw new Error("引擎验证尚未接入 Rust daemon");
-          if (input["scope"] !== "protocol") throw new Error("连接测试范围无效");
-          body["scope"] = "protocol";
+          if (input["scope"] !== "protocol" && input["scope"] !== "engine") throw new Error("连接测试范围无效");
+          body["scope"] = input["scope"];
         }
       } else if (type === "agent.account.create") {
         if (input["agent"] !== "claude") throw new Error("Rust 当前仅支持 Claude 托管账号");
@@ -759,7 +758,7 @@ export class RustRuntime {
           body["credential"] = credential;
         }
       }
-      const result = await this.current().client.accountControl(body, signal, init.timeoutMs ?? (type === "agent.account.api.test" ? 45_000 : 30_000));
+      const result = await this.current().client.accountControl(body, signal, init.timeoutMs ?? (type === "agent.account.api.test" ? (body["scope"] === "engine" ? 90_000 : 45_000) : 30_000));
       if (type === "agent.account.login" && result.sessionId) await this.refresh(true);
       return result as unknown as JsonObject;
     }
@@ -857,6 +856,26 @@ export class RustRuntime {
     if (path === "/_prospero/control/orchestration/action" && init?.method === "POST" && input) {
       const method = input["method"];
       if (typeof method !== "string") throw new Error("不支持的编排操作");
+      if (method.startsWith("schedule.")) {
+        const params = input["params"];
+        if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("定时任务参数无效");
+        const body = params as JsonObject;
+        const client = this.current().client;
+        let result: unknown;
+        switch (method) {
+          case "schedule.list": result = await client.schedules(signal); break;
+          case "schedule.create": result = await client.createSchedule(scheduleCreateInput(body), signal); break;
+          case "schedule.get": result = await client.schedule(requireScheduleId(body["id"]), signal); break;
+          case "schedule.update": { const id = requireScheduleId(body["id"]); result = await client.updateSchedule(id, scheduleUpdateInput(id, body), signal); break; }
+          case "schedule.pause": result = await client.pauseSchedule(requireScheduleId(body["id"]), signal); break;
+          case "schedule.resume": result = await client.resumeSchedule(requireScheduleId(body["id"]), signal); break;
+          case "schedule.delete": result = await client.deleteSchedule(requireScheduleId(body["id"]), signal); break;
+          case "schedule.run": result = await client.runSchedule(requireScheduleId(body["id"]), signal, init.timeoutMs ?? 180_000); break;
+          default: throw new Error("不支持的定时任务操作");
+        }
+        if (method !== "schedule.list" && method !== "schedule.get") await this.refresh(true);
+        return result as JsonObject;
+      }
       const result = await orchestrationAction(this.current().client, method, input["params"], signal, init.timeoutMs);
       await this.refresh(true);
       return result;
@@ -1018,7 +1037,7 @@ export class RustRuntime {
           } else throw new Error("此 Agent 的账号选择尚未接入 Rust daemon");
         }
         if ((model || effort) && agent !== "claude" && agent !== "codex") throw new Error("此 Agent 的模型参数尚未接入 Rust daemon");
-        const head = await this.current().client.createTerminal({ title: agent === "shell" && !command ? "Terminal" : `${agent} · ${basename(String(input["cwd"]))}`, workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) }, agent: agent as never, ...(command ? { command } : {}), ...(accountId ? { accountId } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) }, signal);
+        const head = await this.current().client.createTerminal({ title: agent === "shell" && !command ? "Terminal" : `${agent} · ${basename(String(input["cwd"]))}`, workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) }, agent: agent as never, ...(command ? { command } : {}), ...(accountId ? { accountId } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) }, signal, init.timeoutMs ?? 180_000);
         await this.refresh(true);
         return rustSessionInfo(head);
       }
@@ -1049,7 +1068,7 @@ export class RustRuntime {
         ...(agentPreset !== undefined ? { agentPreset } : {}),
         ...(accountId !== undefined ? { accountId } : {}),
         ...(resume !== undefined ? { resume } : {}),
-      }, signal);
+      }, signal, init.timeoutMs ?? 180_000);
       await this.refresh(true);
       return rustSessionInfo(head);
     }

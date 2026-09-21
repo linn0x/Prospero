@@ -43,7 +43,7 @@ pub struct Output {
     activity_version: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Archive {
     snapshot: Option<TerminalSnapshot>,
     floor: i64,
@@ -213,13 +213,13 @@ impl Output {
     }
 
     fn page(&self, after: i64) -> Result<TerminalPage> {
-        if after < 0 || after > self.seq {
+        if after < 0 {
             return Err(Error::Invalid("terminal cursor is ahead of output".into()));
         }
         let floor = self.seq - self.events.len() as i64;
         let mut events = Vec::new();
         let mut bytes = 0;
-        if after >= floor {
+        if after >= floor && after <= self.seq {
             for (event, size) in self.events.iter().skip((after - floor) as usize).take(64) {
                 if bytes + size > PAGE_BYTES {
                     break;
@@ -234,7 +234,7 @@ impl Output {
             next_seq: after + events.len() as i64,
             latest_seq: self.seq,
             floor_seq: floor,
-            resync_required: after < floor,
+            resync_required: after < floor || after > self.seq,
             events,
             exited: self.exited,
             exit_code: self.exit_code,
@@ -242,6 +242,7 @@ impl Output {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct TerminalActivity {
     version: u64,
     pub busy_since: Option<i64>,
@@ -323,10 +324,6 @@ impl Terminal {
                 return;
             }
         }
-    }
-
-    pub(crate) fn archive(&self) -> Result<Archive> {
-        self.checkpoint(None)?.ok_or(Error::Conflict)
     }
 
     pub(crate) fn checkpoint(&self, after: Option<i64>) -> Result<Option<Archive>> {
@@ -500,3 +497,7 @@ mod tests {
         assert_eq!(output.activity(crate::database::now()).busy_since, None);
     }
 }
+
+pub mod host;
+
+mod handle;

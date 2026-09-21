@@ -116,14 +116,52 @@ async fn completed_terminal_is_archived_and_output_survives_restart() {
     let workspace = TempDir::new().unwrap();
     let database = Database::open(directory.path().into()).await.unwrap();
     let runtime = Terminals::new(database.clone());
-    let head = runtime.create(input(&workspace)).await.unwrap();
+    let mut spec = input(&workspace);
+    spec.agent = Some(prosperod_rs::protocol::AgentKind::Custom);
+    spec.command = Some("printf 'READY\\n'; read value; printf 'runtime-marker\\n'; exit 0".into());
+    let head = runtime.create(spec).await.unwrap();
     assert_eq!(head.status, SessionStatus::Running);
     assert_eq!(runtime.count(), 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut cursor = 0;
+        let mut bytes = Vec::new();
+        loop {
+            let page = runtime
+                .read(
+                    head.id.clone(),
+                    TerminalQuery {
+                        after_seq: Some(cursor),
+                        wait_ms: Some(100),
+                    },
+                )
+                .await
+                .unwrap();
+            cursor = page.next_seq;
+            bytes.extend(
+                page.events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        TerminalEvent::Output { data_b64 } => {
+                            Some(STANDARD.decode(data_b64).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .flatten(),
+            );
+            if String::from_utf8_lossy(&bytes).contains("READY") {
+                break;
+            }
+            assert!(!page.exited, "receiver exited before READY");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     runtime
         .input(
             &head.id,
             TerminalInput {
-                data_b64: STANDARD.encode("printf 'runtime-marker\\n'; exit 0\n"),
+                data_b64: STANDARD.encode("continue\n"),
             },
         )
         .await
@@ -189,7 +227,7 @@ async fn terminal_busy_since_tracks_live_activity() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert!(busy.unwrap() >= head.created_at);
-    runtime.close(&head.id).unwrap();
+    runtime.close(&head.id).await.unwrap();
     settled(&runtime).await;
     let id = head.id.clone();
     let finished = database
@@ -720,7 +758,7 @@ async fn storage_failure_rolls_back_exit_and_keeps_output_available_until_shutdo
     let head = runtime.create(input(&workspace)).await.unwrap();
     let connection = rusqlite::Connection::open(directory.path().join("prospero.sqlite")).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_terminal_exit BEFORE INSERT ON change_events BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
-    runtime.close(&head.id).unwrap();
+    runtime.close(&head.id).await.unwrap();
     settled(&runtime).await;
     assert!(runtime.check().is_err());
     assert!(

@@ -1,3 +1,4 @@
+import { cleanupTerminalHosts } from "./terminal-host-cleanup";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,7 +19,7 @@ function fixture(count = 0, turns = 0) {
   const directory = mkdtempSync(resolve(tmpdir(), "prospero-rust-desktop-"));
   const dataDir = resolve(directory, "daemon");
   const store = new StateStore(resolve(directory, "desktop"), "api");
-  const runtime = new RustRuntime(store, binary, dataDir);
+  const runtime = new RustRuntime(store, binary, dataDir, { HOME: directory, CODEX_HOME: resolve(directory, "codex"), ...(process.platform === "win32" ? {} : { SHELL: "/bin/sh" }) });
   fixtures.push({ directory, runtime });
   if (count) {
     const seeded = spawnSync(binary, ["seed-benchmark", "--data-dir", dataDir, "--sessions", String(count)], { encoding: "utf8", timeout: 30000 });
@@ -33,6 +34,7 @@ function fixture(count = 0, turns = 0) {
 
 afterEach(async () => {
   for (const { directory, runtime } of fixtures.splice(0)) {
+    await cleanupTerminalHosts(resolve(directory, "daemon"));
     expect((await runtime.stop()).ok).toBe(true);
     rmSync(directory, { recursive: true, force: true });
   }
@@ -117,9 +119,9 @@ describe("existing desktop shell with the real Rust runtime", () => {
   it.skipIf(process.platform === "win32")("preserves committed live output when the daemon is killed and recovers without rerunning the shell", async () => {
     const { directory, dataDir, runtime, store } = fixture(10000);
     expect((await runtime.start()).ok).toBe(true);
-    const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "shell", kind: "pty", cwd: directory, cols: 80, rows: 24 } });
+    const command = "sleep 60 & printf 'committed-live-marker GUARD_PIDS:%s:%s\\n' $$ $!; read answer";
+    const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "custom", kind: "pty", command, cwd: directory, cols: 80, rows: 24 } });
     const id = String(head!["id"]);
-    await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: Buffer.from("trap '' HUP; sleep 60 & printf 'committed-live-marker GUARD_PIDS:%s:%s\\n' $$ $!; read answer\n").toString("base64") } });
     const database = new DatabaseSync(resolve(dataDir, "prospero.sqlite"), { readOnly: true });
     let seq = 0;
     let ownedPids: number[] = [];
@@ -135,17 +137,17 @@ describe("existing desktop shell with the real Rust runtime", () => {
       }, { timeout: 5000 });
       process.kill(store.snapshot().daemon.pid!, "SIGKILL");
       await vi.waitFor(() => expect(runtime.managed).toBe(false));
-      await vi.waitFor(() => { for (const pid of ownedPids) expect(() => process.kill(pid, 0)).toThrow(); }, { timeout: 5000 });
+      for (const pid of ownedPids) expect(() => process.kill(pid, 0)).not.toThrow();
       expect((await runtime.start()).ok).toBe(true);
       const connection = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
       const client = new RustClient(connection.baseUrl, connection.token);
-      expect((await client.health()).activeRuntimeSessions).toBe(0);
-      expect((await client.session(id)).status).toBe("failed");
+      expect((await client.health()).activeRuntimeSessions).toBe(1);
+      expect((await client.session(id)).status).toBe("running");
       const snapshot = await client.terminalSnapshot(id);
       expect(snapshot?.seq).toBeGreaterThanOrEqual(seq);
       expect(Buffer.from(snapshot!.dataB64, "base64").toString("utf8")).toContain("committed-live-marker");
       const output = await client.terminalOutput(id, { afterSeq: 0, waitMs: 0 });
-      expect(output.exited).toBe(true);
+      expect(output.exited).toBe(false);
       expect(output.events.length).toBeGreaterThan(0);
       const ahead = await runtime.request(`/_prospero/control/session/${id}/view?outputAfterSeq=${output.latestSeq + 100}`);
       expect(ahead?.["mode"]).toBe("snapshot");
@@ -156,12 +158,12 @@ describe("existing desktop shell with the real Rust runtime", () => {
   it.skipIf(process.platform === "win32")("serializes long Unicode pastes without duplicating or interleaving their chunks", async () => {
     const { directory, runtime } = fixture();
     expect((await runtime.start()).ok).toBe(true);
-    const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "shell", kind: "pty", cwd: directory, cols: 80, rows: 24 } });
-    const id = String(head!["id"]);
     const first = Buffer.from("\x1b[200~" + "中文🦀\n".repeat(1200) + "\x1b[201~");
     const second = Buffer.from("second\n".repeat(1300));
+    const command = `stty raw -echo; : > ready-paste; head -c ${first.length + second.length} > paste.bin; stty sane; sleep 1`;
+    const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "custom", kind: "pty", command, cwd: directory, cols: 80, rows: 24 } });
+    const id = String(head!["id"]);
     const interact = (bytes: Buffer) => runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: bytes.toString("base64") } });
-    await interact(Buffer.from(`stty raw -echo; : > ready-paste; head -c ${first.length + second.length} > paste.bin; stty sane\n`));
     await vi.waitFor(() => expect(existsSync(resolve(directory, "ready-paste"))).toBe(true));
     await Promise.all([interact(first), interact(second)]);
     await vi.waitFor(() => expect(readFileSync(resolve(directory, "paste.bin"))).toEqual(Buffer.concat([first, second])), { timeout: 5000 });
@@ -182,7 +184,7 @@ describe("existing desktop shell with the real Rust runtime", () => {
     }, { timeout: 8000, interval: 100 });
   }, 15000);
 
-  it.skipIf(process.platform === "win32")("owns real terminal processes and archives them before managed shutdown", async () => {
+  it.skipIf(process.platform === "win32")("preserves real terminal processes across managed daemon shutdown", async () => {
     const { directory, dataDir, runtime, store } = fixture();
     expect((await runtime.start()).ok).toBe(true);
     const connection = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
@@ -203,14 +205,16 @@ describe("existing desktop shell with the real Rust runtime", () => {
     }, { timeout: 5000 });
     await vi.waitFor(() => expect(store.snapshot().daemon.sessions.some(session => session.id === head.id)).toBe(true));
     expect((await runtime.stop()).ok).toBe(true);
-    await vi.waitFor(() => expect(() => process.kill(pid!, 0)).toThrow(), { timeout: 2000 });
+    expect(() => process.kill(pid!, 0)).not.toThrow();
     expect((await runtime.start()).ok).toBe(true);
     const restarted = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
     const next = new RustClient(restarted.baseUrl, restarted.token);
-    expect((await next.health()).activeRuntimeSessions).toBe(0);
-    expect((await next.session(head.id)).lifecycle).toBe("archived");
+    expect((await next.health()).activeRuntimeSessions).toBe(1);
+    expect((await next.session(head.id)).lifecycle).toBe("active");
     expect((await next.terminalSnapshot(head.id))?.seq).toBeGreaterThanOrEqual(cursor);
-    expect((await next.terminalOutput(head.id, { afterSeq: cursor, waitMs: 0 })).exited).toBe(true);
+    expect((await next.terminalOutput(head.id, { afterSeq: cursor, waitMs: 0 })).exited).toBe(false);
+    await next.terminalClose(head.id);
+    await vi.waitFor(() => expect(() => process.kill(pid!, 0)).toThrow(), { timeout: 5000 });
   }, 15000);
 
   it.skipIf(process.platform === "win32")("opens shell sessions through the existing control bridge and restores live snapshots", async () => {
@@ -277,11 +281,11 @@ describe("existing desktop shell with the real Rust runtime", () => {
     expect(runtime.managed).toBe(false);
   }, 45000);
 
-  it("rejects a second owner and can recover after an unexpected process exit", async () => {
+  it("attaches a second client without taking ownership and recovers after unexpected exit", async () => {
     const { directory, dataDir, runtime, store } = fixture();
     expect((await runtime.start()).ok).toBe(true);
     const second = new RustRuntime(new StateStore(resolve(directory, "second-desktop"), "api"), binary, dataDir);
-    try { expect((await second.start()).ok).toBe(false); } finally { await second.stop(); }
+    try { expect((await second.start()).ok).toBe(true); expect(second.managed).toBe(false); } finally { await second.stop(); }
     expect(runtime.managed).toBe(true);
     process.kill(store.snapshot().daemon.pid!, "SIGKILL");
     await vi.waitFor(() => expect(runtime.managed).toBe(false));
