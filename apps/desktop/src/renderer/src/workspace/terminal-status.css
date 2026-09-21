@@ -1,0 +1,5 @@
+/* Status changes must not resize the PTY and reflow its existing screen. */
+.terminal-shell.terminal-shell { grid-template-rows: minmax(0, 1fr) auto; }
+.terminal-shell > .terminal-status { position: absolute; z-index: 2; right: 10px; bottom: 6px; min-height: 22px; border: 1px solid #2a2c3d; border-radius: 5px; pointer-events: none; }
+.terminal-shell > .terminal-status.is-quiet { width: 1px; height: 1px; min-height: 0; padding: 0; border: 0; overflow: hidden; clip-path: inset(50%); }
+.terminal-shell > .terminal-status .terminal-shortcut { display: none; }

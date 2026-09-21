@@ -1,3 +1,4 @@
+import "./workspace/terminal-status.css";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -773,7 +774,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
   };
 
   return <div className={bell ? "terminal-shell terminal-bell" : "terminal-shell"}>
-    <div className="terminal-status" role="status" aria-live="polite"><span className={readOnly ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{readOnly ? t("会话已结束 · 只读", "Session ended · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
+    <div className={connected && !readOnly ? "terminal-status is-quiet" : "terminal-status"} role="status" aria-live="polite"><span className={readOnly ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{readOnly ? t("会话已结束 · 只读", "Session ended · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
     {findOpen && <div className="terminal-find">
       <input
         ref={findInputRef}
