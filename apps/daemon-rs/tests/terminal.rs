@@ -155,7 +155,8 @@ async fn excess_output_requires_resync_and_queries_stay_bounded() {
                 wait_ms: None
             })
             .await
-            .is_err()
+            .unwrap()
+            .resync_required
     );
     assert!(
         terminal

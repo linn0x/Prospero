@@ -36,6 +36,8 @@ const ORCHESTRATION_METHODS = new Set([
   "graph.create", "graph.apply",
   "automation.start", "automation.pause",
   "worktree.inspect", "worktree.cleanup",
+  "schedule.list", "schedule.get", "schedule.create", "schedule.update",
+  "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run",
 ]);
 const INTERACTION_TYPES = new Set([
   "chat.send", "term.input", "term.resize", "permission.respond",

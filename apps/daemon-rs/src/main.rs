@@ -1,4 +1,5 @@
 use std::future::IntoFuture;
+use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -48,6 +49,11 @@ enum Command {
         shell: std::ffi::OsString,
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
+    },
+    #[command(hide = true)]
+    TerminalHost {
+        #[arg(long)]
+        directory: PathBuf,
     },
     Serve {
         #[arg(long)]
@@ -359,6 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             std::process::exit(prosperod_rs::terminal::guard::run(parent, shell, args)?);
         }
+        Command::TerminalHost { directory } => prosperod_rs::terminal::host::run(directory)?,
         Command::Serve { data_dir, listen } => {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1403,7 +1410,6 @@ async fn serve(
         return Err("the local API must bind to loopback".into());
     }
     let database = Database::open(directory.clone()).await?;
-    database.call(|store| store.recover_terminals()).await?;
     // Orphaned DAG dispatches from a crashed process are reconciled in one
     // set-based pass before the API accepts traffic (Stage 7 batch recovery).
     let recovery = database.call(|store| store.recover_dispatches()).await?;
@@ -1415,7 +1421,43 @@ async fn serve(
         );
     }
     let token = Token::load(&directory)?;
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    // Keep inherited HTTP endpoints and direct-device reconnects usable when
+    // an ephemeral listener can reclaim its previous port. Explicit ports are
+    // never changed; the CLI's connection-file discovery covers fallback.
+    let previous_port = if address.port() == 0 {
+        std::fs::File::open(directory.join("connection.json"))
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(16_385).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })
+            .ok()
+            .filter(|bytes| bytes.len() <= 16_384)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| {
+                value["baseUrl"]
+                    .as_str()
+                    .and_then(|url| url::Url::parse(url).ok())
+            })
+            .filter(|url| {
+                url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            })
+            .and_then(|url| url.port())
+            .filter(|port| *port != 0)
+    } else {
+        None
+    };
+    let listener = if let Some(port) = previous_port {
+        match tokio::net::TcpListener::bind(SocketAddr::new(address.ip(), port)).await {
+            Ok(listener) => listener,
+            Err(_) => tokio::net::TcpListener::bind(address).await?,
+        }
+    } else {
+        tokio::net::TcpListener::bind(address).await?
+    };
     let address = listener.local_addr()?;
     let local_address = if address.ip().is_unspecified() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
@@ -1453,6 +1495,7 @@ async fn serve(
         control_socket_path,
         cli_dir,
     );
+    api.terminals.recover().await?;
     // Stale agent runs belonged to the previous process; archive them
     // without replaying turns.
     let recovered_agents = api.agents.recover().await?;

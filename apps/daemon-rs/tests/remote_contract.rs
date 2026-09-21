@@ -138,7 +138,7 @@ async fn health_dto_reports_rust_http_contract() {
     assert_eq!(body["database"]["queueDepth"], 0);
     assert!(body["database"]["lastError"].is_null());
     assert_eq!(body["persistence"]["structured"], true);
-    assert_eq!(body["persistence"]["pty"], cfg!(unix));
+    assert_eq!(body["persistence"]["pty"], false); // Api::new uses the owned in-process test backend.
     assert!(body["capabilities"].as_array().unwrap().len() > 5);
     api.database.shutdown().await.unwrap();
 }
