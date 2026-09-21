@@ -419,6 +419,7 @@ pub fn workspace_size(root: &Path) -> Result<(Option<u64>, bool)> {
     };
     let deadline = Instant::now() + Duration::from_millis(1500);
     let mut directories = vec![base.clone()];
+    #[cfg(unix)]
     let mut seen = HashSet::new();
     let mut size = 0_u64;
     let mut count = 0_usize;

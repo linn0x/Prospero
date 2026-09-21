@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -241,6 +242,7 @@ fn read_file(path: &Path) -> Result<Option<String>> {
 
 fn ensure_root(root: &Path) -> Result<()> {
     fs::create_dir_all(root)?;
+    #[cfg(unix)]
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -255,18 +257,22 @@ fn ensure_root(root: &Path) -> Result<()> {
 fn write_atomic(root: &Path, file: &Path, content: &str) -> Result<()> {
     let temporary = root.join(format!(".prospero-config-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut opened = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut opened = options.open(&temporary)?;
         opened.write_all(content.as_bytes())?;
         opened.sync_all()?;
         drop(opened);
         fs::rename(&temporary, file)?;
+        #[cfg(unix)]
         fs::set_permissions(file, fs::Permissions::from_mode(0o600))?;
-        let directory = fs::File::open(root)?;
-        directory.sync_all()?;
+        #[cfg(unix)]
+        {
+            let directory = fs::File::open(root)?;
+            directory.sync_all()?;
+        }
         Ok(())
     })();
     if result.is_err() {

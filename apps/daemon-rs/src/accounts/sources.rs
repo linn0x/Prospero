@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ fn file_signature(path: &Path) -> Result<FileSignature> {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(Error::Invalid("模型源存储文件不安全".into()));
     }
+    #[cfg(unix)]
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(Error::Invalid("模型源存储文件不安全".into()));
     }
@@ -57,12 +59,32 @@ fn file_signature(path: &Path) -> Result<FileSignature> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(&body);
+    #[cfg(unix)]
+    let (dev, ino, mtime_nsec, ctime_nsec) = (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
+        metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128,
+    );
+    #[cfg(not(unix))]
+    let (dev, ino, mtime_nsec, ctime_nsec) = {
+        let nanos = |value: std::io::Result<std::time::SystemTime>| {
+            value
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i128)
+                .unwrap_or(0)
+        };
+        // The content hash below remains authoritative even when filesystem
+        // identity fields are unavailable or timestamps have low resolution.
+        (0, 0, nanos(metadata.modified()), nanos(metadata.created()))
+    };
     Ok(FileSignature::Present {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
+        dev,
+        ino,
         len: metadata.len(),
-        mtime_nsec: metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
-        ctime_nsec: metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128,
+        mtime_nsec,
+        ctime_nsec,
         sha256: hasher
             .finalize()
             .iter()
@@ -73,6 +95,7 @@ fn file_signature(path: &Path) -> Result<FileSignature> {
 
 fn ensure_private_root(root: &Path) -> Result<()> {
     fs::create_dir_all(root)?;
+    #[cfg(unix)]
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -82,7 +105,10 @@ fn ensure_private_root(root: &Path) -> Result<()> {
 }
 
 fn sync_directory(root: &Path) -> Result<()> {
+    #[cfg(unix)]
     fs::File::open(root)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = root;
     Ok(())
 }
 
@@ -639,14 +665,15 @@ impl ModelSources {
         }
         let temporary = self.root.join(format!(".registry.{}.tmp", Uuid::new_v4()));
         let write_result = (|| -> Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&temporary)?;
             file.write_all(&body)?;
             file.sync_all()?;
             drop(file);
+            #[cfg(unix)]
             fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
             if file_signature(&self.file)? != self.disk_signature {
                 return Err(Error::Conflict);

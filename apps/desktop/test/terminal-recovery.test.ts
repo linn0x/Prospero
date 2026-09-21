@@ -56,7 +56,7 @@ it("keeps resize events in order and compacts from trusted snapshots", async () 
   await c.flush(); const fresh=new TerminalRecovery(dir);caches.push(fresh);await fresh.load("s");
   expect(fresh.replay("s",undefined,42,42)).toMatchObject({mode:"snapshot",seq:40});
   expect(fresh.replay("s",40,42,42)).toMatchObject({mode:"events",baseSeq:40,seq:42,events:[{type:"resize",size:{cols:80,rows:24}},output("next")]});
-  expect((await stat(join(dir,"s.json"))).mode & 0o777).toBe(0o600);
+  if (process.platform !== "win32") expect((await stat(join(dir,"s.json"))).mode & 0o777).toBe(0o600);
 });
 
 it("rejects gaps, daemon cursor rollback, corrupt caches and path traversal", async () => {
