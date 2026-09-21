@@ -1,3 +1,4 @@
+import { scheduleTerminalCache } from "./terminal-cache-scheduler";
 import "./workspace/terminal-status.css";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
@@ -588,26 +589,28 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
   useEffect(() => {
     let active = true;
     let waitForOutput = false;
-    let cacheTimer: number | undefined;
-    let cachedOnce = false;
+    let cachedState: string | undefined;
     const generation = ++pollGenerationRef.current;
     const isCurrent = (): boolean => active && pollGenerationRef.current === generation;
-    const scheduleCache = (): void => {
-      if (session.terminalMode === "events") return;
-      if (cacheTimer !== undefined) return;
-      cacheTimer = window.setTimeout(() => {
-        cacheTimer = undefined;
-        if (!isCurrent()) return;
-        if (!stableBufferRef.current) {
-          scheduleCache();
-          return;
+    const cache = scheduleTerminalCache(document, () => {
+      if (!isCurrent()) return true;
+      if (!stableBufferRef.current) return false;
+      const terminal = terminalRef.current;
+      const serialize = serializeRef.current;
+      const cursor = cursorRef.current;
+      if (!terminal || !serialize || cursor === undefined) return true;
+      const state = `${cursor}:${terminal.cols}:${terminal.rows}`;
+      if (cachedState === state) return true;
+      try {
+        if (persistTerminalSession(session.id, terminal, serialize, cursor)) {
+          cachedState = state;
+          return true;
         }
-        const terminal = terminalRef.current;
-        const serialize = serializeRef.current;
-        const cursor = cursorRef.current;
-        if (!terminal || !serialize || cursor === undefined) return;
-        try { cachedOnce = persistTerminalSession(session.id, terminal, serialize, cursor) || cachedOnce; } catch {}
-      }, cachedOnce ? 2_000 : 150);
+      } catch {}
+      return false;
+    });
+    const scheduleCache = (): void => {
+      if (session.terminalMode !== "events") cache.schedule();
     };
     setOperationError(undefined);
     setConnectionError(undefined);
@@ -741,7 +744,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       // cannot be resumed from its old cursor without duplicating its prefix.
       if (!stableBufferRef.current) cursorRef.current = undefined;
       needsFitRef.current = true;
-      if (cacheTimer !== undefined) window.clearTimeout(cacheTimer);
+      cache.dispose();
       if (pollGenerationRef.current === generation) pollGenerationRef.current += 1;
       connectedRef.current = false;
       replayingRef.current = false;
