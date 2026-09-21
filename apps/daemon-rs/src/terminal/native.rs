@@ -108,6 +108,12 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
             let mut exit_code = None;
             let mut signalled = false;
             let mut output_closed = false;
+            #[cfg(target_os = "macos")]
+            let mut exit_probe = Instant::now();
+            #[cfg(target_os = "macos")]
+            let mut exiting = false;
+            #[cfg(not(target_os = "macos"))]
+            let exiting = false;
             loop {
                 if ended.is_none() && stop.load(Ordering::Acquire) && !signalled {
                     terminate(pair.master.as_ref(), pid);
@@ -147,6 +153,19 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                         }
                     }
                 }
+                #[cfg(target_os = "macos")]
+                if ended.is_none() && !read_any && exit_probe.elapsed() >= Duration::from_millis(50)
+                {
+                    exit_probe = Instant::now();
+                    // Darwin may hold a dying process in tty teardown before
+                    // waitpid becomes ready. Drain queued output, then close
+                    // our master handles so that exit can finish.
+                    if process_is_exiting(pid) {
+                        terminate_session(pid as i32, Some(pid as i32));
+                        exiting = true;
+                        ended = Some(Instant::now());
+                    }
+                }
                 if let Some(ended) = ended
                     && (output_closed
                         || (!read_any && ended.elapsed() >= Duration::from_millis(100)))
@@ -182,7 +201,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                     }
                 }
             }
-            if child.try_wait().ok().flatten().is_none() {
+            if !exiting && child.try_wait().ok().flatten().is_none() {
                 let _ = child.kill();
             }
             // Release every master handle before reaping. On macOS a process
@@ -264,6 +283,24 @@ fn handle_control(
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_exiting(pid: u32) -> bool {
+    // PROC_FLAG_INEXIT from the public Darwin sys/proc_info.h ABI.
+    const INEXIT: u32 = 4;
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    read == size && info.pbi_pid == pid && info.pbi_flags & INEXIT != 0
 }
 
 #[cfg(unix)]

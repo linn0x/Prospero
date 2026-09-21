@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -131,6 +132,7 @@ fn credential_path(root: &Path) -> PathBuf {
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -146,6 +148,7 @@ pub(crate) fn write_credential(root: &Path, credential: &Credential) -> Result<(
     let body = serde_json::json!({ "kind": credential.kind.label(), "secret": credential.secret });
     let temporary = root.join(format!(".credential.{}.tmp", Uuid::new_v4()));
     fs::write(&temporary, serde_json::to_vec(&body)?)?;
+    #[cfg(unix)]
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
     fs::rename(&temporary, credential_path(root))?;
     Ok(())
@@ -342,6 +345,7 @@ fn opencode_environment(
         },
     }))?;
     fs::write(&config_file, body)?;
+    #[cfg(unix)]
     fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600))?;
     Ok(vec![
         ("XDG_DATA_HOME".into(), data.to_string_lossy().into_owned()),

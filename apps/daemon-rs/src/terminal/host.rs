@@ -283,9 +283,9 @@ pub fn run(directory: PathBuf) -> Result<()> {
         return Err(Error::Invalid("terminal launch exceeds limit".into()));
     }
     let launch: Launch = serde_json::from_slice(&bytes)?;
-    let mut argv = launch.argv;
+    let argv = launch.argv;
     #[cfg(unix)]
-    {
+    let argv = {
         let mut guarded = vec![
             std::env::current_exe()?.into_os_string(),
             "terminal-guard".into(),
@@ -296,8 +296,8 @@ pub fn run(directory: PathBuf) -> Result<()> {
         guarded.push(argv.first().ok_or(Error::Closed)?.clone());
         guarded.push("--".into());
         guarded.extend(argv.into_iter().skip(1));
-        argv = guarded;
-    }
+        guarded
+    };
     let mut command = portable_pty::CommandBuilder::from_argv(argv);
     command.env_clear();
     for (k, v) in launch.environment {

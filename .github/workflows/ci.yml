@@ -28,7 +28,7 @@ jobs:
             artifact: windows-x64
           - os: windows-11-arm
             artifact: windows-arm64
-          - os: macos-13
+          - os: macos-15-intel
             artifact: mac-x64
           - os: macos-14
             artifact: mac-arm64
@@ -41,11 +41,20 @@ jobs:
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev pkg-config
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          architecture: ${{ endsWith(matrix.artifact, 'arm64') && 'arm64' || 'x64' }}
       - name: Check native workspace
-        run: |
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --locked
+        run: cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test native workspace
+        if: runner.os != 'Windows'
+        run: cargo test --workspace --locked
+      - name: Test Windows workspace within runner Job
+        if: runner.os == 'Windows'
+        # This one case is mandatory in the out-of-Job step below, because a
+        # runner Job intentionally rejects detached-process breakaway.
+        run: cargo test --workspace --locked -- --skip conpty_shell_survives_daemon_restarts_and_explicit_close_archives_it
       - name: Accept Linux native daemon and PTY
         if: runner.os == 'Linux'
         timeout-minutes: 8
@@ -54,7 +63,14 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 8
         shell: pwsh
-        run: cargo build --release --workspace --locked; node tools/perf/rust-daemon-acceptance.mjs --release --seconds 20 --sessions 8 --output target/prospero-acceptance/windows-native.json
+        run: |
+          cargo build --release --workspace --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed' }
+          $artifacts = & cargo test -p prosperod-rs --test terminal_host_lifecycle --no-run --locked --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'Rust lifecycle test build failed' }
+          $executable = @($artifacts | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'terminal_host_lifecycle' -and $_.executable } | ForEach-Object { $_.executable }) | Select-Object -Last 1
+          if (-not $executable) { throw 'Missing Rust lifecycle test executable' }
+          & ./tools/ci/verify-rust-windows-host.ps1 -Workspace $env:GITHUB_WORKSPACE -TestExecutable $executable -NodePath (Get-Command node.exe).Source
       - name: Package Linux Native Desktop
         if: runner.os == 'Linux'
         run: apps/desktop-rs/scripts/package-linux.sh
@@ -245,6 +261,10 @@ jobs:
       - run: npm ci
       - run: npm run typecheck -w @prospero/desktop
       - run: npm run build -w @prospero/desktop
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build bundled Rust daemon and CLI
+        run: cargo build --release -p prosperod-rs --bins --locked
       - name: Stage the bundled daemon runtime
         run: node apps/desktop/scripts/prepare-runtime.mjs
       - name: Package the unsigned macOS app
@@ -312,6 +332,10 @@ jobs:
           cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm run typecheck -w @prospero/desktop
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build bundled Rust daemon and CLI
+        run: cargo build --release -p prosperod-rs --bins --locked
       - name: Build the sandboxed Electron workbench and self-contained x64 package
         run: ./apps/desktop/scripts/package.ps1 -Architecture x64
       - name: Start packaged UI and its bundled daemon
