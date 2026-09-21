@@ -1,0 +1,4 @@
+/* Maintain readable labels instead of shrinking every tab as more sessions open. */
+.topbar-workspace-tabs.tab-strip .workspace-tab { flex: 0 0 196px; min-width: 196px; max-width: 196px; }
+.topbar-workspace-tabs.tab-strip .workspace-tab.is-active { flex-basis: 236px; max-width: 236px; }
+.topbar-workspace-tabs.tab-strip .workspace-tab-main > .truncate { flex: 1; }

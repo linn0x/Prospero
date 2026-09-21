@@ -1,3 +1,4 @@
+import { sessionTabName } from "./session-tab-labels";
 import { useRef, useState } from "react";
 import { Files, GitBranch, Search } from "lucide-react";
 import { openProjectTools } from "../project-tools/tool-state";
@@ -12,6 +13,8 @@ import { sessionLabel, StatusMark } from "./session-presentation";
 
 export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void }) {
   const { t } = useLocale();
+  const label = sessionTabName(session);
+  const project = session.cwd.split(/[\\/]/).filter(Boolean).at(-1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -31,7 +34,7 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
   };
   return <>
     <header className="pane-toolbar session-toolbar">
-      <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}><strong>{sessionLabel(session)}</strong><StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} /><small>{shortPath(session.cwd)}</small></div>
+      <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}><StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} /><strong>{label === project ? shortPath(session.cwd) : label}</strong>{label !== project && <small>{shortPath(session.cwd)}</small>}</div>
       <div className="pane-toolbar-actions">
         <Button variant="ghost" size="icon-sm" aria-label={t("浏览项目文件", "Browse project files")} title={t("浏览项目文件", "Browse project files")} onClick={() => openProjectTools(session.cwd)}><Files /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("搜索项目内容", "Search project contents")} title={t("搜索项目内容", "Search project contents")} onClick={() => openProjectTools(session.cwd, "search")}><Search /></Button>

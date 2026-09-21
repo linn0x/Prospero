@@ -1,3 +1,6 @@
+import { OverviewAttention } from "./attention/OverviewAttention";
+import { AttentionGroup, AttentionFilters, AttentionDetails } from "./attention/AttentionGroups";
+import { attentionSummary, pendingRequests, type AttentionFilter } from "./attention/attention-state";
 import { WindowsTitlebar } from "./app-shell/WindowsTitlebar";
 import { notify } from "./notifications/notifications";
 import { useNavigationHistory } from "./app-shell/use-navigation-history";
@@ -1875,33 +1878,6 @@ function PageHeading({
   );
 }
 
-function AttentionCard({
-  icon: Icon,
-  title,
-  description,
-  status,
-  action,
-}: {
-  icon: ComponentType;
-  title: string;
-  description: string;
-  status: string;
-  action?: React.ReactNode;
-}) {
-  return (
-    <div className="attention-row">
-      <span className={cn("attention-icon", `tone-${status}`)} aria-hidden="true">
-        <Icon />
-      </span>
-      <div className="min-w-0 flex-1">
-        <strong>{title}</strong>
-        <p>{description}</p>
-      </div>
-      {action ?? <ChevronRight className="text-muted-foreground" aria-hidden="true" />}
-    </div>
-  );
-}
-
 function OverviewPane({
   snapshot,
   onOpenSession,
@@ -1925,20 +1901,6 @@ function OverviewPane({
       session.status,
     ),
   );
-  const activeRunIds = new Set(
-    snapshot.orchestration.runs
-      .filter((run) => text(run["status"]) === "active")
-      .map((run) => text(run["id"])),
-  );
-  const failedTasks = snapshot.orchestration.tasks.filter((task) =>
-    activeRunIds.has(text(task["runId"])) &&
-    ["failed", "blocked"].includes(text(task["status"])),
-  ).sort((left, right) => (Number(right["updatedAt"]) || 0) - (Number(left["updatedAt"]) || 0));
-  const pendingGates = snapshot.orchestration.gates.filter(
-    (gate) =>
-      activeRunIds.has(text(gate["runId"])) &&
-      text(gate["status"]) === "pending",
-  ).sort((left, right) => (Number(right["createdAt"]) || 0) - (Number(left["createdAt"]) || 0));
   const activeRun = newestRecord(
     snapshot.orchestration.runs.filter(
       (run) => text(run["status"]) === "active",
@@ -1954,17 +1916,6 @@ function OverviewPane({
   const progress = runTasks.length
     ? Math.round((doneCount / runTasks.length) * 100)
     : 0;
-  const attentionCount =
-    pendingGates.length +
-    failedTasks.length +
-    activeSessions.reduce(
-      (sum, session) =>
-        sum +
-        (session.pendingPermissions ?? 0) +
-        (session.pendingQuestions ?? 0),
-      0,
-    ) +
-    (snapshot.daemon.running ? 0 : 1);
   const orderedActiveSessions = sortSidebarSessions(
     activeSessions,
     undefined,
@@ -1980,136 +1931,7 @@ function OverviewPane({
       <div className="view-container overview-view">
         <h1 className="sr-only">{t("概览", "Overview")}</h1>
         <div className="overview-grid">
-          <Card className="attention-card-shell" data-liquid-glass="panel" role="region" aria-labelledby="overview-attention-title">
-            <CardHeader>
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <CardTitle id="overview-attention-title" role="heading" aria-level={2}>
-                    {t("需要你处理", "Needs your attention")}
-                  </CardTitle>
-                  <CardDescription>
-                    {t(
-                      "先处理会阻塞 Agent 的事项",
-                      "Resolve anything blocking an agent first",
-                    )}
-                  </CardDescription>
-                </div>
-                <Badge
-                  variant={attentionCount ? "secondary" : "outline"}
-                  aria-label={t(
-                    `${String(attentionCount)} 项需要处理`,
-                    `${String(attentionCount)} items need attention`,
-                  )}
-                >
-                  {attentionCount}
-                </Badge>
-              </div>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-1">
-              {!snapshot.daemon.running && (
-                <AttentionCard
-                  icon={WifiOff}
-                  title={t("本地服务离线", "Local service is offline")}
-                  description={
-                    snapshot.daemon.lastError ||
-                    t(
-                      "启动 daemon 后才能继续本地任务",
-                      "Start the daemon to continue local work",
-                    )
-                  }
-                  status="danger"
-                  action={
-                    <Button
-                      size="sm"
-                      onClick={() => void window.prospero.startDaemon()}
-                    >
-                      {t("启动", "Start")}
-                    </Button>
-                  }
-                />
-              )}
-              {pendingGates.slice(0, 2).map((gate) => (
-                <AttentionCard
-                  key={text(gate["id"])}
-                  icon={ListChecks}
-                  title={text(gate["question"], t("审批请求", "Gate request"))}
-                  description={t(
-                    "Run 正在等待你的决定",
-                    "The run is waiting for your decision",
-                  )}
-                  status="warning"
-                  action={
-                    <Button variant="outline" size="sm" onClick={() => onOpenRuns(text(gate["runId"]), text(gate["taskId"]) || undefined)}>
-                      {t("处理", "Review")}
-                    </Button>
-                  }
-                />
-              ))}
-              {failedTasks.slice(0, 2).map((task) => (
-                <AttentionCard
-                  key={text(task["id"])}
-                  icon={CircleAlert}
-                  title={text(task["title"], t("任务失败", "Task failed"))}
-                  description={`${status(text(task["status"]))} · ${t("打开 Run 查看上下文", "Open the run for context")}`}
-                  status="danger"
-                  action={
-                    <Button variant="outline" size="sm" onClick={() => onOpenRuns(text(task["runId"]), text(task["id"]))}>
-                      {t("查看", "View")}
-                    </Button>
-                  }
-                />
-              ))}
-              {activeSessions
-                .filter(
-                  (session) =>
-                    (session.pendingPermissions ?? 0) +
-                      (session.pendingQuestions ?? 0) >
-                    0,
-                )
-                .slice(0, 2)
-                .map((session) => (
-                  <AttentionCard
-                    key={session.id}
-                    icon={MessageSquare}
-                    title={sessionLabel(session)}
-                    description={t(
-                      `${session.agent} 需要输入后才能继续`,
-                      `${session.agent} needs input to continue`,
-                    )}
-                    status="warning"
-                    action={
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => onOpenSession(session.id)}
-                      >
-                        {t("回复", "Reply")}
-                      </Button>
-                    }
-                  />
-                ))}
-              {attentionCount === 0 && (
-                <div className="calm-empty">
-                  <CheckCircle2 />
-                  <div>
-                    <strong>{t("一切顺利", "All clear")}</strong>
-                    <p>
-                      {t(
-                        "当前没有待审批、失败或离线事件。",
-                        "No approvals, failures, or offline events need attention.",
-                      )}
-                    </p>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-            <CardFooter>
-              <Button variant="ghost" size="sm" onClick={onOpenInbox}>
-                {t("打开收件箱", "Open inbox")}{" "}
-                <ArrowRight data-icon="inline-end" />
-              </Button>
-            </CardFooter>
-          </Card>
+          <OverviewAttention snapshot={snapshot} onOpenSession={onOpenSession} onOpenRuns={onOpenRuns} onOpenInbox={onOpenInbox} />
           <Card className="run-focus-card" data-liquid-glass="panel" role="region" aria-labelledby="overview-run-title">
             <CardHeader>
               <div className="flex items-center justify-between gap-3">
@@ -2354,30 +2176,10 @@ function InboxPane({
   const [taskSubmissions, setTaskSubmissions] = useState<Set<string>>(new Set());
   const [taskErrors, setTaskErrors] = useState<Record<string, string>>({});
   const [taskIssueLimit, setTaskIssueLimit] = useState(INBOX_TASK_PAGE_SIZE);
-  const activeRunIds = new Set(
-    snapshot.orchestration.runs
-      .filter((run) => text(run["status"]) === "active")
-      .map((run) => text(run["id"])),
-  );
-  const gates = snapshot.orchestration.gates.filter(
-    (gate) =>
-      activeRunIds.has(text(gate["runId"])) &&
-      text(gate["status"]) === "pending",
-  ).sort((left, right) => (Number(right["createdAt"]) || 0) - (Number(left["createdAt"]) || 0));
-  const taskIssues = snapshot.orchestration.tasks.filter((task) =>
-    activeRunIds.has(text(task["runId"])) &&
-    ["failed", "blocked"].includes(text(task["status"])),
-  ).sort((left, right) => (Number(right["updatedAt"]) || 0) - (Number(left["updatedAt"]) || 0));
+  const attention = useMemo(() => attentionSummary(snapshot), [snapshot]);
+  const [filter, setFilter] = useState<AttentionFilter>("all");
+  const { gates, tasks: taskIssues, total } = attention;
   const visibleTaskIssues = taskIssues.slice(0, taskIssueLimit);
-  const sessionIssues = snapshot.daemon.sessions.filter(
-    (session) =>
-      (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0) > 0,
-  );
-  const total =
-    gates.length +
-    taskIssues.length +
-    sessionIssues.length +
-    (snapshot.daemon.running ? 0 : 1);
   const resolveInboxGate = async (gateId: string, decision: string): Promise<void> => {
     if (gateSubmissionRef.current.has(gateId)) return;
     gateSubmissionRef.current.add(gateId);
@@ -2488,6 +2290,44 @@ function InboxPane({
       </>
     );
   };
+  const sessionCard = (session: SessionInfo, kind: "approvals" | "questions") => (
+            <Card className="inbox-item tone-warning" key={`${kind}-${session.id}`} role="article">
+              <CardHeader>
+                <div className="inbox-item-head">
+                  <span className="attention-icon tone-warning" aria-hidden="true">
+                    <MessageSquare />
+                  </span>
+                  <div>
+                    <CardTitle role="heading" aria-level={3} title={sessionLabel(session)}>{sessionLabel(session)}</CardTitle>
+                    <CardDescription>
+                      {session.agent} · {shortPath(session.cwd)}
+                    </CardDescription>
+                  </div>
+                  <Badge variant="secondary">
+                    {kind === "approvals" ? t("待确认", "Needs approval") : t("待回答", "Needs a reply")}
+                  </Badge>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <p className="line-clamp-3">
+                  {kind === "approvals"
+                    ? t(
+                        `${String(pendingRequests(session, kind))} 个权限请求等待处理`,
+                        `${String(pendingRequests(session, kind))} permission requests awaiting review`,
+                      )
+                    : t(
+                        `${String(pendingRequests(session, kind))} 个问题等待回复`,
+                        `${String(pendingRequests(session, kind))} questions awaiting a reply`,
+                      )}
+                </p>
+              </CardContent>
+              <CardFooter>
+                <Button size="sm" onClick={() => onOpenSession(session.id)}>
+                  {t("打开会话", "Open session")}
+                </Button>
+              </CardFooter>
+            </Card>
+  );
   return (
     <div className="view-scroll">
       <div className="view-container inbox-view">
@@ -2495,8 +2335,8 @@ function InboxPane({
           eyebrow={t("行动队列", "ACTION QUEUE")}
           title={t("收件箱", "Inbox")}
           description={t(
-            "这里只保留需要你采取行动的事件，普通动态不会淹没决策。",
-            "Only actionable events appear here, so routine activity never hides a decision.",
+            "处理待确认、待回答和失败任务。",
+            "Review requests, answer questions, and recover tasks.",
           )}
           actions={
             <Badge variant="secondary" aria-live="polite">
@@ -2504,6 +2344,7 @@ function InboxPane({
             </Badge>
           }
         />
+        <AttentionFilters value={filter} counts={attention.counts} total={total} onChange={setFilter} />
         <div className="inbox-list">
           {!snapshot.daemon.running && (
             <Card className="inbox-item tone-danger" role="article">
@@ -2545,6 +2386,7 @@ function InboxPane({
               </CardFooter>
             </Card>
           )}
+          {(filter === "all" || filter === "approvals") && <AttentionGroup id="inbox-approvals" title={t("待确认", "Needs approval")} count={attention.counts.approvals}>
           {gates.map((gate) => (
             <Card className="inbox-item tone-warning" key={text(gate["id"])} role="article">
               <CardHeader>
@@ -2553,15 +2395,11 @@ function InboxPane({
                     <ListChecks />
                   </span>
                   <div>
-                    <CardTitle role="heading" aria-level={2} title={text(gate["question"])}>
-                      {text(
-                        gate["question"],
-                        t("请求审批", "Review requested"),
-                      )}
+                    <CardTitle role="heading" aria-level={3} title={text(gate["question"])}>
+                      {attention.context(gate).title || t("任务需要确认", "Task needs a decision")}
                     </CardTitle>
                     <CardDescription>
-                      {t("审批请求", "Gate request")} ·{" "}
-                      {text(gate["runId"]).slice(0, 8)}
+                      {attention.context(gate).project || t("审批请求", "Approval request")}
                     </CardDescription>
                   </div>
                   <Badge variant="secondary">
@@ -2569,57 +2407,24 @@ function InboxPane({
                   </Badge>
                 </div>
               </CardHeader>
-              {text(gate["reason"]) && (
-                <CardContent>
-                  <p>{text(gate["reason"])}</p>
-                </CardContent>
-              )}
+              <CardContent>
+                <AttentionDetails summary={t("查看请求并处理", "Review request and respond")} text={[text(gate["question"]), text(gate["reason"])].filter(Boolean).join("\n\n")}>
+                  <div className="flex flex-wrap gap-2">{gateActions(gate)}</div>
+                </AttentionDetails>
+              </CardContent>
               <CardFooter className="flex-wrap">
-                {gateActions(gate)}
                 <Button variant="ghost" size="sm" onClick={() => onOpenRuns(text(gate["runId"]), text(gate["taskId"]) || undefined)}>
                   {t("打开运行", "Open run")}
                 </Button>
               </CardFooter>
             </Card>
           ))}
-          {sessionIssues.map((session) => (
-            <Card className="inbox-item tone-warning" key={session.id} role="article">
-              <CardHeader>
-                <div className="inbox-item-head">
-                  <span className="attention-icon tone-warning" aria-hidden="true">
-                    <MessageSquare />
-                  </span>
-                  <div>
-                    <CardTitle role="heading" aria-level={2} title={sessionLabel(session)}>{sessionLabel(session)}</CardTitle>
-                    <CardDescription>
-                      {session.agent} · {shortPath(session.cwd)}
-                    </CardDescription>
-                  </div>
-                  <Badge variant="secondary">
-                    {t("需要输入", "Needs input")}
-                  </Badge>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <p className="line-clamp-3">
-                  {(session.pendingPermissions ?? 0) > 0
-                    ? t(
-                        `${String(session.pendingPermissions)} 个权限请求等待处理`,
-                        `${String(session.pendingPermissions)} permission requests awaiting review`,
-                      )
-                    : t(
-                        `${String(session.pendingQuestions ?? 0)} 个问题等待回复`,
-                        `${String(session.pendingQuestions ?? 0)} questions awaiting a reply`,
-                      )}
-                </p>
-              </CardContent>
-              <CardFooter>
-                <Button size="sm" onClick={() => onOpenSession(session.id)}>
-                  {t("打开会话", "Open session")}
-                </Button>
-              </CardFooter>
-            </Card>
-          ))}
+          {attention.approvalSessions.map(session => sessionCard(session, "approvals"))}
+          </AttentionGroup>}
+          {(filter === "all" || filter === "questions") && <AttentionGroup id="inbox-questions" title={t("待回答", "Needs a reply")} count={attention.counts.questions}>
+            {attention.questionSessions.map(session => sessionCard(session, "questions"))}
+          </AttentionGroup>}
+          {(filter === "all" || filter === "issues") && <AttentionGroup id="inbox-issues" title={t("失败与阻塞", "Failures & blockers")} count={attention.counts.issues}>
           {visibleTaskIssues.map((task) => (
             <Card className="inbox-item tone-danger" key={text(task["id"])} role="article">
               <CardHeader>
@@ -2628,11 +2433,11 @@ function InboxPane({
                     <CircleAlert />
                   </span>
                   <div>
-                    <CardTitle role="heading" aria-level={2} title={text(task["title"])}>
+                    <CardTitle role="heading" aria-level={3} title={text(task["title"])}>
                       {text(task["title"], t("任务失败", "Task failed"))}
                     </CardTitle>
                     <CardDescription>
-                      {t("任务", "Task")} · {status(text(task["status"]))}
+                      {attention.context(task).project || t("任务", "Task")}
                     </CardDescription>
                   </div>
                   <Badge variant="destructive">
@@ -2641,15 +2446,7 @@ function InboxPane({
                 </div>
               </CardHeader>
               <CardContent>
-                <p className="line-clamp-3">
-                  {text(
-                    task["spec"],
-                    t(
-                      "打开对应 Run 查看失败上下文与执行结果。",
-                      "Open the related run for failure context and results.",
-                    ),
-                  )}
-                </p>
+                <AttentionDetails summary={t("查看完整任务", "Read full task")} text={[text(task["title"]), text(task["spec"])].filter(Boolean).join("\n\n")} />
               </CardContent>
               <CardFooter className="flex-wrap">
                 <Button variant="outline" size="sm" onClick={() => onOpenRuns(text(task["runId"]), text(task["id"]))}>
@@ -2677,7 +2474,9 @@ function InboxPane({
               {t("显示更多失败任务", "Show more failed tasks")} · {taskIssues.length - visibleTaskIssues.length}
             </Button>
           )}
-          {total === 0 && (
+          </AttentionGroup>}
+          {filter !== "all" && attention.counts[filter] === 0 && <p className="text-muted-foreground">{t("这一分类暂无待处理事项。", "No pending items in this category.")}</p>}
+          {total === 0 && filter === "all" && (
             <Empty className="inbox-empty">
               <EmptyHeader>
                 <EmptyMedia variant="icon">
