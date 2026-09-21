@@ -1,3 +1,4 @@
+import { cleanupTerminalHosts } from "./terminal-host-cleanup";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -17,6 +18,9 @@ const MANAGED_CLAUDE = `#!/usr/bin/env python3
 import json, os, sys, threading, time
 
 argv = sys.argv[1:]
+
+if argv == ["--version"]:
+    print("1.2.3-fake"); sys.exit(0)
 
 if argv == ["auth", "status", "--json"]:
     body = os.environ.get("PROSPERO_FAKE_STATUS", "")
@@ -83,6 +87,9 @@ if body:
 const PROFILE_CLAUDE = `#!/usr/bin/env python3
 import json, sys
 argv = sys.argv[1:]
+if "--strict-mcp-config" in argv:
+    exec(${JSON.stringify(readFileSync(resolve("../../apps/daemon-rs/tests/fixtures/engine_probe_cli.py"), "utf8"))})
+    sys.exit(0)
 if argv == ["--version"]:
     sys.stdout.write("1.2.3-fake\\n")
     sys.exit(0)
@@ -129,12 +136,16 @@ function startGateway(options: { authFail?: boolean; pages?: unknown[] } = {}): 
         res.writeHead(200, { "content-type": "text/event-stream" });
         const send = (event: unknown) => res.write(`data: ${JSON.stringify(event)}\n\n`);
         const messages = Array.isArray(body["messages"]) ? body["messages"] as unknown[] : [];
-        if (messages.length === 1) {
+        const hasToolResult = messages.some(message => {
+          const content = (message as Record<string, unknown>)["content"];
+          return Array.isArray(content) && content.some(block => (block as Record<string, unknown>)["type"] === "tool_result");
+        });
+        if (!hasToolResult) {
           const schema = ((body["tools"] as Record<string, unknown>[])[0]!["input_schema"]) as { properties: { nonce: { enum: string[] } } };
           const value = schema.properties.nonce.enum[0]!;
           for (const event of [
             { type: "message_start", message: { type: "message", role: "assistant", id: "msg-1" } },
-            { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool-1", name: "prospero_connection_probe", input: {} } },
+            { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool-1", name: (body["tools"] as Record<string, unknown>[])[0]!["name"], input: {} } },
             { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ nonce: value }) } },
             { type: "content_block_stop", index: 0 },
             { type: "message_delta", delta: { stop_reason: "tool_use" } },
@@ -187,7 +198,7 @@ function fixture() {
   const directory = mkdtempSync(resolve(tmpdir(), "rust-accounts-"));
   const dataDir = resolve(directory, "daemon");
   const store = new StateStore(resolve(directory, "desktop"), "api");
-  const runtime = new RustRuntime(store, binary, dataDir);
+  const runtime = new RustRuntime(store, binary, dataDir, { HOME: directory, CODEX_HOME: resolve(directory, "codex"), ...(process.platform === "win32" ? {} : { SHELL: "/bin/sh" }) });
   fixtures.push({ directory, runtime, dataDir });
   return { directory, runtime, store, dataDir };
 }
@@ -206,6 +217,7 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
 
   afterEach(async () => {
     for (const { directory, runtime } of fixtures.splice(0)) {
+      await cleanupTerminalHosts(resolve(directory, "daemon"));
       expect((await runtime.stop()).ok).toBe(true);
       rmSync(directory, { recursive: true, force: true });
     }
@@ -292,7 +304,7 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
     const gateway = startGateway();
     gateways.push(gateway);
     const bad: Array<[Record<string, unknown>, RegExp]> = [
-      [{ type: "agent.account.api.create", requestId: "r", agent: "codex", name: "x", baseUrl: gateway.url, model: "m", apiKey: SECRET }, /仅支持 Claude/],
+      [{ type: "agent.account.api.create", requestId: "r", agent: "grok", name: "x", baseUrl: gateway.url, model: "m", apiKey: SECRET }, /不支持 API Profile/],
       [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: "https://x\n/path", model: "m", apiKey: SECRET }, /API 地址格式无效/],
       [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: `https://${"a".repeat(2001)}`, model: "m", apiKey: SECRET }, /API 地址格式无效/],
       [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: gateway.url, model: "m", apiKey: "  " }, /API Key 格式无效/],
@@ -302,22 +314,21 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
       [{ type: "agent.account.api.configure", requestId: "r", accountId: "native-claude", name: "x" }, /账号 ID 无效/],
       [{ type: "agent.account.api.configure", requestId: "r", accountId: "../escape", name: "x" }, /账号 ID 无效/],
       [{ type: "agent.account.api.test", requestId: "r", accountId: "native-claude" }, /账号 ID 无效/],
-      [{ type: "agent.account.api.test", requestId: "r", accountId: "abc", scope: "engine" }, /引擎验证尚未接入/],
       [{ type: "agent.account.api.test", requestId: "r", accountId: "abc", scope: "bogus" }, /连接测试范围无效/],
     ];
     for (const [body, matcher] of bad) {
       await expect(control(runtime, body)).rejects.toThrow(matcher);
     }
     // Model-catalog draft validation, including the account/draft XOR and the
-    // anthropic-only protocol gate.
+    // supported protocol gate.
     await expect(control(runtime, {
       type: "agent.account.api.models.get", requestId: "r",
       accountId: "abc", baseUrl: gateway.url, apiKey: SECRET,
     })).rejects.toThrow(/不能同时指定账号与草稿配置/);
     await expect(control(runtime, {
       type: "agent.account.api.models.get", requestId: "r",
-      protocol: "openai_responses", baseUrl: gateway.url, apiKey: SECRET,
-    })).rejects.toThrow(/仅支持 Anthropic 协议/);
+      protocol: "bogus", baseUrl: gateway.url, apiKey: SECRET,
+    })).rejects.toThrow(/模型协议不支持/);
   }, 30_000);
 
   it("runs the API profile create/test/models/configure lifecycle against a fake gateway", async () => {
@@ -364,10 +375,13 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
       validation: { status: "passed", engine: "claude", checks: { runtime: "passed", streaming: "passed", tools: "passed" } },
     });
     expect(gateway.messagesHits()).toBe(2);
+    const engine = await control(runtime, { type: "agent.account.api.test", requestId: "engine", accountId: id, scope: "engine" }, 90_000);
+    expect(engine).toMatchObject({ engineValidation: { status: "passed", engine: "claude" } });
+    expect(gateway.messagesHits()).toBe(4);
     const listed = await list(runtime);
     const listedRow = (listed!["accounts"] as Record<string, unknown>[]).find((row) => row["id"] === id)!;
     expect((listedRow!["apiValidation"] as Record<string, unknown>)["status"]).toBe("passed");
-    expect(String(listedRow!["detail"])).toContain("协议测试通过");
+    expect(String(listedRow!["detail"])).toContain("引擎验证通过");
     expect(JSON.stringify(listed)).not.toContain(SECRET);
 
     // Model catalog for the stored account follows pagination and sorts.

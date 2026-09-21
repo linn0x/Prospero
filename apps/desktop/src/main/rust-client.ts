@@ -79,8 +79,8 @@ export class RustClient {
   }
 
   health(signal: AbortSignal | null = null): Promise<Health> { return this.json("/v1/health", { signal }); }
-  createTerminal(input: CreateTerminal, signal: AbortSignal | null = null): Promise<SessionHead> {
-    return this.json("/v1/terminals", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  createTerminal(input: CreateTerminal, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
+    return this.json("/v1/terminals", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
   terminalSnapshot(value: string, signal: AbortSignal | null = null): Promise<TerminalSnapshot | null> {
     return this.json(`/v1/terminals/${id(value)}/snapshot`, { signal });
@@ -101,8 +101,8 @@ export class RustClient {
   terminalClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/terminals/${id(value)}/close`, { method: "POST", signal });
   }
-  createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null): Promise<SessionHead> {
-    return this.json("/v1/agent-sessions", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
+    return this.json("/v1/agent-sessions", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
   localConversations(agent: "claude" | "codex" | "deepseek", query: string, limit = 20, accountId?: string, signal: AbortSignal | null = null): Promise<ResumableConversation[]> {
     const params = new URLSearchParams({ agent, query, limit: String(limit) });

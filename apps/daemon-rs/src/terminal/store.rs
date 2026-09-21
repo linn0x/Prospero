@@ -62,8 +62,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn recover_terminals(&mut self) -> Result<usize> {
-        let ids = self
+    pub fn active_terminal_ids(&mut self) -> Result<Vec<String>> {
+        let ids: Vec<String> = self
             .connection
             .prepare(
                 "SELECT session_id FROM terminal_runs WHERE active=1 ORDER BY session_id LIMIT 17",
@@ -73,26 +73,42 @@ impl Store {
         if ids.len() > 16 {
             return Err(Error::Schema);
         }
+        Ok(ids)
+    }
+    pub fn recover_terminals(&mut self) -> Result<usize> {
+        self.recover_terminals_except(&[])
+    }
+    pub fn recover_terminals_except(&mut self, retained: &[String]) -> Result<usize> {
+        let ids: Vec<_> = self
+            .active_terminal_ids()?
+            .into_iter()
+            .filter(|id| !retained.contains(id))
+            .collect();
         for id in &ids {
-            let head = self.session(id)?;
-            self.update_session_with(
-                id,
-                UpdateSession {
-                    revision: head.revision,
-                    title: None,
-                    lifecycle: Some(SessionLifecycle::Archived),
-                    status: Some(SessionStatus::Failed),
-                },
-                |tx| {
-                    tx.execute(
-                        "UPDATE terminal_runs SET active=0,exit_code=NULL WHERE session_id=?",
-                        [id],
-                    )?;
-                    Ok(())
-                },
-            )?;
+            self.fail_terminal(id)?;
         }
         Ok(ids.len())
+    }
+
+    pub fn fail_terminal(&mut self, id: &str) -> Result<()> {
+        let head = self.session(id)?;
+        self.update_session_with(
+            id,
+            UpdateSession {
+                revision: head.revision,
+                title: None,
+                lifecycle: Some(SessionLifecycle::Archived),
+                status: Some(SessionStatus::Failed),
+            },
+            |tx| {
+                tx.execute(
+                    "UPDATE terminal_runs SET active=0,exit_code=NULL WHERE session_id=?",
+                    [id],
+                )?;
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     pub fn terminal_output(&self, id: &str, query: TerminalQuery) -> Result<TerminalPage> {

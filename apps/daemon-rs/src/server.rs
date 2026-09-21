@@ -130,7 +130,8 @@ impl Api {
             })
             .unwrap_or_else(|| "development".into());
         let relay_status = crate::relay::RelayStatusHandle::new(database.directory());
-        let terminals = Terminals::with_guard(database.clone(), guard);
+        let guard_hash = guard.as_ref().map(|_| build_id.clone());
+        let terminals = Terminals::with_guard(database.clone(), guard, guard_hash);
         let changes = terminals.changes();
         let agents = Agents::new(database.clone());
         let mut agent_changes = agents.changes().subscribe();
@@ -609,8 +610,20 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
     let Ok(_permit) = api.requests.clone().try_acquire_owned() else {
         return ApiError(Error::Busy).into_response();
     };
-    let mut response = match tokio::time::timeout(Duration::from_secs(10), next.run(request)).await
+    let path = request.uri().path();
+    let request_timeout = if request.method() == axum::http::Method::POST
+        && (matches!(path, "/v1/terminals" | "/v1/agent-sessions")
+            || (path.starts_with("/v1/schedules/") && path.ends_with("/run")))
     {
+        Duration::from_secs(180)
+    } else if path == "/v1/accounts" {
+        Duration::from_secs(90)
+    } else if path == "/v1/launch/models" {
+        Duration::from_secs(35)
+    } else {
+        Duration::from_secs(10)
+    };
+    let mut response = match tokio::time::timeout(request_timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_) => ApiError(Error::Timeout).into_response(),
     };
@@ -1005,11 +1018,11 @@ async fn route_remote_ws_message(
         "approval.policy.set" => remote_approval_policy_set(api, message).await,
         "session.interrupt" => {
             let sid = require_str(&message, "sid")?;
-            api.agents.interrupt(sid).await
+            signal_session(api, sid, false).await
         }
         "session.kill" => {
             let sid = require_str(&message, "sid")?;
-            api.agents.close(sid).await.or_else(|_| api.terminals.close(sid))
+            signal_session(api, sid, true).await
         }
         "permission.respond" => remote_permission_respond(api, message).await,
         "question.respond" => remote_question_respond(api, message).await,
@@ -3218,6 +3231,10 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
                 .map_err(|_| ApiError(Error::Closed))?
         }
     };
+    let mut capabilities = health_capabilities();
+    if api.terminals.detached() {
+        capabilities.push("terminal.detached-host.v1".into());
+    }
     Ok(Json(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
@@ -3230,9 +3247,9 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             queue_depth: database.queue_depth,
             last_error: database.last_error,
         },
-        capabilities: health_capabilities(),
+        capabilities,
         persistence: HealthPersistence {
-            pty: cfg!(unix),
+            pty: api.terminals.detached(),
             structured: true,
         },
         relay,
@@ -4252,9 +4269,58 @@ fn feature_error(error: Error) -> crate::accounts::models::FeatureError {
     }
 }
 
+struct ApiTestLease {
+    account: String,
+    testing: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    released: bool,
+}
+impl ApiTestLease {
+    async fn release(mut self) {
+        self.testing.lock().await.remove(&self.account);
+        self.released = true;
+    }
+}
+impl Drop for ApiTestLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let testing = self.testing.clone();
+            let account = self.account.clone();
+            runtime.spawn(async move {
+                testing.lock().await.remove(&account);
+            });
+        }
+    }
+}
+
 /// Tag-dispatched account control. Managed metadata mutations run through the
 /// database queue; login spawns an isolated `claude setup-token` PTY; the
 /// `api.test`/`api.models.get` profile actions return dedicated envelopes.
+async fn signal_session(api: &Api, id: &str, close: bool) -> Result<()> {
+    let session_id = id.to_owned();
+    let session = api
+        .database
+        .call(move |store| store.session(&session_id))
+        .await?;
+    match (session.kind, close) {
+        (SessionKind::Pty, true) => api.terminals.close(id).await,
+        (SessionKind::Pty, false) => {
+            api.terminals
+                .input(
+                    id,
+                    TerminalInput {
+                        data_b64: BASE64_STANDARD.encode([3]),
+                    },
+                )
+                .await
+        }
+        (_, true) => api.agents.close(id).await,
+        (_, false) => api.agents.interrupt(id).await,
+    }
+}
+
 async fn accounts_route(
     State(api): State<Api>,
     body: std::result::Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -4270,9 +4336,9 @@ async fn accounts_route(
         Err(error) => return ApiError(error).into_response(),
     };
     let request_id = control.request_id().to_owned();
-    let _permit = match api.requests.acquire().await {
+    let _permit = match api.requests.try_acquire() {
         Ok(permit) => permit,
-        Err(_) => return ApiError(Error::Closed).into_response(),
+        Err(_) => return ApiError(Error::Busy).into_response(),
     };
 
     // ── Profile connectivity test: revision capture → probe → record ──────
@@ -4304,6 +4370,11 @@ async fn accounts_route(
         }
         testing.insert(account_id.clone());
     }
+    let lease = ApiTestLease {
+        account: account_id.clone(),
+        testing: api.api_testing.clone(),
+        released: false,
+    };
     let outcome = if engine_scope {
         run_profile_engine_test(&api, &request_id, account_id)
             .await
@@ -4313,10 +4384,7 @@ async fn accounts_route(
             .await
             .map(EitherValidation::Protocol)
     };
-    {
-        let mut testing = api.api_testing.lock().await;
-        testing.remove(account_id);
-    }
+    lease.release().await;
     let (validation, engine_validation) = match outcome {
         Ok(EitherValidation::Protocol(validation)) => (Some(validation), None),
         Ok(EitherValidation::Engine(validation)) => (None, Some(validation)),
@@ -5459,7 +5527,7 @@ async fn terminal_close(
     State(api): State<Api>,
     Path(id): Path<String>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    api.terminals.close(&id)?;
+    api.terminals.close(&id).await?;
     Ok(Json(serde_json::json!({"ok":true})))
 }
 
@@ -6462,6 +6530,129 @@ async fn mark_message_answered(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn saturated_account_requests_fail_fast_instead_of_waiting_on_the_outer_permit() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::worker::Database::open(root.path().to_path_buf())
+            .await
+            .unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+        let count = api.requests.available_permits() as u32;
+        let held = api
+            .requests
+            .clone()
+            .acquire_many_owned(count)
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            accounts_route(
+                State(api.clone()),
+                Ok(Json(
+                    json!({"type":"agent.accounts.list","requestId":"saturated"}),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        database.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_session_signals_route_pty_interrupt_and_close_to_the_terminal() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let database = crate::worker::Database::open(root.path().to_path_buf())
+            .await
+            .unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+        let input=serde_json::from_value(json!({"title":"remote-control","workspace":root.path(),"size":{"cols":80,"rows":24},"agent":"custom","command":"trap 'printf INTERRUPTED' INT; printf READY; while :; do sleep 0.1; done"})).unwrap();
+        let head = api.terminals.create(input).await.unwrap();
+        async fn wait_text(api: &Api, id: &str, marker: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut cursor = 0;
+                let mut bytes = Vec::new();
+                loop {
+                    let page = api
+                        .terminals
+                        .read(
+                            id.to_owned(),
+                            TerminalQuery {
+                                after_seq: Some(cursor),
+                                wait_ms: Some(100),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    cursor = page.next_seq;
+                    for event in page.events {
+                        if let TerminalEvent::Output { data_b64 } = event {
+                            bytes.extend(BASE64_STANDARD.decode(data_b64).unwrap());
+                        }
+                    }
+                    if String::from_utf8_lossy(&bytes).contains(marker) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        wait_text(&api, &head.id, "READY").await;
+        signal_session(&api, &head.id, false).await.unwrap();
+        wait_text(&api, &head.id, "INTERRUPTED").await;
+        signal_session(&api, &head.id, true).await.unwrap();
+        api.terminals.shutdown().await.unwrap();
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_account_probe_releases_its_inflight_lease() {
+        let testing =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::from([
+                "probe".to_owned(),
+            ])));
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let entries = testing.clone();
+        let task = tokio::spawn(async move {
+            let _lease = super::ApiTestLease {
+                account: "probe".into(),
+                testing: entries,
+                released: false,
+            };
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while testing.lock().await.contains("probe") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        testing.lock().await.insert("probe".into());
+        super::ApiTestLease {
+            account: "probe".into(),
+            testing: testing.clone(),
+            released: false,
+        }
+        .release()
+        .await;
+        testing.lock().await.insert("probe".into());
+        tokio::task::yield_now().await;
+        assert!(
+            testing.lock().await.contains("probe"),
+            "completed lease must not release a newer probe"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

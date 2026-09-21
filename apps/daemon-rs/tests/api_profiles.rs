@@ -80,6 +80,8 @@ def answer_controls():
 threading.Thread(target=answer_controls, daemon=True).start()
 time.sleep(600)
 "#;
+    let engine = serde_json::to_string(include_str!("fixtures/engine_probe_cli.py")).unwrap();
+    let script = script.replace("if argv == [\"--version\"]:", &format!("if '--strict-mcp-config' in argv:\n    exec({engine})\n    sys.exit(0)\n\nif argv == [\"--version\"]:"));
     let cli = directory.join("fake-claude-profile.py");
     std::fs::write(&cli, script).unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -209,7 +211,9 @@ async fn messages(
                     .as_str()
                     .unwrap_or("")
                     .to_owned();
-                sse(&tool_stream(&nonce))
+                let mut frames = tool_stream(&nonce);
+                frames[1]["content_block"]["name"] = body["tools"][0]["name"].clone();
+                sse(&frames)
             } else {
                 let receipt = body["messages"]
                     .as_array()
@@ -703,14 +707,11 @@ async fn codex_engine_probe_uses_codex_runtime_and_drops_stale_engine_result() {
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["engineValidation"]["engine"], "codex");
     assert_eq!(result["engineValidation"]["status"], "failed");
-    assert_eq!(
-        result["engineValidation"]["code"],
-        "engine_probe_not_implemented"
-    );
+    assert_eq!(result["engineValidation"]["code"], "runtime_closed");
     assert_eq!(result["engineValidation"]["checks"]["runtime"], "passed");
     assert_eq!(
         result["engineValidation"]["checks"]["configuration"],
-        "passed"
+        "failed"
     );
     assert_eq!(
         result["engineValidation"]["checks"]["streaming"],

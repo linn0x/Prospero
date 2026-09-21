@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::Semaphore;
 
+use super::handle::Handle;
 use super::*;
 use crate::protocol::{SessionHead, SessionStatus, UpdateSession};
 use crate::worker::Database;
@@ -12,8 +13,9 @@ const NATIVE_CODEX_ID: &str = "native-codex";
 
 struct State {
     guard: Option<PathBuf>,
+    guard_hash: Option<String>,
     database: Database,
-    entries: Mutex<HashMap<String, Terminal>>,
+    entries: Mutex<HashMap<String, Handle>>,
     slots: Arc<Semaphore>,
     closed: AtomicBool,
     failed: AtomicBool,
@@ -36,12 +38,17 @@ pub(crate) struct ProgramSpec {
 
 impl Terminals {
     pub fn new(database: Database) -> Self {
-        Self::with_guard(database, None)
+        Self::with_guard(database, None, None)
     }
 
-    pub(crate) fn with_guard(database: Database, guard: Option<PathBuf>) -> Self {
+    pub(crate) fn with_guard(
+        database: Database,
+        guard: Option<PathBuf>,
+        guard_hash: Option<String>,
+    ) -> Self {
         Self(Arc::new(State {
             guard,
+            guard_hash,
             database,
             entries: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(16)),
@@ -51,6 +58,10 @@ impl Terminals {
             checkpoints: Arc::new(Semaphore::new(2)),
             control_environment: std::sync::Mutex::new(None),
         }))
+    }
+
+    pub fn detached(&self) -> bool {
+        self.0.guard.is_some()
     }
 
     pub fn count(&self) -> usize {
@@ -162,40 +173,10 @@ impl Terminals {
                     if reply.send(Ok(head.clone())).is_err()
                         || runtime.0.closed.load(Ordering::Acquire)
                     {
-                        terminal.stop();
+                        let _ = terminal.stop().await;
                     }
-                    let activity_runtime = runtime.clone();
-                    let activity_id = head.id.clone();
-                    let activity_terminal = terminal.clone();
-                    let _activity_task = tokio::spawn(async move {
-                        if let Err(error) = activity_runtime
-                            .persist_activity(&activity_id, &activity_terminal)
-                            .await
-                        {
-                            eprintln!("terminal activity sync failed: {error}");
-                        }
-                    });
-                    if runtime.persist_live(&head.id, &terminal).await.is_err() {
-                        runtime.0.failed.store(true, Ordering::Release);
-                        runtime.0.closed.store(true, Ordering::Release);
-                        terminal.stop();
-                        terminal.wait_exited().await;
-                        eprintln!("terminal checkpoint failed");
-                    }
-                    let finalized = match terminal.archive() {
-                        Ok(archive) => runtime.finish(&head.id, archive).await,
-                        Err(error) => Err(error),
-                    };
-                    if finalized.is_err() {
-                        runtime.0.failed.store(true, Ordering::Release);
-                        runtime.0.closed.store(true, Ordering::Release);
-                        eprintln!("terminal finalization failed");
-                    }
-                    if !runtime.0.failed.load(Ordering::Acquire)
-                        && let Ok(mut entries) = runtime.0.entries.lock()
-                    {
-                        entries.remove(&head.id);
-                    }
+                    runtime.track(head, terminal, permit).await;
+                    return;
                 }
                 Err(error) => {
                     let _ = reply.send(Err(error));
@@ -208,6 +189,169 @@ impl Terminals {
                 .send_modify(|seq| *seq = seq.wrapping_add(1));
         });
         result.await.map_err(|_| Error::Closed)?
+    }
+
+    async fn track(
+        &self,
+        head: SessionHead,
+        terminal: Handle,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let runtime = self.clone();
+        let activity_runtime = runtime.clone();
+        let activity_id = head.id.clone();
+        let activity_terminal = terminal.clone();
+        let activity_task = tokio::spawn(async move {
+            if let Err(error) = activity_runtime
+                .persist_activity(&activity_id, &activity_terminal)
+                .await
+            {
+                eprintln!("terminal activity sync failed: {error}");
+            }
+        });
+        let persistence = runtime.persist_live(&head.id, &terminal).await;
+        if terminal.lost() {
+            activity_task.abort();
+            let id = head.id.clone();
+            if runtime
+                .0
+                .database
+                .call(move |store| store.fail_terminal(&id))
+                .await
+                .is_ok()
+            {
+                if let Ok(mut entries) = runtime.0.entries.lock() {
+                    entries.remove(&head.id);
+                }
+            } else {
+                runtime.0.failed.store(true, Ordering::Release);
+            }
+            drop(permit);
+            runtime
+                .0
+                .changed
+                .send_modify(|seq| *seq = seq.wrapping_add(1));
+            return;
+        }
+        if persistence.is_err() {
+            runtime.0.failed.store(true, Ordering::Release);
+            runtime.0.closed.store(true, Ordering::Release);
+            let _ = terminal.stop().await;
+            terminal.wait_exited().await;
+            eprintln!("terminal checkpoint failed");
+        }
+        activity_task.abort();
+        if terminal.hosted()
+            && runtime.0.closed.load(Ordering::Acquire)
+            && !runtime.0.failed.load(Ordering::Acquire)
+        {
+            if let Ok(mut entries) = runtime.0.entries.lock() {
+                entries.remove(&head.id);
+            }
+            drop(permit);
+            runtime
+                .0
+                .changed
+                .send_modify(|seq| *seq = seq.wrapping_add(1));
+            return;
+        }
+        let finalized = match terminal.archive().await {
+            Ok(archive) => runtime.finish(&head.id, archive).await,
+            Err(error) => Err(error),
+        };
+        if finalized.is_ok() {
+            let _ = terminal.release().await;
+        }
+        if finalized.is_err() {
+            runtime.0.failed.store(true, Ordering::Release);
+            runtime.0.closed.store(true, Ordering::Release);
+            eprintln!("terminal finalization failed");
+        }
+        if !runtime.0.failed.load(Ordering::Acquire)
+            && let Ok(mut entries) = runtime.0.entries.lock()
+        {
+            entries.remove(&head.id);
+        }
+        drop(permit);
+        runtime
+            .0
+            .changed
+            .send_modify(|seq| *seq = seq.wrapping_add(1));
+    }
+
+    pub async fn recover(&self) -> Result<usize> {
+        let ids = self
+            .0
+            .database
+            .call(|store| store.active_terminal_ids())
+            .await?;
+        let mut retained = Vec::new();
+        if self.0.guard.is_some() {
+            for id in &ids {
+                let directory = self.0.database.directory().join("terminal-hosts").join(id);
+                match host::Host::attach(directory.clone()).await {
+                    Ok(host) => {
+                        let permit = self
+                            .0
+                            .slots
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| Error::Busy)?;
+                        let session_id = id.clone();
+                        let head = self
+                            .0
+                            .database
+                            .call(move |store| {
+                                let head = store.session(&session_id)?;
+                                store.update_session(
+                                    &session_id,
+                                    UpdateSession {
+                                        revision: head.revision,
+                                        title: None,
+                                        lifecycle: None,
+                                        status: Some(SessionStatus::Running),
+                                    },
+                                )
+                            })
+                            .await?;
+                        let terminal = Handle::Hosted(host);
+                        self.0
+                            .entries
+                            .lock()
+                            .map_err(|_| Error::Closed)?
+                            .insert(id.clone(), terminal.clone());
+                        retained.push(id.clone());
+                        let runtime = self.clone();
+                        tokio::spawn(async move {
+                            runtime.track(head, terminal, permit).await;
+                        });
+                    }
+                    Err(_) => {
+                        // An owned but temporarily unreachable host must not be
+                        // declared dead or replaced by a second shell.
+                        if host::owner_alive(&directory)? {
+                            return Err(Error::Closed);
+                        }
+                    }
+                }
+            }
+        }
+        let count = retained.len();
+        self.0
+            .database
+            .call(move |store| store.recover_terminals_except(&retained))
+            .await?;
+        host::reap_exited(self.0.database.directory().join("terminal-hosts"), &ids).await?;
+        Ok(count)
+    }
+
+    async fn stopping(&self) {
+        let mut changed = self.0.changed.subscribe();
+        while !self.0.closed.load(Ordering::Acquire) {
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     async fn finish(&self, id: &str, archive: Archive) -> Result<()> {
@@ -230,10 +374,13 @@ impl Terminals {
         Err(Error::Busy)
     }
 
-    async fn persist_activity(&self, id: &str, terminal: &Terminal) -> Result<()> {
+    async fn persist_activity(&self, id: &str, terminal: &Handle) -> Result<()> {
         let mut published: Option<Option<i64>> = None;
         loop {
-            let activity = terminal.activity()?;
+            if terminal.hosted() && self.0.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let activity = terminal.activity().await?;
             if published != Some(activity.busy_since) {
                 let id = id.to_owned();
                 let busy_since = activity.busy_since;
@@ -268,30 +415,31 @@ impl Terminals {
         }
     }
 
-    async fn persist_live(&self, id: &str, terminal: &Terminal) -> Result<()> {
+    async fn persist_live(&self, id: &str, terminal: &Handle) -> Result<()> {
         let mut seq = 0;
         loop {
             tokio::select! {
+                _ = self.stopping(), if terminal.hosted() => return Ok(()),
                 _ = terminal.wait_exited() => return Ok(()),
                 _ = terminal.wait_output(seq) => {},
             }
             // A fixed window from the first change batches a burst without
             // postponing persistence indefinitely under continuous output.
             tokio::select! {
+                _ = self.stopping(), if terminal.hosted() => return Ok(()),
                 _ = terminal.wait_exited() => return Ok(()),
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {},
             }
             let permit = tokio::select! {
+                _ = self.stopping(), if terminal.hosted() => return Ok(()),
                 _ = terminal.wait_exited() => return Ok(()),
                 permit = self.0.checkpoints.clone().acquire_owned() => permit.map_err(|_| Error::Closed)?,
             };
-            let copy = terminal.clone();
-            let archive = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                copy.checkpoint(Some(seq))
-            })
-            .await
-            .map_err(|_| Error::Closed)??;
+            let archive = tokio::select! {
+                _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                archive = terminal.checkpoint(Some(seq)) => archive?,
+            };
+            drop(permit);
             let Some(archive) = archive else {
                 continue;
             };
@@ -319,7 +467,7 @@ impl Terminals {
         &self,
         mut input: CreateTerminal,
         spec: Option<ProgramSpec>,
-    ) -> Result<(SessionHead, Terminal)> {
+    ) -> Result<(SessionHead, Handle)> {
         let workspace = input.workspace.clone();
         let directory = tokio::task::spawn_blocking(move || std::fs::canonicalize(workspace))
             .await
@@ -335,8 +483,9 @@ impl Terminals {
             return Err(Error::Closed);
         }
         let size = input.size;
-        #[cfg(unix)]
-        let guard = self.0.guard.clone();
+        let executable = self.0.guard.clone();
+        let expected_hash = self.0.guard_hash.clone();
+        let host_directory = self.0.database.directory().join("terminal-hosts");
         let account_id = spec.as_ref().and_then(|spec| spec.account_id.clone());
         let control_environment = self
             .0
@@ -350,7 +499,8 @@ impl Terminals {
             .call(move |store| store.create_terminal_with(input, account_id))
             .await?;
         let session_id = head.id.clone();
-        let child = tokio::task::spawn_blocking(move || {
+        let host_directory = host_directory.join(&head.id);
+        let command = tokio::task::spawn_blocking(move || {
             let mut command = match &spec {
                 Some(spec) => {
                     // Explicit program (managed-account login): no shell, no
@@ -364,22 +514,6 @@ impl Terminals {
                 }
                 None => {
                     let shell = login_shell(default_shell());
-                    #[cfg(unix)]
-                    if let Some(guard) = guard {
-                        let mut command = portable_pty::CommandBuilder::new(guard);
-                        command.args([
-                            "terminal-guard",
-                            "--parent",
-                            &std::process::id().to_string(),
-                            "--shell",
-                        ]);
-                        command.arg(shell);
-                        command.args(["--", "-l"]);
-                        command
-                    } else {
-                        login_shell_command(shell)
-                    }
-                    #[cfg(not(unix))]
                     login_shell_command(shell)
                 }
             };
@@ -394,11 +528,25 @@ impl Terminals {
             for key in ["TMUX", "TMUX_PANE", "STY"] {
                 command.env_remove(key);
             }
-            spawn(command, size)
+            command
         })
         .await
-        .map_err(|_| Error::Closed)
-        .and_then(|result| result);
+        .map_err(|_| Error::Closed)?;
+        let child = match executable {
+            Some(exe) => host::Host::start(
+                exe,
+                host_directory,
+                command,
+                size,
+                expected_hash.unwrap_or_default(),
+            )
+            .await
+            .map(Handle::Hosted),
+            None => tokio::task::spawn_blocking(move || spawn(command, size))
+                .await
+                .map_err(|_| Error::Closed)?
+                .map(Handle::Local),
+        };
         let terminal = match child {
             Ok(terminal) => terminal,
             Err(error) => {
@@ -440,9 +588,9 @@ impl Terminals {
             })
             .await;
         if let Err(error) = running {
-            terminal.stop();
+            let _ = terminal.stop().await;
             terminal.wait_exited().await;
-            let archive = terminal.archive()?;
+            let archive = terminal.archive().await?;
             let id = head.id;
             self.0
                 .database
@@ -458,7 +606,7 @@ impl Terminals {
         Ok((running?, terminal))
     }
 
-    fn terminal(&self, id: &str) -> Result<Terminal> {
+    fn terminal(&self, id: &str) -> Result<Handle> {
         crate::database::validate_id(id)?;
         self.0
             .entries
@@ -484,9 +632,7 @@ impl Terminals {
 
     pub async fn snapshot(&self, id: String) -> Result<Option<TerminalSnapshot>> {
         match self.terminal(&id) {
-            Ok(terminal) => tokio::task::spawn_blocking(move || terminal.snapshot())
-                .await
-                .map_err(|_| Error::Closed)?,
+            Ok(terminal) => terminal.snapshot().await,
             Err(Error::NotFound) => {
                 self.0
                     .database
@@ -503,15 +649,25 @@ impl Terminals {
     pub async fn resize(&self, id: &str, size: TerminalSize) -> Result<()> {
         self.terminal(id)?.resize(size).await
     }
-    pub fn close(&self, id: &str) -> Result<()> {
-        self.terminal(id)?.stop();
-        Ok(())
+    pub async fn close(&self, id: &str) -> Result<()> {
+        self.terminal(id)?.stop().await
     }
 
     pub async fn shutdown(&self) -> Result<()> {
         self.0.closed.store(true, Ordering::Release);
-        for terminal in self.0.entries.lock().map_err(|_| Error::Closed)?.values() {
-            terminal.stop();
+        self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1));
+        let terminals: Vec<_> = self
+            .0
+            .entries
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .values()
+            .cloned()
+            .collect();
+        for terminal in terminals {
+            if !terminal.hosted() {
+                terminal.stop().await?;
+            }
         }
         let mut changed = self.0.changed.subscribe();
         tokio::time::timeout(Duration::from_secs(2), async {

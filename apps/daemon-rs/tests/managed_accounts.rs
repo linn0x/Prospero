@@ -25,6 +25,9 @@ import json, os, sys, threading, time
 
 argv = sys.argv[1:]
 
+if argv == ["--version"]:
+    print("1.2.3-fake"); sys.exit(0)
+
 if argv == ["auth", "status", "--json"]:
     body = os.environ.get("PROSPERO_FAKE_STATUS", "")
     if body:

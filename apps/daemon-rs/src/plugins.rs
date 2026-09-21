@@ -358,7 +358,20 @@ impl PluginServiceSupervisor {
                 let old = previous.remove(&key);
                 let runtime = running
                     .get(&key)
-                    .filter(|runtime| runtime.service.config_key == service.config_key);
+                    .filter(|runtime| runtime.service.config_key == service.config_key)
+                    // The runtime map was captured before the store snapshot.
+                    // A stop/exit/restart may have committed in between. Never
+                    // resurrect that old generation or erase its backoff.
+                    .filter(|runtime| {
+                        old.as_ref().is_none_or(|state| {
+                            state.started_at == Some(runtime.started_at)
+                                && matches!(
+                                    state.status,
+                                    PluginServiceStatus::Starting | PluginServiceStatus::Running
+                                )
+                                && state.pid.is_none_or(|pid| pid == runtime.pid)
+                        })
+                    });
                 let mut state = match runtime {
                     Some(runtime) => running_state_with_previous(
                         plugin,
@@ -2728,6 +2741,41 @@ mod tests {
         assert_eq!(started.status, PluginServiceStatus::Running);
         assert!(!stopping.is_finished());
         stopping.await.unwrap().unwrap();
+        supervisor.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_list_snapshot_cannot_resurrect_stopped_generation() {
+        let directory = TempDir::new().unwrap();
+        let root = plugin(directory.path(), Vec::new());
+        let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
+        plugin(
+            directory.path(),
+            vec![service_mode(
+                "worker",
+                PluginServiceMode::Manual,
+                vec![command],
+                None,
+            )],
+        );
+        let supervisor =
+            PluginServiceSupervisor::with_policy(directory.path().to_path_buf(), policy());
+        supervisor.start("test-plugin", "worker").await.unwrap();
+        let stale = supervisor.0.running.lock().await.clone();
+        supervisor.stop("test-plugin", "worker").await.unwrap();
+        let listed = supervisor.list_snapshot(stale).unwrap();
+        assert_eq!(listed.items[0].status, PluginServiceStatus::Stopped);
+        assert_eq!(
+            supervisor
+                .0
+                .store
+                .get("test-plugin", "worker")
+                .unwrap()
+                .unwrap()
+                .status,
+            PluginServiceStatus::Stopped
+        );
         supervisor.stop_all().await;
     }
 
