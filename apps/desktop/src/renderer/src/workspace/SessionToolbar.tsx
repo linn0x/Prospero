@@ -1,3 +1,4 @@
+import { TerminalMouseToggle } from "./TerminalMouseToggle";
 import { sessionTabName } from "./session-tab-labels";
 import { useRef, useState } from "react";
 import { Files, GitBranch, Search } from "lucide-react";
@@ -11,7 +12,7 @@ import { reportError, shortPath } from "../state";
 
 import { sessionLabel, StatusMark } from "./session-presentation";
 
-export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void }) {
+export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus, localSelection, onLocalSelectionChange }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void; localSelection: boolean; onLocalSelectionChange: (value: boolean) => void }) {
   const { t } = useLocale();
   const label = sessionTabName(session);
   const project = session.cwd.split(/[\\/]/).filter(Boolean).at(-1);
@@ -36,6 +37,7 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
     <header className="pane-toolbar session-toolbar">
       <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}><StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} /><strong>{label === project ? shortPath(session.cwd) : label}</strong>{label !== project && <small>{shortPath(session.cwd)}</small>}</div>
       <div className="pane-toolbar-actions">
+        {session.kind === "pty" && <TerminalMouseToggle localSelection={localSelection} onChange={onLocalSelectionChange} />}
         <Button variant="ghost" size="icon-sm" aria-label={t("浏览项目文件", "Browse project files")} title={t("浏览项目文件", "Browse project files")} onClick={() => openProjectTools(session.cwd)}><Files /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("搜索项目内容", "Search project contents")} title={t("搜索项目内容", "Search project contents")} onClick={() => openProjectTools(session.cwd, "search")}><Search /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("查看 Git 变更", "Review Git changes")} title={t("查看 Git 变更", "Review Git changes")} onClick={() => openProjectTools(session.cwd, "git")}><GitBranch /></Button>

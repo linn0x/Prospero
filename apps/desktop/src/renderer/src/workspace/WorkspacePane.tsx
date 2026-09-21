@@ -35,6 +35,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   const root = session ? text(dispatch?.["worktreePath"], session.cwd) : selectedRoot || snapshot.projects[0] || "";
   const { width: effectiveWidth, maxWidth, overlay } = workspaceDockLayout(available, autoWidth ? available * .48 : width);
   const [dock, setDock] = useState<DockState>(() => sessionDockState(readDockPreferences().sessions.find((item) => item.id === dockId)?.state, trajectory));
+  const [localSelection, setLocalSelection] = useState(true);
   const [trajectoryHost, setTrajectoryHost] = useState<HTMLDivElement | null>(null);
   const [dockContainer] = useState(() => {
     if (typeof document === "undefined") return null;
@@ -105,7 +106,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   };
   const account = snapshot.accounts.find((item) => text(item["id"]) === session?.accountId);
   const toolbar = <>
-    {chromeVisible && session && <SessionToolbar session={session} account={account} unread={snapshot.unreadSessionIds.includes(session.id)} contextVisible={dock.visible} onToggleContext={() => setState({ ...dock, visible: !dock.visible })} onToggleFocus={onToggleFocus} />}
+    {chromeVisible && session && <SessionToolbar localSelection={localSelection} onLocalSelectionChange={setLocalSelection} session={session} account={account} unread={snapshot.unreadSessionIds.includes(session.id)} contextVisible={dock.visible} onToggleContext={() => setState({ ...dock, visible: !dock.visible })} onToggleFocus={onToggleFocus} />}
     {chromeVisible && !session && <header className="pane-toolbar project-workspace-toolbar">
       <NativeSelect size="sm" aria-label={t("当前项目", "Current project")} value={root} onChange={event => setSelectedRoot(event.target.value)}>
         {!root && <NativeSelectOption value="">{t("选择项目", "Select project")}</NativeSelectOption>}
@@ -123,7 +124,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
       <main id={active ? "workspace-session-panel" : undefined} role="tabpanel" aria-labelledby={chromeVisible && session ? `workspace-tab-${session.id}` : undefined} aria-label={focus && session ? sessionLabel(session) : undefined} className="workspace-primary">
         {toolbar}
         <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载会话…", "Loading session…")}</div>}>
-          {!session ? empty : session.kind === "pty" ? <TerminalPane key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
+          {!session ? empty : session.kind === "pty" ? <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
         </Suspense>
       </main>
       {visible && !overlay && <>

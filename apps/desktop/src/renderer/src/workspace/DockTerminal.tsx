@@ -1,3 +1,4 @@
+import { TerminalMouseToggle } from "./TerminalMouseToggle";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import type { DesktopSnapshot, SessionInfo } from "../../../shared/types";
@@ -10,6 +11,7 @@ const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ de
 
 export function DockTerminal({ session, root = session.cwd, snapshot, active = true }: { session: SessionInfo; root?: string; snapshot: DesktopSnapshot; active?: boolean }) {
   const { t } = useLocale();
+  const [localSelection, setLocalSelection] = useState(true);
   const [shell, setShell] = useState<SessionInfo>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
@@ -30,8 +32,8 @@ export function DockTerminal({ session, root = session.cwd, snapshot, active = t
     setError(t("终端会话已不存在", "Terminal session no longer exists"));
   }, [t]);
   return <div className="dock-terminal">
-    <div className="dock-terminal-toolbar"><span title={root}>{root}</span>{(error || current && !shellIsLive(current)) && <Button variant="ghost" size="icon-xs" disabled={loading} aria-label={t("重建终端", "Recreate terminal")} onClick={() => setAttempt((value) => value + 1)}><RefreshCw /></Button>}</div>
+    <div className="dock-terminal-toolbar"><span title={root}>{root}</span><TerminalMouseToggle localSelection={localSelection} onChange={setLocalSelection} />{(error || current && !shellIsLive(current)) && <Button variant="ghost" size="icon-xs" disabled={loading} aria-label={t("重建终端", "Recreate terminal")} onClick={() => setAttempt((value) => value + 1)}><RefreshCw /></Button>}</div>
     {error && <div className="workspace-action-error" role="alert">{error}</div>}
-    {loading ? <div className="dock-empty" role="status">{t("正在连接工作区终端…", "Connecting workspace terminal…")}</div> : current ? <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载终端…", "Loading terminal…")}</div>}><TerminalPane key={current.id} session={current} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={forgetShell} /></Suspense> : null}
+    {loading ? <div className="dock-empty" role="status">{t("正在连接工作区终端…", "Connecting workspace terminal…")}</div> : current ? <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载终端…", "Loading terminal…")}</div>}><TerminalPane localSelection={localSelection} key={current.id} session={current} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={forgetShell} /></Suspense> : null}
   </div>;
 }

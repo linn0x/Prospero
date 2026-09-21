@@ -1,3 +1,4 @@
+import { preferLocalTerminalSelection } from "./terminal-mouse";
 import { scheduleTerminalCache } from "./terminal-cache-scheduler";
 import "./workspace/terminal-status.css";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -218,14 +219,16 @@ export function fitTerminalViewport(
   }
 }
 
-export function TerminalPane({ session, fontFamily, fontSize, active = true, onMissingSession }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean; onMissingSession?: (id: string) => void }) {
+export function TerminalPane({ session, fontFamily, fontSize, active = true, localSelection = true, onMissingSession }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean; localSelection?: boolean; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const tRef = useRef(t);
   tRef.current = t;
   const isMac = navigator.platform.toLowerCase().includes("mac") || navigator.userAgent.includes("Macintosh");
   const shortcutHint = isMac
-    ? t("⌥拖动选中 · ⌘C/⌘V 复制粘贴 · ⌘F 查找 · ⌘K 清屏", "⌥drag to select · ⌘C/⌘V copy and paste · ⌘F find · ⌘K clear")
+    ? t("拖动选中（应用交互模式下按住 ⌥） · ⌘C/⌘V 复制粘贴 · ⌘F 查找 · ⌘K 清屏", "Drag to select (hold ⌥ in application mode) · ⌘C/⌘V copy and paste · ⌘F find · ⌘K clear")
     : t("Ctrl+Shift+C/V 复制粘贴 · Ctrl+Shift+F 查找 · Shift+Insert 粘贴", "Ctrl+Shift+C/V copy and paste · Ctrl+Shift+F find · Shift+Insert paste");
+  const localSelectionRef = useRef(localSelection);
+  localSelectionRef.current = localSelection;
   const host = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | undefined>(undefined);
   const fitRef = useRef<FitAddon | undefined>(undefined);
@@ -355,6 +358,9 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
     fitRef.current = fit;
     searchRef.current = search;
     terminal.open(host.current);
+    const mouseHost = host.current;
+    const selectLocally = (event: MouseEvent) => preferLocalTerminalSelection(event, isMac, localSelectionRef.current, terminal.modes.mouseTrackingMode);
+    mouseHost.addEventListener("mousedown", selectLocally, true);
     const fitVisibleSoon = (): void => {
       window.requestAnimationFrame(() => {
         if (terminalRef.current !== terminal) return;
@@ -432,7 +438,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
           void window.prospero.writeClipboard(selection)
             .then(() => showNotice(t("已复制", "Copied")))
             .catch((reason) => setOperationError(reportError(reason)));
-        } else showNotice(t("按住 ⌥ 拖动选择文本", "Hold Option while dragging to select text"));
+        } else showNotice(localSelectionRef.current ? t("拖动选择文本后再复制", "Drag to select text before copying") : isMac ? t("按住 ⌥ 拖动选择文本", "Hold Option while dragging to select text") : t("按住 Shift 拖动选择文本", "Hold Shift while dragging to select text"));
         return false;
       }
       if (action === "selectAll") {
@@ -535,6 +541,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       disposePaste();
       osc52Disposable.dispose();
       bellDisposable.dispose();
+      mouseHost.removeEventListener("mousedown", selectLocally, true);
       terminal.dispose();
       connectedRef.current = false;
       stableBufferRef.current = false;
