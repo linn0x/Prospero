@@ -3,6 +3,7 @@ import type { DesktopSnapshot, DesktopSnapshotPatch } from "../src/shared/types"
 import {
   desktopSnapshotFromPatch,
   isMissingSessionError,
+  isUnrecoverableTerminalError,
   shortPath,
 } from "../src/renderer/src/state";
 
@@ -77,5 +78,11 @@ describe("renderer snapshot state", () => {
     expect(isMissingSessionError(new Error("no such session: stale"))).toBe(true);
     expect(isMissingSessionError("session_not_found")).toBe(true);
     expect(isMissingSessionError(new Error("daemon offline"))).toBe(false);
+  });
+
+  it("recognizes unrecoverable terminal truncation errors", () => {
+    expect(isUnrecoverableTerminalError(new Error("终端历史已裁剪且暂无完整快照，无法可靠恢复画面。请保留已有终端窗口；重新加载不能还原已丢失的屏幕状态。"))).toBe(true);
+    expect(isUnrecoverableTerminalError("终端历史已裁剪")).toBe(true);
+    expect(isUnrecoverableTerminalError(new Error("network timeout"))).toBe(false);
   });
 });
