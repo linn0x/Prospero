@@ -4125,7 +4125,10 @@ async fn model_sources_route(
                 .await
             {
                 Ok(sources) => sources,
-                Err(error) => return ApiError(error).into_response(),
+                Err(error) => {
+                    return Json(SourceResult::failure(&request_id, feature_error(error)))
+                        .into_response();
+                }
             };
             api.publish();
             let mut result = SourceResult::success(&request_id);
@@ -4193,7 +4196,10 @@ async fn model_sources_route(
                 .await
             {
                 Ok(sources) => sources,
-                Err(error) => return ApiError(error).into_response(),
+                Err(error) => {
+                    return Json(SourceResult::failure(&request_id, feature_error(error)))
+                        .into_response();
+                }
             };
             api.publish();
             let accounts = match crate::accounts::snapshot(
@@ -4237,7 +4243,10 @@ async fn model_sources_route(
                 .await
             {
                 Ok(sources) => sources,
-                Err(error) => return ApiError(error).into_response(),
+                Err(error) => {
+                    return Json(SourceResult::failure(&request_id, feature_error(error)))
+                        .into_response();
+                }
             };
             api.publish();
             let accounts =

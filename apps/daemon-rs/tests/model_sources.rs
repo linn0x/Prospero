@@ -211,8 +211,11 @@ async fn source_create_list_models_bind_and_delete_flow() {
             json!({"kind":"delete","sourceId":source_id,"revision":revision}),
         ))
         .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{blocked}");
-    assert_eq!(blocked["code"], "in_use");
+    assert_eq!(status, StatusCode::OK, "{blocked}");
+    assert_eq!(blocked["type"], "model.source.result");
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(blocked["error"]["code"], "in_use");
+    assert_eq!(blocked["error"]["message"], "模型源仍被账号或会话使用");
 }
 
 #[tokio::test]
@@ -485,6 +488,8 @@ async fn migration_apply_rejects_active_profile_sessions() {
             json!({"kind":"migration.apply","migrationId":migration_id,"name":"Blocked"}),
         ))
         .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{applied}");
-    assert_eq!(applied["code"], "in_use");
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["type"], "model.source.result");
+    assert_eq!(applied["ok"], false);
+    assert_eq!(applied["error"]["code"], "in_use");
 }
