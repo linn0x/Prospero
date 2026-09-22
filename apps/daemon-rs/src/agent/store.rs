@@ -185,6 +185,77 @@ impl Store {
         Ok(text)
     }
 
+    /// Claim an all-terminal child batch exactly once and build the prompt
+    /// that wakes its parent for review and integration.
+    pub(crate) fn claim_cross_model_fan_in(
+        &mut self,
+        parent_session_id: &str,
+    ) -> Result<Option<String>> {
+        crate::database::validate_id(parent_session_id)?;
+        let pending: i64 = self.connection.query_row(
+            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND status IN ('starting','running')",
+            [parent_session_id], |row| row.get(0),
+        )?;
+        if pending != 0 {
+            return Ok(None);
+        }
+        let undelivered: i64 = self.connection.query_row(
+            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0",
+            [parent_session_id], |row| row.get(0),
+        )?;
+        if undelivered == 0 {
+            return Ok(None);
+        }
+        let transaction = self.connection.transaction()?;
+        let mut rows = Vec::new();
+        {
+            let mut statement = transaction.prepare(
+                "SELECT status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? ORDER BY created_at,child_session_id",
+            )?;
+            for row in statement.query_map([parent_session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })? {
+                rows.push(row?);
+            }
+        }
+        let claimed = transaction.execute(
+            "UPDATE cross_model_children SET summary_delivered=1,updated_at=? WHERE parent_session_id=? AND summary_delivered=0",
+            params![crate::database::now(),parent_session_id],
+        )?;
+        if claimed == 0 {
+            transaction.rollback()?;
+            return Ok(None);
+        }
+        transaction.commit()?;
+        let mut report = String::from(
+            "跨模型子 Agent 批次已全部结束。请审核以下结果、解决冲突并继续主任务；不要未经核验直接采纳。\n",
+        );
+        for (index, (status, source, route, task, result)) in rows.into_iter().enumerate() {
+            let task = task.chars().take(600).collect::<String>();
+            let result: String = if result.is_empty() {
+                "（没有可用摘要）".into()
+            } else {
+                result.chars().take(4000).collect()
+            };
+            report.push_str(&format!(
+                "\n[子任务 {} · {} · {}/{}]\n任务：{}\n结果：{}\n",
+                index + 1,
+                status,
+                source,
+                route,
+                task,
+                result
+            ));
+        }
+        Ok(Some(report.chars().take(60_000).collect()))
+    }
+
     pub fn create_agent_session(
         &mut self,
         input: CreateAgentSession,
