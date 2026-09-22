@@ -793,6 +793,22 @@ export class RustRuntime {
       if (result.ok && action["kind"] !== "list" && action["kind"] !== "models") await this.refresh(true);
       return result as unknown as JsonObject;
     }
+    const crossChildRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/cross-model-children$/.exec(path);
+    if (crossChildRoute && init?.method === "POST" && input) {
+      const sourceId = requireManagedAccountId(input["sourceId"]);
+      const routeId = requireManagedAccountId(input["routeId"]);
+      const revision = Number(input["revision"]);
+      if (!Number.isInteger(revision) || revision < 1) throw new Error("模型源版本无效");
+      const agent = input["agent"];
+      if (agent !== "codex" && agent !== "claude" && agent !== "opencode") throw new Error("跨模型子 Agent 无效");
+      const task = String(input["task"] ?? "").trim();
+      if (!task || task.length > 65_536 || /[\r\0]/.test(task)) throw new Error("子任务内容无效");
+      const title = input["title"] === undefined ? undefined : String(input["title"] ?? "").trim();
+      if (title !== undefined && (!title || title.length > 512 || /[\r\n\0]/.test(title))) throw new Error("子任务标题无效");
+      const result = await this.current().client.createCrossModelChild(crossChildRoute[1]!, { sourceId, routeId, revision, agent, task, ...(title ? { title } : {}) }, signal, init.timeoutMs ?? 180_000);
+      await this.refresh(true);
+      return result as unknown as JsonObject;
+    }
     if (path === "/_prospero/control/plugins" && (!init?.method || init.method === "GET")) {
       return await this.current().client.plugins(signal) as unknown as JsonObject;
     }

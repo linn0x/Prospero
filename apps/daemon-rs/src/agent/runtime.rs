@@ -596,6 +596,199 @@ impl Agents {
         Ok(head)
     }
 
+    /// Start an independent child structured session against a selected model
+    /// source route.  It deliberately owns its own provider account and
+    /// runtime rather than piggybacking on a parent Codex Task thread.
+    pub async fn create_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        input: CreateCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::accounts::sources::validate_source_id(&input.source_id)?;
+        crate::accounts::sources::validate_source_id(&input.route_id)?;
+        crate::database::validate_text(&input.task, 65_536, false)?;
+        if !matches!(
+            input.agent,
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode
+        ) {
+            return Err(Error::Invalid(
+                "跨模型子任务仅支持 Claude、Codex 或 OpenCode".into(),
+            ));
+        }
+        let data = self.0.database.directory().to_owned();
+        let source_id = input.source_id.clone();
+        let route_id = input.route_id.clone();
+        let revision = input.revision;
+        let agent = input.agent;
+        let (account_id, profile, source_name, route_name) = self
+            .0
+            .database
+            .call(move |store| {
+                let accounts = store.list_managed_accounts(&data)?;
+                let known = accounts
+                    .iter()
+                    .map(|account| account.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let account_agents = accounts
+                    .into_iter()
+                    .map(|account| (account.id, account.agent))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                let source = sources
+                    .list()
+                    .into_iter()
+                    .find(|source| source.id == source_id)
+                    .ok_or(Error::NotFound)?;
+                let route_name = source
+                    .routes
+                    .iter()
+                    .find(|route| route.id == route_id)
+                    .ok_or(Error::NotFound)?
+                    .name
+                    .clone();
+                let source_name = source.name.clone();
+                let outcome = sources.bind(
+                    &source_id,
+                    &route_id,
+                    revision,
+                    Some(agent),
+                    &known,
+                    &account_agents,
+                )?;
+                let (account_id, profile) = match outcome {
+                    crate::accounts::sources::BindOutcome::Existing(account_id) => {
+                        let profile = store
+                            .managed_snapshot_row(&data, &account_id)?
+                            .api_profile
+                            .ok_or(Error::NotFound)?;
+                        (account_id, profile)
+                    }
+                    crate::accounts::sources::BindOutcome::Created {
+                        account_id,
+                        agent,
+                        profile,
+                        name,
+                        secret,
+                    } => {
+                        store.insert_api_profile_account_with_id(
+                            &data,
+                            &account_id,
+                            &name,
+                            agent,
+                            &profile,
+                            &secret,
+                        )?;
+                        (account_id, profile)
+                    }
+                };
+                Ok((account_id, profile, source_name, route_name))
+            })
+            .await?;
+        let title = input
+            .title
+            .unwrap_or_else(|| format!("{} · {}", source_name, route_name));
+        let head = self
+            .create(CreateAgentSession {
+                agent,
+                title,
+                workspace: {
+                    let id = parent_session_id.to_owned();
+                    self.0
+                        .database
+                        .call(move |store| Ok(store.session(&id)?.workspace))
+                        .await?
+                },
+                auto_approve: true,
+                mode: None,
+                model: Some(profile.model.clone()),
+                effort: profile
+                    .model_capabilities
+                    .as_ref()
+                    .and_then(|caps| caps.supported_efforts.as_ref())
+                    .and_then(|values| values.first())
+                    .cloned(),
+                agent_preset: None,
+                account_id: Some(account_id.clone()),
+                resume: None,
+            })
+            .await?;
+        let child = {
+            let child_id = head.id.clone();
+            let parent_id = parent_session_id.to_owned();
+            let task = input.task.clone();
+            let source_id = input.source_id.clone();
+            let route_id = input.route_id.clone();
+            let account_id = account_id.clone();
+            self.0
+                .database
+                .call(move |store| {
+                    store.register_cross_model_child(
+                        &child_id,
+                        &parent_id,
+                        &task,
+                        &source_id,
+                        &route_id,
+                        &account_id,
+                    )
+                })
+                .await?
+        };
+        self.write_cross_model_card(&child, "starting", String::new())
+            .await?;
+        self.send(&head.id, input.task, None, Vec::new()).await?;
+        Ok(child)
+    }
+
+    async fn write_cross_model_card(
+        &self,
+        child: &CrossModelChild,
+        status: &str,
+        summary: String,
+    ) -> Result<()> {
+        let parent_id = child.parent_session_id.clone();
+        let child_id = child.session_id.clone();
+        let card_id = format!("cross-child-{child_id}");
+        let task = child.task.clone();
+        let source = format!("{} / {}", child.source_id, child.route_id);
+        let created_at = child.created_at;
+        let status = status.to_owned();
+        self.0
+            .database
+            .call(move |store| {
+                let expected_revision = store
+                    .timeline_record(&parent_id, &card_id)
+                    .map(|record| record.revision)
+                    .unwrap_or(0);
+                store.write_timeline(
+                    &parent_id,
+                    TimelineWrite {
+                        id: card_id,
+                        turn_id: format!("cross-{child_id}"),
+                        expected_revision,
+                        body: TimelineBody::Subagent {
+                            subagent_id: child_id,
+                            name: source,
+                            role: Some("跨模型子 Agent · YOLO".into()),
+                            task: Some(task),
+                            status: status.into(),
+                            can_message: false,
+                            summary,
+                            created_at,
+                            updated_at: crate::database::now(),
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
     async fn session_entry(&self, id: &str) -> Result<Arc<Session>> {
         crate::database::validate_id(id)?;
         self.0
@@ -1587,6 +1780,62 @@ impl Agents {
         };
         if updated.unwrap_or(false) {
             self.publish();
+        }
+        // A cross-model child is a full independent session.  Once its first
+        // assigned task settles, persist its outcome and rewrite the parent
+        // card with a bounded final answer (or the concrete failure).
+        let child = {
+            let id = id.clone();
+            self.0
+                .database
+                .call(move |store| store.cross_model_child(&id))
+                .await
+        };
+        if let Ok(existing) = child {
+            let result = if let Some(error) = failure {
+                Some(bounded_text(error))
+            } else {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| store.cross_model_child_summary(&id))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let state = if result.as_deref().is_some_and(|value| !value.is_empty())
+                && finish == "completed"
+            {
+                "completed"
+            } else if finish == "interrupted" {
+                "stopped"
+            } else {
+                "failed"
+            };
+            let completed = {
+                let id = id.clone();
+                let result = result.clone();
+                self.0
+                    .database
+                    .call(move |store| {
+                        store.complete_cross_model_child(&id, state, result.as_deref())
+                    })
+                    .await
+            };
+            if let Ok(completed) = completed {
+                let summary = completed.result.clone().unwrap_or_else(|| {
+                    if state == "completed" {
+                        "子任务已完成，没有可回传的文本摘要。".into()
+                    } else {
+                        "子任务未完成。".into()
+                    }
+                });
+                let _ = self
+                    .write_cross_model_card(&completed, state, bounded_text(summary))
+                    .await;
+            } else {
+                let _ = existing;
+            }
         }
     }
 

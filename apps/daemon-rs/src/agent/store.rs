@@ -109,6 +109,82 @@ fn normalize_selection(
 }
 
 impl Store {
+    pub(crate) fn register_cross_model_child(
+        &mut self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        task: &str,
+        source_id: &str,
+        route_id: &str,
+        account_id: &str,
+    ) -> Result<super::CrossModelChild> {
+        crate::database::validate_id(child_session_id)?;
+        crate::database::validate_id(parent_session_id)?;
+        crate::accounts::sources::validate_source_id(source_id)?;
+        crate::accounts::sources::validate_source_id(route_id)?;
+        crate::database::validate_id(account_id)?;
+        crate::database::validate_text(task, 65_536, false)?;
+        self.session(parent_session_id)?;
+        self.session(child_session_id)?;
+        let now = crate::database::now();
+        self.connection.execute(
+            "INSERT INTO cross_model_children(child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'starting',NULL,?7,?7)",
+            params![child_session_id,parent_session_id,task,source_id,route_id,account_id,now],
+        )?;
+        self.cross_model_child(child_session_id)
+    }
+
+    pub(crate) fn cross_model_child(
+        &self,
+        child_session_id: &str,
+    ) -> Result<super::CrossModelChild> {
+        crate::database::validate_id(child_session_id)?;
+        self.connection.query_row(
+            "SELECT child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,created_at,updated_at FROM cross_model_children WHERE child_session_id=?",
+            [child_session_id],
+            |row| Ok(super::CrossModelChild {
+                session_id: row.get(0)?, parent_session_id: row.get(1)?, task: row.get(2)?,
+                source_id: row.get(3)?, route_id: row.get(4)?, account_id: row.get(5)?,
+                status: row.get(6)?, result: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
+            }),
+        ).optional()?.ok_or(Error::NotFound)
+    }
+
+    pub(crate) fn complete_cross_model_child(
+        &mut self,
+        child_session_id: &str,
+        status: &str,
+        result: Option<&str>,
+    ) -> Result<super::CrossModelChild> {
+        if !matches!(status, "completed" | "failed" | "stopped") {
+            return Err(Error::Invalid("跨模型子任务状态无效".into()));
+        }
+        if let Some(result) = result {
+            crate::database::validate_text(result, 65_536, true)?;
+        }
+        let current = self.cross_model_child(child_session_id)?;
+        if matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+            return Ok(current);
+        }
+        self.connection.execute(
+            "UPDATE cross_model_children SET status=?1,result=?2,updated_at=?3 WHERE child_session_id=?4",
+            params![status,result,crate::database::now(),child_session_id],
+        )?;
+        self.cross_model_child(child_session_id)
+    }
+
+    pub(crate) fn cross_model_child_summary(
+        &self,
+        child_session_id: &str,
+    ) -> Result<Option<String>> {
+        crate::database::validate_id(child_session_id)?;
+        let text = self.connection.query_row(
+            "SELECT preview FROM timeline_records WHERE session_id=?1 AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position DESC LIMIT 1",
+            [child_session_id], |row| row.get::<_, String>(0),
+        ).optional()?;
+        Ok(text)
+    }
+
     pub fn create_agent_session(
         &mut self,
         input: CreateAgentSession,

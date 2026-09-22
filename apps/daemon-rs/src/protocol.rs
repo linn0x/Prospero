@@ -77,6 +77,8 @@ pub fn typescript() -> String {
         TerminalInput::decl(&config),
         TerminalSnapshot::decl(&config),
         crate::agent::CreateAgentSession::decl(&config),
+        crate::agent::CreateCrossModelChild::decl(&config),
+        crate::agent::CrossModelChild::decl(&config),
         crate::agent::ResumeInput::decl(&config),
         crate::agent::ResumableConversation::decl(&config),
         crate::agent::ConversationSearchResult::decl(&config),
