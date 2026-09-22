@@ -118,7 +118,6 @@ describe("Code Agent 账号隔离", () => {
     { provider: "unsupported", baseUrl: "https://gateway.example/v1", model: "coder" },
     { protocol: "unsupported", baseUrl: "https://gateway.example/v1", model: "coder" },
     { protocol: null, baseUrl: "https://gateway.example/v1", model: "coder" },
-    { baseUrl: "http://remote.example/v1", model: "coder" },
     { baseUrl: "https://gateway.example/v1", model: "coder", modelCapabilities: { tools: "true" } },
   ])("损坏 Profile 保留身份和原始配置，并拒绝启动: %j", async (raw) => {
     const home = tempHome();
@@ -831,19 +830,29 @@ describe("Code Agent 账号隔离", () => {
     expect(persisted.accounts[0]).toMatchObject({ name: "迁移后的 Chat", apiProfile: { protocol: "openai_chat_completions" } });
   });
 
-  it("第三方 API Profile 拒绝会将密钥发送到非本机 HTTP 或 URL 查询参数的地址", async () => {
+  it("第三方 API Profile 允许外部 HTTP、URL 凭据、查询片段和非 HTTP 协议", async () => {
     const home = tempHome();
     const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
-    await expect(accounts.createApi("codex", "不安全", {
+    await expect(accounts.createApi("codex", "外部 HTTP", {
       baseUrl: "http://gateway.example.com/v1",
       model: "test-model",
       apiKey: "key",
-    })).rejects.toMatchObject({ code: "account_invalid" } satisfies Partial<AgentAccountError>);
+    })).resolves.toMatchObject({ apiProfile: { baseUrl: "http://gateway.example.com/v1" } });
     await expect(accounts.createApi("claude", "含查询", {
       baseUrl: "https://gateway.example.com/v1?token=do-not-store",
       model: "test-model",
       apiKey: "key",
-    })).rejects.toMatchObject({ code: "account_invalid" } satisfies Partial<AgentAccountError>);
+    })).resolves.toMatchObject({ apiProfile: { baseUrl: "https://gateway.example.com/?token=do-not-store" } });
+    await expect(accounts.createApi("claude", "含凭据和片段", {
+      baseUrl: "https://user:pass@gateway.example.com/v1/messages#frag",
+      model: "test-model",
+      apiKey: "key",
+    })).resolves.toMatchObject({ apiProfile: { baseUrl: "https://user:pass@gateway.example.com/#frag" } });
+    await expect(accounts.createApi("codex", "FTP", {
+      baseUrl: "ftp://gateway.example.com/v1/responses",
+      model: "test-model",
+      apiKey: "key",
+    })).resolves.toMatchObject({ apiProfile: { baseUrl: "ftp://gateway.example.com/v1" } });
     await expect(accounts.createApi("codex", "协议错配", {
       provider: "anthropic_compatible",
       protocol: "anthropic",

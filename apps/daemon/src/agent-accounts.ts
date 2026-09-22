@@ -336,11 +336,6 @@ function cleanApiProfile(
   } catch {
     throw new AgentAccountError("API 地址必须是完整 URL", "account_invalid");
   }
-  const localHost = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
-  if ((url.protocol !== "https:" && !(url.protocol === "http:" && localHost)) ||
-      url.username || url.password || url.search || url.hash) {
-    throw new AgentAccountError("API 地址必须使用 HTTPS（localhost 可使用 HTTP）", "account_invalid");
-  }
   url.pathname = url.pathname.replace(/\/+$/, "");
   const suffixes = protocol === "openai_responses"
     ? ["/responses"]
