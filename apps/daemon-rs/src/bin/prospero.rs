@@ -29,6 +29,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkerCommand,
     },
+    /// Dispatch an independent YOLO child session on another model source.
+    Child {
+        #[command(subcommand)]
+        command: ChildCommand,
+    },
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
@@ -221,6 +226,30 @@ enum WorkerCommand {
         final_status: Option<String>,
         #[arg(long = "operation-id")]
         operation_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChildCommand {
+    /// List enabled model-source routes that can be targeted by a child.
+    Sources,
+    /// Start an independent source-bound child and return its session id.
+    Start {
+        /// Parent structured-session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        route: String,
+        #[arg(long)]
+        revision: i64,
+        #[arg(long, default_value = "codex")]
+        agent: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        title: Option<String>,
     },
 }
 
@@ -500,6 +529,38 @@ fn command_request(
                 "worker.stop",
                 json!({"taskId": task, "reason": reason, "finalStatus": final_status, "operationId": operation_id, "actorSessionId": session}),
             ),
+        },
+        Command::Child { command } => match command {
+            ChildCommand::Sources => ("cross_model.child.sources", json!({})),
+            ChildCommand::Start {
+                parent,
+                source,
+                route,
+                revision,
+                agent,
+                task,
+                title,
+            } => {
+                let parent = parent.or(session).ok_or_else(|| {
+                    prosperod_rs::error::Error::Invalid(
+                        "缺少 --parent（或 PROSPERO_SESSION_ID）".into(),
+                    )
+                })?;
+                if !matches!(agent.as_str(), "codex" | "claude" | "opencode") {
+                    return Err(prosperod_rs::error::Error::Invalid(
+                        "--agent 仅支持 codex、claude 或 opencode".into(),
+                    ));
+                }
+                if revision < 1 {
+                    return Err(prosperod_rs::error::Error::Invalid(
+                        "--revision 必须为正整数".into(),
+                    ));
+                }
+                (
+                    "cross_model.child.start",
+                    json!({"parentSessionId": parent, "sourceId": source, "routeId": route, "revision": revision, "agent": agent, "task": require_text(task, "--task")?, "title": title}),
+                )
+            }
         },
         Command::Worktree { command } => match command {
             WorktreeCommand::List { run } => (
