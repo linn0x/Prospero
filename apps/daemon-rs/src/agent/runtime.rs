@@ -1833,6 +1833,22 @@ impl Agents {
                 let _ = self
                     .write_cross_model_card(&completed, state, bounded_text(summary))
                     .await;
+                let parent_id = completed.parent_session_id.clone();
+                let fan_in = self
+                    .0
+                    .database
+                    .call(move |store| store.claim_cross_model_fan_in(&parent_id))
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(report) = fan_in {
+                    // `send` starts immediately for an idle parent and queues
+                    // behind a live turn otherwise, so the coordinator always
+                    // resumes once the entire child batch has settled.
+                    let _ = self
+                        .send(&completed.parent_session_id, report, None, Vec::new())
+                        .await;
+                }
             } else {
                 let _ = existing;
             }
