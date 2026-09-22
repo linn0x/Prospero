@@ -259,6 +259,43 @@ fn valid_token(value: &str) -> bool {
 pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<Value> {
     let client = ControlClient::from_env_or_home(home)?.with_timeout(timeout_for(method, &params));
     match method {
+        "cross_model.child.sources" => {
+            let sources: Value = client.post(
+                "/v1/model-sources",
+                json!({"type":"model.source.action","requestId":"cli-cross-model-sources","action":{"kind":"list"}}),
+            ).await?;
+            let items = sources.get("sources").and_then(Value::as_array).cloned().unwrap_or_default()
+                .into_iter().filter_map(|source| {
+                    let enabled = source.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                    if !enabled { return None; }
+                    let source_id = source.get("id").and_then(Value::as_str)?;
+                    let revision = source.get("revision").and_then(Value::as_i64)?;
+                    let name = source.get("name").and_then(Value::as_str).unwrap_or(source_id);
+                    let routes = source.get("routes").and_then(Value::as_array)?.iter().filter_map(|route| {
+                        if !route.get("enabled").and_then(Value::as_bool).unwrap_or(false) || route.pointer("/modelCapabilities/tools") == Some(&Value::Bool(false)) { return None; }
+                        let protocol = route.get("protocol").and_then(Value::as_str)?;
+                        let agent = match protocol { "anthropic" => "claude", "openai_chat_completions" => "opencode", "openai_responses" => "codex", _ => return None };
+                        Some(json!({"sourceId":source_id,"sourceName":name,"revision":revision,"routeId":route.get("id"),"routeName":route.get("name"),"model":route.get("model"),"agent":agent,"yolo":true}))
+                    }).collect::<Vec<_>>();
+                    Some(routes)
+                }).flatten().collect::<Vec<_>>();
+            Ok(
+                json!({"items":items,"hint":"Use prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. The child always uses YOLO auto-approval."}),
+            )
+        }
+        "cross_model.child.start" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let source = required_id(&params, "sourceId")?;
+            let route = required_id(&params, "routeId")?;
+            let revision = params
+                .get("revision")
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0)
+                .ok_or_else(|| Error::Invalid("模型源版本无效".into()))?;
+            let agent = required_text(&params, "agent")?;
+            let task = required_text(&params, "task")?;
+            client.post(&format!("/v1/agent-sessions/{}/cross-model-children", path_component(&parent)), strip_empty(json!({"sourceId":source,"routeId":route,"revision":revision,"agent":agent,"task":task,"title":optional_text(&params, "title")}), &[])).await
+        }
         "plugin.list" => client.get("/v1/plugins").await,
         "plugin.service.status" => client.get("/v1/plugin-services").await,
         "plugin.service.start" => {
