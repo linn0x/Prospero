@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 use crate::worker::Database;
 
-const MAX_TURNS: usize = 16;
+const MAX_TURNS: usize = 32;
 
 fn decode_base64_lenient(input: &str) -> Result<Vec<u8>> {
     fn value(byte: u8) -> Option<u8> {
