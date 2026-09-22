@@ -88,6 +88,7 @@ pub(crate) fn native_codex_environment(data: &Path) -> Result<(PathBuf, Vec<(Str
         std::fs::create_dir_all(dir)?;
         let _ = set_private_dir_permissions(dir);
     }
+    crate::cross_model_tool::install_codex_skill(&usage_home)?;
 
     let target_auth = usage_home.join("auth.json");
     let shared_auth = shared_codex_home().join("auth.json");

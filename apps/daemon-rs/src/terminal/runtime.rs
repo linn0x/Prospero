@@ -757,6 +757,7 @@ fn native_codex_environment(data: &Path) -> Result<Vec<(String, String)>> {
         .join("codex")
         .join(NATIVE_CODEX_ID);
     private_dir(&root)?;
+    crate::cross_model_tool::install_codex_skill(&root)?;
     Ok(vec![
         ("OPENAI_API_KEY".into(), String::new()),
         ("CODEX_API_KEY".into(), String::new()),
@@ -852,6 +853,15 @@ impl Terminals {
                     .resolve_codex_terminal_account(input.account_id.clone())
                     .await?;
                 let mut args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
+                args.extend([
+                    "-c".into(),
+                    format!(
+                        "developer_instructions={}",
+                        serde_json::to_string(
+                            crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS
+                        )?
+                    ),
+                ]);
                 if let Some(profile) = profile.as_ref() {
                     if profile.protocol() != "openai_responses" {
                         return Err(Error::Invalid(

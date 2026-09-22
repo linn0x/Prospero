@@ -265,6 +265,9 @@ pub(crate) fn profile_account_environment(
     profile: &ApiProfile,
 ) -> Result<Vec<(String, String)>> {
     let root = profile_account_root_for_agent(data, id, agent)?;
+    if agent == AgentKind::Codex {
+        crate::cross_model_tool::install_codex_skill(&root)?;
+    }
     let secret = profile_secret_for_agent(data, id, agent, profile)?.unwrap_or_default();
     if profile.protocol() == "openai_chat_completions" {
         return opencode_environment(&root, profile, &secret);
