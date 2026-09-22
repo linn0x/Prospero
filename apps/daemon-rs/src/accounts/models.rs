@@ -31,6 +31,25 @@ pub(crate) struct CatalogModel {
     pub model_capabilities: Option<ModelCapabilities>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_url_accepts_permissive_external_urls() {
+        let url =
+            models_url("https://user:pass@gateway.example.com/proxy/v1/responses?token=1#frag")
+                .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://user:pass@gateway.example.com/proxy/v1/models?token=1#frag"
+        );
+
+        let ftp = models_url("ftp://gateway.example.com/proxy/v1/responses").unwrap();
+        assert_eq!(ftp.as_str(), "ftp://gateway.example.com/proxy/v1/models");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
@@ -88,20 +107,11 @@ impl ModelsResult {
 fn models_url(base_url: &str) -> std::result::Result<url::Url, FeatureError> {
     let mut url = url::Url::parse(base_url)
         .map_err(|_| FeatureError::new("invalid_request", "API 地址必须是完整 URL"))?;
-    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local);
-    if base_url.len() > 2000
-        || base_url.contains(['\r', '\n', '\0'])
-        || !scheme_ok
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(FeatureError::new(
-            "invalid_request",
-            "API 地址必须使用 HTTPS（localhost 可使用 HTTP），且不能包含凭据或查询参数",
-        ));
+    if base_url.len() > 2000 || base_url.contains(['\r', '\n', '\0']) {
+        return Err(FeatureError::new("invalid_request", "API 地址格式无效"));
+    }
+    if url.cannot_be_a_base() {
+        return Ok(url);
     }
     let path = url.path().trim_end_matches('/').to_string();
     // Strip the recognized API suffixes so a pasted endpoint URL works too.
@@ -122,8 +132,6 @@ fn models_url(base_url: &str) -> std::result::Result<url::Url, FeatureError> {
         stripped.to_string()
     };
     url.set_path(&format!("{normalized}/models"));
-    url.set_query(None);
-    url.set_fragment(None);
     Ok(url)
 }
 

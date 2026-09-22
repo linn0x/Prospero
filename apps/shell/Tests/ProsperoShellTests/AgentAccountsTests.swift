@@ -55,8 +55,11 @@ final class AgentAccountsTests: XCTestCase {
     XCTAssertNil(AgentAccountInputValidator.apiProfile(
       baseURL: "http://localhost:11434/v1", model: "local-model"
     ))
-    XCTAssertNotNil(AgentAccountInputValidator.apiProfile(
+    XCTAssertNil(AgentAccountInputValidator.apiProfile(
       baseURL: "http://gateway.example.test/v1", model: "local-model"
+    ))
+    XCTAssertNil(AgentAccountInputValidator.apiProfile(
+      baseURL: "ftp://user:pass@gateway.example.test/v1?token=1#frag", model: "local-model"
     ))
     XCTAssertNotNil(AgentAccountInputValidator.credential("short", apiKey: false))
     XCTAssertNil(AgentAccountInputValidator.credential("one-character-key", apiKey: true))

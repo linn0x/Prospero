@@ -437,7 +437,7 @@ export default function AgentAccountsScreen() {
             每个 Prospero 账号或 API Profile 都拥有独立的凭据、配置、原生会话历史和 MCP/插件状态；创建会话时仍可选择同一个项目目录。
           </Text>
           <Text style={styles.securityText}>
-            Codex 可由官方 CLI 登录；API Key 和 Claude 独立令牌经配对加密通道写入电脑端安全存储，不写进账号元数据或对话记录。第三方 API 必须使用 HTTPS（localhost 除外）。
+            Codex 可由官方 CLI 登录；API Key 和 Claude 独立令牌经配对加密通道写入电脑端安全存储，不写进账号元数据或对话记录。第三方 API 地址按用户填写透传，仅拒绝缺少 URL scheme 或含换行的格式。
           </Text>
         </View>
 

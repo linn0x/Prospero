@@ -84,10 +84,6 @@ async function checkRuntime(engine: Engine, signal: AbortSignal): Promise<boolea
 function endpoint(baseUrl: string, protocol: AgentApiProtocol): string {
   let url: URL;
   try { url = new URL(baseUrl); } catch { throw new ProbeFailure("invalid_profile", "API Profile 地址无效。"); }
-  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if ((url.protocol !== "https:" && !(url.protocol === "http:" && local)) || url.username || url.password || url.search || url.hash) {
-    throw new ProbeFailure("invalid_profile", "API Profile 地址无效。");
-  }
   url.pathname = url.pathname.replace(/\/+$/, "") + (protocol === "anthropic" ? "/v1/messages" : protocol === "openai_responses" ? "/responses" : "/chat/completions");
   return url.toString();
 }

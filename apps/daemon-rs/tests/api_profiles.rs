@@ -470,18 +470,38 @@ async fn profile_create_validates_connection_fields_and_persists_an_isolated_key
         vec![json!({"data":[{"id":"fakemodel-1"}]})],
     );
 
-    // Plain-HTTP is only allowed for loopback; non-local http(s) shape errors
-    // are rejected before any network access.
-    for bad in [
-        "not-a-url",
-        "http://gateway.example.com/v1",
-        "https://user:pass@gateway.example.com",
-        "https://gateway.example.com?x=1",
-        "ftp://gateway.example.com",
+    // URL policy is intentionally permissive for user-configured gateways:
+    // plain HTTP, credentials, query/fragment components, and non-HTTP schemes
+    // are all accepted. Shape-only rejects still happen before any network access.
+    for (raw, expected) in [
+        (
+            "http://gateway.example.com/v1",
+            "http://gateway.example.com",
+        ),
+        (
+            "https://user:pass@gateway.example.com/v1",
+            "https://user:pass@gateway.example.com",
+        ),
+        (
+            "https://gateway.example.com/v1?token=1#frag",
+            "https://gateway.example.com/?token=1#frag",
+        ),
+        ("ftp://gateway.example.com/v1", "ftp://gateway.example.com"),
     ] {
-        let (status, _) = harness.post(create_payload(bad, "m")).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "baseUrl {bad}");
+        let (status, allowed) = harness.post(create_payload(raw, "m")).await;
+        assert_eq!(status, StatusCode::OK, "{allowed}");
+        let allowed_id = allowed["accountId"].as_str().unwrap();
+        assert_eq!(
+            account(&allowed, allowed_id).unwrap()["apiProfile"]["baseUrl"],
+            expected
+        );
     }
+    let (status, _) = harness.post(create_payload("not-a-url", "m")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = harness
+        .post(create_payload("http://gateway.example.com/\npath", "m"))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     for payload in [
         json!({"type":"agent.account.api.create","requestId":"r","agent":"claude",
             "name":"x","provider":"openai","baseUrl":server.base_url,"model":"m","apiKey":SECRET}),

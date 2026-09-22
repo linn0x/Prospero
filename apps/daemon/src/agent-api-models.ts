@@ -20,10 +20,8 @@ export interface ApiModelCatalogOptions {
 export function apiModelsUrl(baseUrl: string, protocol: AgentApiProtocol): URL {
   let url: URL;
   try { url = new URL(baseUrl); } catch { throw new AgentAccountFeatureError("invalid_request", "API 地址必须是完整 URL"); }
-  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (baseUrl.length > 2000 || /[\r\n\0]/.test(baseUrl) || url.username || url.password || url.search || url.hash ||
-      (url.protocol !== "https:" && !(url.protocol === "http:" && local))) {
-    throw new AgentAccountFeatureError("invalid_request", "API 地址必须使用 HTTPS（localhost 可使用 HTTP），且不能包含凭据或查询参数");
+  if (baseUrl.length > 2000 || /[\r\n\0]/.test(baseUrl)) {
+    throw new AgentAccountFeatureError("invalid_request", "API 地址格式无效");
   }
   let pathname = url.pathname.replace(/\/+$/, "");
   pathname = pathname.replace(/\/(?:chat\/completions|responses|messages|models)$/i, "");

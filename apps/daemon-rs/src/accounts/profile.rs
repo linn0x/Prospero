@@ -302,36 +302,27 @@ pub(crate) fn clean_profile(
     // url::crate is already in the tree via reqwest.
     let mut url =
         url::Url::parse(base_url).map_err(|_| Error::Invalid("API 地址必须是完整 URL".into()))?;
-    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local);
-    if !scheme_ok
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(Error::Invalid(
-            "API 地址必须使用 HTTPS（localhost 可使用 HTTP）".into(),
-        ));
-    }
     // Strip recognized API suffixes so callers may paste the endpoint URL.
-    let path = url.path().trim_end_matches('/').to_string();
-    let suffixes: &[&str] = match parsed_protocol {
-        "openai_responses" => &["/responses"],
-        "openai_chat_completions" => &["/chat/completions"],
-        _ => &["/v1/messages", "/v1"],
-    };
-    let stripped = suffixes
-        .iter()
-        .find_map(|suffix| path.strip_suffix(suffix))
-        .unwrap_or(&path)
-        .trim_end_matches('/');
-    let normalized_path = if stripped.is_empty() { "/" } else { stripped };
-    url.set_path(normalized_path);
-    url.set_query(None);
-    url.set_fragment(None);
+    let mut normalized_path = None;
+    if !url.cannot_be_a_base() {
+        let path = url.path().trim_end_matches('/').to_string();
+        let suffixes: &[&str] = match parsed_protocol {
+            "openai_responses" => &["/responses"],
+            "openai_chat_completions" => &["/chat/completions"],
+            _ => &["/v1/messages", "/v1"],
+        };
+        let stripped = suffixes
+            .iter()
+            .find_map(|suffix| path.strip_suffix(suffix))
+            .unwrap_or(&path)
+            .trim_end_matches('/');
+        let path = if stripped.is_empty() { "/" } else { stripped };
+        url.set_path(path);
+        normalized_path = Some(path.to_owned());
+    }
     let mut normalized = url.to_string();
-    if normalized_path == "/" {
+    if normalized_path.as_deref() == Some("/") && url.query().is_none() && url.fragment().is_none()
+    {
         normalized.truncate(normalized.len() - 1);
     }
     let caps = ModelCapabilities::clean(capabilities.unwrap_or(serde_json::Value::Null))?;
@@ -389,15 +380,8 @@ pub(crate) fn custom_headers(profile: &ApiProfile) -> String {
 pub(crate) fn endpoint(profile: &ApiProfile, suffix: &str) -> Result<String> {
     let mut url = url::Url::parse(&profile.base_url)
         .map_err(|_| Error::Invalid("API Profile 地址无效".into()))?;
-    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local);
-    if !scheme_ok
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(Error::Invalid("API Profile 地址无效".into()));
+    if url.cannot_be_a_base() {
+        return Ok(url.to_string());
     }
     let base = url.path().trim_end_matches('/');
     url.set_path(&format!("{base}{suffix}"));
@@ -674,6 +658,42 @@ mod tests {
         assert_eq!(
             agent_kind(&profile(Some("openai_chat_completions"))),
             crate::protocol::AgentKind::Opencode
+        );
+    }
+
+    #[test]
+    fn profile_validation_accepts_permissive_external_urls() {
+        let profile = clean_profile_inputs(
+            "claude",
+            "https://user:pass@gateway.example.com/v1/messages?token=1#frag",
+            "claude-test",
+            None,
+            None,
+            Some(serde_json::Value::Null),
+        )
+        .unwrap();
+        assert_eq!(
+            profile.base_url,
+            "https://user:pass@gateway.example.com/?token=1#frag"
+        );
+        assert_eq!(
+            endpoint(&profile, "/v1/messages").unwrap(),
+            "https://user:pass@gateway.example.com/v1/messages?token=1#frag"
+        );
+
+        let ftp = clean_profile_inputs(
+            "claude",
+            "ftp://gateway.example.com/v1/messages",
+            "claude-test",
+            None,
+            None,
+            Some(serde_json::Value::Null),
+        )
+        .unwrap();
+        assert_eq!(ftp.base_url, "ftp://gateway.example.com");
+        assert_eq!(
+            endpoint(&ftp, "/v1/messages").unwrap(),
+            "ftp://gateway.example.com/v1/messages"
         );
     }
 }
