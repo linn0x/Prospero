@@ -1496,6 +1496,14 @@ async fn serve(
         cli_dir,
     );
     api.terminals.recover().await?;
+    // A completed cross-model child can outlive the stream callback that
+    // normally records its result.  Reconcile persisted terminal children on
+    // startup *before* generic agent crash recovery so a finished provider
+    // turn remains completed rather than being mislabeled as a failed stale
+    // structured run.
+    if api.agents.reconcile_cross_model_children().await? > 0 {
+        api.publish();
+    }
     // Stale agent runs belonged to the previous process; archive them
     // without replaying turns.
     let recovered_agents = api.agents.recover().await?;

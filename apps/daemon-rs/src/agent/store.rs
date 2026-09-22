@@ -150,6 +150,34 @@ impl Store {
         ).optional()?.ok_or(Error::NotFound)
     }
 
+    /// Cross-model children are independently persisted sessions.  A daemon
+    /// restart or an adapter edge case must not leave a completed provider
+    /// turn stuck forever as `starting`, so the runtime periodically queries
+    /// these rows and settles the ones whose session has reached a terminal
+    /// state.
+    pub(crate) fn unsettled_cross_model_children(&self) -> Result<Vec<super::CrossModelChild>> {
+        let mut statement = self.connection.prepare(
+            "SELECT child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,created_at,updated_at \
+             FROM cross_model_children WHERE status IN ('starting','running') ORDER BY created_at,child_session_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(super::CrossModelChild {
+                session_id: row.get(0)?,
+                parent_session_id: row.get(1)?,
+                task: row.get(2)?,
+                source_id: row.get(3)?,
+                route_id: row.get(4)?,
+                account_id: row.get(5)?,
+                status: row.get(6)?,
+                result: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
     pub(crate) fn complete_cross_model_child(
         &mut self,
         child_session_id: &str,
@@ -160,7 +188,13 @@ impl Store {
             return Err(Error::Invalid("跨模型子任务状态无效".into()));
         }
         if let Some(result) = result {
-            crate::database::validate_text(result, 65_536, true)?;
+            // Final answers are multiline Markdown in the normal case.  Do
+            // not run the strict single-line user-input validator here: it
+            // rejects newlines and used to leave an otherwise completed
+            // cross-model child permanently in `starting`.
+            if result.len() > 65_536 {
+                return Err(Error::Invalid("跨模型子任务摘要过长".into()));
+            }
         }
         let current = self.cross_model_child(child_session_id)?;
         if matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
@@ -254,6 +288,35 @@ impl Store {
             ));
         }
         Ok(Some(report.chars().take(60_000).collect()))
+    }
+
+    /// Undo a fan-in claim when delivery to the parent did not happen.  The
+    /// report stays durable and can be retried after a transient daemon or
+    /// terminal-host failure.
+    pub(crate) fn release_cross_model_fan_in(&mut self, parent_session_id: &str) -> Result<()> {
+        crate::database::validate_id(parent_session_id)?;
+        self.connection.execute(
+            "UPDATE cross_model_children SET summary_delivered=0,updated_at=? WHERE parent_session_id=?",
+            params![crate::database::now(), parent_session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Parents with fully-terminal children whose report has not yet reached
+    /// the parent.  This lets startup recovery retry a failed delivery even
+    /// after every individual child was already settled.
+    pub(crate) fn pending_cross_model_fan_in_parents(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT parent_session_id FROM cross_model_children \
+             GROUP BY parent_session_id \
+             HAVING sum(status IN ('starting','running'))=0 \
+                AND sum(summary_delivered=0)>0 \
+             ORDER BY min(created_at),parent_session_id",
+        )?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(Error::from)
     }
 
     pub fn create_agent_session(
