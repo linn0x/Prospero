@@ -11,7 +11,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { SessionInfo } from "../../shared/types";
-import { isMissingSessionError, reportError, number, text } from "./state";
+import { displayError, isMissingSessionError, isUnrecoverableTerminalError, reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
 import { terminalBytes } from "./terminal-bytes";
@@ -739,7 +739,9 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
           if (terminalRef.current) terminalRef.current.options.disableStdin = true;
           setConnected(false);
           setSyncing(false);
-          setConnectionError(reportError(reason));
+          const message = displayError(reason);
+          setConnectionError(message);
+          if (isUnrecoverableTerminalError(reason)) break;
           await new Promise((wait) => window.setTimeout(wait, 900));
         }
       }
