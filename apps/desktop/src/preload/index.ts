@@ -60,6 +60,7 @@ const api: DesktopApi = {
   revealPath: (path: string) => ipcRenderer.invoke("path:reveal", path),
   openWindowsTerminal: (path: string) => ipcRenderer.invoke("path:terminal", path),
   createSession: (input: SessionCreateInput) => ipcRenderer.invoke("session:create", input),
+  createCrossModelChild: (sessionId, input) => ipcRenderer.invoke("session:cross-model-child", sessionId, input),
   listSessions: (request?: SessionPageRequest) => ipcRenderer.invoke("sessions:list", request),
   cancelSessionPage: (requestId: string) => ipcRenderer.invoke("sessions:cancel", requestId),
   readTimeline: (id, query, requestId) => ipcRenderer.invoke("timeline:read", id, query, requestId),

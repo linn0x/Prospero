@@ -1220,6 +1220,11 @@ function installIpc(): void {
     const subagentId = requireId(rawSubagent, "子 Agent");
     return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/subagent/${encodeURIComponent(subagentId)}/events`);
   });
+  ipcMain.handle("session:cross-model-child", (_event, rawId: unknown, raw: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    const input = requireObject(raw);
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/cross-model-children`, { method: "POST", body: input, timeoutMs: 180_000 });
+  });
   ipcMain.handle("usage:get", (_event, rawId: unknown) => {
     const params = new URLSearchParams();
     if (rawId !== undefined) {

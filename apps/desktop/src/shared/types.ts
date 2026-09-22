@@ -351,6 +351,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   openTerminalContextMenu(options: { copy: boolean; paste: boolean }): Promise<void>;
   writeClipboard(value: string): Promise<{ ok: boolean }>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
+  createCrossModelChild(sessionId: string, input: { sourceId: string; routeId: string; revision: number; agent: "codex" | "claude" | "opencode"; task: string; title?: string }): Promise<JsonObject>;
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
   cancelSessionPage(requestId: string): Promise<void>;
