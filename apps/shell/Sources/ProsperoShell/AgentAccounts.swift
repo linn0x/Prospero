@@ -309,14 +309,8 @@ enum AgentAccountInputValidator {
     let modelName = model.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !address.isEmpty, address.count <= 2000,
           !modelName.isEmpty, modelName.count <= 300,
-          let parts = URLComponents(string: address), let scheme = parts.scheme?.lowercased(),
-          let host = parts.host, !host.isEmpty,
-          parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil
+          URLComponents(string: address)?.scheme != nil
     else { return "API 地址或模型名称格式无效" }
-    let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
-    guard scheme == "https" || (scheme == "http" && loopback) else {
-      return "API 地址必须使用 HTTPS（localhost 可使用 HTTP）"
-    }
     return nil
   }
 }

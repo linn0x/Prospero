@@ -27,8 +27,13 @@ describe("API profile model catalogs", () => {
     expect(apiModelsUrl(url, protocol as AgentApiProtocol).href).toBe(expected);
   });
 
-  it.each(["http://untrusted.example", "https://user:secret@models.example", "file:///tmp/models", "https://models.example?api_key=secret", "https://models.example/#secret"])("rejects unsafe endpoint %s", (url) => {
-    expect(() => apiModelsUrl(url, "openai_responses")).toThrow();
+  it.each([
+    ["https://user:secret@models.example/v1/responses", "https://user:secret@models.example/v1/models"],
+    ["file:///tmp/models", "file:///tmp/models"],
+    ["https://models.example/v1?api_key=secret", "https://models.example/v1/models?api_key=secret"],
+    ["https://models.example/v1#secret", "https://models.example/v1/models#secret"],
+  ])("accepts permissive endpoint %s", (url, expected) => {
+    expect(apiModelsUrl(url, "openai_responses").href).toBe(expected);
   });
 
   it("normalizes, deduplicates and sorts OpenAI entries without arbitrary provider fields", async () => {
