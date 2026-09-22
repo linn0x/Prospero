@@ -516,7 +516,7 @@ export const C2SAgentAccountConfigSetSchema = z.object({
 }).strict();
 
 export const AgentAccountFeatureErrorSchema = z.object({
-  code: z.enum(["authentication", "unsupported", "network", "timeout", "invalid_format", "empty_catalog", "limit_exceeded", "invalid_request", "not_found", "forbidden", "conflict", "syntax", "invalid_config", "storage", "busy"]),
+  code: z.enum(["authentication", "unsupported", "network", "timeout", "invalid_format", "empty_catalog", "limit_exceeded", "invalid_request", "not_found", "forbidden", "conflict", "in_use", "syntax", "invalid_config", "storage", "busy"]),
   message: z.string().min(1).max(500),
   line: z.number().int().positive().optional(),
   column: z.number().int().positive().optional(),
