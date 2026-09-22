@@ -27,8 +27,8 @@ use tokio::sync::{Semaphore, watch};
 use crate::agent::Agents;
 use crate::agent::{
     AgentCompactRequest, AgentModeSelection, AgentModelSelection, AgentSend,
-    ApprovalPolicySelection, CreateAgentSession, PermissionDecision, PermissionMode,
-    QuestionDecision, UsageReport, UsageResult, mode_catalog,
+    ApprovalPolicySelection, CreateAgentSession, CreateCrossModelChild, PermissionDecision,
+    PermissionMode, QuestionDecision, UsageReport, UsageResult, mode_catalog,
 };
 use crate::auth::Token;
 use crate::database::Store;
@@ -197,6 +197,10 @@ impl Api {
             .route("/ws", get(remote_ws))
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children",
+                post(create_cross_model_child),
+            )
             .route("/v1/conversations", get(conversation_search))
             .route("/v1/agent-sessions/queues", get(agent_queues))
             .route("/v1/usage", get(usage_route))
@@ -3640,6 +3644,21 @@ async fn create_agent(
     let head = api.agents.create(input).await?;
     api.publish();
     Ok(Json(head))
+}
+
+async fn create_cross_model_child(
+    State(api): State<Api>,
+    Path(parent_session_id): Path<String>,
+    body: std::result::Result<Json<CreateCrossModelChild>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<crate::agent::CrossModelChild>, ApiError> {
+    let Json(input) =
+        body.map_err(|_| Error::Invalid("invalid cross-model child request".into()))?;
+    let child = api
+        .agents
+        .create_cross_model_child(&parent_session_id, input)
+        .await?;
+    api.publish();
+    Ok(Json(child))
 }
 
 async fn agent_send(

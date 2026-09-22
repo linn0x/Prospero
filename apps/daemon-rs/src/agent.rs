@@ -57,6 +57,42 @@ pub struct CreateAgentSession {
     pub resume: Option<ResumeInput>,
 }
 
+/// Starts an independent structured child session attached to a parent
+/// conversation.  The target is a pinned model-source route, never an
+/// inherited Codex Task thread, so its provider and model may differ.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CreateCrossModelChild {
+    pub source_id: String,
+    pub route_id: String,
+    #[ts(type = "number")]
+    pub revision: i64,
+    pub agent: crate::protocol::AgentKind,
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CrossModelChild {
+    pub session_id: String,
+    pub parent_session_id: String,
+    pub task: String,
+    pub source_id: String,
+    pub route_id: String,
+    pub account_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
 fn default_agent_kind() -> crate::protocol::AgentKind {
     crate::protocol::AgentKind::Claude
 }

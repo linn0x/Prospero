@@ -120,7 +120,7 @@ export function timelineEvent(record: TimelineRecord): JsonObject {
         updatedAt: record.body.updatedAt,
         ...(record.body.summary ? { preview: record.body.summary } : {}),
       };
-      return { ...shared, kind: "subagent.started", subagent };
+      return { ...shared, kind: "subagent.started", subagent, ...(record.body.summary ? { summary: record.body.summary } : {}) };
     }
     case "turn_end": return { ...shared, kind: "turn.end", finish: record.body.finish };
     case "error": return { ...shared, kind: "agent.error", message: record.preview };

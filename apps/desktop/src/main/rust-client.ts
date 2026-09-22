@@ -2,7 +2,7 @@ import type { ContentPage, EventPage, EventQuery, Health, RenameSession, Session
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
-import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, AttachmentChunk, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
+import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, AttachmentChunk, CreateAgentSession, CreateCrossModelChild, CrossModelChild, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, ConversationSearchResult, LaunchModelCatalog, ResumableConversation, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
 import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, SearchResult as RustProjectSearchResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
@@ -103,6 +103,9 @@ export class RustClient {
   }
   createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
     return this.json("/v1/agent-sessions", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  createCrossModelChild(parentId: string, input: CreateCrossModelChild, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<CrossModelChild> {
+    return this.json(`/v1/agent-sessions/${id(parentId)}/cross-model-children`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
   localConversations(agent: "claude" | "codex" | "deepseek", query: string, limit = 20, accountId?: string, signal: AbortSignal | null = null): Promise<ResumableConversation[]> {
     const params = new URLSearchParams({ agent, query, limit: String(limit) });
