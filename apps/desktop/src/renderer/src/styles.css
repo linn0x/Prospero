@@ -619,12 +619,12 @@ kbd {
 .workspace-session-copy { display: block !important; flex: 1; min-width: 0; }
 .workspace-session-copy strong { display: block; overflow: hidden; font-size: var(--ui-text-small); font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-session-link > .status-mark { position: absolute; top: 50%; right: 8px; translate: 0 -50%; margin: 0; overflow: visible; }
-.workspace-session-pin { position: absolute; top: 50%; right: 20px; transform: translateY(-50%); display: grid; width: 22px; height: 24px; place-items: center; padding: 0; color: color-mix(in srgb, var(--sidebar-foreground) 66%, var(--sidebar)); border-radius: var(--ui-radius-panel); opacity: 0; }
+.workspace-session-pin { position: absolute; top: 50%; right: 20px; transform: translateY(-50%); display: grid; width: 22px; height: 24px; place-items: center; padding: 0; color: color-mix(in srgb, var(--sidebar-foreground) 66%, var(--sidebar)); border-radius: var(--ui-radius-panel); opacity: 0; pointer-events: none; }
 .workspace-pinned-item > .session-pin-action { top: 50%; right: 20px; transform: translateY(-50%); width: 22px; height: 24px; }
 .workspace-session-pin:hover,
-.workspace-session-pin:focus-visible { color: var(--sidebar-foreground); opacity: 1; }
-.workspace-session-item:hover > .workspace-session-pin { opacity: 1; }
-.workspace-session-pin.is-pinned { color: var(--sidebar-foreground); opacity: 1; }
+.workspace-session-pin:focus-visible { color: var(--sidebar-foreground); opacity: 1; pointer-events: auto; }
+.workspace-session-item:hover > .workspace-session-pin { opacity: 1; pointer-events: auto; }
+.workspace-session-pin.is-pinned { color: var(--sidebar-foreground); opacity: 1; pointer-events: auto; }
 .workspace-session-pin svg { display: block; width: 13px; height: 13px; stroke: currentColor; }
 .workspace-session-more-item { padding-top: 1px; }
 .workspace-session-more {
@@ -648,12 +648,12 @@ kbd {
 .workspace-session-more svg { width: 12px; height: 12px; flex: none; transition: transform 140ms ease; }
 .workspace-session-more[aria-expanded="true"] svg { transform: rotate(90deg); }
 .workspace-session-more span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-pin-action { color: color-mix(in srgb, var(--sidebar-foreground) 48%, transparent); background: transparent !important; opacity: 0; transition: color 120ms ease, opacity 120ms ease; }
+.session-pin-action { color: color-mix(in srgb, var(--sidebar-foreground) 48%, transparent); background: transparent !important; opacity: 0; pointer-events: none; transition: color 120ms ease, opacity 120ms ease; }
 .prospero-sidebar [data-sidebar="menu-item"]:hover > .session-pin-action,
-.prospero-sidebar [data-sidebar="menu-item"]:focus-within > .session-pin-action { opacity: 1; }
+.prospero-sidebar [data-sidebar="menu-item"]:focus-within > .session-pin-action { opacity: 1; pointer-events: auto; }
 .session-pin-action:hover,
 .session-pin-action:focus-visible { color: var(--sidebar-foreground); }
-.session-pin-action.is-pinned { color: var(--sidebar-foreground); opacity: 1; }
+.session-pin-action.is-pinned { color: var(--sidebar-foreground); opacity: 1; pointer-events: auto; }
 .sidebar-content-shell { overflow: hidden !important; }
 .remote-host-import { display: flex; gap: 8px; margin: 12px 0; }
 .remote-host-import input { min-width: 0; flex: 1; }
