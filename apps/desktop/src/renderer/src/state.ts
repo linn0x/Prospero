@@ -96,6 +96,11 @@ export function isMissingSessionError(error: unknown): boolean {
   return isMissingSessionMessage(displayError(error));
 }
 
+export function isUnrecoverableTerminalError(error: unknown): boolean {
+  const message = displayError(error);
+  return message.includes("无法可靠恢复画面") || message.includes("终端历史已裁剪");
+}
+
 export function displayError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/^Error invoking remote method '[^']+':\s*/, "");
