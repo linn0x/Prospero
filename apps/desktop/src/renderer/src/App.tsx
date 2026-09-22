@@ -248,6 +248,11 @@ const ACTIVE_SESSION_STORAGE_KEY = "prospero.activeSession";
 const ACTIVE_VIEW_STORAGE_KEY = "prospero.activeView";
 const FOCUS_STORAGE_KEY = "prospero.workspaceFocus";
 
+function consumeSidebarAction(event: { preventDefault(): void; stopPropagation(): void }): void {
+  event.preventDefault();
+  event.stopPropagation();
+}
+
 function readSidebarOpenPreference(): boolean | undefined {
   try {
     const value = localStorage.getItem(SIDEBAR_OPEN_STORAGE_KEY);
@@ -474,7 +479,11 @@ const PinnedSessionRow = memo(function PinnedSessionRow({
           `取消置顶 ${sessionLabel(session)}`,
           `Unpin ${sessionLabel(session)}`,
         )}
-        onClick={() => onTogglePin(session.id)}
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          consumeSidebarAction(event);
+          onTogglePin(session.id);
+        }}
       >
         <Pin className="rotate-45" fill="currentColor" />
       </SidebarMenuAction>
@@ -598,7 +607,11 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
             : t(`置顶 ${sessionLabel(session)}`, `Pin ${sessionLabel(session)}`)
         }
         title={pinned ? t("取消置顶", "Unpin") : t("置顶", "Pin")}
-        onClick={() => onTogglePin(session.id)}
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          consumeSidebarAction(event);
+          onTogglePin(session.id);
+        }}
       >
         <Pin aria-hidden="true" />
       </button>
@@ -3893,16 +3906,18 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [activeRemote, view]);
-  const openSession = useCallback((id: string, session?: SessionInfo): void => {
+  const openSession = useCallback((id: string, session?: SessionInfo, options: { openTab?: boolean } = {}): void => {
     setActiveRemoteId(undefined);
     if (session) {
       setHydratedSessions((current) =>
         upsertHydratedSession(current, session, HYDRATED_SESSION_CACHE_LIMIT),
       );
     }
-    setOpenIds((current) =>
-      current.includes(id) ? current : [...current, id],
-    );
+    if (options.openTab === true) {
+      setOpenIds((current) =>
+        current.includes(id) ? current : [...current, id],
+      );
+    }
     setActiveId(id);
     setView("workspaces");
     if (snapshotRef.current.unreadSessionIds.includes(id))
@@ -4028,7 +4043,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         approvalPolicy,
         ...(session.accountId ? { accountId: session.accountId } : {}),
       });
-      openSession(created.id, created);
+      openSession(created.id, created, { openTab: true });
       try {
         await window.prospero.renameSession(
           created.id,
@@ -4048,7 +4063,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const navigation = useNavigationHistory({ view, activeId: view === "workspaces" && !activeRemoteId ? activeId : undefined, activeRemoteId, runTargetId: view === "runs" ? runTargetId : undefined, taskTargetId: view === "runs" ? taskTargetId : undefined }, (destination) => {
     setView(destination.view); setActiveRemoteId(destination.activeRemoteId);
     if (destination.view === "workspaces") setActiveId(destination.activeId);
-    if (destination.activeId) { setActiveId(destination.activeId); setOpenIds((ids) => ids.includes(destination.activeId!) ? ids : [...ids, destination.activeId!]); }
+    if (destination.activeId) { setActiveId(destination.activeId); }
     setRunTargetId(destination.runTargetId); setTaskTargetId(destination.taskTargetId);
   });
   useEffect(() => {
@@ -4151,7 +4166,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             )}
           </Suspense>
           {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
-              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={openSession} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} />}
+              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} />}
               <WorkspacePane
                 active={localWorkspaceVisible}
                 focus={focus}
@@ -4175,7 +4190,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           project={newSessionProject}
           open
           onOpenChange={setNewSessionOpen}
-          onCreated={(session) => openSession(session.id, session)}
+          onCreated={(session) => openSession(session.id, session, { openTab: true })}
           remoteWorkspaces={remote.workspaces}
           onRemoteWorkspace={openRemoteWorkspace}
           onManageHosts={() => selectView("remote")}
