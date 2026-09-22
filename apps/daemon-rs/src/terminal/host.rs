@@ -85,6 +85,14 @@ impl Host {
         }
         Ok(host)
     }
+
+    /// Deliver bytes to an already-owned terminal without requiring the
+    /// daemon's in-memory `Terminals` registry.  This is used by durable
+    /// cross-model fan-in: a CLI parent may be a hosted PTY rather than a
+    /// structured Rust agent session.
+    pub(crate) async fn input(&self, input: TerminalInput) -> Result<()> {
+        self.post("input", &input).await
+    }
     pub async fn start(
         exe: PathBuf,
         directory: PathBuf,

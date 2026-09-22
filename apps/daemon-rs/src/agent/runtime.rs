@@ -371,6 +371,152 @@ impl Agents {
         }
     }
 
+    /// Reconcile cross-model child rows with their independently-persisted
+    /// sessions.  A child can finish before the stream task reaches its
+    /// normal fan-in path (notably when a provider emits `turn/completed`
+    /// and closes immediately).  Without this pass it remains `starting`,
+    /// preventing the parent from ever receiving the batch report.
+    pub async fn reconcile_cross_model_children(&self) -> Result<usize> {
+        let children = self
+            .0
+            .database
+            .call(|store| store.unsettled_cross_model_children())
+            .await?;
+        let mut settled = 0;
+        for child in children {
+            let child_id = child.session_id.clone();
+            let observed = self
+                .0
+                .database
+                .call(move |store| {
+                    let head = store.session(&child_id)?;
+                    let run = store.agent_run(&child_id)?;
+                    let summary = store.cross_model_child_summary(&child_id)?;
+                    Ok((head.lifecycle, head.status, run.active, summary))
+                })
+                .await?;
+            let (lifecycle, status, active, summary) = observed;
+            let terminal = matches!(
+                status,
+                SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Failed
+            ) || lifecycle == SessionLifecycle::Archived
+                || !active;
+            if !terminal {
+                continue;
+            }
+            // Do not archive the child here. A completed structured turn can
+            // legitimately leave its session reusable (and its active run
+            // registered); this reconciliation pass only owns the
+            // cross-model relation and its fan-in report.
+            let result = summary.filter(|text| !text.trim().is_empty()).or_else(|| {
+                (status == SessionStatus::Failed || lifecycle == SessionLifecycle::Archived)
+                    .then_some("子任务运行未生成可用的最终摘要。".into())
+            });
+            let state =
+                if status == SessionStatus::Failed || lifecycle == SessionLifecycle::Archived {
+                    "failed"
+                } else {
+                    "completed"
+                };
+            let child_id = child.session_id.clone();
+            let result_for_store = result.clone();
+            let completed = self
+                .0
+                .database
+                .call(move |store| {
+                    store.complete_cross_model_child(&child_id, state, result_for_store.as_deref())
+                })
+                .await?;
+            let summary = completed.result.clone().unwrap_or_else(|| {
+                if state == "completed" {
+                    "子任务已完成，但没有可回传的文本摘要。".into()
+                } else {
+                    "子任务未完成。".into()
+                }
+            });
+            self.write_cross_model_card(&completed, state, bounded_text(summary))
+                .await?;
+            if self
+                .deliver_pending_cross_model_fan_in(&completed.parent_session_id)
+                .await?
+            {
+                settled += 1;
+            }
+        }
+        // A prior delivery can fail after it has claimed the batch. Retry all
+        // durable, fully-terminal batches even when this invocation did not
+        // settle a child itself.
+        let parents = self
+            .0
+            .database
+            .call(|store| store.pending_cross_model_fan_in_parents())
+            .await?;
+        for parent_id in parents {
+            if self.deliver_pending_cross_model_fan_in(&parent_id).await? {
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+
+    async fn deliver_pending_cross_model_fan_in(&self, parent_session_id: &str) -> Result<bool> {
+        let parent_id = parent_session_id.to_owned();
+        let report = self
+            .0
+            .database
+            .call(move |store| store.claim_cross_model_fan_in(&parent_id))
+            .await?;
+        let Some(report) = report else {
+            return Ok(false);
+        };
+        if let Err(error) = self
+            .deliver_cross_model_fan_in(parent_session_id, report)
+            .await
+        {
+            let parent_id = parent_session_id.to_owned();
+            let _ = self
+                .0
+                .database
+                .call(move |store| store.release_cross_model_fan_in(&parent_id))
+                .await;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Return a completed child-batch report to either kind of parent.
+    /// Structured parents use the normal agent message queue; CLI parents
+    /// are hosted PTYs, so their prompt must be written through the durable
+    /// terminal host rather than through `Agents::send`.
+    async fn deliver_cross_model_fan_in(
+        &self,
+        parent_session_id: &str,
+        report: String,
+    ) -> Result<()> {
+        let parent_id = parent_session_id.to_owned();
+        let parent = self
+            .0
+            .database
+            .call(move |store| Ok(store.session(&parent_id)?))
+            .await?;
+        match parent.kind {
+            SessionKind::Structured => self.send(parent_session_id, report, None, Vec::new()).await,
+            SessionKind::Pty => {
+                let directory = self
+                    .0
+                    .database
+                    .directory()
+                    .join("terminal-hosts")
+                    .join(parent_session_id);
+                let host = crate::terminal::host::Host::attach(directory).await?;
+                host.input(TerminalInput {
+                    data_b64: BASE64_STANDARD.encode(format!("\n\n{report}\n")),
+                })
+                .await
+            }
+        }
+    }
+
     pub fn check(&self) -> Result<()> {
         if self.0.failed.load(Ordering::Acquire) {
             Err(Error::Closed)
@@ -1833,22 +1979,12 @@ impl Agents {
                 let _ = self
                     .write_cross_model_card(&completed, state, bounded_text(summary))
                     .await;
-                let parent_id = completed.parent_session_id.clone();
-                let fan_in = self
-                    .0
-                    .database
-                    .call(move |store| store.claim_cross_model_fan_in(&parent_id))
-                    .await
-                    .ok()
-                    .flatten();
-                if let Some(report) = fan_in {
-                    // `send` starts immediately for an idle parent and queues
-                    // behind a live turn otherwise, so the coordinator always
-                    // resumes once the entire child batch has settled.
-                    let _ = self
-                        .send(&completed.parent_session_id, report, None, Vec::new())
-                        .await;
-                }
+                // Structured parents are queued/resumed through Agents;
+                // hosted CLI parents receive identical text as PTY input.
+                // A failed delivery releases its claim for startup recovery.
+                let _ = self
+                    .deliver_pending_cross_model_fan_in(&completed.parent_session_id)
+                    .await;
             } else {
                 let _ = existing;
             }
