@@ -654,6 +654,20 @@ async fn codex_structured_turn_streams_into_timeline() {
     assert_eq!(turn_start["model"], "gpt-test");
     assert_eq!(turn_start["effort"], "high");
     assert_eq!(turn_start["collaborationMode"]["mode"], "plan");
+    let thread_start: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.workspace.path().join("thread-start.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        thread_start["developerInstructions"],
+        prosperod_rs::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS
+    );
+    assert!(
+        thread_start["developerInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("prospero child sources")
+    );
 }
 
 #[tokio::test]

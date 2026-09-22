@@ -509,10 +509,16 @@ impl Agents {
                     .join("terminal-hosts")
                     .join(parent_session_id);
                 let host = crate::terminal::host::Host::attach(directory).await?;
-                host.input(TerminalInput {
-                    data_b64: BASE64_STANDARD.encode(format!("\n\n{report}\n")),
-                })
-                .await
+                for chunk in crate::cross_model_tool::terminal_fan_in_chunks(
+                    &report,
+                    crate::terminal::INPUT_BYTES,
+                ) {
+                    host.input(TerminalInput {
+                        data_b64: BASE64_STANDARD.encode(chunk),
+                    })
+                    .await?;
+                }
+                Ok(())
             }
         }
     }

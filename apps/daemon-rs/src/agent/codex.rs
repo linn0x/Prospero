@@ -221,6 +221,10 @@ pub(super) async fn spawn_turn(
     base.insert("cwd".into(), json!(workspace));
     base.insert("approvalPolicy".into(), policy.approval_policy);
     base.insert("sandbox".into(), policy.sandbox);
+    base.insert(
+        "developerInstructions".into(),
+        json!(crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS),
+    );
     if let Some(model) = options.model.as_ref() {
         base.insert("model".into(), json!(model));
     }

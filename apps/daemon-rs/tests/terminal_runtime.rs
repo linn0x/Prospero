@@ -403,6 +403,12 @@ sys.stdout.flush()
         json!([
             "--dangerously-bypass-approvals-and-sandbox",
             "-c",
+            format!(
+                "developer_instructions={}",
+                serde_json::to_string(prosperod_rs::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS)
+                    .unwrap()
+            ),
+            "-c",
             "model=\"gpt-6-test\"",
             "-c",
             "model_reasoning_effort=\"high\""
