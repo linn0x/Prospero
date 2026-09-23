@@ -391,11 +391,12 @@ impl Agents {
                 .call(move |store| {
                     let head = store.session(&child_id)?;
                     let run = store.agent_run(&child_id)?;
+                    let task_turn = store.cross_model_child_task_turn(&child_id)?;
                     let summary = store.cross_model_child_summary(&child_id)?;
-                    Ok((head.lifecycle, head.status, run.active, summary))
+                    Ok((head.lifecycle, head.status, run.active, task_turn, summary))
                 })
                 .await?;
-            let (lifecycle, status, active, summary) = observed;
+            let (lifecycle, status, active, task_turn, summary) = observed;
             let terminal = matches!(
                 status,
                 SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Failed
@@ -412,19 +413,26 @@ impl Agents {
                 (status == SessionStatus::Failed || lifecycle == SessionLifecycle::Archived)
                     .then_some("子任务运行未生成可用的最终摘要。".into())
             });
-            let state =
-                if status == SessionStatus::Failed || lifecycle == SessionLifecycle::Archived {
-                    "failed"
-                } else {
-                    "completed"
-                };
+            let state = if status == SessionStatus::Failed
+                || lifecycle == SessionLifecycle::Archived
+                || result.is_none()
+            {
+                "failed"
+            } else {
+                "completed"
+            };
             let child_id = child.session_id.clone();
             let result_for_store = result.clone();
             let completed = self
                 .0
                 .database
                 .call(move |store| {
-                    store.complete_cross_model_child(&child_id, state, result_for_store.as_deref())
+                    store.complete_cross_model_child(
+                        &child_id,
+                        task_turn,
+                        state,
+                        result_for_store.as_deref(),
+                    )
                 })
                 .await?;
             let summary = completed.result.clone().unwrap_or_else(|| {
@@ -460,28 +468,33 @@ impl Agents {
     }
 
     async fn deliver_pending_cross_model_fan_in(&self, parent_session_id: &str) -> Result<bool> {
-        let parent_id = parent_session_id.to_owned();
-        let report = self
-            .0
-            .database
-            .call(move |store| store.claim_cross_model_fan_in(&parent_id))
-            .await?;
-        let Some(report) = report else {
-            return Ok(false);
-        };
-        if let Err(error) = self
-            .deliver_cross_model_fan_in(parent_session_id, report)
-            .await
-        {
+        let mut delivered = false;
+        loop {
             let parent_id = parent_session_id.to_owned();
-            let _ = self
+            let report = self
                 .0
                 .database
-                .call(move |store| store.release_cross_model_fan_in(&parent_id))
-                .await;
-            return Err(error);
+                .call(move |store| store.claim_cross_model_fan_in(&parent_id))
+                .await?;
+            let Some((report, claimed_children)) = report else {
+                return Ok(delivered);
+            };
+            if let Err(error) = self
+                .deliver_cross_model_fan_in(parent_session_id, report)
+                .await
+            {
+                let parent_id = parent_session_id.to_owned();
+                let _ = self
+                    .0
+                    .database
+                    .call(move |store| {
+                        store.release_cross_model_fan_in(&parent_id, &claimed_children)
+                    })
+                    .await;
+                return Err(error);
+            }
+            delivered = true;
         }
-        Ok(true)
     }
 
     /// Return a completed child-batch report to either kind of parent.
@@ -497,7 +510,7 @@ impl Agents {
         let parent = self
             .0
             .database
-            .call(move |store| Ok(store.session(&parent_id)?))
+            .call(move |store| store.session(&parent_id))
             .await?;
         match parent.kind {
             SessionKind::Structured => self.send(parent_session_id, report, None, Vec::new()).await,
@@ -892,6 +905,110 @@ impl Agents {
         Ok(child)
     }
 
+    /// Reuse a completed cross-model child session for another turn. The
+    /// native conversation, pinned account, model route and YOLO policy stay
+    /// unchanged; only this new turn participates in the next parent fan-in.
+    pub async fn follow_up_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        input: super::FollowUpCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        crate::database::validate_text(&input.task, 65_536, false)?;
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let needs_reactivation = self
+            .0
+            .database
+            .call(move |store| store.cross_model_child_needs_reactivation(&parent_id, &child_id))
+            .await?;
+        let permit = if needs_reactivation {
+            Some(
+                self.0
+                    .slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| Error::Busy)?,
+            )
+        } else {
+            None
+        };
+        if needs_reactivation {
+            let parent_id = parent_session_id.to_owned();
+            let child_id = child_session_id.to_owned();
+            let still_needs_reactivation = self
+                .0
+                .database
+                .call(move |store| {
+                    store.cross_model_child_needs_reactivation(&parent_id, &child_id)
+                })
+                .await?;
+            if !still_needs_reactivation {
+                return Err(Error::Conflict);
+            }
+        }
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let task = input.task.clone();
+        let (child, reactivated) = self
+            .0
+            .database
+            .call(move |store| store.reopen_cross_model_child(&parent_id, &child_id, &task))
+            .await?;
+        let task_turn = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.cross_model_child_task_turn(&child_id))
+                .await?
+        };
+        if reactivated {
+            self.0.entries.lock().await.insert(
+                child_session_id.to_owned(),
+                Arc::new(Session {
+                    handle: Mutex::new(None),
+                    usage: Mutex::new(UsageReport {
+                        windows: Vec::new(),
+                        ..Default::default()
+                    }),
+                    ended: watch::channel(()).0,
+                    draining: Mutex::new(()),
+                    permit: Mutex::new(permit),
+                }),
+            );
+        }
+        let launched = async {
+            self.write_cross_model_card(&child, "starting", String::new())
+                .await?;
+            self.send(child_session_id, input.task, None, Vec::new())
+                .await
+        }
+        .await;
+        if let Err(error) = launched {
+            let child_id = child_session_id.to_owned();
+            let message = error.to_string();
+            let failed = self
+                .0
+                .database
+                .call(move |store| {
+                    store.complete_cross_model_child(&child_id, task_turn, "failed", Some(&message))
+                })
+                .await;
+            if let Ok(failed) = failed {
+                let _ = self
+                    .write_cross_model_card(&failed, "failed", bounded_text(error.to_string()))
+                    .await;
+                let _ = self
+                    .deliver_pending_cross_model_fan_in(&failed.parent_session_id)
+                    .await;
+            }
+            return Err(error);
+        }
+        Ok(child)
+    }
+
     async fn write_cross_model_card(
         &self,
         child: &CrossModelChild,
@@ -901,7 +1018,7 @@ impl Agents {
         let parent_id = child.parent_session_id.clone();
         let child_id = child.session_id.clone();
         let card_id = format!("cross-child-{child_id}");
-        let task = child.task.clone();
+        let task = super::store::cross_model_card_task(&child.task);
         let source = format!("{} / {}", child.source_id, child.route_id);
         let created_at = child.created_at;
         let status = status.to_owned();
@@ -923,9 +1040,9 @@ impl Agents {
                             name: source,
                             role: Some("跨模型子 Agent · YOLO".into()),
                             task: Some(task),
-                            status: status.into(),
+                            status,
                             can_message: false,
-                            summary,
+                            summary: super::store::cross_model_card_summary(&summary),
                             created_at,
                             updated_at: crate::database::now(),
                         },
@@ -1944,6 +2061,19 @@ impl Agents {
                 .await
         };
         if let Ok(existing) = child {
+            let task_turn = {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| store.cross_model_child_task_turn(&id))
+                    .await
+            };
+            let Ok(task_turn) = task_turn else {
+                return;
+            };
+            if task_turn != turn {
+                return;
+            }
             let result = if let Some(error) = failure {
                 Some(bounded_text(error))
             } else {
@@ -1970,7 +2100,7 @@ impl Agents {
                 self.0
                     .database
                     .call(move |store| {
-                        store.complete_cross_model_child(&id, state, result.as_deref())
+                        store.complete_cross_model_child(&id, task_turn, state, result.as_deref())
                     })
                     .await
             };

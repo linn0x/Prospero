@@ -280,7 +280,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                     Some(routes)
                 }).flatten().collect::<Vec<_>>();
             Ok(
-                json!({"items":items,"hint":"Use prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. The child always uses YOLO auto-approval."}),
+                json!({"items":items,"hint":"Start: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Children always use YOLO auto-approval."}),
             )
         }
         "cross_model.child.start" => {
@@ -295,6 +295,21 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
             let agent = required_text(&params, "agent")?;
             let task = required_text(&params, "task")?;
             client.post(&format!("/v1/agent-sessions/{}/cross-model-children", path_component(&parent)), strip_empty(json!({"sourceId":source,"routeId":route,"revision":revision,"agent":agent,"task":task,"title":optional_text(&params, "title")}), &[])).await
+        }
+        "cross_model.child.follow_up" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            let task = required_text(&params, "task")?;
+            client
+                .post(
+                    &format!(
+                        "/v1/agent-sessions/{}/cross-model-children/{}/follow-up",
+                        path_component(&parent),
+                        path_component(&child),
+                    ),
+                    json!({"task":task}),
+                )
+                .await
         }
         "plugin.list" => client.get("/v1/plugins").await,
         "plugin.service.status" => client.get("/v1/plugin-services").await,

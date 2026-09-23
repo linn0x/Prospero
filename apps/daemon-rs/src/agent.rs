@@ -74,6 +74,13 @@ pub struct CreateCrossModelChild {
     pub title: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct FollowUpCrossModelChild {
+    pub task: String,
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]

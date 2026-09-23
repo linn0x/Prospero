@@ -251,6 +251,17 @@ enum ChildCommand {
         #[arg(long)]
         title: Option<String>,
     },
+    /// Send another task to an existing completed cross-model child session.
+    FollowUp {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Existing cross-model child session id.
+        #[arg(long)]
+        child: String,
+        #[arg(long)]
+        task: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -559,6 +570,21 @@ fn command_request(
                 (
                     "cross_model.child.start",
                     json!({"parentSessionId": parent, "sourceId": source, "routeId": route, "revision": revision, "agent": agent, "task": require_text(task, "--task")?, "title": title}),
+                )
+            }
+            ChildCommand::FollowUp {
+                parent,
+                child,
+                task,
+            } => {
+                let parent = parent.or(session).ok_or_else(|| {
+                    prosperod_rs::error::Error::Invalid(
+                        "缺少 --parent（或 PROSPERO_SESSION_ID）".into(),
+                    )
+                })?;
+                (
+                    "cross_model.child.follow_up",
+                    json!({"parentSessionId": parent, "childSessionId": child, "task": require_text(task, "--task")?}),
                 )
             }
         },
