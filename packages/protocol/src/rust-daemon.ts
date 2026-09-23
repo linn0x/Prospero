@@ -65,6 +65,7 @@ accountId?: string | null,
  */
 resume?: ResumeInput | null, };
 export type CreateCrossModelChild = { sourceId: string, routeId: string, revision: number, agent: AgentKind, task: string, title?: string | null, };
+export type FollowUpCrossModelChild = { task: string, };
 export type CrossModelChild = { sessionId: string, parentSessionId: string, task: string, sourceId: string, routeId: string, accountId: string, status: string, result?: string | null, createdAt: number, updatedAt: number, };
 export type ResumeInput = {
 /**

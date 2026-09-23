@@ -82,6 +82,35 @@ pub(crate) struct QueuedRow {
     pub attachments: Vec<crate::agent::AttachmentInput>,
 }
 
+pub(crate) type CrossModelFanIn = (String, Vec<(String, i64)>);
+
+const CROSS_MODEL_REPORT_BYTES: usize = 60_000;
+const CROSS_MODEL_REPORT_CHILDREN: usize = 100;
+// Timeline metadata is capped at 8192 bytes after JSON escaping. Keep enough
+// headroom for quotes/backslashes expanding to two bytes plus the remaining
+// subagent-card fields.
+const CROSS_MODEL_CARD_TASK_BYTES: usize = 3_000;
+const CROSS_MODEL_CARD_SUMMARY_BYTES: usize = 300;
+
+pub(crate) fn truncate_utf8_bytes(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+pub(crate) fn cross_model_card_task(value: &str) -> String {
+    truncate_utf8_bytes(value, CROSS_MODEL_CARD_TASK_BYTES)
+}
+
+pub(crate) fn cross_model_card_summary(value: &str) -> String {
+    truncate_utf8_bytes(value, CROSS_MODEL_CARD_SUMMARY_BYTES)
+}
+
 fn decode_attachments(raw: &str) -> Vec<crate::agent::AttachmentInput> {
     serde_json::from_str(raw).unwrap_or_default()
 }
@@ -150,6 +179,89 @@ impl Store {
         ).optional()?.ok_or(Error::NotFound)
     }
 
+    pub(crate) fn cross_model_child_needs_reactivation(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<bool> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        let current = self.cross_model_child(child_session_id)?;
+        if current.parent_session_id != parent_session_id {
+            return Err(Error::NotFound);
+        }
+        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+            return Err(Error::Conflict);
+        }
+        let head = self.session(child_session_id)?;
+        let run = self.agent_run(child_session_id)?;
+        if head.kind != SessionKind::Structured {
+            return Err(Error::Conflict);
+        }
+        if run.active != (head.lifecycle == SessionLifecycle::Active) {
+            return Err(Error::Conflict);
+        }
+        if !run.active && run.native_id.is_none() {
+            return Err(Error::Conflict);
+        }
+        Ok(!run.active)
+    }
+
+    pub(crate) fn reopen_cross_model_child(
+        &mut self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        task: &str,
+    ) -> Result<(super::CrossModelChild, bool)> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        crate::database::validate_text(task, 65_536, false)?;
+        let current = self.cross_model_child(child_session_id)?;
+        if current.parent_session_id != parent_session_id {
+            return Err(Error::NotFound);
+        }
+        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+            return Err(Error::Conflict);
+        }
+        let head = self.session(child_session_id)?;
+        let run = self.agent_run(child_session_id)?;
+        if head.kind != SessionKind::Structured
+            || run.active != (head.lifecycle == SessionLifecycle::Active)
+            || (!run.active && run.native_id.is_none())
+        {
+            return Err(Error::Conflict);
+        }
+        let reactivated = !run.active;
+        if reactivated {
+            self.update_session_with(
+                child_session_id,
+                UpdateSession {
+                    revision: head.revision,
+                    title: None,
+                    lifecycle: Some(SessionLifecycle::Active),
+                    status: Some(SessionStatus::Idle),
+                },
+                |transaction| {
+                    transaction.execute(
+                        "UPDATE agent_runs SET active=1 WHERE session_id=?",
+                        [child_session_id],
+                    )?;
+                    transaction.execute(
+                        "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
+                        params![task, run.turn + 1, crate::database::now(), child_session_id],
+                    )?;
+                    Ok(())
+                },
+            )?;
+        } else {
+            self.connection.execute(
+                "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
+                params![task, run.turn + 1, crate::database::now(), child_session_id],
+            )?;
+        }
+        Ok((self.cross_model_child(child_session_id)?, reactivated))
+    }
+
     /// Cross-model children are independently persisted sessions.  A daemon
     /// restart or an adapter edge case must not leave a completed provider
     /// turn stuck forever as `starting`, so the runtime periodically queries
@@ -181,9 +293,13 @@ impl Store {
     pub(crate) fn complete_cross_model_child(
         &mut self,
         child_session_id: &str,
+        task_turn: i64,
         status: &str,
         result: Option<&str>,
     ) -> Result<super::CrossModelChild> {
+        if task_turn <= 0 {
+            return Err(Error::Invalid("跨模型子任务轮次无效".into()));
+        }
         if !matches!(status, "completed" | "failed" | "stopped") {
             return Err(Error::Invalid("跨模型子任务状态无效".into()));
         }
@@ -197,13 +313,19 @@ impl Store {
             }
         }
         let current = self.cross_model_child(child_session_id)?;
+        if self.cross_model_child_task_turn(child_session_id)? != task_turn {
+            return Err(Error::Conflict);
+        }
         if matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
             return Ok(current);
         }
-        self.connection.execute(
-            "UPDATE cross_model_children SET status=?1,result=?2,updated_at=?3 WHERE child_session_id=?4",
-            params![status,result,crate::database::now(),child_session_id],
+        let updated = self.connection.execute(
+            "UPDATE cross_model_children SET status=?1,result=?2,updated_at=?3 WHERE child_session_id=?4 AND task_turn=?5 AND status IN ('starting','running')",
+            params![status,result,crate::database::now(),child_session_id,task_turn],
         )?;
+        if updated != 1 {
+            return Err(Error::Conflict);
+        }
         self.cross_model_child(child_session_id)
     }
 
@@ -213,10 +335,22 @@ impl Store {
     ) -> Result<Option<String>> {
         crate::database::validate_id(child_session_id)?;
         let text = self.connection.query_row(
-            "SELECT preview FROM timeline_records WHERE session_id=?1 AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position DESC LIMIT 1",
+            "SELECT preview FROM timeline_records WHERE session_id=?1 AND turn_id='turn' || (SELECT task_turn FROM cross_model_children WHERE child_session_id=?1) AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position DESC LIMIT 1",
             [child_session_id], |row| row.get::<_, String>(0),
         ).optional()?;
         Ok(text)
+    }
+
+    pub(crate) fn cross_model_child_task_turn(&self, child_session_id: &str) -> Result<i64> {
+        crate::database::validate_id(child_session_id)?;
+        self.connection
+            .query_row(
+                "SELECT task_turn FROM cross_model_children WHERE child_session_id=?",
+                [child_session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::NotFound)
     }
 
     /// Claim an all-terminal child batch exactly once and build the prompt
@@ -224,7 +358,7 @@ impl Store {
     pub(crate) fn claim_cross_model_fan_in(
         &mut self,
         parent_session_id: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<CrossModelFanIn>> {
         crate::database::validate_id(parent_session_id)?;
         let pending: i64 = self.connection.query_row(
             "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND status IN ('starting','running')",
@@ -244,61 +378,107 @@ impl Store {
         let mut rows = Vec::new();
         {
             let mut statement = transaction.prepare(
-                "SELECT status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? ORDER BY created_at,child_session_id",
+                "SELECT child_session_id,task_generation,status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 ORDER BY created_at,child_session_id LIMIT ?2",
             )?;
-            for row in statement.query_map([parent_session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })? {
+            for row in statement.query_map(
+                params![parent_session_id, CROSS_MODEL_REPORT_CHILDREN as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )? {
                 rows.push(row?);
             }
         }
-        let claimed = transaction.execute(
-            "UPDATE cross_model_children SET summary_delivered=1,updated_at=? WHERE parent_session_id=? AND summary_delivered=0",
-            params![crate::database::now(),parent_session_id],
-        )?;
-        if claimed == 0 {
+        if rows.is_empty() {
             transaction.rollback()?;
             return Ok(None);
+        }
+        let claims = rows
+            .iter()
+            .map(|(session_id, generation, ..)| (session_id.clone(), *generation))
+            .collect::<Vec<_>>();
+        for (child_session_id, generation) in &claims {
+            let claimed = transaction.execute(
+                "UPDATE cross_model_children SET summary_delivered=1,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=0",
+                params![crate::database::now(), parent_session_id, child_session_id, generation],
+            )?;
+            if claimed != 1 {
+                transaction.rollback()?;
+                return Ok(None);
+            }
         }
         transaction.commit()?;
         let mut report = String::from(
             "跨模型子 Agent 批次已全部结束。请审核以下结果、解决冲突并继续主任务；不要未经核验直接采纳。\n",
         );
-        for (index, (status, source, route, task, result)) in rows.into_iter().enumerate() {
-            let task = task.chars().take(600).collect::<String>();
-            let result: String = if result.is_empty() {
-                "（没有可用摘要）".into()
-            } else {
-                result.chars().take(4000).collect()
-            };
-            report.push_str(&format!(
-                "\n[子任务 {} · {} · {}/{}]\n任务：{}\n结果：{}\n",
+        let row_count = rows.len();
+        for (index, (session_id, _generation, status, source, route, task, result)) in
+            rows.into_iter().enumerate()
+        {
+            // Share the remaining UTF-8 byte budget fairly across every row
+            // so all claimed children are represented and send() can always
+            // accept the resulting prompt.
+            let remaining_rows = row_count - index;
+            let section_budget = (CROSS_MODEL_REPORT_BYTES - report.len()) / remaining_rows;
+            let prefix = format!(
+                "\n[子任务 {} · {} · {}/{} · 会话 {}]\n任务：",
                 index + 1,
                 status,
                 source,
                 route,
-                task,
-                result
+                session_id,
+            );
+            let separator = "\n结果：";
+            let suffix = "\n";
+            let fixed = prefix.len() + separator.len() + suffix.len();
+            let content_budget = section_budget.saturating_sub(fixed);
+            let task_budget = content_budget.min(1_800).min(content_budget / 3);
+            let task = truncate_utf8_bytes(&task, task_budget);
+            let result = if result.is_empty() {
+                "（没有可用摘要）".to_owned()
+            } else {
+                truncate_utf8_bytes(&result, content_budget.saturating_sub(task.len()))
+            };
+            report.push_str(&prefix);
+            report.push_str(&task);
+            report.push_str(separator);
+            report.push_str(&truncate_utf8_bytes(
+                &result,
+                section_budget
+                    .saturating_sub(prefix.len() + task.len() + separator.len() + suffix.len()),
             ));
+            report.push_str(suffix);
         }
-        Ok(Some(report.chars().take(60_000).collect()))
+        debug_assert!(report.len() <= CROSS_MODEL_REPORT_BYTES);
+        Ok(Some((report, claims)))
     }
 
     /// Undo a fan-in claim when delivery to the parent did not happen.  The
     /// report stays durable and can be retried after a transient daemon or
     /// terminal-host failure.
-    pub(crate) fn release_cross_model_fan_in(&mut self, parent_session_id: &str) -> Result<()> {
+    pub(crate) fn release_cross_model_fan_in(
+        &mut self,
+        parent_session_id: &str,
+        claims: &[(String, i64)],
+    ) -> Result<()> {
         crate::database::validate_id(parent_session_id)?;
-        self.connection.execute(
-            "UPDATE cross_model_children SET summary_delivered=0,updated_at=? WHERE parent_session_id=?",
-            params![crate::database::now(), parent_session_id],
-        )?;
+        let transaction = self.connection.transaction()?;
+        for (child_session_id, generation) in claims {
+            crate::database::validate_id(child_session_id)?;
+            transaction.execute(
+                "UPDATE cross_model_children SET summary_delivered=0,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=1",
+                params![crate::database::now(), parent_session_id, child_session_id, generation],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -900,5 +1080,286 @@ impl Store {
         }
         transaction.commit()?;
         Ok(row)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{AgentKind, CreateSession, SessionKind};
+
+    fn session(store: &mut Store, title: &str) -> String {
+        store
+            .create_session(CreateSession {
+                agent: AgentKind::Codex,
+                kind: SessionKind::Structured,
+                title: title.into(),
+                workspace: "/synthetic".into(),
+            })
+            .unwrap()
+            .id
+    }
+
+    fn active_child_session(store: &mut Store, title: &str) -> String {
+        let id = session(store, title);
+        store
+            .connection
+            .execute(
+                "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id) VALUES(?1,'codex',1,'auto','default',1,'native-child')",
+                [&id],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn completed_cross_model_child_can_be_reopened_for_a_new_fan_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(
+                &child,
+                &parent,
+                "first task",
+                "source-b",
+                "gemini-route",
+                "account-b",
+            )
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("first result"))
+            .unwrap();
+
+        let (first_report, first_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(first_report.contains("first task"));
+        assert!(first_report.contains("first result"));
+        assert!(first_report.contains(&format!("会话 {child}")));
+        assert_eq!(first_claim, vec![(child.clone(), 1)]);
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
+
+        let (reopened, reactivated) = store
+            .reopen_cross_model_child(&parent, &child, "refine the answer")
+            .unwrap();
+        assert!(!reactivated);
+        assert_eq!(reopened.status, "starting");
+        assert_eq!(reopened.task, "refine the answer");
+        assert!(reopened.result.is_none());
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
+
+        store
+            .complete_cross_model_child(&child, 2, "completed", Some("refined result"))
+            .unwrap();
+        let (follow_up_report, follow_up_claim) =
+            store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(!follow_up_report.contains("first task"));
+        assert!(!follow_up_report.contains("first result"));
+        assert!(follow_up_report.contains("refine the answer"));
+        assert!(follow_up_report.contains("refined result"));
+        assert_eq!(follow_up_claim, vec![(child, 2)]);
+    }
+
+    #[test]
+    fn failed_delivery_releases_only_the_claimed_follow_up_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let first = active_child_session(&mut store, "first child");
+        let second = active_child_session(&mut store, "second child");
+        for (child, task) in [(&first, "first task"), (&second, "second task")] {
+            store
+                .register_cross_model_child(child, &parent, task, "source", "route", "account")
+                .unwrap();
+            store
+                .complete_cross_model_child(child, 1, "completed", Some("done"))
+                .unwrap();
+        }
+        let (_, original_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+
+        let _ = store
+            .reopen_cross_model_child(&parent, &first, "follow-up")
+            .unwrap();
+        store
+            .complete_cross_model_child(&first, 2, "completed", Some("new result"))
+            .unwrap();
+        store
+            .release_cross_model_fan_in(&parent, &original_claim)
+            .unwrap();
+
+        let (report, claimed) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(report.contains("second task"));
+        assert!(report.contains("follow-up"));
+        assert_eq!(claimed, vec![(first, 2), (second, 1)]);
+    }
+
+    #[test]
+    fn archived_completed_child_is_reactivated_with_its_native_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "first task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+        store.archive_agent_session(&child, true).unwrap();
+
+        assert!(
+            store
+                .cross_model_child_needs_reactivation(&parent, &child)
+                .unwrap()
+        );
+        let (reopened, reactivated) = store
+            .reopen_cross_model_child(&parent, &child, "continue")
+            .unwrap();
+        assert!(reactivated);
+        assert_eq!(reopened.status, "starting");
+        let head = store.session(&child).unwrap();
+        assert_eq!(head.lifecycle, SessionLifecycle::Active);
+        assert_eq!(head.status, SessionStatus::Idle);
+        let run = store.agent_run(&child).unwrap();
+        assert!(run.active);
+        assert_eq!(run.native_id.as_deref(), Some("native-child"));
+        assert_eq!(run.policy, ApprovalPolicy::Auto);
+    }
+
+    #[test]
+    fn follow_up_summary_never_reuses_a_previous_turn_answer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "first", "source", "route", "account")
+            .unwrap();
+        store
+            .append_agent_records(
+                &child,
+                vec![TimelineWrite {
+                    id: "turn1-answer".into(),
+                    turn_id: "turn1".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::Message {
+                        role: MessageRole::Assistant,
+                        final_answer: true,
+                        attachments: Vec::new(),
+                    },
+                    text: "old answer".into(),
+                    replace: false,
+                    subagent_id: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store.cross_model_child_summary(&child).unwrap().as_deref(),
+            Some("old answer")
+        );
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("old answer"))
+            .unwrap();
+        store
+            .reopen_cross_model_child(&parent, &child, "follow-up")
+            .unwrap();
+        assert_eq!(store.cross_model_child_task_turn(&child).unwrap(), 2);
+        assert_eq!(store.cross_model_child_summary(&child).unwrap(), None);
+    }
+
+    #[test]
+    fn stale_completion_cannot_overwrite_a_new_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "first", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("first"))
+            .unwrap();
+        store
+            .reopen_cross_model_child(&parent, &child, "follow-up")
+            .unwrap();
+        assert!(matches!(
+            store.complete_cross_model_child(&child, 1, "failed", Some("stale")),
+            Err(Error::Conflict)
+        ));
+        let current = store.cross_model_child(&child).unwrap();
+        assert_eq!(current.status, "starting");
+        assert_eq!(current.task, "follow-up");
+    }
+
+    #[test]
+    fn fan_in_stays_within_the_message_byte_limit_and_names_every_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let mut children = Vec::new();
+        for index in 0..20 {
+            let child = active_child_session(&mut store, &format!("child {index}"));
+            store
+                .register_cross_model_child(
+                    &child,
+                    &parent,
+                    &"任务".repeat(10_000),
+                    "source",
+                    "route",
+                    "account",
+                )
+                .unwrap();
+            store
+                .complete_cross_model_child(&child, 1, "completed", Some(&"结果".repeat(10_000)))
+                .unwrap();
+            children.push(child);
+        }
+        let (report, claims) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(report.len() <= CROSS_MODEL_REPORT_BYTES);
+        assert_eq!(claims.len(), children.len());
+        assert!(children.iter().all(|child| report.contains(child)));
+    }
+
+    #[test]
+    fn fan_in_claims_only_the_children_in_each_bounded_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        for index in 0..101 {
+            let child = active_child_session(&mut store, &format!("child {index}"));
+            store
+                .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+                .unwrap();
+            store
+                .complete_cross_model_child(&child, 1, "completed", Some("done"))
+                .unwrap();
+        }
+        let (_, first) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(first.len(), 100);
+        let (_, second) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
+    }
+
+    #[test]
+    fn card_fields_are_utf8_byte_bounded() {
+        assert_eq!(cross_model_card_task(&"中".repeat(8_000)).len(), 3_000);
+        assert_eq!(cross_model_card_summary(&"中".repeat(1_000)).len(), 300);
+        assert!(
+            serde_json::to_vec(&TimelineBody::Subagent {
+                subagent_id: "x".repeat(128),
+                name: "x".repeat(201),
+                role: Some("跨模型子 Agent · YOLO".into()),
+                task: Some(cross_model_card_task(&"\"".repeat(65_536))),
+                status: "completed".into(),
+                can_message: false,
+                summary: cross_model_card_summary(&"\"".repeat(65_536)),
+                created_at: i64::MAX,
+                updated_at: i64::MAX,
+            })
+            .unwrap()
+            .len()
+                <= 8_192
+        );
     }
 }
