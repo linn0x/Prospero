@@ -3,6 +3,7 @@ import {
   canDeliverTerminalInteraction,
   fitTerminalViewport,
   getTerminalEmptyFrameDelay,
+  openTerminalExternalUrl,
   terminalBootstrapCursor,
   terminalClipboardAction,
   terminalInputShouldScrollToBottom,
@@ -114,6 +115,23 @@ describe("terminal clipboard shortcuts", () => {
 
   it("keeps Shift+Insert paste available outside macOS", () => {
     expect(terminalShortcutAction(key({ shiftKey: true, code: "Insert" }), false)).toBe("paste");
+  });
+
+  it("opens normalized external URLs through the native bridge", () => {
+    const openExternal = vi.fn();
+    vi.stubGlobal("window", { prospero: { openExternal } });
+    const event = { preventDefault: vi.fn() } as unknown as MouseEvent;
+
+    try {
+      expect(openTerminalExternalUrl(event, "https://user:pass@example.com/a?token=1#frag")).toBe(true);
+      expect(openExternal).toHaveBeenCalledWith("https://user:pass@example.com/a?token=1#frag");
+      expect(openTerminalExternalUrl(event, "ftp://example.com/file")).toBe(true);
+      expect(openExternal).toHaveBeenCalledWith("ftp://example.com/file");
+      expect(openTerminalExternalUrl(event, "javascript:alert(1)")).toBe(false);
+      expect(openExternal).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

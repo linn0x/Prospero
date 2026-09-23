@@ -29,4 +29,11 @@ describe("Markdown rendering", () => {
     expect(html).not.toContain('href="D:/private/secret.md"');
     expect(html).not.toContain('javascript:');
   });
+  it("strips terminal control bytes before markdown rendering", () => {
+    const html = render('\x1b[31m### 中文标题\x1b[0m\r\n正文\b本\x1b]8;;https://example.test\x1b\\链接\x1b]8;;\x1b\\');
+    expect(html).toContain("<h3>中文标题</h3>");
+    expect(html).toContain("正本");
+    expect(html).toContain("链接");
+    for (const leaked of ["\\u001b", "[31m", "]8;;", "\\u0008"]) expect(html).not.toContain(leaked);
+  });
 });
