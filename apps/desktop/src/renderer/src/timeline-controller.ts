@@ -45,10 +45,12 @@ export class TimelineController {
     this.attemptedQuery = query;
     this.publish({ ...this.state, loading: true, error: undefined, live });
     try {
-      const page = await pageRequest(this.api, controller.signal, id => this.api.readTimeline(this.sessionId, query, id));
+      let page = await pageRequest(this.api, controller.signal, id => this.api.readTimeline(this.sessionId, query, id));
       if (controller.signal.aborted) return;
       this.validate(page.items);
       if (!page.items.length && page.latestPosition > 0 && (query.before !== null || query.after !== null)) { await this.load(latest, true); return; }
+      page = await this.completeBoundaryTurns(page, controller.signal);
+      if (controller.signal.aborted) return;
       this.query = query; this.sequence = page.revision; this.failures = 0; this.loadFailed = false;
       this.publish({ page, loading: false, error: undefined, live });
     } catch { if (!controller.signal.aborted) { this.failures++; this.loadFailed = true; this.publish({ ...this.state, loading: false, error: "无法读取会话记录，请重试" }); } }
@@ -57,6 +59,44 @@ export class TimelineController {
 
   private validate(items: TimelineRecord[]): void {
     if (items.length > 40 || new TextEncoder().encode(JSON.stringify(items)).byteLength > 1024 * 1024) throw new Error("Timeline page exceeds limit");
+  }
+
+  /**
+   * Timeline pages are record-based while the conversation UI is turn-based.
+   * Materialize only the two turns cut by a page boundary so a final answer
+   * can never be separated from its turn_end after reload or navigation.
+   */
+  private async completeBoundaryTurns(page: TimelinePage, signal: AbortSignal): Promise<TimelinePage> {
+    if (!page.items.length) return page;
+    let items = page.items;
+    const firstTurn = items[0]!.turnId;
+    while (items[0]!.position > 1 && items[0]!.turnId === firstTurn) {
+      const older = await pageRequest(this.api, signal, id => this.api.readTimeline(this.sessionId, { before: items[0]!.position, after: null, limit: 40 }, id));
+      if (signal.aborted) return page;
+      this.validate(older.items);
+      const sameTurn = older.items.filter(item => item.turnId === firstTurn);
+      if (!sameTurn.length) break;
+      items = [...sameTurn, ...items];
+      if (sameTurn.length !== older.items.length || older.older === null) break;
+    }
+    const lastTurn = items.at(-1)!.turnId;
+    while (items.at(-1)!.body.kind !== "turn_end" && items.at(-1)!.position < page.latestPosition) {
+      const newer = await pageRequest(this.api, signal, id => this.api.readTimeline(this.sessionId, { before: null, after: items.at(-1)!.position, limit: 40 }, id));
+      if (signal.aborted) return page;
+      this.validate(newer.items);
+      const sameTurn = newer.items.filter(item => item.turnId === lastTurn);
+      if (!sameTurn.length) break;
+      items = [...items, ...sameTurn];
+      if (sameTurn.some(item => item.body.kind === "turn_end") || sameTurn.length !== newer.items.length || newer.newer === null) break;
+    }
+    const first = items[0]?.position ?? 0;
+    const last = items.at(-1)?.position ?? 0;
+    return {
+      ...page,
+      items,
+      older: first > 1 ? first : null,
+      newer: last < page.latestPosition ? last : null,
+    };
   }
 
   private schedule(delay = 500): void {
