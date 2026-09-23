@@ -233,6 +233,42 @@ enum WorkerCommand {
 enum ChildCommand {
     /// List enabled model-source routes that can be targeted by a child.
     Sources,
+    /// List cross-model children for the current or specified parent.
+    List {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long = "pending-result")]
+        pending_result: bool,
+    },
+    /// Inspect one cross-model child.
+    Get {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        child: String,
+    },
+    /// Read the child session's recent timeline events.
+    Logs {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        child: String,
+        #[arg(long, default_value_t = 80)]
+        limit: usize,
+    },
+    /// Read the child session's final result and diffs.
+    Result {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        child: String,
+    },
     /// Start an independent source-bound child and return its session id.
     Start {
         /// Parent structured-session id. Defaults to PROSPERO_SESSION_ID.
@@ -261,6 +297,42 @@ enum ChildCommand {
         child: String,
         #[arg(long)]
         task: String,
+    },
+    /// Add guidance to a currently running cross-model child.
+    Message {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        child: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Stop a currently running cross-model child and fan in a stopped result.
+    Cancel {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        child: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Re-deliver a completed child's result to the parent.
+    Redeliver {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        child: String,
+    },
+    /// Mark a completed child's result as processed by the parent.
+    Ack {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        child: String,
     },
     /// Wake the parent after a delay with a fresh status snapshot of all children.
     Check {
@@ -552,6 +624,30 @@ fn command_request(
         },
         Command::Child { command } => match command {
             ChildCommand::Sources => ("cross_model.child.sources", json!({})),
+            ChildCommand::List {
+                parent,
+                status,
+                pending_result,
+            } => (
+                "cross_model.child.list",
+                json!({"parentSessionId": parent.or(session), "status": status, "pendingResult": pending_result}),
+            ),
+            ChildCommand::Get { parent, child } => (
+                "cross_model.child.get",
+                json!({"parentSessionId": child_parent(parent, session)?, "childSessionId": child}),
+            ),
+            ChildCommand::Logs {
+                parent,
+                child,
+                limit,
+            } => (
+                "cross_model.child.logs",
+                json!({"parentSessionId": child_parent(parent, session)?, "childSessionId": child, "limit": limit}),
+            ),
+            ChildCommand::Result { parent, child } => (
+                "cross_model.child.result",
+                json!({"parentSessionId": child_parent(parent, session)?, "childSessionId": child}),
+            ),
             ChildCommand::Start {
                 parent,
                 source,
@@ -596,6 +692,30 @@ fn command_request(
                     json!({"parentSessionId": parent, "childSessionId": child, "task": require_text(task, "--task")?}),
                 )
             }
+            ChildCommand::Message {
+                parent,
+                child,
+                text,
+            } => (
+                "cross_model.child.message",
+                json!({"parentSessionId": child_parent(parent, session)?, "childSessionId": child, "text": require_text(text, "--text")?}),
+            ),
+            ChildCommand::Cancel {
+                parent,
+                child,
+                reason,
+            } => (
+                "cross_model.child.cancel",
+                json!({"parentSessionId": child_parent(parent, session)?, "childSessionId": child, "reason": reason}),
+            ),
+            ChildCommand::Redeliver { parent, child } => (
+                "cross_model.child.redeliver",
+                json!({"parentSessionId": child_parent(parent, session)?, "childSessionId": child}),
+            ),
+            ChildCommand::Ack { parent, child } => (
+                "cross_model.child.ack",
+                json!({"parentSessionId": child_parent(parent, session)?, "childSessionId": child}),
+            ),
             ChildCommand::Check {
                 parent,
                 after_seconds,
@@ -840,6 +960,15 @@ fn schedule_request(
             "schedule.run",
             json!({"id": id, "operationId": operation_id}),
         ),
+    })
+}
+
+fn child_parent(
+    parent: Option<String>,
+    session: Option<String>,
+) -> prosperod_rs::error::Result<String> {
+    parent.or(session).ok_or_else(|| {
+        prosperod_rs::error::Error::Invalid("缺少 --parent（或 PROSPERO_SESSION_ID）".into())
     })
 }
 
