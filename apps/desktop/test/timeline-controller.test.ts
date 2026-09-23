@@ -3,7 +3,7 @@ import type { EventPage, TimelinePage, TimelineQuery, TimelineRecord } from "@pr
 import { TimelineController, TimelineViewCache, timelineEvent } from "../src/renderer/src/timeline-controller";
 
 function entry(position: number, revision = 1, preview = `Record ${position}`): TimelineRecord {
-  return { id: `record-${position}`, turnId: `turn-${Math.floor(position / 4)}`, position, revision, body: { kind: "message", role: "assistant", finalAnswer: true }, preview, bytes: preview.length, generation: 1, truncated: false };
+  return { id: `record-${position}`, turnId: `turn-${position}`, position, revision, body: { kind: "message", role: "assistant", finalAnswer: true }, preview, bytes: preview.length, generation: 1, truncated: false };
 }
 function page(query: TimelineQuery, total = 100000, revision = 10): TimelinePage {
   const start = query.after !== null ? query.after + 1 : Math.max(1, (query.before ?? total + 1) - 40);
@@ -12,6 +12,9 @@ function page(query: TimelineQuery, total = 100000, revision = 10): TimelinePage
 }
 function changes(nextSeq: number, positions: number[] = [], gap = false): EventPage {
   return { items: positions.map(position => ({ scope: "timeline:session", seq: nextSeq, kind: "timeline.updated", entityId: `record-${position}`, data: { position, revision: 2 } })), nextSeq, latestSeq: nextSeq, floorSeq: gap ? nextSeq - 1 : 0, hasMore: false, resyncRequired: gap };
+}
+function turnEntry(position: number, turnId: string, body: TimelineRecord["body"], preview = ""): TimelineRecord {
+  return { id: `record-${position}`, turnId, position, revision: 1, body, preview, bytes: preview.length, generation: 1, truncated: false };
 }
 afterEach(() => vi.useRealTimers());
 
@@ -30,12 +33,12 @@ describe("paged materialized timelines", () => {
     await controller.older();
     await vi.advanceTimersByTimeAsync(500);
     expect(controller.getSnapshot().page?.items[0]?.position).toBe(99921);
-    expect(api.readTimeline).toHaveBeenCalledTimes(2);
+    expect(api.readTimeline.mock.calls.filter(([, query]) => query.before === null && query.after === null)).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(500);
     expect(controller.getSnapshot().page?.items.find(item => item.position === 99930)?.preview).toBe("Updated");
     expect(api.lookupTimeline.mock.calls[0]?.[1]).toEqual(["record-99930"]);
     expect(controller.getSnapshot().page?.items).toHaveLength(40);
-    expect(api.readTimeline).toHaveBeenCalledTimes(2);
+    expect(api.readTimeline.mock.calls.filter(([, query]) => query.before === null && query.after === null)).toHaveLength(1);
     controller.stop(); expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -78,6 +81,48 @@ describe("paged materialized timelines", () => {
     fail = false; await controller.retry();
     expect(controller.getSnapshot().page?.items[0]?.position).toBe(99921);
     expect(controller.getSnapshot().error).toBeUndefined();
+    controller.stop();
+  });
+
+  it("materializes a complete long turn when the latest page cuts off its final answer", async () => {
+    vi.useFakeTimers();
+    const records = [
+      turnEntry(1, "turn1", { kind: "message", role: "user", finalAnswer: false }, "question"),
+      turnEntry(2, "turn1", { kind: "message", role: "assistant", finalAnswer: true }, "complete answer"),
+      ...Array.from({ length: 94 }, (_, index) => turnEntry(index + 3, "turn1", { kind: "tool", name: "bash", state: "success", summary: "done" }, `tool ${index}`)),
+      turnEntry(97, "turn1", { kind: "turn_end", finish: "completed" }),
+    ];
+    const readTimeline = vi.fn(async (_id: string, query: TimelineQuery): Promise<TimelinePage> => {
+      const eligible = query.after !== null
+        ? records.filter(item => item.position > query.after!).slice(0, query.limit ?? 40)
+        : records.filter(item => item.position < (query.before ?? Number.MAX_SAFE_INTEGER)).slice(-(query.limit ?? 40));
+      return { items: eligible, older: eligible[0]!.position > 1 ? eligible[0]!.position : null, newer: eligible.at(-1)!.position < records.length ? eligible.at(-1)!.position : null, latestPosition: records.length, revision: 10 };
+    });
+    const controller = new TimelineController({ readTimeline, readTimelineChanges: vi.fn(async () => changes(10)), lookupTimeline: vi.fn(), cancelSessionPage: vi.fn(async () => {}) }, "session");
+    controller.start(); await vi.advanceTimersByTimeAsync(0);
+    expect(controller.getSnapshot().page?.items).toHaveLength(97);
+    expect(controller.getSnapshot().page?.items[1]?.preview).toBe("complete answer");
+    expect(readTimeline).toHaveBeenCalledTimes(3);
+    controller.stop();
+  });
+
+  it("materializes a turn longer than the old 2000-record safety cap", async () => {
+    vi.useFakeTimers();
+    const records = [
+      turnEntry(1, "turn1", { kind: "message", role: "assistant", finalAnswer: true }, "very old answer"),
+      ...Array.from({ length: 2_038 }, (_, index) => turnEntry(index + 2, "turn1", { kind: "tool", name: "bash", state: "success", summary: "done" }, `tool ${index}`)),
+      turnEntry(2_040, "turn1", { kind: "turn_end", finish: "completed" }),
+    ];
+    const readTimeline = vi.fn(async (_id: string, query: TimelineQuery): Promise<TimelinePage> => {
+      const eligible = query.after !== null
+        ? records.filter(item => item.position > query.after!).slice(0, query.limit ?? 40)
+        : records.filter(item => item.position < (query.before ?? Number.MAX_SAFE_INTEGER)).slice(-(query.limit ?? 40));
+      return { items: eligible, older: eligible[0]!.position > 1 ? eligible[0]!.position : null, newer: eligible.at(-1)!.position < records.length ? eligible.at(-1)!.position : null, latestPosition: records.length, revision: 10 };
+    });
+    const controller = new TimelineController({ readTimeline, readTimelineChanges: vi.fn(async () => changes(10)), lookupTimeline: vi.fn(), cancelSessionPage: vi.fn(async () => {}) }, "session");
+    controller.start(); await vi.advanceTimersByTimeAsync(0);
+    expect(controller.getSnapshot().page?.items).toHaveLength(2_040);
+    expect(controller.getSnapshot().page?.items[0]?.preview).toBe("very old answer");
     controller.stop();
   });
 });
