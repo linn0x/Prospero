@@ -79,6 +79,8 @@ pub fn typescript() -> String {
         crate::agent::CreateAgentSession::decl(&config),
         crate::agent::CreateCrossModelChild::decl(&config),
         crate::agent::FollowUpCrossModelChild::decl(&config),
+        crate::agent::ScheduleCrossModelCheck::decl(&config),
+        crate::agent::CrossModelCheck::decl(&config),
         crate::agent::CrossModelChild::decl(&config),
         crate::agent::ResumeInput::decl(&config),
         crate::agent::ResumableConversation::decl(&config),

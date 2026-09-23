@@ -83,6 +83,7 @@ pub(crate) struct QueuedRow {
 }
 
 pub(crate) type CrossModelFanIn = (String, Vec<(String, i64)>);
+pub(crate) type ClaimedCrossModelCheck = (super::CrossModelCheck, String);
 
 const CROSS_MODEL_REPORT_BYTES: usize = 60_000;
 const CROSS_MODEL_REPORT_CHILDREN: usize = 100;
@@ -353,8 +354,9 @@ impl Store {
             .ok_or(Error::NotFound)
     }
 
-    /// Claim an all-terminal child batch exactly once and build the prompt
-    /// that wakes its parent for review and integration.
+    /// Claim every newly-terminal child exactly once and build an incremental
+    /// report. Running siblings never block a completed result; the report
+    /// produced for the last terminal child carries the all-finished marker.
     pub(crate) fn claim_cross_model_fan_in(
         &mut self,
         parent_session_id: &str,
@@ -364,11 +366,8 @@ impl Store {
             "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND status IN ('starting','running')",
             [parent_session_id], |row| row.get(0),
         )?;
-        if pending != 0 {
-            return Ok(None);
-        }
         let undelivered: i64 = self.connection.query_row(
-            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0",
+            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND status IN ('completed','failed','stopped')",
             [parent_session_id], |row| row.get(0),
         )?;
         if undelivered == 0 {
@@ -378,7 +377,7 @@ impl Store {
         let mut rows = Vec::new();
         {
             let mut statement = transaction.prepare(
-                "SELECT child_session_id,task_generation,status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 ORDER BY created_at,child_session_id LIMIT ?2",
+                "SELECT child_session_id,task_generation,status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND status IN ('completed','failed','stopped') ORDER BY updated_at,child_session_id LIMIT ?2",
             )?;
             for row in statement.query_map(
                 params![parent_session_id, CROSS_MODEL_REPORT_CHILDREN as i64],
@@ -416,9 +415,20 @@ impl Store {
             }
         }
         transaction.commit()?;
-        let mut report = String::from(
-            "跨模型子 Agent 批次已全部结束。请审核以下结果、解决冲突并继续主任务；不要未经核验直接采纳。\n",
-        );
+        let remaining_terminal = undelivered.saturating_sub(rows.len() as i64);
+        let mut report = if pending == 0 && remaining_terminal == 0 {
+            String::from(
+                "跨模型子 Agent 最终 fan-in：本批所有子任务均已结束。请整合结果并继续主任务；不要未经核验直接采纳。\n",
+            )
+        } else if remaining_terminal > 0 {
+            format!(
+                "跨模型子 Agent 增量 fan-in：以下子任务刚刚结束；另有 {remaining_terminal} 个已结束结果等待下一批投递，{pending} 个子任务仍在运行。你可以先处理这些结果；不要未经核验直接采纳。\n"
+            )
+        } else {
+            format!(
+                "跨模型子 Agent 增量 fan-in：以下子任务刚刚结束，仍有 {pending} 个子任务运行中。你可以先处理这些结果，或继续等待后续 fan-in；不要未经核验直接采纳。\n"
+            )
+        };
         let row_count = rows.len();
         for (index, (session_id, _generation, status, source, route, task, result)) in
             rows.into_iter().enumerate()
@@ -461,6 +471,191 @@ impl Store {
         Ok(Some((report, claims)))
     }
 
+    /// Persist a one-shot parent wakeup. The delay is represented as an
+    /// absolute wall-clock deadline so it survives daemon restarts.
+    pub(crate) fn schedule_cross_model_check(
+        &mut self,
+        parent_session_id: &str,
+        delay_seconds: i64,
+    ) -> Result<super::CrossModelCheck> {
+        crate::database::validate_id(parent_session_id)?;
+        if !(1..=7 * 24 * 60 * 60).contains(&delay_seconds) {
+            return Err(Error::Invalid("检查延时必须在 1 秒到 7 天之间".into()));
+        }
+        self.session(parent_session_id)?;
+        let now = crate::database::now();
+        let due_at = now
+            .checked_add(delay_seconds.saturating_mul(1_000))
+            .ok_or_else(|| Error::Invalid("检查时间无效".into()))?;
+        let id = format!("cross-check-{}", uuid::Uuid::new_v4().simple());
+        self.connection.execute(
+            "INSERT INTO cross_model_checks(id,parent_session_id,due_at,state,claimed_at,created_at,delivered_at) VALUES(?1,?2,?3,'pending',NULL,?4,NULL)",
+            params![id, parent_session_id, due_at, now],
+        )?;
+        Ok(super::CrossModelCheck {
+            id,
+            parent_session_id: parent_session_id.to_owned(),
+            due_at,
+            state: "pending".into(),
+            created_at: now,
+        })
+    }
+
+    /// Claim the next due check, including a claim whose delivery lease
+    /// expired after a daemon crash, and snapshot all current child states.
+    pub(crate) fn claim_due_cross_model_check(
+        &mut self,
+        lease_millis: i64,
+    ) -> Result<Option<ClaimedCrossModelCheck>> {
+        if lease_millis <= 0 {
+            return Err(Error::Invalid("检查租约无效".into()));
+        }
+        let now = crate::database::now();
+        let stale_before = now.saturating_sub(lease_millis);
+        let candidate = self
+            .connection
+            .query_row(
+                "SELECT id,parent_session_id,due_at,state,created_at FROM cross_model_checks \
+                 WHERE (state='pending' AND due_at<=?1) OR (state='claimed' AND claimed_at<=?2) \
+                 ORDER BY due_at,id LIMIT 1",
+                params![now, stale_before],
+                |row| {
+                    Ok(super::CrossModelCheck {
+                        id: row.get(0)?,
+                        parent_session_id: row.get(1)?,
+                        due_at: row.get(2)?,
+                        state: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(mut check) = candidate else {
+            return Ok(None);
+        };
+        let claimed = self.connection.execute(
+            "UPDATE cross_model_checks SET state='claimed',claimed_at=?1 \
+             WHERE id=?2 AND ((state='pending' AND due_at<=?1) OR (state='claimed' AND claimed_at<=?3))",
+            params![now, check.id, stale_before],
+        )?;
+        if claimed != 1 {
+            return Ok(None);
+        }
+        check.state = "claimed".into();
+
+        let (total, starting, running, completed, failed, stopped) = self.connection.query_row(
+            "SELECT count(*), \
+             coalesce(sum(status='starting'),0),coalesce(sum(status='running'),0), \
+             coalesce(sum(status='completed'),0),coalesce(sum(status='failed'),0), \
+             coalesce(sum(status='stopped'),0) \
+             FROM cross_model_children WHERE parent_session_id=?1",
+            [&check.parent_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        let mut rows = Vec::new();
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT child_session_id,task_generation,status,task,coalesce(result,'') \
+                 FROM cross_model_children WHERE parent_session_id=?1 \
+                 ORDER BY updated_at DESC,child_session_id LIMIT ?2",
+            )?;
+            for row in statement.query_map(
+                params![&check.parent_session_id, CROSS_MODEL_REPORT_CHILDREN as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )? {
+                rows.push(row?);
+            }
+        }
+        let mut report = format!(
+            "跨模型子 Agent 定时检查（检查 {}）：共 {} 个；starting {}，running {}，completed {}，failed {}，stopped {}。请根据当前状态继续主任务；仍在运行的子任务无需重复派发。\n",
+            check.id, total, starting, running, completed, failed, stopped,
+        );
+        if rows.is_empty() {
+            report.push_str("当前主会话没有跨模型子 Agent。\n");
+        } else if total > rows.len() as i64 {
+            report.push_str(&format!(
+                "以下仅列出最近更新的 {} 个子任务；汇总数量覆盖全部子任务。\n",
+                rows.len()
+            ));
+        }
+        let row_count = rows.len();
+        for (index, (session_id, generation, status, task, result)) in rows.into_iter().enumerate()
+        {
+            let remaining_rows = row_count - index;
+            let section_budget = (CROSS_MODEL_REPORT_BYTES - report.len()) / remaining_rows;
+            let prefix = format!(
+                "\n[子任务 {} · generation {} · {} · 会话 {}]\n任务：",
+                index + 1,
+                generation,
+                status,
+                session_id
+            );
+            let separator = "\n最近结果：";
+            let suffix = "\n";
+            let fixed = prefix.len() + separator.len() + suffix.len();
+            let content_budget = section_budget.saturating_sub(fixed);
+            let task_budget = content_budget.min(1_800).min(content_budget / 3);
+            let task = truncate_utf8_bytes(&task, task_budget);
+            let result = if result.is_empty() {
+                "（尚无最终结果）".to_owned()
+            } else {
+                truncate_utf8_bytes(&result, content_budget.saturating_sub(task.len()))
+            };
+            report.push_str(&prefix);
+            report.push_str(&task);
+            report.push_str(separator);
+            report.push_str(&truncate_utf8_bytes(
+                &result,
+                section_budget
+                    .saturating_sub(prefix.len() + task.len() + separator.len() + suffix.len()),
+            ));
+            report.push_str(suffix);
+        }
+        debug_assert!(report.len() <= CROSS_MODEL_REPORT_BYTES);
+        Ok(Some((check, report)))
+    }
+
+    pub(crate) fn mark_cross_model_check_delivered(&mut self, id: &str) -> Result<()> {
+        crate::database::validate_id(id)?;
+        let changed = self.connection.execute(
+            "UPDATE cross_model_checks SET state='delivered',delivered_at=?1 WHERE id=?2 AND state='claimed'",
+            params![crate::database::now(), id],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_cross_model_check(&mut self, id: &str) -> Result<()> {
+        crate::database::validate_id(id)?;
+        let changed = self.connection.execute(
+            "UPDATE cross_model_checks SET state='pending',claimed_at=NULL WHERE id=?1 AND state='claimed'",
+            [id],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
     /// Undo a fan-in claim when delivery to the parent did not happen.  The
     /// report stays durable and can be retried after a transient daemon or
     /// terminal-host failure.
@@ -489,8 +684,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT parent_session_id FROM cross_model_children \
              GROUP BY parent_session_id \
-             HAVING sum(status IN ('starting','running'))=0 \
-                AND sum(summary_delivered=0)>0 \
+             HAVING sum(summary_delivered=0 AND status IN ('completed','failed','stopped'))>0 \
              ORDER BY min(created_at),parent_session_id",
         )?;
         statement
@@ -1158,6 +1352,125 @@ mod tests {
         assert!(follow_up_report.contains("refine the answer"));
         assert!(follow_up_report.contains("refined result"));
         assert_eq!(follow_up_claim, vec![(child, 2)]);
+    }
+
+    #[test]
+    fn terminal_child_fans_in_while_a_sibling_is_still_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let first = active_child_session(&mut store, "first child");
+        let second = active_child_session(&mut store, "second child");
+        for child in [&first, &second] {
+            store
+                .register_cross_model_child(child, &parent, "task", "source", "route", "account")
+                .unwrap();
+        }
+        store
+            .complete_cross_model_child(&first, 1, "completed", Some("first result"))
+            .unwrap();
+
+        let (incremental, first_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(incremental.contains("增量 fan-in"));
+        assert!(incremental.contains("仍有 1 个子任务运行中"));
+        assert!(incremental.contains(&first));
+        assert!(!incremental.contains(&second));
+        assert_eq!(first_claim, vec![(first, 1)]);
+
+        store
+            .complete_cross_model_child(&second, 1, "completed", Some("second result"))
+            .unwrap();
+        let (final_report, second_claim) =
+            store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(final_report.contains("最终 fan-in"));
+        assert!(final_report.contains(&second));
+        assert_eq!(second_claim, vec![(second, 1)]);
+    }
+
+    #[test]
+    fn cross_model_checks_claim_reclaim_release_and_deliver() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(
+                &child,
+                &parent,
+                "inspect progress",
+                "source",
+                "route",
+                "account",
+            )
+            .unwrap();
+        let check = store.schedule_cross_model_check(&parent, 1).unwrap();
+        assert!(store.claim_due_cross_model_check(60_000).unwrap().is_none());
+        store
+            .connection
+            .execute(
+                "UPDATE cross_model_checks SET due_at=0 WHERE id=?1",
+                [&check.id],
+            )
+            .unwrap();
+
+        let (claimed, report) = store.claim_due_cross_model_check(60_000).unwrap().unwrap();
+        assert_eq!(claimed.id, check.id);
+        assert!(report.contains("starting 1"));
+        assert!(report.contains(&child));
+        assert!(report.contains("generation 1"));
+        assert!(store.claim_due_cross_model_check(60_000).unwrap().is_none());
+
+        store.release_cross_model_check(&check.id).unwrap();
+        let (retried, _) = store.claim_due_cross_model_check(60_000).unwrap().unwrap();
+        assert_eq!(retried.id, check.id);
+        store
+            .connection
+            .execute(
+                "UPDATE cross_model_checks SET claimed_at=0 WHERE id=?1",
+                [&check.id],
+            )
+            .unwrap();
+        let (reclaimed, _) = store.claim_due_cross_model_check(60_000).unwrap().unwrap();
+        assert_eq!(reclaimed.id, check.id);
+
+        store.mark_cross_model_check_delivered(&check.id).unwrap();
+        assert!(store.claim_due_cross_model_check(60_000).unwrap().is_none());
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM cross_model_checks WHERE id=?1",
+                [&check.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "delivered");
+    }
+
+    #[test]
+    fn schema_27_is_upgraded_with_persistent_cross_model_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(directory.path()).unwrap();
+            store
+                .connection
+                .execute_batch("DROP TABLE cross_model_checks; PRAGMA user_version=27;")
+                .unwrap();
+        }
+        let store = Store::open(directory.path()).unwrap();
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let table: String = store
+            .connection
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name='cross_model_checks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 28);
+        assert_eq!(table, "cross_model_checks");
     }
 
     #[test]

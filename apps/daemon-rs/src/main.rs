@@ -1544,6 +1544,13 @@ async fn serve(
     }
     let shutdown_api = api.clone();
     let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+    let check_agents = api.agents.clone();
+    let check_stopped = stopped.clone();
+    let cross_model_check_task = tokio::spawn(async move {
+        check_agents
+            .run_cross_model_check_worker(check_stopped)
+            .await;
+    });
     let status_bind = if address.ip().is_unspecified() {
         None
     } else {
@@ -1594,6 +1601,7 @@ async fn serve(
     api.plugin_services.stop_all().await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), projection_task).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), cross_model_check_task).await;
     let terminals_stopped = api.terminals.shutdown().await;
     let agents_stopped = api.agents.shutdown().await;
     let _ = std::fs::remove_file(directory.join("connection.json"));
