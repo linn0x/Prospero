@@ -58,6 +58,10 @@ describe("conversation display", () => {
 
   it("only opens links supported by the native external-link bridge", () => {
     expect(externalMarkdownUrl("https://example.com/a")).toBe("https://example.com/a");
-    for (const value of ["javascript:alert(1)", "data:text/html,hello", "file:///C:/secret", "mailto:a@example.com", "/local", ""]) expect(externalMarkdownUrl(value)).toBeUndefined();
+    expect(externalMarkdownUrl("https://user:pass@example.com/a?token=secret#frag")).toBe("https://user:pass@example.com/a?token=secret#frag");
+    expect(externalMarkdownUrl("ftp://example.com/file")).toBe("ftp://example.com/file");
+    expect(externalMarkdownUrl("file:///tmp/report.txt")).toBe("file:///tmp/report.txt");
+    expect(externalMarkdownUrl("mailto:a@example.com")).toBe("mailto:a@example.com");
+    for (const value of ["javascript:alert(1)", "data:text/html,hello", "vbscript:alert(1)", "D:/private/secret.md", "/local", ""]) expect(externalMarkdownUrl(value)).toBeUndefined();
   });
 });

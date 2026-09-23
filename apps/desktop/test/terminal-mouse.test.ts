@@ -15,4 +15,12 @@ describe("local terminal selection", () => {
       preferLocalTerminalSelection(event, true, local, "any"); expect(event.altKey).toBe(false);
     }
   });
+  it("does not force selection while clicking an xterm link", () => {
+    const event = {
+      ...mouse(),
+      composedPath: () => [{ classList: { contains: (value: string) => value === "xterm-cursor-pointer" } }],
+    } as unknown as MouseEvent;
+    preferLocalTerminalSelection(event, true, true, "any");
+    expect(event.altKey).toBe(false);
+  });
 });
