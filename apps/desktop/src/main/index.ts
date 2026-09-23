@@ -8,6 +8,7 @@ import { isAbsolute, resolve } from "node:path";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell, Tray } from "electron";
 import type { MenuItemConstructorOptions, Rectangle } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, SessionPage, SessionPageRequest, WorkflowTemplate } from "../shared/types";
+import { normalizeExternalUrl } from "../shared/external-url";
 import { desktopSettingsPatch } from "../shared/desktop-settings";
 import { accountModelsRequest, accountModelsResult, accountConfigRequest, accountConfigResult } from "../shared/account-features";
 import { windowAppearance } from "../shared/window-appearance";
@@ -1014,10 +1015,9 @@ function installIpc(): void {
   // readText 拿不到 clipboard-read、writeText 拿不到 clipboard-sanitized-write。
   // 顺带修好 OSC 52 —— tmux copy-mode 里 yank、vim 里 "+y 本该同步到系统剪贴板。
   ipcMain.handle("external:open", async (_event, value: unknown) => {
-    // 只放行 http(s)。终端输出里什么都可能出现,file:// 或自定义 scheme 被
-    // 当成链接点开等于把任意本地路径交给 LaunchServices。
-    if (typeof value !== "string" || !/^https?:\/\//i.test(value)) throw new Error("链接无效");
-    await shell.openExternal(value);
+    const url = normalizeExternalUrl(value);
+    if (!url) throw new Error("链接无效");
+    await shell.openExternal(url);
     return { ok: true };
   });
   ipcMain.handle("clipboard:read", () => clipboard.readText());

@@ -7,10 +7,10 @@ import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../shared/terminal-typography";
-import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { SessionInfo } from "../../shared/types";
+import { EXTERNAL_URL_REGEX, normalizeExternalUrl } from "../../shared/external-url";
 import { displayError, isMissingSessionError, isUnrecoverableTerminalError, reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
@@ -219,6 +219,14 @@ export function fitTerminalViewport(
   }
 }
 
+export function openTerminalExternalUrl(event: MouseEvent, uri: string): boolean {
+  event.preventDefault();
+  const url = normalizeExternalUrl(uri);
+  if (!url) return false;
+  void window.prospero.openExternal(url);
+  return true;
+}
+
 export function TerminalPane({ session, fontFamily, fontSize, active = true, localSelection = true, onMissingSession }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean; localSelection?: boolean; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const tRef = useRef(t);
@@ -329,6 +337,10 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       altClickMovesCursor: false,
       rightClickSelectsWord: true,
       scrollOnUserInput: false,
+      linkHandler: {
+        allowNonHttpProtocols: true,
+        activate: openTerminalExternalUrl,
+      },
       theme: {
         background: "#1a1b26", foreground: "#c0caf5", cursor: "#c0caf5",
         cursorAccent: "#1a1b26", selectionBackground: "#283457",
@@ -350,10 +362,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
     serializeRef.current = serialize;
     // URL 可点。在 Electron 里必须显式交给系统浏览器打开 —— 渲染进程的
     // will-navigate 是被拦掉的,直接跳转只会是一个什么都不发生的点击。
-    terminal.loadAddon(new WebLinksAddon((event, uri) => {
-      event.preventDefault();
-      if (/^https?:\/\//i.test(uri)) void window.prospero.openExternal(uri);
-    }));
+    terminal.loadAddon(new WebLinksAddon(openTerminalExternalUrl, { urlRegex: EXTERNAL_URL_REGEX }));
     terminalRef.current = terminal;
     fitRef.current = fit;
     searchRef.current = search;
@@ -390,11 +399,6 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       setSyncing(true);
       restoreReadyRef.current = Promise.resolve();
     }
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
-      terminal.loadAddon(webgl);
-    } catch { /* Canvas renderer remains available. */ }
     if (!cached) {
       fitToHost();
       fitVisibleSoon();

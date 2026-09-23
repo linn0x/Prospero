@@ -13,6 +13,7 @@ import { reportError } from "../state";
 import { externalMarkdownUrl, normalizeMathDelimiters } from "./markdown";
 import { resolveProjectFileReference } from "./file-references";
 import { openProjectFile } from "../project-tools/tool-state";
+import { terminalPlainText } from "../terminal-text";
 import "katex/dist/katex.min.css";
 
 const remarkPlugins = [remarkGfm, remarkMath, remarkGemoji];
@@ -35,7 +36,7 @@ function CodeBlock({ node, children, onError }: Omit<ComponentProps<"pre">, "onE
 
 export const MarkdownContent = memo(function MarkdownContent({ value, onError, projectRoot }: { value: string; onError: (message?: string) => void; projectRoot?: string | undefined }) {
   const { t } = useLocale();
-  const content = useMemo(() => normalizeMathDelimiters(value), [value]);
+  const content = useMemo(() => normalizeMathDelimiters(terminalPlainText(value)), [value]);
   const components = useMemo<Components>(() => {
     const open = (href: string): void => { void window.prospero.openExternal(href).catch((reason: unknown) => onError(reportError(reason))); };
     return {

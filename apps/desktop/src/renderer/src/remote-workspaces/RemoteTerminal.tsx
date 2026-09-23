@@ -2,8 +2,10 @@ import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "reac
 import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../../shared/terminal-typography";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import type { DesktopSettings } from "../../../shared/types";
+import { EXTERNAL_URL_REGEX, normalizeExternalUrl } from "../../../shared/external-url";
 import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
 import { reportError } from "../state";
@@ -14,6 +16,14 @@ import "./remote-workspaces.css";
 
 export type RemoteTerminalSettings = Pick<DesktopSettings, "terminalFontFamily" | "terminalFontSize" | "theme">;
 export type RemoteTerminalHandle = { interrupt(): void; focus(): void };
+
+export function openRemoteTerminalExternalUrl(event: MouseEvent, uri: string): boolean {
+  event.preventDefault();
+  const url = normalizeExternalUrl(uri);
+  if (!url) return false;
+  void window.prospero.openExternal(url);
+  return true;
+}
 
 export function RemoteTerminal({ hostId, sid, connected, settings, label, controlRef }: {
   hostId: string; sid: string; connected: boolean; settings: RemoteTerminalSettings; label?: string; controlRef?: Ref<RemoteTerminalHandle>;
@@ -43,11 +53,13 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
       fontSize: settingsRef.current.terminalFontSize, fontFamily: terminalFontFamilyWithFallbacks(settingsRef.current.terminalFontFamily),
       cursorBlink: !motion.matches, cursorStyle: "bar", lineHeight: TERMINAL_LINE_HEIGHT, letterSpacing: 0, fontWeight: "400", fontWeightBold: "700", minimumContrastRatio: 4.5,
       rightClickSelectsWord: true, macOptionClickForcesSelection: window.prospero.platform === "darwin",
+      linkHandler: { allowNonHttpProtocols: true, activate: openRemoteTerminalExternalUrl },
       theme: remoteTerminalTheme(getComputedStyle(document.documentElement)) });
     terminal.current = term;
     configureRustTerminalUnicode(term);
     const fit = new FitAddon();
     term.loadAddon(fit);
+    term.loadAddon(new WebLinksAddon(openRemoteTerminalExternalUrl, { urlRegex: EXTERNAL_URL_REGEX }));
     term.open(container.current);
     let disposed = false;
     let attached = false;
