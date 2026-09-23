@@ -711,6 +711,29 @@ impl Store {
         })
     }
 
+    pub(crate) fn timeline_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<serde_json::Value>, i64)> {
+        let page = self.timeline(
+            session_id,
+            TimelineQuery {
+                before: None,
+                after: None,
+                limit: Some(limit),
+            },
+        )?;
+        let events = page
+            .items
+            .iter()
+            .filter_map(|record| {
+                timeline_chat_event(record, &|id| self.record_full_text(session_id, id))
+            })
+            .collect();
+        Ok((events, page.revision))
+    }
+
     /// Full persisted text of a timeline record (used by the on-demand
     /// subagent transcript, whose preview may be truncated). Bounded to keep
     /// a single snapshot response small.
@@ -826,7 +849,7 @@ impl Store {
 
 /// Map one persisted timeline record into the legacy chat-event shape the
 /// renderer's subagent detail pane already understands.
-fn subagent_chat_event(
+pub(crate) fn timeline_chat_event(
     record: &TimelineRecord,
     full_text: &dyn Fn(&str) -> Result<String>,
 ) -> Option<serde_json::Value> {
@@ -882,8 +905,37 @@ fn subagent_chat_event(
             "questions": questions,
             "resolved": resolved,
         }),
-        // Cards, turn markers and user prompts don't belong in the detail log.
-        TimelineBody::Subagent { .. } | TimelineBody::TurnEnd { .. } => return None,
+        TimelineBody::TurnEnd { finish, diffs } => json!({
+            "kind": "turn.end",
+            "finish": finish,
+            "diffs": diffs,
+        }),
+        TimelineBody::Subagent {
+            subagent_id,
+            name,
+            role,
+            task,
+            status,
+            can_message,
+            summary,
+            created_at,
+            updated_at,
+        } => json!({
+            "kind": "subagent.updated",
+            "subagent": {
+                "id": subagent_id,
+                "name": name,
+                "role": role,
+                "task": task,
+                "status": status,
+                "canMessage": can_message,
+                "preview": summary,
+                "createdAt": created_at,
+                "updatedAt": updated_at,
+            },
+            "summary": summary,
+            "status": status,
+        }),
     };
     let mut merged = shared;
     if let (Some(base), Some(extra)) = (merged.as_object_mut(), event.as_object()) {
@@ -892,4 +944,14 @@ fn subagent_chat_event(
         }
     }
     Some(merged)
+}
+
+fn subagent_chat_event(
+    record: &TimelineRecord,
+    full_text: &dyn Fn(&str) -> Result<String>,
+) -> Option<serde_json::Value> {
+    match &record.body {
+        TimelineBody::Subagent { .. } | TimelineBody::TurnEnd { .. } => None,
+        _ => timeline_chat_event(record, full_text),
+    }
 }

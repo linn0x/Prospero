@@ -84,9 +84,43 @@ pub struct FollowUpCrossModelChild {
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
+pub struct MessageCrossModelChild {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CancelCrossModelChild {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
 pub struct ScheduleCrossModelCheck {
     #[ts(type = "number")]
     pub delay_seconds: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CrossModelChildQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub pending_result: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CrossModelChildLogsQuery {
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -115,10 +149,47 @@ pub struct CrossModelChild {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    pub summary_delivered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub summary_delivered_at: Option<i64>,
+    pub summary_acknowledged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub summary_acknowledged_at: Option<i64>,
     #[ts(type = "number")]
     pub created_at: i64,
     #[ts(type = "number")]
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CrossModelChildPage {
+    pub items: Vec<CrossModelChild>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CrossModelChildLogs {
+    pub child: CrossModelChild,
+    #[ts(type = "Array<Record<string, unknown>>")]
+    pub events: Vec<serde_json::Value>,
+    #[ts(type = "number")]
+    pub ev_seq: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CrossModelChildResult {
+    pub child: CrossModelChild,
+    pub result: String,
+    pub diffs: Vec<crate::protocol::FileDiff>,
+    pub delivered: bool,
+    pub acknowledged: bool,
 }
 
 fn default_agent_kind() -> crate::protocol::AgentKind {

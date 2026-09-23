@@ -393,6 +393,39 @@ async fn task_delivery_routes_settle_live_dispatches() {
 }
 
 #[tokio::test]
+async fn cross_model_child_management_routes_expose_empty_lists() {
+    let (_directory, api) = fixture().await;
+    let parent = api
+        .database
+        .call(|store| {
+            Ok(store
+                .create_session(CreateSession {
+                    agent: AgentKind::Codex,
+                    kind: SessionKind::Structured,
+                    title: "parent".into(),
+                    workspace: "/synthetic".into(),
+                })?
+                .id)
+        })
+        .await
+        .unwrap();
+
+    let (status, listed) = send(
+        &api,
+        "GET",
+        &format!("/v1/agent-sessions/{parent}/cross-model-children"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["items"], json!([]));
+
+    let (status, all) = send(&api, "GET", "/v1/cross-model-children", None).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["items"], json!([]));
+}
+
+#[tokio::test]
 async fn gates_and_messages_flow_through_the_http_routes() {
     let (_directory, api) = fixture().await;
     let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;

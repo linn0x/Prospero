@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::error::Result;
 
 #[doc(hidden)]
-pub const CODEX_DEVELOPER_INSTRUCTIONS: &str = r#"Prospero cross-model child tool is available in this session. When the user asks to delegate or dispatch work through Prospero, or asks for a child using a named external model/source such as Gemini or DeepSeek, use the shell CLI `prospero child sources` and then `prospero child start`; do not use Codex's internal sub-agent/Task model catalog for that request. Always discover sourceId, routeId, revision, and agent live from `prospero child sources`; require an exact requested source/model match and never hardcode IDs. Start with `prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <complete task>`. To give more work to an existing completed Prospero child, reuse its session with `prospero child follow-up --child <sessionId> --task <complete follow-up>` instead of starting a replacement. To revisit child progress after a delay without blocking this turn, run `prospero child check --after <seconds>`; Prospero persistently schedules a one-shot parent wakeup. PROSPERO_SESSION_ID supplies the parent automatically. Each child is YOLO/auto-approved. Do not send premature stop, summarize-now, or no-more-exploration instructions. End the parent turn after dispatch. Prospero injects each completed child as an incremental fan-in; the last result is marked final, and any scheduled check injects a fresh status snapshot. Continue by synthesizing each report for the user."#;
+pub const CODEX_DEVELOPER_INSTRUCTIONS: &str = r#"Prospero cross-model child tool is available in this session. When the user asks to delegate or dispatch work through Prospero, or asks for a child using a named external model/source such as Gemini or DeepSeek, use the shell CLI `prospero child sources` and then `prospero child start`; do not use Codex's internal sub-agent/Task model catalog for that request. Always discover sourceId, routeId, revision, and agent live from `prospero child sources`; require an exact requested source/model match and never hardcode IDs. Start with `prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <complete task>`. Use `prospero child list`, `prospero child get`, `prospero child logs`, and `prospero child result` to inspect child state and outputs. To guide a running child, use `prospero child message --child <sessionId> --text <guidance>`; if the child already completed, reuse its context with `prospero child follow-up --child <sessionId> --task <complete follow-up>` instead of starting a replacement. To stop a running child, use `prospero child cancel --child <sessionId> --reason <reason>`. To re-deliver a missed result, use `prospero child redeliver --child <sessionId>`; after synthesizing a child result, mark it processed with `prospero child ack --child <sessionId>`. To revisit child progress after a delay without blocking this turn, run `prospero child check --after <seconds>`; Prospero persistently schedules a one-shot parent wakeup. PROSPERO_SESSION_ID supplies the parent automatically. Each child is YOLO/auto-approved. Do not send premature stop, summarize-now, or no-more-exploration instructions. End the parent turn after dispatch. Prospero injects each completed child as an incremental fan-in; the last result is marked final, and any scheduled check injects a fresh status snapshot. Continue by synthesizing each report for the user."#;
 
 pub(crate) const SKILL_NAME: &str = "prospero-cross-model";
 
@@ -31,10 +31,13 @@ Use Prospero's own child-session layer for cross-model delegation.
 
    `PROSPERO_SESSION_ID` supplies the parent session. Only pass `--parent` when explicitly operating for another session. Use the `agent` value returned by `prospero child sources`.
 4. Children always run in YOLO/auto-approval mode. Give each child a complete objective and acceptance criteria. Do not tell it to stop exploring, summarize immediately, or otherwise force an early answer.
-5. The fan-in report includes each child's Prospero session id. When the user asks an existing completed child to continue or refine its work, reuse its context with `prospero child follow-up --child <sessionId> --task <complete follow-up>`. Do not create a replacement session.
-6. If the user asks you to check progress later, run `prospero child check --after <seconds>`. This is a durable one-shot wakeup: end the current turn rather than sleeping or polling.
-7. After all requested children are started, end the current parent turn. Do not poll or use Codex internal Task/sub-agent tools. Prospero injects each completed child as an incremental fan-in and marks the last fan-in final.
-8. When a fan-in or scheduled status report arrives, continue the parent work and synthesize it for the user.
+5. Use `prospero child list`, `prospero child get`, `prospero child logs`, and `prospero child result` to inspect state, recent transcript, full result text, diffs, delivery state, and acknowledgment state.
+6. To guide a running child without starting a new turn, use `prospero child message --child <sessionId> --text <guidance>`. This is for live steering only; if it fails because the child is no longer running, use follow-up instead.
+7. The fan-in report includes each child's Prospero session id. When the user asks an existing completed child to continue or refine its work, reuse its context with `prospero child follow-up --child <sessionId> --task <complete follow-up>`. Do not create a replacement session.
+8. Use `prospero child cancel --child <sessionId> --reason <reason>` to stop a running child; use `prospero child redeliver --child <sessionId>` if the parent appears to have missed a result; after synthesizing a result, use `prospero child ack --child <sessionId>`.
+9. If the user asks you to check progress later, run `prospero child check --after <seconds>`. This is a durable one-shot wakeup: end the current turn rather than sleeping or polling.
+10. After all requested children are started, end the current parent turn. Do not poll or use Codex internal Task/sub-agent tools. Prospero injects each completed child as an incremental fan-in and marks the last fan-in final.
+11. When a fan-in or scheduled status report arrives, continue the parent work and synthesize it for the user.
 
 If no route matches, report the live routes returned by `prospero child sources` and ask the user to choose.
 "#;
@@ -115,6 +118,13 @@ mod tests {
     fn model_contract_exposes_completed_child_follow_up() {
         assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child follow-up --child"));
         assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child check --after"));
+        assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child list"));
+        assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child logs"));
+        assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child result"));
+        assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child message --child"));
+        assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child cancel --child"));
+        assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child redeliver --child"));
+        assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("prospero child ack --child"));
         assert!(CODEX_DEVELOPER_INSTRUCTIONS.contains("incremental fan-in"));
         assert!(SKILL.contains("Prospero session id"));
         assert!(SKILL.contains("Do not create a replacement session"));

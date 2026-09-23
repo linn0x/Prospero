@@ -66,9 +66,16 @@ accountId?: string | null,
 resume?: ResumeInput | null, };
 export type CreateCrossModelChild = { sourceId: string, routeId: string, revision: number, agent: AgentKind, task: string, title?: string | null, };
 export type FollowUpCrossModelChild = { task: string, };
+export type MessageCrossModelChild = { text: string, };
+export type CancelCrossModelChild = { reason?: string | null, };
 export type ScheduleCrossModelCheck = { delaySeconds: number, };
+export type CrossModelChildQuery = { parentSessionId?: string | null, status?: string | null, pendingResult: boolean, };
+export type CrossModelChildLogsQuery = { limit: number | null, };
 export type CrossModelCheck = { id: string, parentSessionId: string, dueAt: number, state: string, createdAt: number, };
-export type CrossModelChild = { sessionId: string, parentSessionId: string, task: string, sourceId: string, routeId: string, accountId: string, status: string, result?: string | null, createdAt: number, updatedAt: number, };
+export type CrossModelChild = { sessionId: string, parentSessionId: string, task: string, sourceId: string, routeId: string, accountId: string, status: string, result?: string | null, summaryDelivered: boolean, summaryDeliveredAt?: number | null, summaryAcknowledged: boolean, summaryAcknowledgedAt?: number | null, createdAt: number, updatedAt: number, };
+export type CrossModelChildPage = { items: Array<CrossModelChild>, };
+export type CrossModelChildLogs = { child: CrossModelChild, events: Array<Record<string, unknown>>, evSeq: number, };
+export type CrossModelChildResult = { child: CrossModelChild, result: string, diffs: Array<FileDiff>, delivered: boolean, acknowledged: boolean, };
 export type ResumeInput = {
 /**
  * Agent-native conversation/session id to attach on the first turn.

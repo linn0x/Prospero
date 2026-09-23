@@ -27,9 +27,10 @@ use tokio::sync::{Semaphore, watch};
 use crate::agent::Agents;
 use crate::agent::{
     AgentCompactRequest, AgentModeSelection, AgentModelSelection, AgentSend,
-    ApprovalPolicySelection, CreateAgentSession, CreateCrossModelChild, FollowUpCrossModelChild,
-    PermissionDecision, PermissionMode, QuestionDecision, ScheduleCrossModelCheck, UsageReport,
-    UsageResult, mode_catalog,
+    ApprovalPolicySelection, CancelCrossModelChild, CreateAgentSession, CreateCrossModelChild,
+    CrossModelChildLogsQuery, CrossModelChildQuery, FollowUpCrossModelChild,
+    MessageCrossModelChild, PermissionDecision, PermissionMode, QuestionDecision,
+    ScheduleCrossModelCheck, UsageReport, UsageResult, mode_catalog,
 };
 use crate::auth::Token;
 use crate::database::Store;
@@ -199,12 +200,44 @@ impl Api {
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
             .route(
+                "/v1/cross-model-children",
+                get(list_all_cross_model_children),
+            )
+            .route(
                 "/v1/agent-sessions/{id}/cross-model-children",
-                post(create_cross_model_child),
+                get(list_cross_model_children).post(create_cross_model_child),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children/{child}",
+                get(get_cross_model_child),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children/{child}/logs",
+                get(cross_model_child_logs),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children/{child}/result",
+                get(cross_model_child_result),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children/{child}/message",
+                post(message_cross_model_child),
             )
             .route(
                 "/v1/agent-sessions/{id}/cross-model-children/{child}/follow-up",
                 post(follow_up_cross_model_child),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children/{child}/cancel",
+                post(cancel_cross_model_child),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children/{child}/redeliver",
+                post(redeliver_cross_model_child),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-children/{child}/ack",
+                post(ack_cross_model_child),
             )
             .route(
                 "/v1/agent-sessions/{id}/cross-model-checks",
@@ -3670,6 +3703,89 @@ async fn create_cross_model_child(
     Ok(Json(child))
 }
 
+async fn list_cross_model_children(
+    State(api): State<Api>,
+    Path(parent_session_id): Path<String>,
+    query: std::result::Result<
+        Query<CrossModelChildQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> std::result::Result<Json<crate::agent::CrossModelChildPage>, ApiError> {
+    let Query(mut query) =
+        query.map_err(|_| Error::Invalid("invalid cross-model child query".into()))?;
+    query.parent_session_id = Some(parent_session_id);
+    Ok(Json(api.agents.list_cross_model_children(query).await?))
+}
+
+async fn list_all_cross_model_children(
+    State(api): State<Api>,
+    query: std::result::Result<
+        Query<CrossModelChildQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> std::result::Result<Json<crate::agent::CrossModelChildPage>, ApiError> {
+    let Query(query) =
+        query.map_err(|_| Error::Invalid("invalid cross-model child query".into()))?;
+    Ok(Json(api.agents.list_cross_model_children(query).await?))
+}
+
+async fn get_cross_model_child(
+    State(api): State<Api>,
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+) -> std::result::Result<Json<crate::agent::CrossModelChild>, ApiError> {
+    Ok(Json(
+        api.agents
+            .cross_model_child(&parent_session_id, &child_session_id)
+            .await?,
+    ))
+}
+
+async fn cross_model_child_logs(
+    State(api): State<Api>,
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+    query: std::result::Result<
+        Query<CrossModelChildLogsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> std::result::Result<Json<crate::agent::CrossModelChildLogs>, ApiError> {
+    let Query(query) =
+        query.map_err(|_| Error::Invalid("invalid cross-model child log query".into()))?;
+    Ok(Json(
+        api.agents
+            .cross_model_child_logs(&parent_session_id, &child_session_id, query)
+            .await?,
+    ))
+}
+
+async fn cross_model_child_result(
+    State(api): State<Api>,
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+) -> std::result::Result<Json<crate::agent::CrossModelChildResult>, ApiError> {
+    Ok(Json(
+        api.agents
+            .cross_model_child_result(&parent_session_id, &child_session_id)
+            .await?,
+    ))
+}
+
+async fn message_cross_model_child(
+    State(api): State<Api>,
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+    body: std::result::Result<
+        Json<MessageCrossModelChild>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> std::result::Result<Json<crate::agent::CrossModelChild>, ApiError> {
+    let Json(input) =
+        body.map_err(|_| Error::Invalid("invalid cross-model child message".into()))?;
+    let child = api
+        .agents
+        .message_cross_model_child(&parent_session_id, &child_session_id, input)
+        .await?;
+    api.publish();
+    Ok(Json(child))
+}
+
 async fn follow_up_cross_model_child(
     State(api): State<Api>,
     Path((parent_session_id, child_session_id)): Path<(String, String)>,
@@ -3683,6 +3799,47 @@ async fn follow_up_cross_model_child(
     let child = api
         .agents
         .follow_up_cross_model_child(&parent_session_id, &child_session_id, input)
+        .await?;
+    api.publish();
+    Ok(Json(child))
+}
+
+async fn cancel_cross_model_child(
+    State(api): State<Api>,
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+    body: std::result::Result<Json<CancelCrossModelChild>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<crate::agent::CrossModelChild>, ApiError> {
+    let input = match body {
+        Ok(Json(input)) => input,
+        Err(_) => CancelCrossModelChild { reason: None },
+    };
+    let child = api
+        .agents
+        .cancel_cross_model_child(&parent_session_id, &child_session_id, input)
+        .await?;
+    api.publish();
+    Ok(Json(child))
+}
+
+async fn redeliver_cross_model_child(
+    State(api): State<Api>,
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+) -> std::result::Result<Json<crate::agent::CrossModelChild>, ApiError> {
+    let child = api
+        .agents
+        .redeliver_cross_model_child(&parent_session_id, &child_session_id)
+        .await?;
+    api.publish();
+    Ok(Json(child))
+}
+
+async fn ack_cross_model_child(
+    State(api): State<Api>,
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+) -> std::result::Result<Json<crate::agent::CrossModelChild>, ApiError> {
+    let child = api
+        .agents
+        .acknowledge_cross_model_child(&parent_session_id, &child_session_id)
         .await?;
     api.publish();
     Ok(Json(child))

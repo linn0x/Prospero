@@ -112,6 +112,31 @@ pub(crate) fn cross_model_card_summary(value: &str) -> String {
     truncate_utf8_bytes(value, CROSS_MODEL_CARD_SUMMARY_BYTES)
 }
 
+fn cross_model_select_columns() -> &'static str {
+    "child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,summary_delivered,summary_delivered_at,summary_acknowledged,summary_acknowledged_at,created_at,updated_at"
+}
+
+fn cross_model_child_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::CrossModelChild> {
+    let summary_delivered: i64 = row.get(8)?;
+    let summary_acknowledged: i64 = row.get(10)?;
+    Ok(super::CrossModelChild {
+        session_id: row.get(0)?,
+        parent_session_id: row.get(1)?,
+        task: row.get(2)?,
+        source_id: row.get(3)?,
+        route_id: row.get(4)?,
+        account_id: row.get(5)?,
+        status: row.get(6)?,
+        result: row.get(7)?,
+        summary_delivered: summary_delivered != 0,
+        summary_delivered_at: row.get(9)?,
+        summary_acknowledged: summary_acknowledged != 0,
+        summary_acknowledged_at: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
 fn decode_attachments(raw: &str) -> Vec<crate::agent::AttachmentInput> {
     serde_json::from_str(raw).unwrap_or_default()
 }
@@ -169,15 +194,65 @@ impl Store {
         child_session_id: &str,
     ) -> Result<super::CrossModelChild> {
         crate::database::validate_id(child_session_id)?;
-        self.connection.query_row(
-            "SELECT child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,created_at,updated_at FROM cross_model_children WHERE child_session_id=?",
-            [child_session_id],
-            |row| Ok(super::CrossModelChild {
-                session_id: row.get(0)?, parent_session_id: row.get(1)?, task: row.get(2)?,
-                source_id: row.get(3)?, route_id: row.get(4)?, account_id: row.get(5)?,
-                status: row.get(6)?, result: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
-            }),
-        ).optional()?.ok_or(Error::NotFound)
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT {} FROM cross_model_children WHERE child_session_id=?",
+                    cross_model_select_columns()
+                ),
+                [child_session_id],
+                cross_model_child_row,
+            )
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    pub(crate) fn list_cross_model_children(
+        &self,
+        parent_session_id: Option<&str>,
+        status: Option<&str>,
+        pending_result: bool,
+    ) -> Result<Vec<super::CrossModelChild>> {
+        if let Some(parent_session_id) = parent_session_id {
+            crate::database::validate_id(parent_session_id)?;
+        }
+        if let Some(status) = status
+            && !matches!(
+                status,
+                "starting" | "running" | "completed" | "failed" | "stopped"
+            )
+        {
+            return Err(Error::Invalid("跨模型子任务状态无效".into()));
+        }
+        let mut conditions = Vec::new();
+        let mut params = Vec::new();
+        if let Some(parent) = parent_session_id {
+            params.push(parent.to_owned());
+            conditions.push(format!("parent_session_id=?{}", params.len()));
+        }
+        if let Some(status) = status {
+            params.push(status.to_owned());
+            conditions.push(format!("status=?{}", params.len()));
+        }
+        if pending_result {
+            conditions.push(
+                "status IN ('completed','failed','stopped') AND summary_delivered=1 AND summary_acknowledged=0".into(),
+            );
+        }
+        let sql = format!(
+            "SELECT {} FROM cross_model_children{} ORDER BY updated_at DESC,child_session_id",
+            cross_model_select_columns(),
+            if conditions.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", conditions.join(" AND "))
+            },
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows =
+            statement.query_map(rusqlite::params_from_iter(params), cross_model_child_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     pub(crate) fn cross_model_child_needs_reactivation(
@@ -248,7 +323,7 @@ impl Store {
                         [child_session_id],
                     )?;
                     transaction.execute(
-                        "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
+                        "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
                         params![task, run.turn + 1, crate::database::now(), child_session_id],
                     )?;
                     Ok(())
@@ -256,7 +331,7 @@ impl Store {
             )?;
         } else {
             self.connection.execute(
-                "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
+                "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
                 params![task, run.turn + 1, crate::database::now(), child_session_id],
             )?;
         }
@@ -270,23 +345,10 @@ impl Store {
     /// state.
     pub(crate) fn unsettled_cross_model_children(&self) -> Result<Vec<super::CrossModelChild>> {
         let mut statement = self.connection.prepare(
-            "SELECT child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,created_at,updated_at \
+            "SELECT child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,summary_delivered,summary_delivered_at,summary_acknowledged,summary_acknowledged_at,created_at,updated_at \
              FROM cross_model_children WHERE status IN ('starting','running') ORDER BY created_at,child_session_id",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok(super::CrossModelChild {
-                session_id: row.get(0)?,
-                parent_session_id: row.get(1)?,
-                task: row.get(2)?,
-                source_id: row.get(3)?,
-                route_id: row.get(4)?,
-                account_id: row.get(5)?,
-                status: row.get(6)?,
-                result: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        })?;
+        let rows = statement.query_map([], cross_model_child_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)
     }
@@ -330,6 +392,21 @@ impl Store {
         self.cross_model_child(child_session_id)
     }
 
+    pub(crate) fn mark_cross_model_child_running(
+        &mut self,
+        child_session_id: &str,
+    ) -> Result<super::CrossModelChild> {
+        crate::database::validate_id(child_session_id)?;
+        let updated = self.connection.execute(
+            "UPDATE cross_model_children SET status='running',updated_at=?1 WHERE child_session_id=?2 AND status='starting'",
+            params![crate::database::now(), child_session_id],
+        )?;
+        if updated > 1 {
+            return Err(Error::Conflict);
+        }
+        self.cross_model_child(child_session_id)
+    }
+
     pub(crate) fn cross_model_child_summary(
         &self,
         child_session_id: &str,
@@ -340,6 +417,44 @@ impl Store {
             [child_session_id], |row| row.get::<_, String>(0),
         ).optional()?;
         Ok(text)
+    }
+
+    pub(crate) fn cross_model_child_result(&self, child_session_id: &str) -> Result<String> {
+        crate::database::validate_id(child_session_id)?;
+        let record_id = self
+            .connection
+            .query_row(
+                "SELECT id FROM timeline_records WHERE session_id=?1 AND turn_id='turn' || (SELECT task_turn FROM cross_model_children WHERE child_session_id=?1) AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position DESC LIMIT 1",
+                [child_session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(record_id) = record_id else {
+            return Ok(String::new());
+        };
+        let page =
+            self.timeline_text(child_session_id, &record_id, TimelineTextQuery::default())?;
+        Ok(super::store::truncate_utf8_bytes(&page.text, 65_536))
+    }
+
+    pub(crate) fn cross_model_child_diffs(&self, child_session_id: &str) -> Result<Vec<FileDiff>> {
+        crate::database::validate_id(child_session_id)?;
+        self.connection
+            .query_row(
+                "SELECT body FROM timeline_records WHERE session_id=?1 AND turn_id='turn' || (SELECT task_turn FROM cross_model_children WHERE child_session_id=?1) AND json_extract(body,'$.kind')='turn_end' ORDER BY position DESC LIMIT 1",
+                [child_session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|body| {
+                let body: TimelineBody = serde_json::from_str(&body)?;
+                match body {
+                    TimelineBody::TurnEnd { diffs, .. } => Ok(diffs),
+                    _ => Ok(Vec::new()),
+                }
+            })
+            .transpose()
+            .map(|value| value.unwrap_or_default())
     }
 
     pub(crate) fn cross_model_child_task_turn(&self, child_session_id: &str) -> Result<i64> {
@@ -406,7 +521,7 @@ impl Store {
             .collect::<Vec<_>>();
         for (child_session_id, generation) in &claims {
             let claimed = transaction.execute(
-                "UPDATE cross_model_children SET summary_delivered=1,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=0",
+                "UPDATE cross_model_children SET summary_delivered=1,summary_delivered_at=?1,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=0",
                 params![crate::database::now(), parent_session_id, child_session_id, generation],
             )?;
             if claimed != 1 {
@@ -669,7 +784,7 @@ impl Store {
         for (child_session_id, generation) in claims {
             crate::database::validate_id(child_session_id)?;
             transaction.execute(
-                "UPDATE cross_model_children SET summary_delivered=0,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=1",
+                "UPDATE cross_model_children SET summary_delivered=0,summary_delivered_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=1",
                 params![crate::database::now(), parent_session_id, child_session_id, generation],
             )?;
         }
@@ -691,6 +806,50 @@ impl Store {
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(Error::from)
+    }
+
+    pub(crate) fn acknowledge_cross_model_child(
+        &mut self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<super::CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        let current = self.cross_model_child(child_session_id)?;
+        if current.parent_session_id != parent_session_id {
+            return Err(Error::NotFound);
+        }
+        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+            return Err(Error::Conflict);
+        }
+        let now = crate::database::now();
+        self.connection.execute(
+            "UPDATE cross_model_children SET summary_acknowledged=1,summary_acknowledged_at=?1,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3",
+            params![now, parent_session_id, child_session_id],
+        )?;
+        self.cross_model_child(child_session_id)
+    }
+
+    pub(crate) fn reset_cross_model_delivery(
+        &mut self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<super::CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        let current = self.cross_model_child(child_session_id)?;
+        if current.parent_session_id != parent_session_id {
+            return Err(Error::NotFound);
+        }
+        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+            return Err(Error::Conflict);
+        }
+        let now = crate::database::now();
+        self.connection.execute(
+            "UPDATE cross_model_children SET summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3",
+            params![now, parent_session_id, child_session_id],
+        )?;
+        self.cross_model_child(child_session_id)
     }
 
     pub fn create_agent_session(
@@ -1388,6 +1547,134 @@ mod tests {
     }
 
     #[test]
+    fn cross_model_child_delivery_can_be_acknowledged_and_redelivered() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+
+        let listed = store
+            .list_cross_model_children(Some(&parent), Some("completed"), false)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].summary_delivered);
+        let (_report, claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        let delivered = store.cross_model_child(&child).unwrap();
+        assert!(delivered.summary_delivered);
+        assert!(delivered.summary_delivered_at.is_some());
+        assert!(!delivered.summary_acknowledged);
+        assert_eq!(
+            store
+                .list_cross_model_children(Some(&parent), None, true)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let acknowledged = store
+            .acknowledge_cross_model_child(&parent, &child)
+            .unwrap();
+        assert!(acknowledged.summary_acknowledged);
+        assert!(acknowledged.summary_acknowledged_at.is_some());
+        assert_eq!(
+            store
+                .list_cross_model_children(Some(&parent), None, true)
+                .unwrap()
+                .len(),
+            0
+        );
+
+        store.reset_cross_model_delivery(&parent, &child).unwrap();
+        let redeliverable = store.cross_model_child(&child).unwrap();
+        assert!(!redeliverable.summary_delivered);
+        assert!(!redeliverable.summary_acknowledged);
+        let (_again, again_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(claim, again_claim);
+    }
+
+    #[test]
+    fn cross_model_child_result_reads_final_answer_and_diffs() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .append_agent_records(
+                &child,
+                vec![
+                    TimelineWrite {
+                        id: "turn1-user".into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::User,
+                            final_answer: false,
+                            attachments: Vec::new(),
+                        },
+                        text: "task".into(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                    TimelineWrite {
+                        id: "turn1-final".into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::Assistant,
+                            final_answer: true,
+                            attachments: Vec::new(),
+                        },
+                        text: "full final result".into(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                    TimelineWrite {
+                        id: "turn1-end".into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::TurnEnd {
+                            finish: "completed".into(),
+                            diffs: vec![FileDiff {
+                                path: "apps/daemon-rs/src/agent/store.rs".into(),
+                                patch: "@@ test".into(),
+                                additions: 1,
+                                deletions: 0,
+                                truncated: false,
+                            }],
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("preview result"))
+            .unwrap();
+
+        assert_eq!(
+            store.cross_model_child_result(&child).unwrap(),
+            "full final result"
+        );
+        let diffs = store.cross_model_child_diffs(&child).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "apps/daemon-rs/src/agent/store.rs");
+        let (events, _) = store.timeline_events(&child, 20).unwrap();
+        assert!(events.iter().any(|event| event["kind"] == "assistant.text"));
+        assert!(events.iter().any(|event| event["kind"] == "turn.end"));
+    }
+
+    #[test]
     fn cross_model_checks_claim_reclaim_release_and_deliver() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(directory.path()).unwrap();
@@ -1447,13 +1734,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_27_is_upgraded_with_persistent_cross_model_checks() {
+    fn schema_28_is_upgraded_with_cross_model_ack_columns() {
         let directory = tempfile::tempdir().unwrap();
         {
             let store = Store::open(directory.path()).unwrap();
             store
                 .connection
-                .execute_batch("DROP TABLE cross_model_checks; PRAGMA user_version=27;")
+                .execute_batch("ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; PRAGMA user_version=28;")
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
@@ -1461,16 +1748,16 @@ mod tests {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        let table: String = store
+        let columns: i64 = store
             .connection
             .query_row(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name='cross_model_checks'",
+                "SELECT count(*) FROM pragma_table_info('cross_model_children') WHERE name IN ('summary_delivered_at','summary_acknowledged','summary_acknowledged_at')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 28);
-        assert_eq!(table, "cross_model_checks");
+        assert_eq!(version, 29);
+        assert_eq!(columns, 3);
     }
 
     #[test]
@@ -1503,7 +1790,11 @@ mod tests {
         let (report, claimed) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
         assert!(report.contains("second task"));
         assert!(report.contains("follow-up"));
-        assert_eq!(claimed, vec![(first, 2), (second, 1)]);
+        let mut claimed = claimed;
+        claimed.sort();
+        let mut expected = vec![(first, 2), (second, 1)];
+        expected.sort();
+        assert_eq!(claimed, expected);
     }
 
     #[test]
