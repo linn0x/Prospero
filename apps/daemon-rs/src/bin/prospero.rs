@@ -262,6 +262,15 @@ enum ChildCommand {
         #[arg(long)]
         task: String,
     },
+    /// Wake the parent after a delay with a fresh status snapshot of all children.
+    Check {
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Delay in seconds before Prospero wakes and checks the children.
+        #[arg(long = "after")]
+        after_seconds: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -585,6 +594,25 @@ fn command_request(
                 (
                     "cross_model.child.follow_up",
                     json!({"parentSessionId": parent, "childSessionId": child, "task": require_text(task, "--task")?}),
+                )
+            }
+            ChildCommand::Check {
+                parent,
+                after_seconds,
+            } => {
+                let parent = parent.or(session).ok_or_else(|| {
+                    prosperod_rs::error::Error::Invalid(
+                        "缺少 --parent（或 PROSPERO_SESSION_ID）".into(),
+                    )
+                })?;
+                if !(1..=7 * 24 * 60 * 60).contains(&after_seconds) {
+                    return Err(prosperod_rs::error::Error::Invalid(
+                        "--after 必须在 1 秒到 7 天之间".into(),
+                    ));
+                }
+                (
+                    "cross_model.child.check",
+                    json!({"parentSessionId": parent, "delaySeconds": after_seconds}),
                 )
             }
         },
