@@ -180,6 +180,33 @@ fn cli_notify_configures_and_clears_endpoint() {
 }
 
 #[test]
+fn child_cli_help_exposes_management_commands() {
+    let home = tempfile::TempDir::new().unwrap();
+    let output = run_at(
+        env!("CARGO_BIN_EXE_prospero"),
+        home.path(),
+        &["child", "--help"],
+    );
+    assert!(output.status.success(), "{}", text(&output));
+    let body = text(&output);
+    for command in [
+        "list",
+        "get",
+        "logs",
+        "result",
+        "message",
+        "cancel",
+        "redeliver",
+        "ack",
+    ] {
+        assert!(
+            body.contains(command),
+            "missing child command {command}: {body}"
+        );
+    }
+}
+
+#[test]
 fn cli_plugin_and_schedule_commands_use_running_rust_daemon() {
     let home = tempfile::TempDir::new().unwrap();
     let codex_home = home.path().join("codex-home");

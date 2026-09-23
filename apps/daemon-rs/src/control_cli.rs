@@ -280,8 +280,83 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                     Some(routes)
                 }).flatten().collect::<Vec<_>>();
             Ok(
-                json!({"items":items,"hint":"Start: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Recheck later: prospero child check --after <seconds>. Children always use YOLO auto-approval."}),
+                json!({"items":items,"hint":"Start: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. Inspect: prospero child list|get|logs|result. Guide a running child: prospero child message --child <sessionId> --text <text>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Stop: prospero child cancel --child <sessionId>. Re-deliver: prospero child redeliver --child <sessionId>. Mark processed: prospero child ack --child <sessionId>. Recheck later: prospero child check --after <seconds>. Children always use YOLO auto-approval."}),
             )
+        }
+        "cross_model.child.list" => {
+            let parent = optional_text(&params, "parentSessionId");
+            let status = optional_text(&params, "status");
+            let mut query = Vec::new();
+            if let Some(status) = status {
+                query.push(format!("status={}", query_component(&status)));
+            }
+            if params
+                .get("pendingResult")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                query.push("pendingResult=true".into());
+            }
+            let path = if let Some(parent) = parent {
+                format!(
+                    "/v1/agent-sessions/{}/cross-model-children{}",
+                    path_component(&parent),
+                    if query.is_empty() {
+                        String::new()
+                    } else {
+                        format!("?{}", query.join("&"))
+                    },
+                )
+            } else {
+                format!(
+                    "/v1/cross-model-children{}",
+                    if query.is_empty() {
+                        String::new()
+                    } else {
+                        format!("?{}", query.join("&"))
+                    },
+                )
+            };
+            client.get(&path).await
+        }
+        "cross_model.child.get" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            client
+                .get(&format!(
+                    "/v1/agent-sessions/{}/cross-model-children/{}",
+                    path_component(&parent),
+                    path_component(&child),
+                ))
+                .await
+        }
+        "cross_model.child.logs" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_i64)
+                .filter(|value| (1..=100).contains(value))
+                .unwrap_or(80);
+            client
+                .get(&format!(
+                    "/v1/agent-sessions/{}/cross-model-children/{}/logs?limit={}",
+                    path_component(&parent),
+                    path_component(&child),
+                    limit,
+                ))
+                .await
+        }
+        "cross_model.child.result" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            client
+                .get(&format!(
+                    "/v1/agent-sessions/{}/cross-model-children/{}/result",
+                    path_component(&parent),
+                    path_component(&child),
+                ))
+                .await
         }
         "cross_model.child.start" => {
             let parent = required_id(&params, "parentSessionId")?;
@@ -308,6 +383,63 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                         path_component(&child),
                     ),
                     json!({"task":task}),
+                )
+                .await
+        }
+        "cross_model.child.message" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            let text = required_text(&params, "text")?;
+            client
+                .post(
+                    &format!(
+                        "/v1/agent-sessions/{}/cross-model-children/{}/message",
+                        path_component(&parent),
+                        path_component(&child),
+                    ),
+                    json!({"text":text}),
+                )
+                .await
+        }
+        "cross_model.child.cancel" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            client
+                .post(
+                    &format!(
+                        "/v1/agent-sessions/{}/cross-model-children/{}/cancel",
+                        path_component(&parent),
+                        path_component(&child),
+                    ),
+                    strip_empty(json!({"reason": optional_text(&params, "reason")}), &[]),
+                )
+                .await
+        }
+        "cross_model.child.redeliver" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            client
+                .post(
+                    &format!(
+                        "/v1/agent-sessions/{}/cross-model-children/{}/redeliver",
+                        path_component(&parent),
+                        path_component(&child),
+                    ),
+                    json!({}),
+                )
+                .await
+        }
+        "cross_model.child.ack" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let child = required_id(&params, "childSessionId")?;
+            client
+                .post(
+                    &format!(
+                        "/v1/agent-sessions/{}/cross-model-children/{}/ack",
+                        path_component(&parent),
+                        path_component(&child),
+                    ),
+                    json!({}),
                 )
                 .await
         }

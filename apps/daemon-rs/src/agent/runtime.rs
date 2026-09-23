@@ -972,8 +972,41 @@ impl Agents {
         };
         self.write_cross_model_card(&child, "starting", String::new())
             .await?;
-        self.send(&head.id, input.task, None, Vec::new()).await?;
-        Ok(child)
+        match self.send(&head.id, input.task, None, Vec::new()).await {
+            Ok(()) => {
+                let running = {
+                    let child_id = head.id.clone();
+                    self.0
+                        .database
+                        .call(move |store| store.mark_cross_model_child_running(&child_id))
+                        .await?
+                };
+                self.write_cross_model_card(&running, "running", String::new())
+                    .await?;
+                Ok(running)
+            }
+            Err(error) => {
+                let failed = {
+                    let child_id = head.id.clone();
+                    let message = error.to_string();
+                    self.0
+                        .database
+                        .call(move |store| {
+                            store.complete_cross_model_child(&child_id, 1, "failed", Some(&message))
+                        })
+                        .await
+                };
+                if let Ok(failed) = failed {
+                    let _ = self
+                        .write_cross_model_card(&failed, "failed", bounded_text(error.to_string()))
+                        .await;
+                    let _ = self
+                        .deliver_pending_cross_model_fan_in(&failed.parent_session_id)
+                        .await;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Reuse a completed cross-model child session for another turn. The
@@ -1054,6 +1087,15 @@ impl Agents {
             self.write_cross_model_card(&child, "starting", String::new())
                 .await?;
             self.send(child_session_id, input.task, None, Vec::new())
+                .await?;
+            let running = {
+                let child_id = child_session_id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| store.mark_cross_model_child_running(&child_id))
+                    .await?
+            };
+            self.write_cross_model_card(&running, "running", String::new())
                 .await
         }
         .await;
@@ -1080,6 +1122,246 @@ impl Agents {
         Ok(child)
     }
 
+    async fn cross_model_child_for_parent(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        self.0
+            .database
+            .call(move |store| {
+                let child = store.cross_model_child(&child_id)?;
+                if child.parent_session_id != parent_id {
+                    return Err(Error::NotFound);
+                }
+                Ok(child)
+            })
+            .await
+    }
+
+    pub async fn list_cross_model_children(
+        &self,
+        query: CrossModelChildQuery,
+    ) -> Result<CrossModelChildPage> {
+        let parent = query.parent_session_id;
+        let status = query.status;
+        let pending_result = query.pending_result;
+        let items = self
+            .0
+            .database
+            .call(move |store| {
+                store.list_cross_model_children(
+                    parent.as_deref(),
+                    status.as_deref(),
+                    pending_result,
+                )
+            })
+            .await?;
+        Ok(CrossModelChildPage { items })
+    }
+
+    pub async fn cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        self.cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await
+    }
+
+    pub async fn cross_model_child_logs(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        query: CrossModelChildLogsQuery,
+    ) -> Result<CrossModelChildLogs> {
+        let limit = query.limit.unwrap_or(80);
+        if !(1..=100).contains(&limit) {
+            return Err(Error::Invalid("日志条数必须在 1 到 100 之间".into()));
+        }
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let (child, events, ev_seq) = self
+            .0
+            .database
+            .call(move |store| {
+                let child = store.cross_model_child(&child_id)?;
+                if child.parent_session_id != parent_id {
+                    return Err(Error::NotFound);
+                }
+                let (events, ev_seq) = store.timeline_events(&child_id, limit)?;
+                Ok((child, events, ev_seq))
+            })
+            .await?;
+        Ok(CrossModelChildLogs {
+            child,
+            events,
+            ev_seq,
+        })
+    }
+
+    pub async fn cross_model_child_result(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChildResult> {
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let (child, full_result, diffs) = self
+            .0
+            .database
+            .call(move |store| {
+                let child = store.cross_model_child(&child_id)?;
+                if child.parent_session_id != parent_id {
+                    return Err(Error::NotFound);
+                }
+                let full_result = store.cross_model_child_result(&child_id)?;
+                let diffs = store.cross_model_child_diffs(&child_id)?;
+                Ok((child, full_result, diffs))
+            })
+            .await?;
+        let delivered = child.summary_delivered;
+        let acknowledged = child.summary_acknowledged;
+        let result = if full_result.trim().is_empty() {
+            child.result.clone().unwrap_or_default()
+        } else {
+            full_result
+        };
+        Ok(CrossModelChildResult {
+            child,
+            result,
+            diffs,
+            delivered,
+            acknowledged,
+        })
+    }
+
+    pub async fn message_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        input: MessageCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_text(&input.text, 65_536, false)?;
+        let child = self
+            .cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await?;
+        if !matches!(child.status.as_str(), "starting" | "running") {
+            return Err(Error::Conflict);
+        }
+        let entry = self.session_entry(child_session_id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::Conflict)?;
+        if !handle.steerable.load(Ordering::Acquire) {
+            return Err(Error::Conflict);
+        }
+        let workspace = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| Ok(store.session(&child_id)?.workspace))
+                .await?
+        };
+        let expanded = self.expand_prompt(&workspace, &input.text).await?;
+        handle.driver.lock().await.steer(&expanded, &[]).await?;
+        drop(guard);
+        self.record_steer(child_session_id, &input.text, &[])
+            .await?;
+        let running = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.mark_cross_model_child_running(&child_id))
+                .await?
+        };
+        self.write_cross_model_card(&running, "running", "已向子 Agent 追加要求。".into())
+            .await?;
+        self.publish();
+        Ok(running)
+    }
+
+    pub async fn cancel_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        input: CancelCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        let child = self
+            .cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await?;
+        if matches!(child.status.as_str(), "completed" | "failed" | "stopped") {
+            return Ok(child);
+        }
+        let task_turn = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.cross_model_child_task_turn(&child_id))
+                .await?
+        };
+        let reason = input
+            .reason
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "子任务已被主会话停止。".into());
+        crate::database::validate_text(&reason, 65_536, false)?;
+        let stopped = {
+            let child_id = child_session_id.to_owned();
+            let reason = reason.clone();
+            self.0
+                .database
+                .call(move |store| {
+                    store.complete_cross_model_child(&child_id, task_turn, "stopped", Some(&reason))
+                })
+                .await?
+        };
+        let _ = self.close(child_session_id).await;
+        self.write_cross_model_card(&stopped, "stopped", bounded_text(reason))
+            .await?;
+        self.deliver_pending_cross_model_fan_in(parent_session_id)
+            .await?;
+        Ok(stopped)
+    }
+
+    pub async fn acknowledge_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let child = self
+            .0
+            .database
+            .call(move |store| store.acknowledge_cross_model_child(&parent_id, &child_id))
+            .await?;
+        self.publish();
+        Ok(child)
+    }
+
+    pub async fn redeliver_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.reset_cross_model_delivery(&parent_id, &child_id))
+            .await?;
+        self.deliver_pending_cross_model_fan_in(parent_session_id)
+            .await?;
+        let child = self
+            .cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await?;
+        self.publish();
+        Ok(child)
+    }
+
     async fn write_cross_model_card(
         &self,
         child: &CrossModelChild,
@@ -1093,6 +1375,7 @@ impl Agents {
         let source = format!("{} / {}", child.source_id, child.route_id);
         let created_at = child.created_at;
         let status = status.to_owned();
+        let can_message = matches!(status.as_str(), "starting" | "running");
         self.0
             .database
             .call(move |store| {
@@ -1112,7 +1395,7 @@ impl Agents {
                             role: Some("跨模型子 Agent · YOLO".into()),
                             task: Some(task),
                             status,
-                            can_message: false,
+                            can_message,
                             summary: super::store::cross_model_card_summary(&summary),
                             created_at,
                             updated_at: crate::database::now(),
@@ -2176,15 +2459,16 @@ impl Agents {
                     .await
             };
             if let Ok(completed) = completed {
+                let card_status = completed.status.clone();
                 let summary = completed.result.clone().unwrap_or_else(|| {
-                    if state == "completed" {
+                    if card_status == "completed" {
                         "子任务已完成，没有可回传的文本摘要。".into()
                     } else {
                         "子任务未完成。".into()
                     }
                 });
                 let _ = self
-                    .write_cross_model_card(&completed, state, bounded_text(summary))
+                    .write_cross_model_card(&completed, &card_status, bounded_text(summary))
                     .await;
                 // Structured parents are queued/resumed through Agents;
                 // hosted CLI parents receive identical text as PTY input.
