@@ -1510,6 +1510,12 @@ async fn serve(
     if recovered_agents > 0 {
         api.publish();
     }
+    // Crash recovery archives runs that were still executing. Reconcile a
+    // second time so their current cross-model generation becomes a terminal
+    // failure instead of remaining in `starting` forever.
+    if api.agents.reconcile_cross_model_children().await? > 0 {
+        api.publish();
+    }
     api.schedules.start().await;
     api.plugin_services.start_auto().await;
     let running_automations = database

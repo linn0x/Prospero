@@ -804,7 +804,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 27);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -1022,7 +1022,7 @@ fn imports_legacy_orchestration_sqlite_and_recovers_paused_work() {
 }
 
 #[test]
-fn v8_database_is_migrated_forward_to_v23() {
+fn v8_database_is_migrated_forward_to_current_schema() {
     // Build a v8 database by initialising the pre-orchestration schema with the
     // legacy application id, then prove Store::open upgrades it in place.
     let directory = TempDir::new().unwrap();
@@ -1042,13 +1042,13 @@ fn v8_database_is_migrated_forward_to_v23() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 27);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
 
 #[test]
-fn v9_database_is_migrated_forward_to_v23() {
+fn v9_database_is_migrated_forward_to_current_schema() {
     // A v9 database (Stage 7 current schema) gains the v10 worktree table and
     // dispatch column without losing rows.
     let directory = TempDir::new().unwrap();
@@ -1072,7 +1072,7 @@ fn v9_database_is_migrated_forward_to_v23() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        23
+        27
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -1090,7 +1090,7 @@ fn v9_database_is_migrated_forward_to_v23() {
 }
 
 #[test]
-fn v10_database_is_migrated_forward_to_v23() {
+fn v10_database_is_migrated_forward_to_current_schema() {
     // A v10 database gains agent_runs.permission_mode with the default mode.
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("prospero.sqlite");
@@ -1131,7 +1131,7 @@ fn v10_database_is_migrated_forward_to_v23() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        23
+        27
     );
     let mode: String = connection
         .query_row(
@@ -1146,7 +1146,7 @@ fn v10_database_is_migrated_forward_to_v23() {
 }
 
 #[test]
-fn v11_database_is_migrated_forward_to_v23() {
+fn v11_database_is_migrated_forward_to_current_schema() {
     // A v11 database gains the subagent registry table and the timeline
     // subagent_id column without losing the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1191,7 +1191,7 @@ fn v11_database_is_migrated_forward_to_v23() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        23
+        27
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1240,7 +1240,7 @@ fn v11_database_is_migrated_forward_to_v23() {
 }
 
 #[test]
-fn v12_database_is_migrated_forward_to_v23() {
+fn v12_database_is_migrated_forward_to_current_schema() {
     // A v12 database gains the busy-turn message-queue table without losing
     // the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1288,7 +1288,7 @@ fn v12_database_is_migrated_forward_to_v23() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        23
+        27
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1328,7 +1328,7 @@ fn v12_database_is_migrated_forward_to_v23() {
 }
 
 #[test]
-fn v13_database_is_migrated_forward_to_v23() {
+fn v13_database_is_migrated_forward_to_current_schema() {
     // A v13 database gains the queue attachments column with an empty JSON
     // default, without losing the existing run or queued row.
     let directory = TempDir::new().unwrap();
@@ -1386,7 +1386,7 @@ fn v13_database_is_migrated_forward_to_v23() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        23
+        27
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -1419,7 +1419,7 @@ fn v13_database_is_migrated_forward_to_v23() {
 }
 
 #[test]
-fn v14_database_is_migrated_forward_to_v23() {
+fn v14_database_is_migrated_forward_to_current_schema() {
     // A v14 database gains the agent_runs.model/effort launch-selection
     // columns (NULL for sessions created before the slice) without losing the
     // existing run.
@@ -1474,7 +1474,7 @@ fn v14_database_is_migrated_forward_to_v23() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        23
+        27
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -1511,7 +1511,7 @@ fn v14_database_is_migrated_forward_to_v23() {
 }
 
 #[test]
-fn v15_database_is_migrated_forward_to_v23() {
+fn v15_database_is_migrated_forward_to_current_schema() {
     // A v15 database gains the managed_accounts registry and the account_id
     // binding columns on agent/terminal runs without losing existing runs.
     let directory = TempDir::new().unwrap();
@@ -1582,7 +1582,7 @@ fn v15_database_is_migrated_forward_to_v23() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        23
+        27
     );
     let has_engine_validation_column: i64 = connection
         .query_row(
