@@ -280,7 +280,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                     Some(routes)
                 }).flatten().collect::<Vec<_>>();
             Ok(
-                json!({"items":items,"hint":"Start: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Children always use YOLO auto-approval."}),
+                json!({"items":items,"hint":"Start: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Recheck later: prospero child check --after <seconds>. Children always use YOLO auto-approval."}),
             )
         }
         "cross_model.child.start" => {
@@ -308,6 +308,23 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                         path_component(&child),
                     ),
                     json!({"task":task}),
+                )
+                .await
+        }
+        "cross_model.child.check" => {
+            let parent = required_id(&params, "parentSessionId")?;
+            let delay_seconds = params
+                .get("delaySeconds")
+                .and_then(Value::as_i64)
+                .filter(|value| (1..=7 * 24 * 60 * 60).contains(value))
+                .ok_or_else(|| Error::Invalid("检查延时必须在 1 秒到 7 天之间".into()))?;
+            client
+                .post(
+                    &format!(
+                        "/v1/agent-sessions/{}/cross-model-checks",
+                        path_component(&parent),
+                    ),
+                    json!({"delaySeconds":delay_seconds}),
                 )
                 .await
         }

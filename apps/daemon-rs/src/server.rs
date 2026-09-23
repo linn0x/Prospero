@@ -28,7 +28,8 @@ use crate::agent::Agents;
 use crate::agent::{
     AgentCompactRequest, AgentModeSelection, AgentModelSelection, AgentSend,
     ApprovalPolicySelection, CreateAgentSession, CreateCrossModelChild, FollowUpCrossModelChild,
-    PermissionDecision, PermissionMode, QuestionDecision, UsageReport, UsageResult, mode_catalog,
+    PermissionDecision, PermissionMode, QuestionDecision, ScheduleCrossModelCheck, UsageReport,
+    UsageResult, mode_catalog,
 };
 use crate::auth::Token;
 use crate::database::Store;
@@ -204,6 +205,10 @@ impl Api {
             .route(
                 "/v1/agent-sessions/{id}/cross-model-children/{child}/follow-up",
                 post(follow_up_cross_model_child),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/cross-model-checks",
+                post(schedule_cross_model_check),
             )
             .route("/v1/conversations", get(conversation_search))
             .route("/v1/agent-sessions/queues", get(agent_queues))
@@ -3681,6 +3686,24 @@ async fn follow_up_cross_model_child(
         .await?;
     api.publish();
     Ok(Json(child))
+}
+
+async fn schedule_cross_model_check(
+    State(api): State<Api>,
+    Path(parent_session_id): Path<String>,
+    body: std::result::Result<
+        Json<ScheduleCrossModelCheck>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> std::result::Result<Json<crate::agent::CrossModelCheck>, ApiError> {
+    let Json(input) =
+        body.map_err(|_| Error::Invalid("invalid cross-model check request".into()))?;
+    let check = api
+        .agents
+        .schedule_cross_model_check(&parent_session_id, input)
+        .await?;
+    api.publish();
+    Ok(Json(check))
 }
 
 async fn agent_send(

@@ -20,6 +20,7 @@ use crate::protocol::*;
 use crate::worker::Database;
 
 const MAX_TURNS: usize = 32;
+const CROSS_MODEL_CHECK_LEASE_MILLIS: i64 = 60_000;
 
 fn decode_base64_lenient(input: &str) -> Result<Vec<u8>> {
     fn value(byte: u8) -> Option<u8> {
@@ -532,6 +533,76 @@ impl Agents {
                     .await?;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    pub async fn schedule_cross_model_check(
+        &self,
+        parent_session_id: &str,
+        input: super::ScheduleCrossModelCheck,
+    ) -> Result<super::CrossModelCheck> {
+        crate::database::validate_id(parent_session_id)?;
+        let parent_id = parent_session_id.to_owned();
+        let delay_seconds = input.delay_seconds;
+        let check = self
+            .0
+            .database
+            .call(move |store| store.schedule_cross_model_check(&parent_id, delay_seconds))
+            .await?;
+        self.publish();
+        Ok(check)
+    }
+
+    /// Deliver every due one-shot child status check. Structured parents use
+    /// the ordinary durable queue when busy; PTY parents receive the same
+    /// prompt through their terminal host.
+    pub async fn deliver_due_cross_model_checks(&self) -> Result<usize> {
+        let mut delivered = 0;
+        loop {
+            let claimed = self
+                .0
+                .database
+                .call(|store| store.claim_due_cross_model_check(CROSS_MODEL_CHECK_LEASE_MILLIS))
+                .await?;
+            let Some((check, report)) = claimed else {
+                return Ok(delivered);
+            };
+            if let Err(error) = self
+                .deliver_cross_model_fan_in(&check.parent_session_id, report)
+                .await
+            {
+                let check_id = check.id.clone();
+                let _ = self
+                    .0
+                    .database
+                    .call(move |store| store.release_cross_model_check(&check_id))
+                    .await;
+                return Err(error);
+            }
+            let check_id = check.id;
+            self.0
+                .database
+                .call(move |store| store.mark_cross_model_check_delivered(&check_id))
+                .await?;
+            delivered += 1;
+            self.publish();
+        }
+    }
+
+    pub async fn run_cross_model_check_worker(&self, mut stopping: watch::Receiver<bool>) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let _ = self.deliver_due_cross_model_checks().await;
+                }
+                changed = stopping.changed() => {
+                    if changed.is_err() || *stopping.borrow() {
+                        return;
+                    }
+                }
             }
         }
     }

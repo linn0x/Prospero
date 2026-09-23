@@ -81,6 +81,27 @@ pub struct FollowUpCrossModelChild {
     pub task: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct ScheduleCrossModelCheck {
+    #[ts(type = "number")]
+    pub delay_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct CrossModelCheck {
+    pub id: String,
+    pub parent_session_id: String,
+    #[ts(type = "number")]
+    pub due_at: i64,
+    pub state: String,
+    #[ts(type = "number")]
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
