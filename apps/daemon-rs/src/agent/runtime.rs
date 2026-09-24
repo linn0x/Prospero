@@ -3608,6 +3608,7 @@ impl Agents {
     /// Archive runs left active by a previous daemon process. The provider
     /// process is gone with that daemon, so turns are never replayed.
     pub async fn recover(&self) -> Result<usize> {
+        let _ = super::codex::cleanup_stale_app_servers(self.0.database.directory()).await;
         let ids: Vec<String> = self
             .0
             .database
