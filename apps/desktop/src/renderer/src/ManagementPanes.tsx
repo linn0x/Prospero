@@ -122,6 +122,7 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
                     <div className="tag-row">
                       <span className="pill">{device.allowShell ? "Shell" : t("只读", "Read only")}</span>
                       {device.allowOrchestration && <span className="pill">{t("编排", "Orchestration")}</span>}
+                      {device.relayReady && <span className="pill">Relay</span>}
                     </div>
                   </div>
                   <button

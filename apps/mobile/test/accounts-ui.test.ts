@@ -23,4 +23,10 @@ describe("account management UI", () => {
   it("keeps rename available for every managed account", () => {
     expect(screen).toContain('{account.managed && <Action label="重命名"');
   });
+
+  it("exposes shared model source bindings on mobile", () => {
+    expect(screen).toContain("共享模型源");
+    expect(screen).toContain('conn.modelSourceAction({ kind: "list" })');
+    expect(screen).toContain('conn.modelSourceAction({ kind: "bind"');
+  });
 });

@@ -18,6 +18,7 @@ import {
   CAPABILITY_AGENT_API_ENGINE_VALIDATION,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
+  CAPABILITY_MODEL_SOURCES,
   CAPABILITY_FS_PUT_ACK,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
@@ -51,6 +52,7 @@ import {
   type AgentApiProtocol,
   type AgentCredentialKind,
   type CodeAgentKind,
+  type ModelSourceAction,
   type AgentEventBody,
   type AgentQuestionAnswer,
   type ApprovalPolicy,
@@ -69,6 +71,7 @@ import {
   type S2CError,
   type S2CHelloOk,
   type S2CMessage,
+  type S2CModelSourceResult,
   type S2COrchestrationSnapshot,
   type S2CTermOutput,
   type S2CTermSnapshot,
@@ -260,6 +263,10 @@ export class HostConnection {
 
   get supportsAgentApiProtocols(): boolean {
     return this.supportsCapability(CAPABILITY_AGENT_API_PROTOCOLS);
+  }
+
+  get supportsModelSources(): boolean {
+    return this.supportsCapability(CAPABILITY_MODEL_SOURCES);
   }
 
   get supportsAgentApiValidation(): boolean {
@@ -855,6 +862,7 @@ export class HostConnection {
       case "workspace.summary.result":
       case "conversation.results":
       case "agent.accounts.result":
+      case "model.source.result":
       case "fs.listing":
       case "fs.content":
       case "fs.written":
@@ -883,6 +891,7 @@ export class HostConnection {
         if (this.rejectFsFor("#workspace", msg.message)) return;
         if (this.rejectFsFor("#conversations", msg.message)) return;
         if (this.rejectFsFor("#accounts", msg.message)) return;
+        if (this.rejectFsFor("#model-sources", msg.message)) return;
         this.events.emit("serverError", msg);
         return;
       case "hello.ok":
@@ -914,6 +923,8 @@ export class HostConnection {
           ? "#conversations"
           : msg.type === "agent.accounts.result"
             ? "#accounts"
+            : msg.type === "model.source.result"
+              ? "#model-sources"
           : (msg.sid ?? "#account");
     const responsePath =
       msg.type === "workspace.summary.result"
@@ -934,6 +945,8 @@ export class HostConnection {
               ? `#conversation.results:${msg.requestId}`
               : msg.type === "agent.accounts.result"
                 ? `#agent.accounts:${msg.requestId}`
+                : msg.type === "model.source.result"
+                  ? `#model.source:${msg.requestId}`
               : msg.type === "agent.control.result"
                 ? `#agent.control:${msg.requestId}`
                 : (msg.path ?? `#${msg.type}`);
@@ -1072,6 +1085,20 @@ export class HostConnection {
   async agentAccounts(): Promise<AgentAccount[]> {
     const requestId = this.agentRequestId();
     return (await this.accountRequest({ type: "agent.accounts.list", requestId })).accounts;
+  }
+
+  async modelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult> {
+    if (!this.supportsModelSources) throw new Error("请先升级电脑端以使用共享模型源");
+    const requestId = this.agentRequestId();
+    const result = await this.fsRequest<S2CModelSourceResult>(
+      "#model-sources",
+      `#model.source:${requestId}`,
+      { type: "model.source.action", requestId, action },
+      45_000,
+      false,
+    );
+    if (!result.ok) throw new Error(result.error?.message ?? "模型源操作失败");
+    return result;
   }
 
   createAgentAccount(agent: CodeAgentKind, name: string): Promise<AgentAccountsResult> {

@@ -321,6 +321,7 @@ export class RustRuntime {
   private refreshing: Promise<void> | undefined;
   private sequence = 0;
   private orchestrationSequence = 0;
+  private nextDevicesPollAt = 0;
   private ready = false;
   private readonly terminalRecovery: TerminalRecovery;
   flushTerminalRecovery(): Promise<void> { return this.terminalRecovery.flush(); }
@@ -395,6 +396,7 @@ export class RustRuntime {
   }
 
   private clearState(): void {
+    this.nextDevicesPollAt = 0;
     this.store.setApiState({ running: false, config: { bind: "127.0.0.1", port: 0 }, status: {}, devices: {}, orchestration: {}, projects: [] });
   }
 
@@ -413,12 +415,18 @@ export class RustRuntime {
     const { client, pid, baseUrl } = this.current();
     const signal = this.controller.signal;
     const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
-    const [summary, active, recent, workspaces, health, schedules, queues, controls, orchestration] = await Promise.all([
+    const [summary, active, recent, workspaces, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
       client.sessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       client.health(signal),
+      client.devices(signal).catch((error: unknown) => {
+        // Device rows are management UI state; a transient read failure must
+        // not blank the existing device list or prevent the daemon from starting.
+        this.store.appendLog(`[rust] devices read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return { items: this.store.snapshot().devices };
+      }),
       client.schedules(signal).catch((error: unknown) => {
         this.store.appendLog(`[rust] schedules read failed: ${error instanceof Error ? error.message : String(error)}\n`);
         return [];
@@ -444,11 +452,12 @@ export class RustRuntime {
     ]);
     signal.throwIfAborted();
     if (orchCursor) this.orchestrationSequence = orchCursor.latestSeq;
+    this.nextDevicesPollAt = Date.now() + 2_000;
     const queueById = new Map(queues.queues.map(queue => [queue.sessionId, queue.items]));
     const controlsById = new Map(controls.controls.map(item => [item.sessionId, item]));
     const sessions = [...active.items, ...recent.items].map(head => rustSessionInfo(head, queueById.get(head.id), controlsById.get(head.id)));
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
-    this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
+    this.store.setApiState({ running: true, config: {}, devices: devices as unknown as JsonObject, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
       persistence: health.persistence,
       daemonVersion: health.daemonVersion,
@@ -487,10 +496,15 @@ export class RustRuntime {
         }
       }
       const { client } = this.current();
-      const [sessions, orchestration] = await Promise.all([
+      const now = Date.now();
+      const shouldPollDevices = now >= this.nextDevicesPollAt;
+      if (shouldPollDevices) this.nextDevicesPollAt = now + 2_000;
+      const [sessions, orchestration, devices] = await Promise.all([
         client.events({ scope: "sessions", afterSeq: this.sequence, limit: 100 }, this.controller.signal),
         client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 100 }, this.controller.signal),
+        shouldPollDevices ? client.devices(this.controller.signal).catch(() => null) : Promise.resolve(null),
       ]);
+      if (devices) this.store.setApiDevices(devices as unknown as JsonObject);
       if (sessions.resyncRequired || sessions.latestSeq !== this.sequence
         || orchestration.resyncRequired || orchestration.latestSeq !== this.orchestrationSequence) {
         await this.refresh();
@@ -1194,6 +1208,27 @@ export class RustRuntime {
     if (known?.kind === "structured" || known?.kind === "pty") return known.kind;
     const head = await this.current().client.session(id, signal);
     return head.kind;
+  }
+
+
+  async createPairing(input: { name: string; allowShell: boolean; allowOrchestration: boolean }): Promise<{ output: string; uri?: string }> {
+    const result = await this.current().client.createPairing(input, this.controller.signal);
+    const current = this.store.snapshot().devices.filter((device) => device.id !== result.device.id);
+    this.store.setApiDevices({ items: [...current, result.device] } as unknown as JsonObject);
+    await this.refresh(true).catch((error: unknown) => {
+      this.store.appendLog(`[rust] refresh after pairing failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+    return { output: result.uri, uri: result.uri };
+  }
+
+  async revokeDevice(id: string): Promise<{ ok: boolean; output: string }> {
+    const result = await this.current().client.revokeDevice(id, this.controller.signal);
+    const current = this.store.snapshot().devices.filter((device) => device.id !== id);
+    this.store.setApiDevices({ items: current } as unknown as JsonObject);
+    await this.refresh(true).catch((error: unknown) => {
+      this.store.appendLog(`[rust] refresh after device revoke failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+    return { ok: result.ok, output: result.ok ? `revoked ${result.id}` : "" };
   }
 
   async runCli(args: string[]): Promise<{ code: number; output: string }> {

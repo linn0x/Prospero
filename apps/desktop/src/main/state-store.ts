@@ -412,19 +412,26 @@ export class StateStore extends EventEmitter {
       return reuseEquivalent(previous?.daemon, candidate);
     })();
 
+    const deviceRows = arrayValue(devicesRoot["devices"]).length > 0
+      ? arrayValue(devicesRoot["devices"])
+      : arrayValue(devicesRoot["items"]);
     const devices = previous && previousInputs?.devices === devicesRoot
       ? previous.devices
-      : reuseEquivalent(previous?.devices, arrayValue(devicesRoot["devices"]).map((entry): DeviceInfo => {
+      : reuseEquivalent(previous?.devices, deviceRows.map((entry, index): DeviceInfo => {
         const value = objectValue(entry);
         const allowShell = booleanValue(value["allowShell"]);
         const token = stringValue(value["token"]);
+        const id = stringValue(value["id"])
+          || createHash("sha256").update(token || `${stringValue(value["name"], "device")}:${String(index)}`).digest("base64url");
+        const lastSeenAt = numberValue(value["lastSeenAt"]);
         return {
-          id: createHash("sha256").update(token).digest("base64url"),
+          id,
           name: stringValue(value["name"], "未命名设备"),
           allowShell,
           allowOrchestration: booleanValue(value["allowOrchestration"], allowShell),
-          bound: typeof value["clientPubKey"] === "string",
-          lastSeenAt: numberValue(value["lastSeenAt"]),
+          bound: booleanValue(value["bound"], typeof value["clientPubKey"] === "string"),
+          relayReady: booleanValue(value["relayReady"]),
+          ...(lastSeenAt > 0 ? { lastSeenAt } : {}),
         };
       }));
     const orchestrationSnapshot = previous && previousInputs?.orchestration === orchestration
@@ -536,6 +543,15 @@ export class StateStore extends EventEmitter {
       running: state.running,
       projects: reuseEquivalent(this.apiState.projects, state.projects),
     };
+    this.changed();
+  }
+
+  setApiDevices(devices: JsonObject): void {
+    if (this.backend !== "api") throw new Error("API data is not enabled");
+    if (Buffer.byteLength(JSON.stringify(devices)) > 256 * 1024) throw new Error("API devices projection exceeds page limit");
+    const next = reuseEquivalent(this.apiState.devices, devices);
+    if (next === this.apiState.devices) return;
+    this.apiState = { ...this.apiState, devices: next };
     this.changed();
   }
 
