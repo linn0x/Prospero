@@ -1382,9 +1382,11 @@ function installIpc(): void {
   ipcMain.handle("device:pair", async (_event, raw: unknown) => {
     const input = requireObject(raw);
     const name = typeof input["name"] === "string" ? input["name"].trim().slice(0, 80) : "Windows device";
-    const args = ["pair", "--name", name || "Windows device"];
-    if (input["allowShell"] !== true) args.push("--no-shell");
-    if (input["allowOrchestration"] !== true) args.push("--no-orchestration");
+    const payload = { name: name || "Windows device", allowShell: input["allowShell"] === true, allowOrchestration: input["allowOrchestration"] === true };
+    if (runtime instanceof RustRuntime) return runtime.createPairing(payload);
+    const args = ["pair", "--name", payload.name];
+    if (!payload.allowShell) args.push("--no-shell");
+    if (!payload.allowOrchestration) args.push("--no-orchestration");
     const result = await runtime.runCli(args);
     if (result.code !== 0) throw new Error(result.output || "配对失败");
     const uri = result.output.match(/prospero:\/\/\S+/)?.[0];
@@ -1397,6 +1399,7 @@ function installIpc(): void {
     const name = input["name"].trim();
     const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "撤销设备", message: `确认撤销“${name}”？`, detail: "撤销后，该设备需要重新配对才能访问 Prospero。", buttons: ["取消", "确认撤销"], defaultId: 0, cancelId: 0 });
     if (confirmation.response !== 1) return { ok: false, output: "", cancelled: true };
+    if (runtime instanceof RustRuntime) return runtime.revokeDevice(id);
     const result = await runtime.runCli(["revoke", "--id", id]);
     return { ok: result.code === 0, output: result.output };
   });

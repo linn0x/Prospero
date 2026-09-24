@@ -22,9 +22,10 @@ import { CameraView, useCameraPermissions } from "expo-camera";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { decodePairingQR } from "@prospero/protocol";
 import { useDiscovery } from "@/lib/discovery";
-import { upsertHostFromPairing } from "@/lib/hosts";
+import { getHosts, upsertHostFromPairing } from "@/lib/hosts";
 import { pairingErrorNotice } from "@/lib/pairing-error-notice";
 import { decodeManualPairing } from "@/lib/manual-pairing";
+import { useApp } from "@/lib/store";
 import { color, radius, space } from "@/lib/theme";
 
 const glassApiAvailable = Platform.OS === "ios" && isLiquidGlassAvailable() && isGlassEffectAPIAvailable();
@@ -55,6 +56,7 @@ export default function PairScreen() {
   const [reduceTransparency, setReduceTransparency] = useState(false);
   const scannedRef = useRef(false);
   const { d, mode: requestedMode } = useLocalSearchParams<{ d?: string; mode?: string }>();
+  const setHosts = useApp((state) => state.setHosts);
   const mode = requestedMode === "manual" ? "manual" : "scan";
   const glassEnabled = glassApiAvailable && !reduceTransparency;
   // 扫描同网段的 prosperod:让用户确认这台电脑确实在线，再去扫码。
@@ -87,6 +89,15 @@ export default function PairScreen() {
         ? decodePairingQR(text.trim(), { allowInsecureLoopback })
         : decodeManualPairing(text, manualAddress, allowInsecureLoopback);
       const host = await upsertHostFromPairing(payload);
+      try {
+        setHosts(await getHosts());
+      } catch {
+        const current = useApp.getState().hosts;
+        const index = current.findIndex((item) => item.id === host.id);
+        setHosts(index >= 0
+          ? current.map((item) => item.id === host.id ? host : item)
+          : [...current, host]);
+      }
       // 深链每次都会把 /pair 压进栈,replace 只换掉这一层 —— 反复扫码/点深链
       // 会攒出一摞 host 页,返回要点很多下。先退回根再进。
       if (router.canDismiss()) router.dismissAll();
@@ -97,7 +108,7 @@ export default function PairScreen() {
       const notice = pairingErrorNotice(e);
       Alert.alert(notice.title, notice.message);
     }
-  }, []);
+  }, [setHosts]);
 
   const requestCameraAccess = (): void => {
     const action = permission?.canAskAgain === false ? Linking.openSettings() : requestPermission();

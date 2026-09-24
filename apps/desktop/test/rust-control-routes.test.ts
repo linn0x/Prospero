@@ -109,6 +109,34 @@ describe("Rust desktop control routes", () => {
     ]);
   });
 
+
+  it("maps Rust paired devices into the desktop API snapshot", async () => {
+    const client = {
+      events: async () => ({ latestSeq: 0, events: [], resyncRequired: false }),
+      summary: async () => ({ total: 0, active: 0, archived: 0, attention: 0, latestSeq: 0 }),
+      sessions: async () => ({ items: [], total: 0, latestSeq: 0 }),
+      workspaces: async () => ({ items: [], latestSeq: 0 }),
+      health: async () => ({ capabilities: [], persistence: { pty: true, structured: true }, daemonVersion: "test" }),
+      devices: async () => ({ items: [{ id: "device-1", name: "Android", allowShell: true, allowOrchestration: true, bound: true, relayReady: true, createdAt: 1, lastSeenAt: 2 }] }),
+      schedules: async () => [],
+      agentQueues: async () => ({ queues: [] }),
+      agentControls: async () => ({ controls: [] }),
+    };
+    const calls: unknown[] = [];
+    const store = {
+      backend: "api",
+      setManagedState: () => undefined,
+      appendLog: () => undefined,
+      setApiState: (state: unknown) => calls.push(state),
+    } as unknown as StateStore;
+    const runtime = new RustRuntime(store, "/opt/prosperod-rs", "/tmp/prospero-rust/daemon");
+    (runtime as unknown as { connection: unknown }).connection = { client, pid: 10, baseUrl: "http://127.0.0.1:7423" };
+
+    await (runtime as unknown as { refresh: () => Promise<void> }).refresh();
+
+    expect(calls[0]).toMatchObject({ devices: { items: [{ id: "device-1", relayReady: true }] } });
+  });
+
   it("passes Codex PTY API Profile account selection to Rust", async () => {
     const calls: unknown[] = [];
     const client = {

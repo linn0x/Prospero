@@ -180,6 +180,7 @@ describe("RustRuntime CLI bridge", () => {
       if (url.includes("/v1/session-summary")) return new Response(JSON.stringify({ total: 0, active: 0, archived: 0, attention: 0, latestSeq: 0 }));
       if (url.includes("/v1/sessions?")) return new Response(JSON.stringify({ items: [], total: 0, latestSeq: 0 }));
       if (url.includes("/v1/workspaces?")) return new Response(JSON.stringify({ items: [], latestSeq: 0 }));
+      if (url.endsWith("/v1/devices")) return new Response(JSON.stringify({ items: [] }));
       if (url.includes("/v1/schedules")) return new Response(JSON.stringify([]));
       if (url.includes("/v1/agent-sessions/queues")) return new Response(JSON.stringify({ queues: [] }));
       if (url.includes("/v1/agent-sessions/controls")) return new Response(JSON.stringify({ controls: [] }));
