@@ -659,6 +659,7 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
     let path = request.uri().path();
     let request_timeout = if request.method() == axum::http::Method::POST
         && (matches!(path, "/v1/terminals" | "/v1/agent-sessions")
+            || path.starts_with("/v1/agent-sessions/")
             || (path.starts_with("/v1/schedules/") && path.ends_with("/run")))
     {
         Duration::from_secs(180)

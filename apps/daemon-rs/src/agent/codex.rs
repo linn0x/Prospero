@@ -35,6 +35,7 @@ enum PendingResponse {
     FinishOnError {
         method: String,
         subagent: Option<String>,
+        retry_params: Option<Value>,
     },
 }
 
@@ -205,6 +206,77 @@ async fn rpc_error_message(
         prefix.push_str(&format!("；data：{}", truncate_chars(&data, 1000)));
     }
     diagnostic_message(diagnostics, &prefix).await
+}
+
+fn sandbox_policy_schema_error(error: &Value) -> bool {
+    let haystack = format!(
+        "{} {}",
+        summarize(error.get("message")),
+        summarize(error.get("data"))
+    );
+    let lower = haystack.to_ascii_lowercase();
+    lower.contains("unknown variant")
+        && (haystack.contains("danger-full-access")
+            || haystack.contains("workspace-write")
+            || haystack.contains("dangerFullAccess")
+            || haystack.contains("workspaceWrite"))
+}
+
+fn alternate_sandbox_policy(policy: &Value) -> Option<Value> {
+    let typ = policy.get("type").and_then(Value::as_str)?;
+    match typ {
+        "danger-full-access" => Some(json!({ "type": "dangerFullAccess" })),
+        "dangerFullAccess" => Some(json!({ "type": "danger-full-access" })),
+        "workspace-write" => Some(json!({
+            "type": "workspaceWrite",
+            "writableRoots": policy
+                .get("writable_roots")
+                .or_else(|| policy.get("writableRoots"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        })),
+        "workspaceWrite" => Some(json!({
+            "type": "workspace-write",
+            "writable_roots": policy
+                .get("writableRoots")
+                .or_else(|| policy.get("writable_roots"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        })),
+        _ => None,
+    }
+}
+
+fn alternate_turn_start_params(params: &Value) -> Option<Value> {
+    let mut object = params.as_object()?.clone();
+    let alternate = alternate_sandbox_policy(object.get("sandboxPolicy")?)?;
+    object.insert("sandboxPolicy".into(), alternate);
+    Some(Value::Object(object))
+}
+
+async fn retry_turn_start(
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    responses: &PendingResponses,
+    method: String,
+    subagent: Option<String>,
+    params: Value,
+) -> bool {
+    let id = uuid::Uuid::new_v4().as_u128().to_string();
+    responses.lock().await.insert(
+        id.clone(),
+        PendingResponse::FinishOnError {
+            method: method.clone(),
+            subagent,
+            retry_params: None,
+        },
+    );
+    writer
+        .send((
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            None,
+        ))
+        .await
+        .is_ok()
 }
 
 fn spawn_stderr_tail_drain(mut stderr: tokio::process::ChildStderr, stderr_tail: StderrTail) {
@@ -548,13 +620,6 @@ pub(super) async fn spawn_turn(
     });
 
     let turn_start_id = 1_000_000_u64;
-    responses.lock().await.insert(
-        turn_start_id.to_string(),
-        PendingResponse::FinishOnError {
-            method: "turn/start".into(),
-            subagent: None,
-        },
-    );
     let mut turn_params = serde_json::Map::new();
     turn_params.insert("threadId".into(), json!(thread_id));
     turn_params.insert(
@@ -573,9 +638,18 @@ pub(super) async fn spawn_turn(
     if let Some(effort) = options.effort.as_ref() {
         turn_params.insert("effort".into(), json!(effort));
     }
+    let turn_params = Value::Object(turn_params);
+    responses.lock().await.insert(
+        turn_start_id.to_string(),
+        PendingResponse::FinishOnError {
+            method: "turn/start".into(),
+            subagent: None,
+            retry_params: alternate_turn_start_params(&turn_params),
+        },
+    );
     if frames_tx
         .try_send((
-            json!({ "jsonrpc": "2.0", "id": turn_start_id, "method": "turn/start", "params": Value::Object(turn_params) }),
+            json!({ "jsonrpc": "2.0", "id": turn_start_id, "method": "turn/start", "params": turn_params }),
             None,
         ))
         .is_err()
@@ -748,8 +822,25 @@ async fn read_notifications(
                             };
                             let _ = tx.send(result);
                         }
-                        PendingResponse::FinishOnError { method, subagent } => {
+                        PendingResponse::FinishOnError {
+                            method,
+                            subagent,
+                            retry_params,
+                        } => {
                             if let Some(error) = message.get("error") {
+                                if let Some(params) = retry_params
+                                    && sandbox_policy_schema_error(error)
+                                    && retry_turn_start(
+                                        &writer,
+                                        &state.responses,
+                                        method.clone(),
+                                        subagent.clone(),
+                                        params,
+                                    )
+                                    .await
+                                {
+                                    continue;
+                                }
                                 let text =
                                     rpc_error_message(Some(&method), error, &state.diagnostics)
                                         .await;
@@ -2230,6 +2321,7 @@ impl CodexTurn {
             PendingResponse::FinishOnError {
                 method: method.to_owned(),
                 subagent,
+                retry_params: alternate_turn_start_params(&params),
             },
         );
         let (ack, ack_rx) = oneshot::channel();
