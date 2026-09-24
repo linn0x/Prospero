@@ -15,6 +15,22 @@ import type {
   WorkerStartOutcome,
 } from "@prospero/protocol/rust-daemon";
 
+
+export type RustDeviceView = {
+  id: string;
+  name: string;
+  allowShell: boolean;
+  allowOrchestration: boolean;
+  bound: boolean;
+  relayReady: boolean;
+  createdAt: number;
+  lastSeenAt?: number | null;
+};
+export type RustDeviceList = { items: RustDeviceView[] };
+export type RustPairingCreate = { name: string; allowShell: boolean; allowOrchestration: boolean };
+export type RustPairingCreated = { device: RustDeviceView; uri: string };
+export type RustDeviceRevoked = { ok: boolean; id: string };
+
 const MAX_BYTES = 2 * 1024 * 1024;
 function id(value: string): string {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("Invalid record id");
@@ -79,6 +95,16 @@ export class RustClient {
   }
 
   health(signal: AbortSignal | null = null): Promise<Health> { return this.json("/v1/health", { signal }); }
+
+  devices(signal: AbortSignal | null = null): Promise<RustDeviceList> {
+    return this.json("/v1/devices", { signal });
+  }
+  createPairing(input: RustPairingCreate, signal: AbortSignal | null = null): Promise<RustPairingCreated> {
+    return this.json("/v1/pairings", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  revokeDevice(deviceId: string, signal: AbortSignal | null = null): Promise<RustDeviceRevoked> {
+    return this.json(`/v1/devices/${id(deviceId)}`, { method: "DELETE", signal });
+  }
   createTerminal(input: CreateTerminal, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
     return this.json("/v1/terminals", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }

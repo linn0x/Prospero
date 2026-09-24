@@ -110,6 +110,28 @@ describe("Electron state snapshot caching", () => {
     expect(JSON.stringify(snapshot.devices)).not.toContain("device-secret");
   });
 
+  it("accepts Rust API paired-device projections without hashing missing tokens", () => {
+    const store = new StateStore(testHome(), "api");
+    store.setApiState({
+      running: true,
+      config: {},
+      status: { pid: process.pid, port: 12345, bind: "127.0.0.1", sessions: [] },
+      devices: { items: [{ id: "device-1", name: "Android", allowShell: true, allowOrchestration: true, bound: true, relayReady: true, createdAt: 1, lastSeenAt: 2 }] },
+      orchestration: {},
+      projects: [],
+    });
+
+    expect(store.snapshot().devices).toEqual([{
+      id: "device-1",
+      name: "Android",
+      allowShell: true,
+      allowOrchestration: true,
+      bound: true,
+      relayReady: true,
+      lastSeenAt: 2,
+    }]);
+  });
+
   it("never projects the relay host secret into the renderer snapshot", () => {
     const home = testHome();
     writeJson(home, "config.json", {

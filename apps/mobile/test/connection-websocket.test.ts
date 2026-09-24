@@ -5,6 +5,7 @@ import {
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_API_PROTOCOLS,
   CAPABILITY_FS_PUT_ACK,
+  CAPABILITY_MODEL_SOURCES,
   CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_WORKSPACE_SUMMARY,
   generateKeyPairB64,
@@ -538,6 +539,37 @@ describe("HostConnection WebSocket candidates", () => {
       internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: request.requestId, action: "api_configure", ok: true, accounts: [] }));
       await pending;
     }
+    connection.stop();
+  });
+
+  it("lists and binds model sources through the shared source control channel", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_MODEL_SOURCES]);
+
+    const pending = connection.modelSourceAction({ kind: "bind", sourceId: "source-1", revision: 2, routeId: "route-1", agent: "codex" });
+    const request = JSON.parse(socket.sent[0]!);
+    expect(request).toMatchObject({
+      type: "model.source.action",
+      action: { kind: "bind", sourceId: "source-1", revision: 2, routeId: "route-1", agent: "codex" },
+    });
+    internals.onMessage(JSON.stringify({
+      type: "model.source.result",
+      requestId: request.requestId,
+      ok: true,
+      accountId: "account-1",
+      accounts: [],
+    }));
+    await expect(pending).resolves.toMatchObject({ ok: true, accountId: "account-1" });
     connection.stop();
   });
 

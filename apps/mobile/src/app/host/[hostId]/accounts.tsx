@@ -16,10 +16,12 @@ import type {
   AgentModelCapabilities,
   AgentCredentialKind,
   CodeAgentKind,
+  ModelSource,
+  ModelSourceRoute,
   S2CMessage,
   UsageAccount,
 } from "@prospero/protocol";
-import { getAgentAccountEngine } from "@prospero/protocol";
+import { CAPABILITY_MODEL_SOURCES, getAgentAccountEngine } from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
@@ -42,8 +44,10 @@ type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
 type AccountsPageCache = {
   accounts: AgentAccount[];
+  sources: ModelSource[];
   usage: UsageResult | null;
   accountsUpdatedAt: number;
+  sourcesUpdatedAt: number;
 };
 
 const ACCOUNTS_CACHE_TTL_MS = 60_000;
@@ -53,8 +57,21 @@ function cacheAccounts(hostId: string, accounts: AgentAccount[]): void {
   const cached = accountsPageCache.get(hostId);
   accountsPageCache.set(hostId, {
     accounts,
+    sources: cached?.sources ?? [],
     usage: cached?.usage ?? null,
     accountsUpdatedAt: Date.now(),
+    sourcesUpdatedAt: cached?.sourcesUpdatedAt ?? 0,
+  });
+}
+
+function cacheSources(hostId: string, sources: ModelSource[]): void {
+  const cached = accountsPageCache.get(hostId);
+  accountsPageCache.set(hostId, {
+    accounts: cached?.accounts ?? [],
+    sources,
+    usage: cached?.usage ?? null,
+    accountsUpdatedAt: cached?.accountsUpdatedAt ?? 0,
+    sourcesUpdatedAt: Date.now(),
   });
 }
 
@@ -62,8 +79,10 @@ function cacheUsage(hostId: string, usage: UsageResult | null): void {
   const cached = accountsPageCache.get(hostId);
   accountsPageCache.set(hostId, {
     accounts: cached?.accounts ?? [],
+    sources: cached?.sources ?? [],
     usage,
     accountsUpdatedAt: cached?.accountsUpdatedAt ?? 0,
+    sourcesUpdatedAt: cached?.sourcesUpdatedAt ?? 0,
   });
 }
 
@@ -105,6 +124,7 @@ export default function AgentAccountsScreen() {
   const { conn, runtime } = useHostConnection(hostId);
   const initialCache = hostId ? accountsPageCache.get(hostId) : undefined;
   const [accounts, setAccounts] = useState<AgentAccount[]>(() => initialCache?.accounts ?? []);
+  const [sources, setSources] = useState<ModelSource[]>(() => initialCache?.sources ?? []);
   const [loading, setLoading] = useState(() => initialCache === undefined);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -116,6 +136,10 @@ export default function AgentAccountsScreen() {
   const rememberAccounts = useCallback((nextAccounts: AgentAccount[]): void => {
     setAccounts(nextAccounts);
     if (hostId) cacheAccounts(hostId, nextAccounts);
+  }, [hostId]);
+  const rememberSources = useCallback((nextSources: ModelSource[]): void => {
+    setSources(nextSources);
+    if (hostId) cacheSources(hostId, nextSources);
   }, [hostId]);
 
   const refresh = useCallback(async (showLoading = false): Promise<void> => {
@@ -132,11 +156,14 @@ export default function AgentAccountsScreen() {
     setLoading(showLoading || cached === undefined);
     setError(null);
     try {
-      const [nextAccounts, nextUsage] = await Promise.all([
+      const [nextAccounts, nextUsage, sourceResult] = await Promise.all([
         conn.agentAccounts(),
         conn.usageGet().catch(() => null),
+        conn.supportsModelSources ? conn.modelSourceAction({ kind: "list" }).catch(() => null) : null,
       ]);
       rememberAccounts(nextAccounts);
+      if (sourceResult?.sources) rememberSources(sourceResult.sources);
+      else if (!conn.supportsModelSources) rememberSources([]);
       setUsage(nextUsage);
       if (hostId) cacheUsage(hostId, nextUsage);
       setNow(Date.now());
@@ -145,22 +172,25 @@ export default function AgentAccountsScreen() {
     } finally {
       setLoading(false);
     }
-  }, [conn, hostId, rememberAccounts, runtime.status]);
+  }, [conn, hostId, rememberAccounts, rememberSources, runtime.status]);
 
   useFocusEffect(
     useCallback(() => {
       const cached = hostId ? accountsPageCache.get(hostId) : undefined;
       if (cached) {
         setAccounts(cached.accounts);
+        setSources(cached.sources);
         setUsage(cached.usage);
         setNow(Date.now());
         setLoading(false);
       }
-      if (!cached || Date.now() - cached.accountsUpdatedAt >= ACCOUNTS_CACHE_TTL_MS) {
+      const accountsStale = !cached || Date.now() - cached.accountsUpdatedAt >= ACCOUNTS_CACHE_TTL_MS;
+      const sourcesStale = conn?.supportsModelSources === true && (!cached || Date.now() - cached.sourcesUpdatedAt >= 10_000);
+      if (accountsStale || sourcesStale) {
         void refresh(cached === undefined);
       }
       return undefined;
-    }, [hostId, refresh]),
+    }, [conn?.supportsModelSources, hostId, refresh]),
   );
 
   useEffect(() => {
@@ -190,6 +220,29 @@ export default function AgentAccountsScreen() {
     }
     return result;
   }, [usage]);
+
+  const sourceRoutesByAgent = useMemo(() => {
+    const result: Record<CodeAgentKind, { source: ModelSource; route: ModelSourceRoute }[]> = {
+      claude: [],
+      codex: [],
+      opencode: [],
+    };
+    for (const source of sources) {
+      if (!source.enabled) continue;
+      for (const route of source.routes) {
+        if (!route.enabled || route.modelCapabilities?.tools === false) continue;
+        if (route.protocol === "anthropic") {
+          result.claude.push({ source, route });
+        } else {
+          // Codex can run both Responses and Chat-Completions compatible
+          // sources; OpenCode is limited to Chat-Completions compatible routes.
+          result.codex.push({ source, route });
+          if (route.protocol === "openai_chat_completions") result.opencode.push({ source, route });
+        }
+      }
+    }
+    return result;
+  }, [sources]);
 
   const mutate = async (
     accountId: string,
@@ -252,6 +305,22 @@ export default function AgentAccountsScreen() {
       })),
       { text: "取消", style: "cancel" as const },
     ]);
+  };
+
+  const bindModelSource = async (agent: CodeAgentKind, source: ModelSource, route: ModelSourceRoute): Promise<void> => {
+    if (!conn) return;
+    setBusyId(`source:${source.id}:${route.id}`);
+    setError(null);
+    try {
+      const result = await conn.modelSourceAction({ kind: "bind", sourceId: source.id, revision: source.revision, routeId: route.id, agent });
+      if (result.accounts) rememberAccounts(result.accounts);
+      if (result.sources) rememberSources(result.sources);
+      if (!result.accounts || !result.sources) await refresh(false);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setBusyId(null);
+    }
   };
 
   const openConfigureApi = (account: AgentAccount): void => {
@@ -471,9 +540,38 @@ export default function AgentAccountsScreen() {
               </View>
             </View>
 
+            {conn?.supportsModelSources && sourceRoutesByAgent[agent].length > 0 && (
+              <View style={styles.sourcePanel}>
+                <Text style={styles.sourceTitle}>共享模型源</Text>
+                {sourceRoutesByAgent[agent].slice(0, 8).map(({ source, route }) => {
+                  const busy = busyId === `source:${source.id}:${route.id}`;
+                  return (
+                    <View key={`${source.id}:${route.id}`} style={styles.sourceRow}>
+                      <View style={styles.sourceCopy}>
+                        <Text style={styles.sourceName}>{source.name}</Text>
+                        <Text style={styles.sourceMeta}>{route.name} · {route.model}</Text>
+                      </View>
+                      <Pressable
+                        style={({ pressed }) => [styles.sourceButton, busy && styles.disabled, pressed && styles.pressed]}
+                        disabled={busyId !== null}
+                        onPress={() => void bindModelSource(agent, source, route)}
+                      >
+                        {busy ? <ActivityIndicator size="small" color={color.accent} /> : <Text style={styles.sourceButtonText}>绑定</Text>}
+                      </Pressable>
+                    </View>
+                  );
+                })}
+                {sourceRoutesByAgent[agent].length > 8 && <Text style={styles.environment}>另有 {String(sourceRoutesByAgent[agent].length - 8)} 个模型，可在电脑端调整默认或停用不常用模型。</Text>}
+              </View>
+            )}
+            {conn?.supportsCapability(CAPABILITY_MODEL_SOURCES) && sources.length === 0 && (
+              <Text style={styles.environment}>电脑端暂无启用的共享模型源。</Text>
+            )}
+
             {grouped[agent].map((account) => {
               const busy = busyId !== null;
               const hasApiProfile = Boolean(account.apiProfile || account.apiProfileError);
+              const sourceBound = Boolean(account.modelSource);
               return (
                 <View key={account.id} style={styles.card}>
                   <View style={styles.cardTop}>
@@ -488,6 +586,12 @@ export default function AgentAccountsScreen() {
                         {account.authMethod && <Text style={styles.meta}>· {account.authMethod}</Text>}
                       </View>
                       {account.detail && !hasApiProfile && <Text style={styles.environment}>{account.detail}</Text>}
+                      {account.modelSource && (
+                        <Text style={styles.environment}>
+                          共享模型源 · {account.modelSource.sourceName} / {account.modelSource.routeName} · v{String(account.modelSource.revision)}
+                          {account.modelSource.current ? "" : " · 历史绑定"}
+                        </Text>
+                      )}
                       <Text style={styles.environment}>
                         {account.apiProfile
                           ? `${getAgentAccountEngine(account)} · ${accountApiProtocolLabel(accountApiProtocolFromProfile(account.agent, account.apiProfile.protocol))} · ${account.apiProfile.model}\n${account.apiProfile.baseUrl}`
@@ -526,14 +630,14 @@ export default function AgentAccountsScreen() {
                         {conn?.supportsAgentApiValidation && <Action label="测试 API 连接" disabled={busy || Boolean(account.apiProfileError) || account.status === "signed_out"} onPress={() => { if (conn) void mutate(account.id, () => conn.testAgentApiProfile(account.id)).catch(() => {}); }} />}
                         {conn?.supportsAgentApiEngineValidation && <Action label="验证 Agent 执行" disabled={busy || Boolean(account.apiProfileError) || account.status === "signed_out"} onPress={() => { if (conn) void mutate(account.id, () => conn.testAgentApiProfile(account.id, "engine")).catch(() => {}); }} />}
                         <Action
-                          label={account.activeSessions > 0 ? "结束会话后配置" : account.apiProfileError ? "修复配置" : "重新配置"}
+                          label={sourceBound ? "在模型源中修改" : account.activeSessions > 0 ? "结束会话后配置" : account.apiProfileError ? "修复配置" : "重新配置"}
                           onPress={() => openConfigureApi(account)}
-                          disabled={busy || account.activeSessions > 0}
+                          disabled={busy || sourceBound || account.activeSessions > 0}
                         />
                         <Action
-                          label={account.activeSessions > 0 ? "结束会话后换 Key" : "替换 API Key"}
+                          label={sourceBound ? "模型源统一管理 Key" : account.activeSessions > 0 ? "结束会话后换 Key" : "替换 API Key"}
                           onPress={() => openCredential(account, "api_key")}
-                          disabled={busy || account.activeSessions > 0 || Boolean(account.apiProfileError)}
+                          disabled={busy || sourceBound || account.activeSessions > 0 || Boolean(account.apiProfileError)}
                         />
                       </>
                     ) : (
@@ -564,8 +668,8 @@ export default function AgentAccountsScreen() {
                       />
                     )}
                     {account.managed && <Action label="重命名" onPress={() => openRename(account)} disabled={busy} />}
-                    {account.status === "signed_in" && <Action label={account.apiProfile && account.activeSessions > 0 ? "结束会话后移除密钥" : account.apiProfile ? "移除密钥" : "注销"} onPress={() => confirmLogout(account)} disabled={busy || Boolean(account.apiProfile && account.activeSessions > 0)} danger />}
-                    {account.managed && <Action label={account.activeSessions > 0 ? "结束会话后删除" : "删除"} onPress={() => confirmDelete(account)} disabled={busy || account.activeSessions > 0} danger />}
+                    {account.status === "signed_in" && <Action label={sourceBound ? "由模型源管理" : account.apiProfile && account.activeSessions > 0 ? "结束会话后移除密钥" : account.apiProfile ? "移除密钥" : "注销"} onPress={() => confirmLogout(account)} disabled={busy || sourceBound || Boolean(account.apiProfile && account.activeSessions > 0)} danger />}
+                    {account.managed && <Action label={sourceBound ? "模型源绑定" : account.activeSessions > 0 ? "结束会话后删除" : "删除"} onPress={() => confirmDelete(account)} disabled={busy || sourceBound || account.activeSessions > 0} danger />}
                   </View>
                 </View>
               );
@@ -802,6 +906,14 @@ const styles = StyleSheet.create({
   sectionTitle: { ...font.body, fontWeight: "700" },
   addButton: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 10, paddingVertical: 7, borderRadius: radius.sm, backgroundColor: color.accentBg },
   addButtonText: { color: color.accent, fontSize: 12, fontWeight: "700" },
+  sourcePanel: { backgroundColor: color.surface, borderRadius: radius.md, padding: space.md, gap: space.sm },
+  sourceTitle: { ...font.meta, color: color.accent, fontWeight: "700" },
+  sourceRow: { flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: 4 },
+  sourceCopy: { flex: 1, gap: 2 },
+  sourceName: { ...font.meta, color: color.text, fontWeight: "700" },
+  sourceMeta: { ...font.meta, color: color.textDim },
+  sourceButton: { minHeight: 36, minWidth: 58, alignItems: "center", justifyContent: "center", borderRadius: radius.sm, backgroundColor: color.accentBg },
+  sourceButtonText: { color: color.accent, fontSize: 12, fontWeight: "700" },
   card: { backgroundColor: color.surface, borderRadius: radius.md, padding: space.md, gap: space.md },
   cardTop: { flexDirection: "row", alignItems: "center", gap: space.sm },
   cardCopy: { flex: 1, gap: 5 },

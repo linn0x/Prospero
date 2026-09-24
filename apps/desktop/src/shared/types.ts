@@ -99,6 +99,7 @@ export type DeviceInfo = {
   allowShell: boolean;
   allowOrchestration: boolean;
   bound: boolean;
+  relayReady?: boolean;
   lastSeenAt?: number;
 };
 
