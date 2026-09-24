@@ -7,7 +7,7 @@
 //! sessions no longer fall back to the legacy daemon boundary.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const APP_SERVER_LEASE_VERSION: i64 = 1;
 
 type StderrTail = Arc<Mutex<String>>;
 
@@ -313,7 +314,10 @@ async fn fail_pending_responses(responses: &PendingResponses, message: String) {
 }
 
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
         libc::kill(pid as i32, libc::SIGKILL);
@@ -321,8 +325,356 @@ fn kill_process_group(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     let _ = pid;
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    pid > 1 && unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+fn codex_home_from_environment(environment: &[(String, String)]) -> Option<PathBuf> {
+    environment
+        .iter()
+        .rev()
+        .find(|(key, value)| key == "CODEX_HOME" && !value.is_empty())
+        .map(|(_, value)| PathBuf::from(value))
+}
+
+fn existing_safe_dir(path: &Path) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+fn owned_codex_home_from_environment(
+    data: &Path,
+    environment: &[(String, String)],
+) -> Option<PathBuf> {
+    let requested_home = codex_home_from_environment(environment)?;
+    let home = existing_safe_dir(&requested_home)?;
+    let data = data.canonicalize().ok()?;
+    let roots = data.join("agent-accounts");
+    let native_home = roots
+        .join("codex-usage")
+        .join(super::usage::NATIVE_CODEX_ID)
+        .join("home");
+    if existing_safe_dir(&native_home).as_deref() == Some(home.as_path()) {
+        return Some(home);
+    }
+    let managed_root = existing_safe_dir(&roots.join("codex"))?;
+    let relative = home.strip_prefix(managed_root).ok()?;
+    if relative.components().count() == 1 {
+        Some(home)
+    } else {
+        None
+    }
+}
+
+fn app_server_lease_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join(".prospero").join("app-server-leases")
+}
+
+fn thread_writer_lock(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
+    if crate::database::validate_id(thread_id).is_err() {
+        return None;
+    }
+    Some(
+        codex_home
+            .join("thread-writer-locks")
+            .join(format!("{thread_id}.lock")),
+    )
+}
+
+fn cleanup_thread_writer_lock(codex_home: Option<&Path>, thread_id: &str) {
+    let Some(codex_home) = codex_home else {
+        return;
+    };
+    let Some(lock) = thread_writer_lock(codex_home, thread_id) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&lock);
+}
+
+fn safe_pid(value: Option<&Value>) -> Option<u32> {
+    let pid = value?.as_u64()?;
+    (pid > 1 && pid <= i32::MAX as u64).then_some(pid as u32)
+}
+
+fn lease_json(child_pid: u32, thread_id: Option<&str>) -> Value {
+    json!({
+        "version": APP_SERVER_LEASE_VERSION,
+        "ownerPid": std::process::id(),
+        "childPid": child_pid,
+        "processGroup": child_pid,
+        "threadId": thread_id,
+        "createdAt": crate::database::now(),
+    })
+}
+
+fn write_app_server_lease(codex_home: &Path, child_pid: u32) -> Result<PathBuf> {
+    if let Ok(metadata) = std::fs::symlink_metadata(codex_home)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Invalid("CODEX_HOME 不是安全目录".into()));
+    }
+    let state_root = codex_home.join(".prospero");
+    if let Ok(metadata) = std::fs::symlink_metadata(&state_root)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Invalid("CODEX_HOME 运行目录无效".into()));
+    }
+    let directory = app_server_lease_dir(codex_home);
+    std::fs::create_dir_all(&directory)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&directory)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Invalid("CODEX_HOME app-server 租约目录无效".into()));
+    }
+    let _ = set_private_dir_permissions(&directory);
+    let path = directory.join(format!("{child_pid}.json"));
+    let temporary = directory.join(format!(".{child_pid}.{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&lease_json(child_pid, None))?,
+    )?;
+    let _ = set_private_file_permissions(&temporary);
+    std::fs::rename(&temporary, &path)?;
+    Ok(path)
+}
+
+fn update_app_server_lease(path: &Path, child_pid: u32, thread_id: &str) {
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    if std::fs::write(
+        &temporary,
+        serde_json::to_vec(&lease_json(child_pid, Some(thread_id))).unwrap_or_default(),
+    )
+    .is_ok()
+    {
+        let _ = set_private_file_permissions(&temporary);
+        let _ = std::fs::rename(temporary, path);
+    }
+}
+
+fn cleanup_stale_app_servers_in_home(codex_home: &Path) -> usize {
+    let directory = app_server_lease_dir(codex_home);
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return 0;
+    };
+    let mut cleaned = 0;
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let owner_pid = safe_pid(value.get("ownerPid"));
+        if owner_pid == Some(std::process::id()) {
+            continue;
+        }
+        if owner_pid.is_some_and(process_alive) {
+            continue;
+        }
+        if let Some(pgid) =
+            safe_pid(value.get("processGroup")).or_else(|| safe_pid(value.get("childPid")))
+        {
+            kill_process_group(pgid);
+            cleaned += 1;
+        }
+        if let Some(thread_id) = value.get("threadId").and_then(Value::as_str) {
+            cleanup_thread_writer_lock(Some(codex_home), thread_id);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    cleaned
+}
+
+pub(crate) async fn cleanup_stale_app_servers(data: &Path) -> Result<usize> {
+    let data = data.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let roots = data.join("agent-accounts");
+        let mut homes = vec![
+            roots
+                .join("codex-usage")
+                .join(super::usage::NATIVE_CODEX_ID)
+                .join("home"),
+        ];
+        let managed = roots.join("codex");
+        if let Ok(entries) = std::fs::read_dir(&managed) {
+            for entry in entries.filter_map(std::result::Result::ok) {
+                let path = entry.path();
+                if std::fs::symlink_metadata(&path)
+                    .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    homes.push(path);
+                }
+            }
+        }
+        Ok(homes
+            .into_iter()
+            .map(|home| cleanup_stale_app_servers_in_home(&home))
+            .sum())
+    })
+    .await
+    .map_err(|_| Error::Closed)?
+}
+
+#[derive(Clone)]
+pub(crate) struct AppServerCleanup {
+    child_pid: u32,
+    codex_home: Option<PathBuf>,
+    lease_path: Option<PathBuf>,
+}
+
+impl AppServerCleanup {
+    pub(crate) fn new(
+        data: &Path,
+        child_pid: u32,
+        environment: &[(String, String)],
+    ) -> Result<Self> {
+        let codex_home = owned_codex_home_from_environment(data, environment);
+        if let Some(home) = codex_home.as_ref() {
+            cleanup_stale_app_servers_in_home(home);
+        }
+        let lease_path = match codex_home.as_ref() {
+            Some(home) => Some(write_app_server_lease(home, child_pid)?),
+            None => None,
+        };
+        Ok(Self {
+            child_pid,
+            codex_home,
+            lease_path,
+        })
+    }
+
+    pub(crate) fn record_thread(&self, thread_id: &str) {
+        if let Some(path) = self.lease_path.as_ref() {
+            update_app_server_lease(path, self.child_pid, thread_id);
+        }
+    }
+
+    pub(crate) fn cleanup_thread_lock(&self, thread_id: &str) {
+        cleanup_thread_writer_lock(self.codex_home.as_deref(), thread_id);
+    }
+
+    pub(crate) async fn terminate(&self, child: &mut Child) {
+        kill_process_group(self.child_pid);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        if !process_alive(self.child_pid)
+            && let Some(path) = self.lease_path.as_ref()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn cleanup_thread_lock_for_environment(
+    data: &Path,
+    environment: &[(String, String)],
+    thread_id: &str,
+) {
+    cleanup_thread_writer_lock(
+        owned_codex_home_from_environment(data, environment).as_deref(),
+        thread_id,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_for(home: &Path) -> Vec<(String, String)> {
+        vec![("CODEX_HOME".into(), home.to_string_lossy().into_owned())]
+    }
+
+    #[test]
+    fn owned_codex_home_accepts_only_daemon_account_roots() {
+        let data = tempfile::TempDir::new().unwrap();
+        let native = data
+            .path()
+            .join("agent-accounts")
+            .join("codex-usage")
+            .join(super::super::usage::NATIVE_CODEX_ID)
+            .join("home");
+        let managed = data
+            .path()
+            .join("agent-accounts")
+            .join("codex")
+            .join("acct");
+        let nested = managed.join("nested");
+        let outside = tempfile::TempDir::new().unwrap();
+        for dir in [&native, &managed, &nested] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        assert_eq!(
+            owned_codex_home_from_environment(data.path(), &env_for(&native)).as_deref(),
+            Some(native.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            owned_codex_home_from_environment(data.path(), &env_for(&managed)).as_deref(),
+            Some(managed.canonicalize().unwrap().as_path())
+        );
+        assert!(owned_codex_home_from_environment(data.path(), &env_for(&nested)).is_none());
+        assert!(owned_codex_home_from_environment(data.path(), &env_for(outside.path())).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_codex_home_rejects_symlinked_account_root() {
+        use std::os::unix::fs::symlink;
+
+        let data = tempfile::TempDir::new().unwrap();
+        let target = tempfile::TempDir::new().unwrap();
+        let link = data
+            .path()
+            .join("agent-accounts")
+            .join("codex")
+            .join("acct");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(target.path(), &link).unwrap();
+
+        assert!(owned_codex_home_from_environment(data.path(), &env_for(&link)).is_none());
+    }
 }
 
 pub(super) struct CodexTurn {
@@ -339,6 +691,7 @@ pub(super) struct CodexTurn {
     child_pid: u32,
     responses: PendingResponses,
     diagnostics: ProcessDiagnostics,
+    cleanup: AppServerCleanup,
 }
 
 #[derive(Clone)]
@@ -356,10 +709,12 @@ struct StartingRpc {
     stdout: BufReader<tokio::process::ChildStdout>,
     next_id: u64,
     diagnostics: ProcessDiagnostics,
+    cleanup: AppServerCleanup,
 }
 
 impl StartingRpc {
     async fn start(
+        data: &Path,
         workspace: &str,
         environment: &[(String, String)],
         app_server_args: &[String],
@@ -404,17 +759,40 @@ impl StartingRpc {
                 ))
             }
         })?;
+        let child_pid = child.id().ok_or(Error::Closed)?;
+        let cleanup = match AppServerCleanup::new(data, child_pid, environment) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                kill_process_group(child_pid);
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                return Err(error);
+            }
+        };
         if let Some(stderr) = child.stderr.take() {
             spawn_stderr_tail_drain(stderr, diagnostics.stderr_tail.clone());
         }
-        let stdin = child.stdin.take().ok_or(Error::Closed)?;
-        let stdout = child.stdout.take().ok_or(Error::Closed)?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                cleanup.terminate(&mut child).await;
+                return Err(Error::Closed);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                cleanup.terminate(&mut child).await;
+                return Err(Error::Closed);
+            }
+        };
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
             diagnostics,
+            cleanup,
         })
     }
 
@@ -513,8 +891,11 @@ pub(super) async fn spawn_turn(
         let (_home, environment) = super::usage::native_codex_environment(data)?;
         (environment, Vec::new())
     };
-    let mut rpc = StartingRpc::start(workspace, &environment, &app_server_args).await?;
-    let child_pid = rpc.child.id().ok_or(Error::Closed)?;
+    if let Some(thread_id) = native_id {
+        cleanup_thread_lock_for_environment(data, &environment, thread_id);
+    }
+    let mut rpc = StartingRpc::start(data, workspace, &environment, &app_server_args).await?;
+    let child_pid = rpc.cleanup.child_pid;
     let policy = execution_policy(workspace, options.policy);
     let startup = async {
         rpc.request(
@@ -566,12 +947,11 @@ pub(super) async fn spawn_turn(
     let thread_id = match startup {
         Ok(thread_id) => thread_id,
         Err(error) => {
-            kill_process_group(child_pid);
-            let _ = rpc.child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(2), rpc.child.wait()).await;
+            rpc.cleanup.terminate(&mut rpc.child).await;
             return Err(error);
         }
     };
+    rpc.cleanup.record_thread(&thread_id);
 
     let (frames_tx, mut frames_rx) = mpsc::channel::<(Value, Option<oneshot::Sender<()>>)>(32);
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
@@ -596,8 +976,11 @@ pub(super) async fn spawn_turn(
     let reader_current_turns = current_turns.clone();
     let reader_frames = frames_tx.clone();
     let reader_thread_id = thread_id.clone();
+    let cleanup_thread_id = reader_thread_id.clone();
     let reader_responses = responses.clone();
     let diagnostics = rpc.diagnostics.clone();
+    let cleanup = rpc.cleanup.clone();
+    let driver_cleanup = cleanup.clone();
     let reader_diagnostics = diagnostics.clone();
     let auto_approve = options.policy == ApprovalPolicy::Auto;
     tokio::spawn(async move {
@@ -615,8 +998,8 @@ pub(super) async fn spawn_turn(
             },
         )
         .await;
-        let _ = rpc.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), rpc.child.wait()).await;
+        cleanup.cleanup_thread_lock(&cleanup_thread_id);
+        cleanup.terminate(&mut rpc.child).await;
     });
 
     let turn_start_id = 1_000_000_u64;
@@ -674,6 +1057,7 @@ pub(super) async fn spawn_turn(
         child_pid,
         responses,
         diagnostics,
+        cleanup: driver_cleanup,
     })
 }
 
@@ -684,7 +1068,7 @@ pub(super) async fn read_subagent_history_once(
     subagent_id: &str,
 ) -> Result<Option<Vec<Value>>> {
     let (_home, environment) = super::usage::native_codex_environment(data)?;
-    let mut rpc = StartingRpc::start(workspace, &environment, &[]).await?;
+    let mut rpc = StartingRpc::start(data, workspace, &environment, &[]).await?;
     let result = async {
         rpc.request(
             "initialize",
@@ -723,8 +1107,7 @@ pub(super) async fn read_subagent_history_once(
         Ok(Some(history_events(thread, subagent_id)))
     }
     .await;
-    let _ = rpc.child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), rpc.child.wait()).await;
+    rpc.cleanup.terminate(&mut rpc.child).await;
     result
 }
 
@@ -2441,6 +2824,7 @@ impl CodexTurn {
     }
 
     pub(super) fn kill(&self) {
+        self.cleanup.cleanup_thread_lock(&self.thread_id);
         kill_process_group(self.child_pid);
     }
 }

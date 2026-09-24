@@ -124,14 +124,16 @@ struct CodexRpc {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    cleanup: super::codex::AppServerCleanup,
 }
 
 impl CodexRpc {
-    async fn start(cwd: PathBuf, env: &[(String, String)]) -> Result<Self> {
-        Self::start_with_args(cwd, env, &[]).await
+    async fn start(data: &Path, cwd: PathBuf, env: &[(String, String)]) -> Result<Self> {
+        Self::start_with_args(data, cwd, env, &[]).await
     }
 
     async fn start_with_args(
+        data: &Path,
         cwd: PathBuf,
         env: &[(String, String)],
         app_server_args: &[String],
@@ -143,9 +145,19 @@ impl CodexRpc {
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(false);
         for (key, value) in env {
             command.env(key, value);
+        }
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -154,29 +166,64 @@ impl CodexRpc {
                 Error::Io(error)
             }
         })?;
+        let child_pid = child.id().ok_or(Error::Closed)?;
+        let cleanup = match super::codex::AppServerCleanup::new(data, child_pid, env) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                super::codex::kill_process_group(child_pid);
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                return Err(error);
+            }
+        };
         if let Some(mut stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut sink = Vec::new();
                 let _ = stderr.read_to_end(&mut sink).await;
             });
         }
-        let stdin = child.stdin.take().ok_or(Error::Closed)?;
-        let stdout = child.stdout.take().ok_or(Error::Closed)?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                cleanup.terminate(&mut child).await;
+                return Err(Error::Closed);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                cleanup.terminate(&mut child).await;
+                return Err(Error::Closed);
+            }
+        };
         let mut rpc = Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            cleanup,
         };
-        rpc.request(
-            "initialize",
-            json!({
-                "clientInfo": { "name": "prospero", "title": "Prospero", "version": env!("CARGO_PKG_VERSION") },
-                "capabilities": { "experimentalApi": true, "requestAttestation": false },
-            }),
-        )
-        .await?;
-        rpc.notify("initialized", json!({})).await?;
+        let initialized = rpc
+            .request(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "prospero",
+                        "title": "Prospero",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": { "experimentalApi": true, "requestAttestation": false },
+                }),
+            )
+            .await;
+        if let Err(error) = initialized {
+            rpc.cleanup.terminate(&mut rpc.child).await;
+            return Err(error);
+        }
+        if let Err(error) = rpc.notify("initialized", json!({})).await {
+            rpc.cleanup.terminate(&mut rpc.child).await;
+            return Err(error);
+        }
         Ok(rpc)
     }
 
@@ -232,14 +279,13 @@ impl CodexRpc {
 
     async fn shutdown(mut self) {
         let _ = self.stdin.shutdown().await;
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
+        self.cleanup.terminate(&mut self.child).await;
     }
 }
 
 pub(crate) async fn read_native_codex_usage(data: &Path) -> Result<Option<UsageReport>> {
     let (cwd, env) = native_codex_environment(data)?;
-    let mut rpc = CodexRpc::start(cwd, &env).await?;
+    let mut rpc = CodexRpc::start(data, cwd, &env).await?;
     let result = async {
         let identity = rpc
             .request("account/read", json!({ "refreshToken": true }))
@@ -542,7 +588,7 @@ pub(crate) async fn search_native_codex_conversations(
     limit: usize,
 ) -> Result<Vec<crate::agent::ResumableConversation>> {
     let (cwd, env) = native_codex_environment(data)?;
-    let mut rpc = CodexRpc::start(cwd.clone(), &env).await?;
+    let mut rpc = CodexRpc::start(data, cwd.clone(), &env).await?;
     let trimmed = query.trim();
     let params = if trimmed.is_empty() {
         json!({ "limit": limit, "sortKey": "updated_at", "sortDirection": "desc", "archived": false })
@@ -623,15 +669,16 @@ pub(crate) async fn read_native_codex_models(
     data: &Path,
 ) -> Result<crate::agent::LaunchModelCatalog> {
     let (cwd, env) = native_codex_environment(data)?;
-    read_codex_models(cwd, &env, &[]).await
+    read_codex_models(data, cwd, &env, &[]).await
 }
 
 async fn read_codex_models(
+    data: &Path,
     cwd: PathBuf,
     env: &[(String, String)],
     app_server_args: &[String],
 ) -> Result<crate::agent::LaunchModelCatalog> {
-    let mut rpc = CodexRpc::start_with_args(cwd, env, app_server_args).await?;
+    let mut rpc = CodexRpc::start_with_args(data, cwd, env, app_server_args).await?;
     let result = async {
         let mut models = Vec::new();
         let mut cursor: Option<String> = None;

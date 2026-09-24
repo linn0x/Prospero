@@ -385,6 +385,19 @@ for line in sys.stdin:
             time.sleep(0.1)
             break
         emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": params.get("threadId"), "turn": {"id": turn_id}}})
+        if scenario == "codexhang":
+            codex_home = os.environ.get("CODEX_HOME", "")
+            with open(os.path.join(os.getcwd(), "fake.pid"), "w") as pid:
+                pid.write(str(os.getpid()))
+            with open(os.path.join(os.getcwd(), "codex-home.txt"), "w") as home:
+                home.write(codex_home)
+            if codex_home:
+                locks = os.path.join(codex_home, "thread-writer-locks")
+                os.makedirs(locks, exist_ok=True)
+                open(os.path.join(locks, params.get("threadId") + ".lock"), "a").close()
+            sys.stdout.flush()
+            time.sleep(30)
+            break
         if scenario == "codexapproval":
             emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "tool-1", "type": "commandExecution", "command": "echo ok"}}})
             emit({"jsonrpc": "2.0", "id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {"threadId": params.get("threadId"), "itemId": "tool-1", "command": "echo ok"}})
@@ -449,6 +462,55 @@ for line in sys.stdin:
     else:
         respond(rpc_id, {})
 "#;
+
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+async fn wait_until_process_exits(pid: i32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while process_alive(pid) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "process {pid} survived"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+fn spawn_process_group_sleep() -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg("sleep 30");
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().unwrap()
+}
+
+#[cfg(unix)]
+async fn wait_child_exit(child: &mut std::process::Child) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "process group {} survived",
+            child.id()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 struct Harness {
     _data: TempDir,
@@ -693,6 +755,113 @@ async fn codex_structured_turn_streams_into_timeline() {
             .unwrap()
             .contains("prospero child sources")
     );
+}
+
+#[tokio::test]
+async fn codex_close_kills_app_server_group_and_cleans_thread_lock() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexhang").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "hang codex".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let pid_path = harness.workspace.path().join("fake.pid");
+    let home_path = harness.workspace.path().join("codex-home.txt");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !pid_path.exists() || !home_path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake codex did not report pid/home"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid: i32 = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let codex_home = std::path::PathBuf::from(std::fs::read_to_string(&home_path).unwrap());
+    let lock = codex_home
+        .join("thread-writer-locks")
+        .join("thread-created.lock");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !lock.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake codex did not create thread lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    harness.agents.close(&head.id).await.unwrap();
+    wait_until_process_exits(pid).await;
+    assert!(!lock.exists(), "thread lock should be removed on close");
+    let lease_dir = codex_home.join(".prospero/app-server-leases");
+    let stale_leases = std::fs::read_dir(&lease_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(std::result::Result::ok))
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    assert!(
+        stale_leases.is_empty(),
+        "app-server lease should be removed"
+    );
+}
+
+#[tokio::test]
+async fn recovery_kills_stale_codex_app_server_lease_and_thread_lock() {
+    let _guard = SERIAL.lock().await;
+    let data = TempDir::new().unwrap();
+    let database = Database::open(data.path().to_path_buf()).await.unwrap();
+    let agents = Agents::new(database.clone());
+    let codex_home = data
+        .path()
+        .join("agent-accounts")
+        .join("codex-usage")
+        .join("native-codex")
+        .join("home");
+    let lock_dir = codex_home.join("thread-writer-locks");
+    let lease_dir = codex_home.join(".prospero/app-server-leases");
+    std::fs::create_dir_all(&lock_dir).unwrap();
+    std::fs::create_dir_all(&lease_dir).unwrap();
+    let lock = lock_dir.join("thread-stale.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let mut child = spawn_process_group_sleep();
+    let pid = child.id();
+    let lease = lease_dir.join(format!("{pid}.json"));
+    std::fs::write(
+        &lease,
+        json!({
+            "version": 1,
+            "ownerPid": 999_999_999_u32,
+            "childPid": pid,
+            "processGroup": pid,
+            "threadId": "thread-stale",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let recovered = agents.recover().await.unwrap();
+    assert_eq!(recovered, 0);
+    wait_child_exit(&mut child).await;
+    assert!(!lock.exists(), "stale thread lock should be removed");
+    assert!(!lease.exists(), "stale app-server lease should be removed");
+    database.shutdown().await.unwrap();
 }
 
 #[tokio::test]
