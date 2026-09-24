@@ -401,14 +401,14 @@ fn execution_policy(workspace: &str, policy: ApprovalPolicy) -> ExecutionPolicy 
             approval_policy: json!("never"),
             approval_policy_for_turn: json!("never"),
             sandbox: json!("danger-full-access"),
-            sandbox_policy: json!({ "type": "dangerFullAccess" }),
+            sandbox_policy: json!({ "type": "danger-full-access" }),
         }
     } else {
         ExecutionPolicy {
             approval_policy: json!("untrusted"),
             approval_policy_for_turn: json!("untrusted"),
             sandbox: json!("workspace-write"),
-            sandbox_policy: json!({ "type": "workspaceWrite", "writableRoots": [workspace] }),
+            sandbox_policy: json!({ "type": "workspace-write", "writable_roots": [workspace] }),
         }
     }
 }
