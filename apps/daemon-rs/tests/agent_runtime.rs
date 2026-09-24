@@ -350,6 +350,11 @@ for line in sys.stdin:
     elif method == "thread/start":
         with open(os.path.join(os.getcwd(), "thread-start.json"), "w") as log:
             log.write(json.dumps(params))
+        if scenario == "codexstarterror":
+            sys.stderr.write("\033[31mprovider stderr says bad gateway\033[0m\n")
+            sys.stderr.flush()
+            emit({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32001, "message": "bad model provider", "data": {"hint": "wire_api invalid"}}})
+            continue
         respond(rpc_id, {"thread": {"id": next_thread}})
     elif method == "thread/resume":
         respond(rpc_id, {"thread": {"id": params.get("threadId", "thread-resumed")}})
@@ -370,6 +375,12 @@ for line in sys.stdin:
     elif method == "turn/start":
         with open(os.path.join(os.getcwd(), "turn-start.json"), "w") as log:
             log.write(json.dumps(params))
+        if scenario == "codexturnerror":
+            sys.stderr.write("\033[31mturn stderr says invalid mode\033[0m\n")
+            sys.stderr.flush()
+            emit({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32002, "message": "invalid collaboration mode", "data": {"field": "collaborationMode"}}})
+            time.sleep(0.1)
+            break
         emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": params.get("threadId"), "turn": {"id": turn_id}}})
         if scenario == "codexapproval":
             emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "tool-1", "type": "commandExecution", "command": "echo ok"}}})
@@ -654,6 +665,17 @@ async fn codex_structured_turn_streams_into_timeline() {
     assert_eq!(turn_start["model"], "gpt-test");
     assert_eq!(turn_start["effort"], "high");
     assert_eq!(turn_start["collaborationMode"]["mode"], "plan");
+    assert_eq!(turn_start["sandboxPolicy"]["type"], "workspace-write");
+    let wire_root = std::path::PathBuf::from(
+        turn_start["sandboxPolicy"]["writable_roots"][0]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        std::fs::canonicalize(wire_root).unwrap(),
+        std::fs::canonicalize(harness.workspace.path()).unwrap()
+    );
+    assert!(turn_start["sandboxPolicy"].get("writableRoots").is_none());
     let thread_start: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(harness.workspace.path().join("thread-start.json")).unwrap(),
     )
@@ -667,6 +689,101 @@ async fn codex_structured_turn_streams_into_timeline() {
             .as_str()
             .unwrap()
             .contains("prospero child sources")
+    );
+}
+
+#[tokio::test]
+async fn codex_thread_start_rpc_error_exposes_diagnostics() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexstarterror").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    let error = harness
+        .agents
+        .send(&head.id, "hi codex".into(), None, Vec::new())
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("codex thread/start JSON-RPC error"),
+        "{error}"
+    );
+    assert!(error.contains("bad model provider"), "{error}");
+    assert!(error.contains("wire_api invalid"), "{error}");
+    assert!(
+        error.contains("最近 stderr：provider stderr says bad gateway"),
+        "{error}"
+    );
+    assert!(error.contains("命令："), "{error}");
+    assert!(error.contains("app-server"), "{error}");
+    assert!(!error.contains("sk-profile-secret"), "{error}");
+    let records = harness.records(&head.id).await;
+    assert!(records.iter().any(|(_, body, preview)| {
+        matches!(body, TimelineBody::Error)
+            && preview.contains("codex thread/start JSON-RPC error")
+            && preview.contains("provider stderr says bad gateway")
+    }));
+    assert_eq!(
+        harness.status(&head.id).await,
+        prosperod_rs::protocol::SessionStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn codex_turn_start_rpc_error_marks_failed_with_diagnostics() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexturnerror").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "hi codex".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "failed")
+            })
+        })
+        .await;
+    let error = records
+        .iter()
+        .find_map(|(_, body, preview)| {
+            matches!(body, TimelineBody::Error).then_some(preview.clone())
+        })
+        .unwrap_or_default();
+
+    assert!(error.contains("codex turn/start JSON-RPC error"), "{error}");
+    assert!(error.contains("invalid collaboration mode"), "{error}");
+    assert!(error.contains("collaborationMode"), "{error}");
+    assert!(
+        error.contains("最近 stderr：turn stderr says invalid mode"),
+        "{error}"
+    );
+    assert_eq!(
+        harness.status(&head.id).await,
+        prosperod_rs::protocol::SessionStatus::Failed
     );
 }
 

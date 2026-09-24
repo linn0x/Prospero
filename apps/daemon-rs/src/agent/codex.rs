@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -25,17 +25,219 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
-type PendingResponses =
-    Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>>>;
+type StderrTail = Arc<Mutex<String>>;
+
+enum PendingResponse {
+    Reply {
+        method: String,
+        tx: oneshot::Sender<std::result::Result<Value, String>>,
+    },
+    FinishOnError {
+        method: String,
+        subagent: Option<String>,
+    },
+}
+
+type PendingResponses = Arc<Mutex<HashMap<String, PendingResponse>>>;
 
 struct NotificationState {
     current_turn: Arc<Mutex<Option<String>>>,
     current_turns: Arc<Mutex<HashMap<String, String>>>,
     responses: PendingResponses,
+    diagnostics: ProcessDiagnostics,
 }
 
 fn binary() -> String {
     std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into())
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_owned();
+    }
+    value.chars().take(max).collect()
+}
+
+fn tail_chars(value: &str, max: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max {
+        return value.to_owned();
+    }
+    chars[chars.len().saturating_sub(max)..].iter().collect()
+}
+
+fn strip_ansi_and_controls(value: &str) -> String {
+    enum State {
+        Text,
+        Escape,
+        Csi,
+    }
+    let mut state = State::Text;
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match state {
+            State::Text => match ch {
+                '\u{1b}' => state = State::Escape,
+                '\r' | '\n' | '\t' => out.push(ch),
+                c if c.is_control() => {}
+                c => out.push(c),
+            },
+            State::Escape => {
+                state = if ch == '[' { State::Csi } else { State::Text };
+            }
+            State::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    state = State::Text;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn sensitive_env(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("key")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("authorization")
+}
+
+fn redact_arg(arg: &str) -> String {
+    let lower = arg.to_ascii_lowercase();
+    let sensitive = lower.contains("api_key=")
+        || lower.contains("token=")
+        || lower.contains("secret=")
+        || lower.contains("password=")
+        || lower.contains("authorization=");
+    if sensitive {
+        if let Some((key, _)) = arg.split_once('=') {
+            return format!("{}=<redacted>", truncate_chars(key, 200));
+        }
+        return "<redacted>".into();
+    }
+    truncate_chars(&strip_ansi_and_controls(arg), 300)
+}
+
+fn diagnostic_context(diagnostics: &ProcessDiagnostics, stderr_tail: Option<&str>) -> String {
+    let command = std::iter::once(diagnostics.file.as_str())
+        .chain(diagnostics.args.iter().map(String::as_str))
+        .map(redact_arg)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env = diagnostics
+        .env
+        .iter()
+        .map(|(key, value)| {
+            if sensitive_env(key) {
+                format!("{key}=<{}>", if value.is_empty() { "empty" } else { "set" })
+            } else {
+                format!(
+                    "{key}={}",
+                    truncate_chars(&strip_ansi_and_controls(value), 300)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut parts = vec![
+        format!("命令：{command}"),
+        format!(
+            "工作目录：{}",
+            truncate_chars(&strip_ansi_and_controls(&diagnostics.cwd), 500)
+        ),
+    ];
+    if !env.is_empty() {
+        parts.push(format!("环境：{env}"));
+    }
+    if let Some(tail) = stderr_tail {
+        let clean = strip_ansi_and_controls(tail);
+        let tail = tail_chars(clean.trim(), 1000);
+        if !tail.is_empty() {
+            parts.push(format!("最近 stderr：{tail}"));
+        }
+    }
+    parts.join("；")
+}
+
+fn diagnostic_message_sync(diagnostics: &ProcessDiagnostics, prefix: &str) -> String {
+    truncate_chars(
+        &format!("{prefix}；{}", diagnostic_context(diagnostics, None)),
+        4000,
+    )
+}
+
+async fn diagnostic_message(diagnostics: &ProcessDiagnostics, prefix: &str) -> String {
+    // stderr and stdout close notifications race. Give the stderr drain a tiny
+    // chance to capture the final diagnostic line before we publish the error.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let tail = diagnostics.stderr_tail.lock().await.clone();
+    truncate_chars(
+        &format!("{prefix}；{}", diagnostic_context(diagnostics, Some(&tail))),
+        4000,
+    )
+}
+
+async fn rpc_error_message(
+    method: Option<&str>,
+    error: &Value,
+    diagnostics: &ProcessDiagnostics,
+) -> String {
+    let code = error.get("code").map(|value| summarize(Some(value)));
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("codex RPC failed");
+    let data = error
+        .get("data")
+        .filter(|value| !value.is_null())
+        .map(|value| summarize(Some(value)));
+    let mut prefix = match method {
+        Some(method) => format!("codex {method} JSON-RPC error"),
+        None => "codex app-server JSON-RPC error".into(),
+    };
+    if let Some(code) = code {
+        prefix.push_str(&format!(" code={code}"));
+    }
+    prefix.push_str(&format!(": {}", truncate_chars(message, 1000)));
+    if let Some(data) = data {
+        prefix.push_str(&format!("；data：{}", truncate_chars(&data, 1000)));
+    }
+    diagnostic_message(diagnostics, &prefix).await
+}
+
+fn spawn_stderr_tail_drain(mut stderr: tokio::process::ChildStderr, stderr_tail: StderrTail) {
+    tokio::spawn(async move {
+        let mut buffer = [0_u8; 2048];
+        loop {
+            let read = match stderr.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let chunk = String::from_utf8_lossy(&buffer[..read]);
+            let mut tail = stderr_tail.lock().await;
+            tail.push_str(&chunk);
+            if tail.chars().count() > 4000 {
+                *tail = tail_chars(&tail, 4000);
+            }
+        }
+    });
+}
+
+async fn fail_pending_responses(responses: &PendingResponses, message: String) {
+    let pending = {
+        let mut guard = responses.lock().await;
+        guard
+            .drain()
+            .map(|(_, pending)| pending)
+            .collect::<Vec<_>>()
+    };
+    for pending in pending {
+        if let PendingResponse::Reply { tx, .. } = pending {
+            let _ = tx.send(Err(message.clone()));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -64,6 +266,16 @@ pub(super) struct CodexTurn {
     mode: PermissionMode,
     child_pid: u32,
     responses: PendingResponses,
+    diagnostics: ProcessDiagnostics,
+}
+
+#[derive(Clone)]
+struct ProcessDiagnostics {
+    file: String,
+    args: Vec<String>,
+    cwd: String,
+    env: Vec<(String, String)>,
+    stderr_tail: StderrTail,
 }
 
 struct StartingRpc {
@@ -71,6 +283,7 @@ struct StartingRpc {
     stdin: tokio::process::ChildStdin,
     stdout: BufReader<tokio::process::ChildStdout>,
     next_id: u64,
+    diagnostics: ProcessDiagnostics,
 }
 
 impl StartingRpc {
@@ -79,10 +292,19 @@ impl StartingRpc {
         environment: &[(String, String)],
         app_server_args: &[String],
     ) -> Result<Self> {
-        let mut command = Command::new(binary());
+        let file = binary();
+        let mut args = vec!["app-server".to_owned()];
+        args.extend(app_server_args.iter().cloned());
+        let diagnostics = ProcessDiagnostics {
+            file: file.clone(),
+            args: args.clone(),
+            cwd: workspace.to_owned(),
+            env: environment.to_vec(),
+            stderr_tail: Arc::new(Mutex::new(String::new())),
+        };
+        let mut command = Command::new(&file);
         command
-            .arg("app-server")
-            .args(app_server_args)
+            .args(&args)
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -104,14 +326,14 @@ impl StartingRpc {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Error::Feature("agent_unavailable".into(), "未安装 codex".into())
             } else {
-                Error::Io(error)
+                Error::Invalid(diagnostic_message_sync(
+                    &diagnostics,
+                    &format!("codex app-server 启动失败: {error}"),
+                ))
             }
         })?;
-        if let Some(mut stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut sink = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut sink).await;
-            });
+        if let Some(stderr) = child.stderr.take() {
+            spawn_stderr_tail_drain(stderr, diagnostics.stderr_tail.clone());
         }
         let stdin = child.stdin.take().ok_or(Error::Closed)?;
         let stdout = child.stdout.take().ok_or(Error::Closed)?;
@@ -120,6 +342,7 @@ impl StartingRpc {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            diagnostics,
         })
     }
 
@@ -139,9 +362,17 @@ impl StartingRpc {
             &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
         )
         .await?;
-        tokio::time::timeout(START_TIMEOUT, read_response(&mut self.stdout, id))
-            .await
-            .map_err(|_| Error::Timeout)?
+        match tokio::time::timeout(
+            START_TIMEOUT,
+            read_response(&mut self.stdout, id, method, &self.diagnostics),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(Error::Invalid(
+                diagnostic_message(&self.diagnostics, &format!("codex {method} 超时")).await,
+            )),
+        }
     }
 }
 
@@ -156,12 +387,20 @@ async fn write_frame(stdin: &mut tokio::process::ChildStdin, frame: &Value) -> R
 async fn read_response(
     stdout: &mut BufReader<tokio::process::ChildStdout>,
     id: u64,
+    method: &str,
+    diagnostics: &ProcessDiagnostics,
 ) -> Result<Value> {
     loop {
         let mut line = String::new();
         let n = stdout.read_line(&mut line).await?;
         if n == 0 {
-            return Err(Error::Closed);
+            return Err(Error::Invalid(
+                diagnostic_message(
+                    diagnostics,
+                    &format!("codex {method} 失败: app-server stdout 已关闭"),
+                )
+                .await,
+            ));
         }
         if line.len() > MAX_LINE_BYTES {
             return Err(Error::Invalid("codex response too large".into()));
@@ -173,11 +412,9 @@ async fn read_response(
             continue;
         }
         if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("codex RPC failed");
-            return Err(Error::Invalid(message.chars().take(1000).collect()));
+            return Err(Error::Invalid(
+                rpc_error_message(Some(method), error, diagnostics).await,
+            ));
         }
         return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
     }
@@ -206,51 +443,63 @@ pub(super) async fn spawn_turn(
     };
     let mut rpc = StartingRpc::start(workspace, &environment, &app_server_args).await?;
     let child_pid = rpc.child.id().ok_or(Error::Closed)?;
-    rpc.request(
-        "initialize",
-        json!({
-            "clientInfo": { "name": "prospero", "title": "Prospero", "version": env!("CARGO_PKG_VERSION") },
-            "capabilities": { "experimentalApi": true, "requestAttestation": false },
-        }),
-    )
-    .await?;
-    rpc.notify("initialized", json!({})).await?;
-
     let policy = execution_policy(workspace, options.policy);
-    let mut base = serde_json::Map::new();
-    base.insert("cwd".into(), json!(workspace));
-    base.insert("approvalPolicy".into(), policy.approval_policy);
-    base.insert("sandbox".into(), policy.sandbox);
-    base.insert(
-        "developerInstructions".into(),
-        json!(crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS),
-    );
-    if let Some(model) = options.model.as_ref() {
-        base.insert("model".into(), json!(model));
-    }
-    let started = if let Some(thread_id) = native_id {
-        let mut params = base.clone();
-        params.insert("threadId".into(), json!(thread_id));
-        match rpc.request("thread/resume", Value::Object(params)).await {
-            Ok(value) => value,
-            Err(Error::Invalid(message))
-                if message.to_ascii_lowercase().contains("no rollout found") =>
-            {
-                rpc.request("thread/start", Value::Object(base)).await?
-            }
-            Err(error) => return Err(error),
+    let startup = async {
+        rpc.request(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "prospero", "title": "Prospero", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true, "requestAttestation": false },
+            }),
+        )
+        .await?;
+        rpc.notify("initialized", json!({})).await?;
+
+        let mut base = serde_json::Map::new();
+        base.insert("cwd".into(), json!(workspace));
+        base.insert("approvalPolicy".into(), policy.approval_policy.clone());
+        base.insert("sandbox".into(), policy.sandbox.clone());
+        base.insert(
+            "developerInstructions".into(),
+            json!(crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS),
+        );
+        if let Some(model) = options.model.as_ref() {
+            base.insert("model".into(), json!(model));
         }
-    } else {
-        rpc.request("thread/start", Value::Object(base)).await?
+        let started = if let Some(thread_id) = native_id {
+            let mut params = base.clone();
+            params.insert("threadId".into(), json!(thread_id));
+            match rpc.request("thread/resume", Value::Object(params)).await {
+                Ok(value) => value,
+                Err(Error::Invalid(message))
+                    if message.to_ascii_lowercase().contains("no rollout found") =>
+                {
+                    rpc.request("thread/start", Value::Object(base)).await?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            rpc.request("thread/start", Value::Object(base)).await?
+        };
+        started
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .or_else(|| started.get("threadId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Invalid("codex thread/start 未返回 threadId".into()))
+    }
+    .await;
+    let thread_id = match startup {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            kill_process_group(child_pid);
+            let _ = rpc.child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), rpc.child.wait()).await;
+            return Err(error);
+        }
     };
-    let thread_id = started
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .or_else(|| started.get("threadId"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Invalid("codex thread/start 未返回 threadId".into()))?
-        .to_owned();
 
     let (frames_tx, mut frames_rx) = mpsc::channel::<(Value, Option<oneshot::Sender<()>>)>(32);
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
@@ -276,6 +525,8 @@ pub(super) async fn spawn_turn(
     let reader_frames = frames_tx.clone();
     let reader_thread_id = thread_id.clone();
     let reader_responses = responses.clone();
+    let diagnostics = rpc.diagnostics.clone();
+    let reader_diagnostics = diagnostics.clone();
     let auto_approve = options.policy == ApprovalPolicy::Auto;
     tokio::spawn(async move {
         read_notifications(
@@ -288,6 +539,7 @@ pub(super) async fn spawn_turn(
                 current_turn: reader_current_turn,
                 current_turns: reader_current_turns,
                 responses: reader_responses,
+                diagnostics: reader_diagnostics,
             },
         )
         .await;
@@ -296,6 +548,13 @@ pub(super) async fn spawn_turn(
     });
 
     let turn_start_id = 1_000_000_u64;
+    responses.lock().await.insert(
+        turn_start_id.to_string(),
+        PendingResponse::FinishOnError {
+            method: "turn/start".into(),
+            subagent: None,
+        },
+    );
     let mut turn_params = serde_json::Map::new();
     turn_params.insert("threadId".into(), json!(thread_id));
     turn_params.insert(
@@ -314,12 +573,18 @@ pub(super) async fn spawn_turn(
     if let Some(effort) = options.effort.as_ref() {
         turn_params.insert("effort".into(), json!(effort));
     }
-    frames_tx
+    if frames_tx
         .try_send((
             json!({ "jsonrpc": "2.0", "id": turn_start_id, "method": "turn/start", "params": Value::Object(turn_params) }),
             None,
         ))
-        .map_err(|_| Error::Closed)?;
+        .is_err()
+    {
+        responses.lock().await.remove(&turn_start_id.to_string());
+        return Err(Error::Invalid(
+            diagnostic_message(&diagnostics, "codex turn/start 失败: app-server 队列不可写").await,
+        ));
+    }
 
     Ok(CodexTurn {
         stdin: frames_tx,
@@ -334,6 +599,7 @@ pub(super) async fn spawn_turn(
         mode: options.mode,
         child_pid,
         responses,
+        diagnostics,
     })
 }
 
@@ -401,14 +667,14 @@ fn execution_policy(workspace: &str, policy: ApprovalPolicy) -> ExecutionPolicy 
             approval_policy: json!("never"),
             approval_policy_for_turn: json!("never"),
             sandbox: json!("danger-full-access"),
-            sandbox_policy: json!({ "type": "dangerFullAccess" }),
+            sandbox_policy: json!({ "type": "danger-full-access" }),
         }
     } else {
         ExecutionPolicy {
             approval_policy: json!("untrusted"),
             approval_policy_for_turn: json!("untrusted"),
             sandbox: json!("workspace-write"),
-            sandbox_policy: json!({ "type": "workspaceWrite", "writableRoots": [workspace] }),
+            sandbox_policy: json!({ "type": "workspace-write", "writable_roots": [workspace] }),
         }
     }
 }
@@ -453,7 +719,9 @@ async fn read_notifications(
             let _ = events
                 .send(AdapterEvent::Finish {
                     interrupted: false,
-                    error: Some("codex response too large".into()),
+                    error: Some(
+                        diagnostic_message(&state.diagnostics, "codex response too large").await,
+                    ),
                     cost_usd: None,
                     input_tokens: last_input_tokens,
                     output_tokens: last_output_tokens,
@@ -467,32 +735,56 @@ async fn read_notifications(
             continue;
         };
         if message.get("method").is_none() {
-            if let Some(id) = rpc_id_key(message.get("id"))
-                && let Some(tx) = state.responses.lock().await.remove(&id)
-            {
-                let result = if let Some(error) = message.get("error") {
-                    Err(error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("codex RPC failed")
-                        .chars()
-                        .take(1000)
-                        .collect::<String>())
-                } else {
-                    Ok(message.get("result").cloned().unwrap_or_else(|| json!({})))
-                };
-                let _ = tx.send(result);
+            if let Some(id) = rpc_id_key(message.get("id")) {
+                let pending = state.responses.lock().await.remove(&id);
+                if let Some(pending) = pending {
+                    match pending {
+                        PendingResponse::Reply { method, tx } => {
+                            let result = if let Some(error) = message.get("error") {
+                                Err(rpc_error_message(Some(&method), error, &state.diagnostics)
+                                    .await)
+                            } else {
+                                Ok(message.get("result").cloned().unwrap_or_else(|| json!({})))
+                            };
+                            let _ = tx.send(result);
+                        }
+                        PendingResponse::FinishOnError { method, subagent } => {
+                            if let Some(error) = message.get("error") {
+                                let text =
+                                    rpc_error_message(Some(&method), error, &state.diagnostics)
+                                        .await;
+                                if let Some(subagent) = subagent {
+                                    let _ = events
+                                        .send(AdapterEvent::SubagentUpdate {
+                                            subagent,
+                                            status: "failed",
+                                            can_message: false,
+                                            summary: Some(text),
+                                        })
+                                        .await;
+                                } else {
+                                    let _ = events
+                                        .send(AdapterEvent::Finish {
+                                            interrupted: false,
+                                            error: Some(text),
+                                            cost_usd: None,
+                                            input_tokens: last_input_tokens,
+                                            output_tokens: last_output_tokens,
+                                            diffs: Vec::new(),
+                                        })
+                                        .await;
+                                    sent_finish = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             continue;
         }
         if let Some(error) = message.get("error") {
-            let text = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("codex RPC failed")
-                .chars()
-                .take(1000)
-                .collect::<String>();
+            let text = rpc_error_message(None, error, &state.diagnostics).await;
             let _ = events
                 .send(AdapterEvent::Finish {
                     interrupted: false,
@@ -796,10 +1088,12 @@ async fn read_notifications(
         }
     }
     if !sent_finish {
+        let message = diagnostic_message(&state.diagnostics, "codex stream closed").await;
+        fail_pending_responses(&state.responses, message.clone()).await;
         let _ = events
             .send(AdapterEvent::Finish {
                 interrupted: false,
-                error: Some("codex stream closed".into()),
+                error: Some(message),
                 cost_usd: None,
                 input_tokens: last_input_tokens,
                 output_tokens: last_output_tokens,
@@ -1861,7 +2155,12 @@ impl CodexTurn {
         if let Some(effort) = self.effort.as_ref() {
             params.insert("effort".into(), json!(effort));
         }
-        self.send_request("turn/start", Value::Object(params)).await
+        self.send_turn_start_request(
+            "turn/start",
+            Value::Object(params),
+            Some(subagent_id.to_owned()),
+        )
+        .await
     }
 
     pub(super) async fn read_subagent_history(
@@ -1912,29 +2211,27 @@ impl CodexTurn {
     }
 
     async fn send_request(&self, method: &str, params: Value) -> Result<()> {
-        let (ack, ack_rx) = oneshot::channel();
-        self.stdin
-            .send((
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": uuid::Uuid::new_v4().as_u128().to_string(),
-                    "method": method,
-                    "params": params,
-                }),
-                Some(ack),
-            ))
-            .await
-            .map_err(|_| Error::Closed)?;
-        tokio::time::timeout(CONTROL_TIMEOUT, ack_rx)
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|_| Error::Closed)
+        if method != "turn/start" {
+            self.send_request_value(method, params).await.map(|_| ())
+        } else {
+            self.send_turn_start_request(method, params, None).await
+        }
     }
 
-    async fn send_request_value(&self, method: &str, params: Value) -> Result<Value> {
+    async fn send_turn_start_request(
+        &self,
+        method: &str,
+        params: Value,
+        subagent: Option<String>,
+    ) -> Result<()> {
         let id = uuid::Uuid::new_v4().as_u128().to_string();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.responses.lock().await.insert(id.clone(), reply_tx);
+        self.responses.lock().await.insert(
+            id.clone(),
+            PendingResponse::FinishOnError {
+                method: method.to_owned(),
+                subagent,
+            },
+        );
         let (ack, ack_rx) = oneshot::channel();
         let send_result = self
             .stdin
@@ -1950,25 +2247,102 @@ impl CodexTurn {
             .await;
         if send_result.is_err() {
             self.responses.lock().await.remove(&id);
-            return Err(Error::Closed);
+            return Err(Error::Invalid(
+                diagnostic_message(
+                    &self.diagnostics,
+                    "codex turn/start 失败: app-server 管道不可写",
+                )
+                .await,
+            ));
+        }
+        match tokio::time::timeout(CONTROL_TIMEOUT, ack_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.responses.lock().await.remove(&id);
+                Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, "codex turn/start 失败: 写入未确认")
+                        .await,
+                ))
+            }
+            Err(_) => {
+                self.responses.lock().await.remove(&id);
+                Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, "codex turn/start 发送超时").await,
+                ))
+            }
+        }
+    }
+
+    async fn send_request_value(&self, method: &str, params: Value) -> Result<Value> {
+        let id = uuid::Uuid::new_v4().as_u128().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.responses.lock().await.insert(
+            id.clone(),
+            PendingResponse::Reply {
+                method: method.to_owned(),
+                tx: reply_tx,
+            },
+        );
+        let (ack, ack_rx) = oneshot::channel();
+        let send_result = self
+            .stdin
+            .send((
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                }),
+                Some(ack),
+            ))
+            .await;
+        if send_result.is_err() {
+            self.responses.lock().await.remove(&id);
+            return Err(Error::Invalid(
+                diagnostic_message(
+                    &self.diagnostics,
+                    &format!("codex {method} 失败: app-server 管道不可写"),
+                )
+                .await,
+            ));
         }
         match tokio::time::timeout(CONTROL_TIMEOUT, ack_rx).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 self.responses.lock().await.remove(&id);
-                return Err(Error::Closed);
+                return Err(Error::Invalid(
+                    diagnostic_message(
+                        &self.diagnostics,
+                        &format!("codex {method} 失败: 写入未确认"),
+                    )
+                    .await,
+                ));
             }
             Err(_) => {
                 self.responses.lock().await.remove(&id);
-                return Err(Error::Timeout);
+                return Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, &format!("codex {method} 发送超时"))
+                        .await,
+                ));
             }
         }
         let result = match tokio::time::timeout(CONTROL_TIMEOUT, reply_rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => return Err(Error::Closed),
+            Ok(Err(_)) => {
+                return Err(Error::Invalid(
+                    diagnostic_message(
+                        &self.diagnostics,
+                        &format!("codex {method} 失败: app-server 响应通道关闭"),
+                    )
+                    .await,
+                ));
+            }
             Err(_) => {
                 self.responses.lock().await.remove(&id);
-                return Err(Error::Timeout);
+                return Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, &format!("codex {method} 响应超时"))
+                        .await,
+                ));
             }
         };
         result.map_err(Error::Invalid)
