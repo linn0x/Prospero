@@ -1644,21 +1644,21 @@ impl Agents {
             agent_preset: run.agent_preset.clone(),
         };
         let engine = engine_agent(run.agent, options.api_profile.as_ref());
-        let driver = match engine {
-            AgentKind::Claude => Driver::Claude(spawn_turn(
+        let driver = match match engine {
+            AgentKind::Claude => spawn_turn(
                 &workspace,
                 &expanded,
                 &attachments,
                 native_id.as_deref(),
                 &options,
-            )?),
+            )
+            .map(Driver::Claude),
             AgentKind::Codex => {
                 if !attachments.is_empty() {
-                    return Err(Error::Invalid(
+                    Err(Error::Invalid(
                         "Codex structured runtime 暂不支持图片附件".into(),
-                    ));
-                }
-                Driver::Codex(
+                    ))
+                } else {
                     super::codex::spawn_turn(
                         self.0.database.directory(),
                         &workspace,
@@ -1666,33 +1666,76 @@ impl Agents {
                         native_id.as_deref(),
                         &options,
                     )
-                    .await?,
-                )
+                    .await
+                    .map(Driver::Codex)
+                }
             }
-            AgentKind::Deepseek => Driver::Deepseek(
-                super::deepseek::spawn_turn(
-                    &workspace,
-                    &expanded,
-                    &attachments,
-                    native_id.as_deref(),
-                    &options,
-                )
-                .await?,
-            ),
-            AgentKind::Opencode => Driver::Opencode(
-                super::opencode::spawn_turn(
-                    &workspace,
-                    &expanded,
-                    &attachments,
-                    native_id.as_deref(),
-                    &options,
-                )
-                .await?,
-            ),
-            _ => {
-                return Err(Error::Invalid(
-                    "Agent 暂未接入 Rust structured runtime".into(),
-                ));
+            AgentKind::Deepseek => super::deepseek::spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )
+            .await
+            .map(Driver::Deepseek),
+            AgentKind::Opencode => super::opencode::spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )
+            .await
+            .map(Driver::Opencode),
+            _ => Err(Error::Invalid(
+                "Agent 暂未接入 Rust structured runtime".into(),
+            )),
+        } {
+            Ok(driver) => driver,
+            Err(error) => {
+                let message = error.to_string();
+                let terminal = vec![
+                    TimelineWrite {
+                        id: format!("turn{turn}-error"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Error,
+                        text: bounded_text(message),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                    TimelineWrite {
+                        id: format!("turn{turn}-end"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::TurnEnd {
+                            finish: "failed".into(),
+                            diffs: Vec::new(),
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                ];
+                let _ = {
+                    let id = id.to_owned();
+                    self.0
+                        .database
+                        .call(move |store| store.append_agent_records(&id, terminal))
+                        .await
+                };
+                let _ = {
+                    let id = id.to_owned();
+                    self.0
+                        .database
+                        .call(move |store| {
+                            store.finish_agent_turn_status(&id, SessionStatus::Failed)
+                        })
+                        .await
+                };
+                self.publish();
+                return Err(error);
             }
         };
         let handle = Arc::new(Handle {
