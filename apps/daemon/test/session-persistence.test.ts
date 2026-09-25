@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
 import type {
   AdapterContext,
@@ -110,6 +110,68 @@ async function seedRecoverableQueuedState(home: string): Promise<string> {
 }
 
 describe("结构化会话持久化", () => {
+  it("allows concurrent transient SessionManager subscribers above the EventEmitter default", async () => {
+    const manager = new SessionManager();
+    const listeners = Array.from({ length: 16 }, () => () => {});
+
+    expect(manager.getMaxListeners()).toBe(0);
+    for (const listener of listeners) manager.on("state", listener);
+    expect(manager.listenerCount("state")).toBe(listeners.length);
+    for (const listener of listeners) manager.off("state", listener);
+    await manager.disposeAll();
+  });
+
+  it("does not schedule persistence from callbacks that arrive while shutdown is flushing", async () => {
+    const home = tempHome();
+    writeFileSync(path.join(home, "deleted-sessions.json"), JSON.stringify({ version: 1, ids: ["deleted-before-shutdown"] }));
+    const adapter = new FakePersistentAdapter(undefined);
+    const manager = new SessionManager({ home, adapterFactory: () => adapter });
+    await manager.create({
+      agent: "codex",
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    await manager.flushPersistence();
+
+    const internals = manager as unknown as {
+      ensureSessionDatabase(): Promise<void>;
+      persistStructuredNow(): Promise<void>;
+    };
+    const originalEnsure = internals.ensureSessionDatabase.bind(manager);
+    let enteredFlush: (() => void) | null = null;
+    let releaseFlush: (() => void) | null = null;
+    const flushEntered = new Promise<void>((resolve) => { enteredFlush = resolve; });
+    const flushRelease = new Promise<void>((resolve) => { releaseFlush = resolve; });
+    vi.spyOn(internals, "ensureSessionDatabase").mockImplementation(async () => {
+      enteredFlush?.();
+      await flushRelease;
+      await originalEnsure();
+    });
+    const persist = vi.spyOn(internals, "persistStructuredNow");
+
+    vi.useFakeTimers();
+    try {
+      adapter.askPermission();
+      const disposing = manager.disposeAll();
+      await flushEntered;
+
+      // This models a process-exit/provider callback arriving while the final
+      // flush is suspended. It must not leave a debounce timer behind that can
+      // run after disposeAll closes and nulls the database.
+      adapter.askPermission();
+      releaseFlush?.();
+      await disposing;
+      await vi.advanceTimersByTimeAsync(250);
+
+      expect(persist).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("损坏的删除栅栏不会静默恢复已删除会话", () => {
     const home = tempHome();
     writeFileSync(path.join(home, "deleted-sessions.json"), "{");

@@ -1496,6 +1496,12 @@ async fn serve(
         cli_dir,
     );
     api.terminals.recover().await?;
+    // A crash can interrupt fan-in after reserving terminal child results but
+    // before queueing or starting the parent turn. Only claims backed by a
+    // durable queue row survive this recovery pass.
+    if api.agents.recover_cross_model_fan_in_claims().await? > 0 {
+        api.publish();
+    }
     // A completed cross-model child can outlive the stream callback that
     // normally records its result.  Reconcile persisted terminal children on
     // startup *before* generic agent crash recovery so a finished provider

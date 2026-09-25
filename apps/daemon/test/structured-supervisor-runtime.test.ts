@@ -1,7 +1,8 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStructuredSupervisorHostLease } from "../src/structured-supervisor-runtime-lease.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "../src/structured-supervisor-runtime.js";
@@ -18,6 +19,86 @@ function temp(prefix: string): string {
 function writePrivate(file: string, content: string): void {
   writeFileSync(file, content, { mode: 0o600 });
   chmodSync(file, 0o600);
+}
+
+function writeFinderMetadata(file: string): void {
+  writeFileSync(file, "Finder metadata\n", { mode: 0o644 });
+  chmodSync(file, 0o644);
+}
+
+async function waitForFiles(files: readonly string[], timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!files.every((file) => existsSync(file))) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for snapshot workers");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function concurrentSnapshotWorker(
+  runtimeModule: string,
+  runtimeRoot: string,
+  runnerPath: string,
+  marker: string,
+  release: string,
+): Promise<{ directory: string }> {
+  const workerSource = [
+    'import { chmodSync, existsSync, writeFileSync } from "node:fs";',
+    'import path from "node:path";',
+    "const [runtimeModule, runtimeRoot, runnerPath, marker, release] = process.argv.slice(1);",
+    "const runtime = await import(runtimeModule);",
+    "let snapshot;",
+    "try {",
+    "  snapshot = runtime.createStructuredSupervisorRuntimeSnapshot({",
+    "    runtimeRoot,",
+    "    runnerPath,",
+    "    afterCopyForTest: (_attempt, staging) => {",
+    '      const metadata = path.join(staging, ".DS_Store");',
+    '      writeFileSync(metadata, "Finder metadata\\n", { mode: 0o644 });',
+    "      chmodSync(metadata, 0o644);",
+    '      writeFileSync(marker, "ready\\n", { mode: 0o600 });',
+    "      const deadline = Date.now() + 15_000;",
+    "      while (!existsSync(release)) {",
+    '        if (Date.now() >= deadline) throw new Error("timed out waiting for concurrent publish release");',
+    "        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);",
+    "      }",
+    "    },",
+    "  });",
+    '  process.stdout.write(JSON.stringify({ directory: snapshot.directory }) + "\\n");',
+    "} finally {",
+    "  snapshot?.release();",
+    "}",
+  ].join("\n");
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      workerSource,
+      runtimeModule,
+      runtimeRoot,
+      runnerPath,
+      marker,
+      release,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code !== 0) {
+        reject(new Error("snapshot worker exited " + String(code) + ": " + stderr.trim()));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout.trim()) as { directory: string });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
 }
 
 function runtimeFixture(prefix: string): { source: string; runtimeRoot: string; runner: string } {
@@ -82,6 +163,7 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
     mkdirSync(path.join(packageRoot, "dist"), { recursive: true, mode: 0o700 });
     writePrivate(path.join(packageRoot, "dist", "index.mjs"), "import { dependency } from '@fixture/dependency'; export const value = `package:${dependency}`;\n");
     writePrivate(path.join(packageRoot, "asset.txt"), "full package asset\n");
+    writeFinderMetadata(path.join(packageRoot, ".DS_Store"));
     writePrivate(path.join(dependencyRoot, "package.json"), JSON.stringify({ name: "@fixture/dependency", type: "module", exports: "./index.mjs" }));
     writePrivate(path.join(dependencyRoot, "index.mjs"), "export const dependency = 'dependency';\n");
     writePrivate(path.join(fixture.source, "local.mjs"), "export const local = 'local';\n");
@@ -94,12 +176,93 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
       expect(first.directory.startsWith(fixture.runtimeRoot)).toBe(true);
       const packageImage = path.join(first.directory, "dist", "node_modules", "@fixture", "value");
       expect(existsSync(path.join(packageImage, "asset.txt"))).toBe(true);
+      expect(existsSync(path.join(packageImage, ".DS_Store"))).toBe(false);
       expect(existsSync(path.join(packageImage, "node_modules", "@fixture", "dependency", "index.mjs"))).toBe(true);
       expect(existsSync(path.join(packageImage, "dist", "node_modules", "@fixture", "dependency", "index.mjs"))).toBe(false);
       expect(execFileSync(process.execPath, [first.runnerPath], { encoding: "utf8" }).trim()).toBe("local:package:dependency");
     } finally {
       first.release();
       second.release();
+    }
+  });
+
+  it("reuses a complete snapshot when Finder metadata appears in the published tree", () => {
+    const fixture = runtimeFixture("prospero-runtime-finder-published");
+    writePrivate(fixture.runner, "console.log('immutable');\n");
+    const first = createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    });
+    first.release();
+    writeFinderMetadata(path.join(first.directory, ".DS_Store"));
+    writeFinderMetadata(path.join(first.directory, "dist", ".DS_Store"));
+
+    const second = createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    });
+    try {
+      expect(second.directory).toBe(first.directory);
+      expect(execFileSync(process.execPath, [second.runnerPath], { encoding: "utf8" }).trim()).toBe("immutable");
+    } finally {
+      second.release();
+    }
+  });
+
+  it("reclaims stale staging trees containing Finder metadata", () => {
+    const fixture = runtimeFixture("prospero-runtime-finder-staging");
+    writePrivate(fixture.runner, "console.log('current');\n");
+    mkdirSync(fixture.runtimeRoot, { recursive: true, mode: 0o700 });
+    chmodSync(fixture.runtimeRoot, 0o700);
+    const stale = path.join(fixture.runtimeRoot, ".structured-supervisor-staging-orphan");
+    const nested = path.join(stale, "dist");
+    mkdirSync(nested, { recursive: true, mode: 0o700 });
+    writePrivate(path.join(nested, "runner.mjs"), "console.log('orphan');\n");
+    writeFinderMetadata(path.join(stale, ".DS_Store"));
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1_000);
+    utimesSync(stale, old, old);
+
+    const snapshot = createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    });
+    try {
+      expect(existsSync(stale)).toBe(false);
+    } finally {
+      snapshot.release();
+    }
+  });
+
+  it("publishes one idempotent snapshot across concurrent daemons and removes losing staging trees", async () => {
+    const fixture = runtimeFixture("prospero-runtime-concurrent-publish");
+    const control = temp("prospero-runtime-concurrent-control-");
+    const release = path.join(control, "release");
+    const markers = Array.from({ length: 4 }, (_, index) => path.join(control, "ready-" + String(index)));
+    const runtimeModule = pathToFileURL(
+      path.join(import.meta.dirname, "..", "dist", "structured-supervisor-runtime.js"),
+    ).href;
+    writePrivate(fixture.runner, "console.log('shared');\n");
+    const workers = markers.map((marker) => concurrentSnapshotWorker(
+      runtimeModule,
+      fixture.runtimeRoot,
+      fixture.runner,
+      marker,
+      release,
+    ));
+
+    try {
+      await waitForFiles(markers);
+      writePrivate(release, "publish\n");
+      const snapshots = await Promise.all(workers);
+      expect(new Set(snapshots.map((snapshot) => snapshot.directory)).size).toBe(1);
+      expect(existsSync(path.join(snapshots[0]!.directory, ".DS_Store"))).toBe(true);
+      expect(readdirSync(fixture.runtimeRoot).filter((name) =>
+        name.startsWith(".structured-supervisor-staging-"))).toEqual([]);
+      expect(readdirSync(fixture.runtimeRoot).filter((name) =>
+        /^structured-supervisor-[a-f0-9]{64}$/.test(name))).toHaveLength(1);
+    } finally {
+      if (!existsSync(release)) writePrivate(release, "publish\n");
+      await Promise.allSettled(workers);
     }
   });
 
@@ -201,6 +364,7 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
     try {
       expect(existsSync(retained.directory)).toBe(true);
       retained.release();
+      writeFinderMetadata(path.join(fixture.runtimeRoot, "leases", ".DS_Store"));
       writePrivate(fixture.runner, "console.log('three');\n");
       const afterRelease = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
       try {
@@ -304,6 +468,7 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
     ["an extra private file", (directory) => writePrivate(path.join(directory, "injected-0600"), "not in the record\n")],
     ["an extra private directory", (directory) => mkdirSync(path.join(directory, "injected-directory"), { mode: 0o700 })],
     ["an unexpected symlink", (directory) => symlinkSync("snapshot.json", path.join(directory, "injected-link"), "file")],
+    ["a .DS_Store symlink", (directory) => symlinkSync("snapshot.json", path.join(directory, ".DS_Store"), "file")],
     ["a file mode change", (directory) => chmodSync(path.join(directory, "dist", "runner.mjs"), 0o700)],
     ["a file replaced by a directory", (directory) => {
       const runner = path.join(directory, "dist", "runner.mjs");

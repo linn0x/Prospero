@@ -94,8 +94,16 @@ export interface StructuredSupervisorRuntimeSnapshotOptions {
   runtimeRoot: string;
   /** Test seam; production always resolves the runner beside this daemon. */
   runnerPath?: string;
-  /** Exercises the source-stability retry without weakening production checks. */
-  afterCopyForTest?: (attempt: number) => void;
+  /** Exercises source-stability and publication races without weakening production checks. */
+  afterCopyForTest?: (attempt: number, staging: string) => void;
+}
+
+/** Finder may recreate this non-runtime file; links/directories stay unsafe. */
+function isIgnoredMetadataFile(
+  name: string,
+  metadata: { isFile(): boolean; isSymbolicLink(): boolean },
+): boolean {
+  return name === ".DS_Store" && metadata.isFile() && !metadata.isSymbolicLink();
 }
 
 /**
@@ -283,6 +291,7 @@ function collectRuntimeImage(runner: string): RuntimeImage {
         if (entry.name === "node_modules") continue;
         const source = path.join(directory, entry.name);
         const metadata = lstatSync(source);
+        if (isIgnoredMetadataFile(entry.name, metadata)) continue;
         if (metadata.isSymbolicLink()) {
           throw new Error("structured supervisor runtime package contains a symlink");
         }
@@ -477,6 +486,7 @@ function privateTree(directory: string): boolean {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const child = path.join(directory, entry.name);
     const metadata = lstatSync(child);
+    if (isIgnoredMetadataFile(entry.name, metadata)) continue;
     if (metadata.isSymbolicLink()) return false;
     if (metadata.isDirectory()) {
       if (!privateTree(child)) return false;
@@ -530,8 +540,11 @@ function readActiveLeases(runtimeRoot: string, now: number): Set<string> | null 
     if (!isPrivateDirectory(directory)) return null;
     const active = new Set<string>();
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) return null;
       const file = path.join(directory, entry.name);
+      let metadata;
+      try { metadata = lstatSync(file); } catch { return null; }
+      if (isIgnoredMetadataFile(entry.name, metadata)) continue;
+      if (!metadata.isFile() || metadata.isSymbolicLink() || !entry.name.endsWith(".json")) return null;
       if (!isPrivateFile(file)) return null;
       let parsed: unknown;
       try { parsed = JSON.parse(readFileSync(file, "utf8")); } catch { return null; }
@@ -680,6 +693,7 @@ function hasExactSnapshotInventory(directory: string, image: RuntimeImage): bool
       } catch {
         return false;
       }
+      if (isIgnoredMetadataFile(entry.name, childMetadata)) continue;
       if (expectedDirectories.has(child)) {
         if (!childMetadata.isDirectory() || childMetadata.isSymbolicLink()) return false;
         if (!walk(child)) return false;
@@ -716,6 +730,31 @@ function validExistingSnapshot(
     return imageDigest(contentDigest, expected) === digest && digestFiles(image.files, directory) === contentDigest;
   } catch {
     return false;
+  }
+}
+
+function isConcurrentPublishCollision(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EEXIST" || code === "ENOTEMPTY";
+}
+
+function publishSnapshot(
+  staging: string,
+  published: string,
+  digest: string,
+  contentDigest: string,
+  image: RuntimeImage,
+): void {
+  try {
+    renameSync(staging, published);
+  } catch (error) {
+    // rename(2) reports an existing non-empty directory as EEXIST on some
+    // POSIX filesystems and ENOTEMPTY on others. The content-addressed winner
+    // is equivalent only after its complete record, inventory, and bytes pass
+    // the same validation as our staging image.
+    if (!isConcurrentPublishCollision(error) || !validExistingSnapshot(published, digest, contentDigest, image)) {
+      throw error;
+    }
   }
 }
 
@@ -781,7 +820,7 @@ export function createStructuredSupervisorRuntimeSnapshot(
     chmodSync(staging, 0o700);
     try {
       copyImage(staging, image);
-      options.afterCopyForTest?.(attempt);
+      options.afterCopyForTest?.(attempt, staging);
       // Copy correctness and source stability are separate checks: either a
       // short read or a concurrent overwrite rejects this attempt.
       if (digestFiles(image.files, staging) !== contentDigest) {
@@ -792,12 +831,7 @@ export function createStructuredSupervisorRuntimeSnapshot(
 
       privateWrite(path.join(staging, "snapshot.json"), `${JSON.stringify(record)}\n`);
       const published = path.join(options.runtimeRoot, `${SNAPSHOT_PREFIX}${digest}`);
-      try {
-        renameSync(staging, published);
-      } catch (error) {
-        // A concurrent daemon may have won publication of this same content.
-        if (!validExistingSnapshot(published, digest, contentDigest, image)) throw error;
-      }
+      publishSnapshot(staging, published, digest, contentDigest, image);
       if (!validExistingSnapshot(published, digest, contentDigest, image)) {
         throw new Error("structured supervisor runtime snapshot is incomplete");
       }

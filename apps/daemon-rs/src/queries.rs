@@ -18,6 +18,8 @@ struct Cursor {
     lifecycle: Option<SessionLifecycle>,
     workspace: Option<String>,
     text: Option<String>,
+    #[serde(default)]
+    exclude_cross_model_children: bool,
 }
 
 struct QueryBudget<'a>(&'a Connection);
@@ -172,7 +174,42 @@ impl Store {
         })
     }
 
-    pub fn sessions(&self, mut query: SessionQuery) -> Result<SessionPage> {
+    pub fn sidebar_lookup_sessions(&self, input: SessionLookup) -> Result<SessionLookupResult> {
+        let result = self.lookup_sessions(input)?;
+        let mut items = Vec::with_capacity(result.items.len());
+        let mut missing_ids = result.missing_ids;
+        for head in result.items {
+            let child: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1)",
+                [&head.id],
+                |row| row.get(0),
+            )?;
+            if child {
+                missing_ids.push(head.id);
+            } else {
+                items.push(head);
+            }
+        }
+        Ok(SessionLookupResult {
+            items,
+            missing_ids,
+            latest_seq: result.latest_seq,
+        })
+    }
+
+    pub fn sessions(&self, query: SessionQuery) -> Result<SessionPage> {
+        self.sessions_filtered(query, false)
+    }
+
+    pub fn sidebar_sessions(&self, query: SessionQuery) -> Result<SessionPage> {
+        self.sessions_filtered(query, true)
+    }
+
+    fn sessions_filtered(
+        &self,
+        mut query: SessionQuery,
+        exclude_cross_model_children: bool,
+    ) -> Result<SessionPage> {
         let limit = page_limit(query.limit)?;
         if let Some(workspace) = &query.workspace {
             validate_text(workspace, 4096, false)?;
@@ -198,6 +235,7 @@ impl Store {
                 || cursor.lifecycle != query.lifecycle
                 || cursor.workspace != query.workspace
                 || cursor.text != query.text
+                || cursor.exclude_cross_model_children != exclude_cross_model_children
             {
                 return Err(Error::Invalid("cursor does not match query".into()));
             }
@@ -214,6 +252,11 @@ impl Store {
         if let Some(workspace) = &query.workspace {
             clauses.push("h.workspace=?");
             values.push(workspace.clone().into());
+        }
+        if exclude_cross_model_children {
+            clauses.push(
+                "NOT EXISTS(SELECT 1 FROM cross_model_children c WHERE c.child_session_id=h.id)",
+            );
         }
         if let Some(text) = &query.text {
             let tokens: Vec<_> = text
@@ -236,7 +279,10 @@ impl Store {
             let summary = self.session_summary(query.workspace.as_deref())?;
             let available = match query.lifecycle { Some(SessionLifecycle::Active) => summary.active, Some(SessionLifecycle::Archived) => summary.archived, None => summary.total };
             let global_total = if query.workspace.is_some() { self.session_summary(None)?.total } else { summary.total };
-            let total = if query.text.is_some() {
+            let total = if exclude_cross_model_children {
+                let sql = format!("SELECT count(*) FROM session_heads h WHERE {}", clauses.join(" AND "));
+                self.connection.query_row(&sql, params_from_iter(&values), |row| row.get(0))?
+            } else if query.text.is_some() {
                 if available == global_total {
                     self.connection.query_row("SELECT count(*) FROM session_search WHERE session_search MATCH ?", [values.last().unwrap()], |row| row.get(0))?
                 } else {
@@ -248,7 +294,7 @@ impl Store {
             };
             if total == 0 { return Ok(SessionPage { items: vec![], next_cursor: None, previous_cursor: None, has_more: false, total, latest_seq: summary.latest_seq }); }
             let mut source = "session_heads h".to_owned();
-            if query.text.is_some() && total == available {
+            if !exclude_cross_model_children && query.text.is_some() && total == available {
                 clauses.pop(); values.pop();
             } else if query.text.is_some() && total > available / 4 {
                 let index = match (query.workspace.is_some(), query.lifecycle.is_some()) {
@@ -286,7 +332,7 @@ impl Store {
                     self.connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {source} WHERE {} LIMIT 1)", filters.join(" AND ")), params_from_iter(parameters), |row| row.get::<_, bool>(0))?
                 } else { false }
             } else { false };
-            let encode = |head: &SessionHead, before| serde_json::to_vec(&Cursor { before, created_at: head.created_at, id: head.id.clone(), lifecycle: query.lifecycle, workspace: query.workspace.clone(), text: query.text.clone() }).map(|value| URL_SAFE_NO_PAD.encode(value));
+            let encode = |head: &SessionHead, before| serde_json::to_vec(&Cursor { before, created_at: head.created_at, id: head.id.clone(), lifecycle: query.lifecycle, workspace: query.workspace.clone(), text: query.text.clone(), exclude_cross_model_children }).map(|value| URL_SAFE_NO_PAD.encode(value));
             let has_next = if before { opposite } else { has_more };
             let has_previous = if before { has_more } else { opposite };
             let next_cursor = if has_next { items.last().map(|head| encode(head, false)).transpose()? } else { None };

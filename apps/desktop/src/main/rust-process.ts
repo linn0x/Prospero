@@ -48,8 +48,13 @@ export class RustProcess {
 
   async attach(timeoutMs = 2500): Promise<RustConnection | undefined> {
     if (this.connection && this.managed) return this.connection;
+    let connection: RustConnection;
     try {
-      const connection = this.readConnectionFile();
+      connection = this.readConnectionFile();
+    } catch {
+      return undefined;
+    }
+    try {
       const health = await connection.client.health(AbortSignal.timeout(timeoutMs));
       if (health.apiVersion !== 1 || health.backend !== "rust") return undefined;
       if (!this.expectedBuildId || health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
@@ -57,8 +62,23 @@ export class RustProcess {
       try { await connection.client.shutdown(AbortSignal.timeout(700), health.buildId); } catch { return this.accept(connection, health.buildId, true, true); }
       return await this.waitForReplacement(connection.pid, Math.max(timeoutMs, 20_000));
     } catch {
+      // A live daemon whose HTTP shell responds but whose runtime/database
+      // worker is unavailable cannot be attached and still owns the data-dir
+      // lock. Ask that authenticated process to retire, then wait for the lock
+      // owner to exit before launch() starts a replacement.
+      await connection.client.shutdown(AbortSignal.timeout(700)).catch(() => {});
+      await this.waitForPidExit(connection.pid, Math.max(timeoutMs, 5_000));
       return undefined;
     }
+  }
+
+  private async waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try { process.kill(pid, 0); } catch { return true; }
+      await delay(100);
+    }
+    return false;
   }
 
   start(): Promise<RustConnection> {
