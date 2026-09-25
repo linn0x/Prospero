@@ -22,6 +22,13 @@ use crate::worker::Database;
 const MAX_TURNS: usize = 32;
 const CROSS_MODEL_CHECK_LEASE_MILLIS: i64 = 60_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentReportDelivery {
+    Submitted,
+    Queued,
+    Delivered,
+}
+
 fn decode_base64_lenient(input: &str) -> Result<Vec<u8>> {
     fn value(byte: u8) -> Option<u8> {
         match byte {
@@ -296,6 +303,9 @@ struct Session {
 struct State {
     database: Database,
     entries: Mutex<HashMap<String, Arc<Session>>>,
+    /// Serializes claim + delivery for each parent so a later final fan-in
+    /// cannot overtake an earlier incremental batch.
+    fan_in_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     slots: Arc<Semaphore>,
     closed: AtomicBool,
     failed: AtomicBool,
@@ -334,6 +344,7 @@ impl Agents {
         Self(Arc::new(State {
             database,
             entries: Mutex::new(HashMap::new()),
+            fan_in_locks: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(MAX_TURNS)),
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -377,6 +388,13 @@ impl Agents {
     /// normal fan-in path (notably when a provider emits `turn/completed`
     /// and closes immediately).  Without this pass it remains `starting`,
     /// preventing the parent from ever receiving the batch report.
+    pub async fn recover_cross_model_fan_in_claims(&self) -> Result<usize> {
+        self.0
+            .database
+            .call(|store| store.release_orphaned_cross_model_fan_in_claims())
+            .await
+    }
+
     pub async fn reconcile_cross_model_children(&self) -> Result<usize> {
         let children = self
             .0
@@ -469,6 +487,26 @@ impl Agents {
     }
 
     async fn deliver_pending_cross_model_fan_in(&self, parent_session_id: &str) -> Result<bool> {
+        let delivery_lock = {
+            let mut locks = self.0.fan_in_locks.lock().await;
+            locks
+                .entry(parent_session_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _delivery = delivery_lock.lock().await;
+        let parent_id = parent_session_id.to_owned();
+        let parent = self
+            .0
+            .database
+            .call(move |store| store.session(&parent_id))
+            .await?;
+        if parent.lifecycle != SessionLifecycle::Active
+            || (parent.kind == SessionKind::Structured
+                && self.session_entry(parent_session_id).await.is_err())
+        {
+            return Ok(false);
+        }
         let mut delivered = false;
         loop {
             let parent_id = parent_session_id.to_owned();
@@ -477,22 +515,43 @@ impl Agents {
                 .database
                 .call(move |store| store.claim_cross_model_fan_in(&parent_id))
                 .await?;
-            let Some((report, claimed_children)) = report else {
+            let Some(fan_in) = report else {
                 return Ok(delivered);
             };
-            if let Err(error) = self
-                .deliver_cross_model_fan_in(parent_session_id, report)
-                .await
-            {
+            let super::store::CrossModelFanIn {
+                report,
+                claim_id,
+                children: claimed_children,
+            } = fan_in;
+            let delivery = self
+                .deliver_cross_model_fan_in(parent_session_id, report, Some(claim_id.clone()))
+                .await;
+            let delivery = match delivery {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    let parent_id = parent_session_id.to_owned();
+                    let _ = self
+                        .0
+                        .database
+                        .call(move |store| {
+                            store.release_cross_model_fan_in(
+                                &parent_id,
+                                &claim_id,
+                                &claimed_children,
+                            )
+                        })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if delivery == ParentReportDelivery::Submitted {
                 let parent_id = parent_session_id.to_owned();
-                let _ = self
-                    .0
+                self.0
                     .database
                     .call(move |store| {
-                        store.release_cross_model_fan_in(&parent_id, &claimed_children)
+                        store.mark_cross_model_fan_in_delivered(&parent_id, &claim_id)
                     })
-                    .await;
-                return Err(error);
+                    .await?;
             }
             delivered = true;
         }
@@ -506,7 +565,8 @@ impl Agents {
         &self,
         parent_session_id: &str,
         report: String,
-    ) -> Result<()> {
+        cross_model_claim_id: Option<String>,
+    ) -> Result<ParentReportDelivery> {
         let parent_id = parent_session_id.to_owned();
         let parent = self
             .0
@@ -514,7 +574,16 @@ impl Agents {
             .call(move |store| store.session(&parent_id))
             .await?;
         match parent.kind {
-            SessionKind::Structured => self.send(parent_session_id, report, None, Vec::new()).await,
+            SessionKind::Structured => {
+                self.send_internal(
+                    parent_session_id,
+                    report,
+                    None,
+                    Vec::new(),
+                    cross_model_claim_id,
+                )
+                .await
+            }
             SessionKind::Pty => {
                 let directory = self
                     .0
@@ -523,16 +592,38 @@ impl Agents {
                     .join("terminal-hosts")
                     .join(parent_session_id);
                 let host = crate::terminal::host::Host::attach(directory).await?;
-                for chunk in crate::cross_model_tool::terminal_fan_in_chunks(
+                let chunks = crate::cross_model_tool::terminal_fan_in_chunks(
                     &report,
                     crate::terminal::INPUT_BYTES,
-                ) {
+                );
+                let (last, leading) = chunks.split_last().expect("fan-in stream is non-empty");
+                for chunk in leading {
                     host.input(TerminalInput {
                         data_b64: BASE64_STANDARD.encode(chunk),
                     })
                     .await?;
                 }
-                Ok(())
+                if let Some(claim_id) = cross_model_claim_id.as_deref() {
+                    self.mark_cross_model_fan_in_delivered(parent_session_id, claim_id)
+                        .await?;
+                }
+                if let Err(error) = host
+                    .input(TerminalInput {
+                        data_b64: BASE64_STANDARD.encode(last),
+                    })
+                    .await
+                {
+                    if let Some(claim_id) = cross_model_claim_id.as_deref() {
+                        self.rollback_cross_model_fan_in_delivery(parent_session_id, claim_id)
+                            .await;
+                    }
+                    return Err(error);
+                }
+                Ok(if cross_model_claim_id.is_some() {
+                    ParentReportDelivery::Delivered
+                } else {
+                    ParentReportDelivery::Submitted
+                })
             }
         }
     }
@@ -569,7 +660,7 @@ impl Agents {
                 return Ok(delivered);
             };
             if let Err(error) = self
-                .deliver_cross_model_fan_in(&check.parent_session_id, report)
+                .deliver_cross_model_fan_in(&check.parent_session_id, report, None)
                 .await
             {
                 let check_id = check.id.clone();
@@ -1430,14 +1521,40 @@ impl Agents {
         delivery: Option<String>,
         attachments: Vec<AttachmentInput>,
     ) -> Result<()> {
+        self.send_internal(id, text, delivery, attachments, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn send_internal(
+        &self,
+        id: &str,
+        text: String,
+        delivery: Option<String>,
+        attachments: Vec<AttachmentInput>,
+        cross_model_claim_id: Option<String>,
+    ) -> Result<ParentReportDelivery> {
         validate_message(&text, &attachments)?;
         let entry = self.session_entry(id).await?;
         let mut guard = entry.handle.lock().await;
         let Some(handle) = guard.clone() else {
             // Idle: start a fresh turn immediately.
-            let (turn, handle) = self.launch_turn(id, text, attachments, &mut guard).await?;
+            let claimed = cross_model_claim_id.is_some();
+            let (turn, handle) = self
+                .launch_turn(
+                    id,
+                    text,
+                    attachments,
+                    cross_model_claim_id.as_deref(),
+                    &mut guard,
+                )
+                .await?;
             self.spawn_chain(id.to_owned(), turn, handle);
-            return Ok(());
+            return Ok(if claimed {
+                ParentReportDelivery::Delivered
+            } else {
+                ParentReportDelivery::Submitted
+            });
         };
         // Busy turn: either steer the live CLI or park the message in the
         // persistent queue for the turn-end drain.
@@ -1452,6 +1569,7 @@ impl Agents {
             text: text.clone(),
             created_at: crate::database::now(),
             attachments,
+            cross_model_claim_id,
         };
         let steering = delivery.as_deref() == Some("steer");
         if steering && handle.steerable.load(Ordering::Acquire) {
@@ -1473,14 +1591,14 @@ impl Agents {
             {
                 self.record_steer(id, &text, &row.attachments).await?;
                 self.publish();
-                return Ok(());
+                return Ok(ParentReportDelivery::Submitted);
             }
             // The current turn can no longer accept a steer (broken pipe /
             // result already emitted): degrade to the front of the queue. The
             // message and its images must not be lost.
         }
         self.enqueue(id, &row, steering).await?;
-        Ok(())
+        Ok(ParentReportDelivery::Queued)
     }
 
     async fn enqueue(&self, id: &str, row: &QueuedRow, front: bool) -> Result<()> {
@@ -1492,6 +1610,55 @@ impl Agents {
             .await?;
         self.publish();
         Ok(())
+    }
+
+    async fn mark_cross_model_fan_in_delivered(
+        &self,
+        parent_session_id: &str,
+        claim_id: &str,
+    ) -> Result<()> {
+        let claim_id = claim_id.to_owned();
+        let parent_id = parent_session_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.mark_cross_model_fan_in_delivered(&parent_id, &claim_id))
+            .await?;
+        Ok(())
+    }
+
+    async fn release_queued_cross_model_fan_in_claim(
+        &self,
+        parent_session_id: &str,
+        row: &QueuedRow,
+    ) {
+        let Some(claim_id) = row.cross_model_claim_id.clone() else {
+            return;
+        };
+        let parent_id = parent_session_id.to_owned();
+        let _ = self
+            .0
+            .database
+            .call(move |store| store.release_cross_model_fan_in_claim(&parent_id, &claim_id))
+            .await;
+    }
+
+    async fn rollback_cross_model_fan_in_delivery(&self, parent_session_id: &str, claim_id: &str) {
+        let parent_id = parent_session_id.to_owned();
+        let claim_id = claim_id.to_owned();
+        let _ = self
+            .0
+            .database
+            .call(move |store| store.rollback_cross_model_fan_in_delivery(&parent_id, &claim_id))
+            .await;
+    }
+
+    fn retry_pending_cross_model_fan_in(&self, parent_session_id: String) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let _ = runtime
+                .deliver_pending_cross_model_fan_in(&parent_session_id)
+                .await;
+        });
     }
 
     /// Persist a successfully-delivered steer as a user message immediately:
@@ -1558,6 +1725,7 @@ impl Agents {
         id: &str,
         text: String,
         attachments: Vec<AttachmentInput>,
+        cross_model_claim_id: Option<&str>,
         guard: &mut MutexGuard<'_, Option<Arc<Handle>>>,
     ) -> Result<(i64, Arc<Handle>)> {
         if self.0.closed.load(Ordering::Acquire) {
@@ -1644,6 +1812,9 @@ impl Agents {
             agent_preset: run.agent_preset.clone(),
         };
         let engine = engine_agent(run.agent, options.api_profile.as_ref());
+        if let Some(claim_id) = cross_model_claim_id {
+            self.mark_cross_model_fan_in_delivered(id, claim_id).await?;
+        }
         let driver = match match engine {
             AgentKind::Claude => spawn_turn(
                 &workspace,
@@ -1694,6 +1865,10 @@ impl Agents {
         } {
             Ok(driver) => driver,
             Err(error) => {
+                if let Some(claim_id) = cross_model_claim_id {
+                    self.rollback_cross_model_fan_in_delivery(id, claim_id)
+                        .await;
+                }
                 let message = error.to_string();
                 let terminal = vec![
                     TimelineWrite {
@@ -1786,28 +1961,51 @@ impl Agents {
                     break;
                 };
                 match runtime
-                    .launch_turn(&id, row.text.clone(), row.attachments.clone(), &mut guard)
+                    .launch_turn(
+                        &id,
+                        row.text.clone(),
+                        row.attachments.clone(),
+                        row.cross_model_claim_id.as_deref(),
+                        &mut guard,
+                    )
                     .await
                 {
                     Ok((next_turn, next_handle)) => {
                         turn = next_turn;
                         handle = next_handle;
+                        // Popping one queue row frees capacity. Retry a fan-in
+                        // that previously rolled back because the queue was
+                        // full; the active handle makes it re-enter at the tail.
+                        runtime.retry_pending_cross_model_fan_in(id.clone());
                         // Guard drops here; run_turn runs without it, and the
                         // next loop iteration takes the drain slot again.
                     }
                     // Archive raced the pop: the queue was cleared by design
                     // (user killed the session); do not replay it.
-                    Err(Error::Conflict) | Err(Error::NotFound) => break,
+                    Err(Error::Conflict) | Err(Error::NotFound) => {
+                        runtime
+                            .release_queued_cross_model_fan_in_claim(&id, &row)
+                            .await;
+                        break;
+                    }
                     Err(Error::Closed) => {
                         // Daemon shutdown: put the popped row back so a future
                         // daemon can drain it rather than dropping the text.
-                        let _ = runtime.enqueue(&id, &row, true).await;
+                        if runtime.enqueue(&id, &row, true).await.is_err() {
+                            runtime
+                                .release_queued_cross_model_fan_in_claim(&id, &row)
+                                .await;
+                        }
                         break;
                     }
                     Err(error) => {
                         // Transient failure: keep the message at the front;
                         // the next user-sent turn drains it on completion.
-                        let _ = runtime.enqueue(&id, &row, true).await;
+                        if runtime.enqueue(&id, &row, true).await.is_err() {
+                            runtime
+                                .release_queued_cross_model_fan_in_claim(&id, &row)
+                                .await;
+                        }
                         runtime.drain_error(&id, turn, &error.to_string()).await;
                         break;
                     }
@@ -1862,15 +2060,26 @@ impl Agents {
                 _ => return,
             };
             match runtime
-                .launch_turn(&id, row.text.clone(), row.attachments.clone(), &mut guard)
+                .launch_turn(
+                    &id,
+                    row.text.clone(),
+                    row.attachments.clone(),
+                    row.cross_model_claim_id.as_deref(),
+                    &mut guard,
+                )
                 .await
             {
                 Ok((turn, handle)) => {
                     drop(guard);
-                    runtime.spawn_chain(id, turn, handle);
+                    runtime.spawn_chain(id.clone(), turn, handle);
+                    runtime.retry_pending_cross_model_fan_in(id.clone());
                 }
                 Err(error) => {
-                    let _ = runtime.enqueue(&id, &row, true).await;
+                    if runtime.enqueue(&id, &row, true).await.is_err() {
+                        runtime
+                            .release_queued_cross_model_fan_in_claim(&id, &row)
+                            .await;
+                    }
                     runtime.drain_error(&id, 0, &error.to_string()).await;
                 }
             }
@@ -2690,6 +2899,7 @@ impl Agents {
     /// Cancel a message that has not been dispatched yet. A steer that was
     /// already delivered has no queue row and cannot be withdrawn.
     pub async fn remove_queued(&self, id: &str, queue_id: &str) -> Result<()> {
+        let parent_id = id.to_owned();
         let id = id.to_owned();
         let queue_id = queue_id.to_owned();
         self.0
@@ -2697,6 +2907,9 @@ impl Agents {
             .call(move |store| store.remove_message(&id, &queue_id))
             .await?;
         self.publish();
+        // Removing any row frees a slot; removing a fan-in row also releases
+        // its durable claim in the same database transaction.
+        self.retry_pending_cross_model_fan_in(parent_id);
         Ok(())
     }
 
@@ -2720,6 +2933,11 @@ impl Agents {
                 .find(|item| item.id == queue_id)
                 .ok_or(Error::NotFound)?
         };
+        if row.cross_model_claim_id.is_some() {
+            // Internal fan-in reports must start a distinct parent turn so the
+            // durable claim can be completed exactly at that boundary.
+            return Err(Error::Conflict);
+        }
         let mut steered = false;
         let guard = entry.handle.lock().await;
         if let Some(handle) = guard.as_ref()
@@ -2762,6 +2980,7 @@ impl Agents {
             }
             self.record_steer(id, &row.text, &row.attachments).await?;
             self.publish();
+            self.retry_pending_cross_model_fan_in(id.to_owned());
             return Ok(());
         }
         // Not steered: mark guide and move to the front, then kick the drain

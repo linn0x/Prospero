@@ -320,6 +320,8 @@ impl Api {
             .route("/v1/terminals/{id}/resize", post(terminal_resize))
             .route("/v1/terminals/{id}/close", post(terminal_close))
             .route("/v1/sessions", get(sessions))
+            .route("/v1/sessions/sidebar", get(sidebar_sessions))
+            .route("/v1/sessions/sidebar/lookup", post(sidebar_lookup))
             .route("/v1/skills", get(list_skills_route))
             .route("/v1/plugins", get(plugin_list))
             .route("/v1/plugin-services", get(plugin_service_status))
@@ -5789,6 +5791,26 @@ async fn sessions(
 ) -> std::result::Result<Json<SessionPage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid session query".into()))?;
     Ok(Json(api.call(move |store| store.sessions(query)).await?))
+}
+
+async fn sidebar_sessions(
+    State(api): State<Api>,
+    query: std::result::Result<Query<SessionQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<SessionPage>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid session query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.sidebar_sessions(query)).await?,
+    ))
+}
+
+async fn sidebar_lookup(
+    State(api): State<Api>,
+    Json(input): Json<SessionLookup>,
+) -> std::result::Result<Json<SessionLookupResult>, ApiError> {
+    Ok(Json(
+        api.call(move |store| store.sidebar_lookup_sessions(input))
+            .await?,
+    ))
 }
 
 async fn session(

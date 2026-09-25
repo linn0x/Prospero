@@ -363,10 +363,11 @@ export class RustRuntime {
       this.store.setManagedState(this.managed ? this.connection.pid : undefined, false);
       this.schedule();
       return { ok: true };
-    } catch {
+    } catch (cause) {
       await this.process.stop();
       this.clearState();
       const error = "Rust 服务启动失败，请检查实验构建和独立数据目录";
+      this.store.appendLog(`[rust] startup failed: ${cause instanceof Error ? cause.message : String(cause)}\n`);
       this.store.setManagedState(undefined, false, error);
       return { ok: false, error };
     }
@@ -417,8 +418,8 @@ export class RustRuntime {
     const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
     const [summary, active, recent, workspaces, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
-      client.sessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
-      client.sessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
+      client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
+      client.sidebarSessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       client.health(signal),
       client.devices(signal).catch((error: unknown) => {
@@ -527,7 +528,7 @@ export class RustRuntime {
         if (!cursor || cursor.key !== key || typeof cursor.id !== "string" || !ids.includes(cursor.id)) throw new Error("会话游标与筛选不匹配");
         start = ids.indexOf(cursor.id) + 1;
       }
-      const result = await client.lookup(ids, signal);
+      const result = await client.sidebarLookup(ids, signal);
       const heads = result.items.filter(head => !request.terminal || head.lifecycle === "archived");
       const remaining = heads.filter(head => ids.indexOf(head.id) >= start);
       const items = remaining.slice(0, request.limit ?? 100);
@@ -536,7 +537,7 @@ export class RustRuntime {
       };
     }
     const [page, summary] = await Promise.all([
-      client.sessions({ limit: request.limit ?? 100, cursor: request.cursor ?? null, lifecycle: request.terminal ? "archived" : null, text: request.query ?? null, workspace: request.workspace ?? null }, signal),
+      client.sidebarSessions({ limit: request.limit ?? 100, cursor: request.cursor ?? null, lifecycle: request.terminal ? "archived" : null, text: request.query ?? null, workspace: request.workspace ?? null }, signal),
       client.summary(request.workspace, signal),
     ]);
     return { items: page.items.map(head => rustSessionInfo(head)), total: page.total, active: summary.active, terminal: summary.archived, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}), ...(page.previousCursor ? { previousCursor: page.previousCursor } : {}) };

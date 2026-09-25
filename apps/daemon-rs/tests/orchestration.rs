@@ -804,7 +804,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -1042,7 +1042,7 @@ fn v8_database_is_migrated_forward_to_current_schema() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
@@ -1072,7 +1072,7 @@ fn v9_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        28
+        30
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -1131,7 +1131,7 @@ fn v10_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        28
+        30
     );
     let mode: String = connection
         .query_row(
@@ -1191,7 +1191,7 @@ fn v11_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        28
+        30
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1288,7 +1288,7 @@ fn v12_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        28
+        30
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1386,7 +1386,7 @@ fn v13_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        28
+        30
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -1474,7 +1474,7 @@ fn v14_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        28
+        30
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -1582,7 +1582,7 @@ fn v15_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        28
+        30
     );
     let has_engine_validation_column: i64 = connection
         .query_row(
