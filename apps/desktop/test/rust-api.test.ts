@@ -12,13 +12,17 @@ describe("Rust desktop API boundary", () => {
   });
 
   it("uses bounded typed routes with owner credentials and no redirects", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ items: [], hasMore: false, nextCursor: null })));
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({ items: [], hasMore: false, nextCursor: null })));
     const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
     await client.sessions({ limit: 100, cursor: "cursor+value", lifecycle: "archived", workspace: null, text: null });
     const [url, init] = fetcher.mock.calls[0]!;
     expect(String(url)).toContain("cursor=cursor%2Bvalue");
     expect(init?.headers).toMatchObject({ authorization: `Bearer ${token}` });
     expect(init?.redirect).toBe("error");
+    await client.sidebarSessions({ limit: 20, cursor: null, lifecycle: "active", workspace: null, text: null });
+    expect(String(fetcher.mock.calls[1]![0])).toContain("/v1/sessions/sidebar?");
+    await client.sidebarLookup(["fixture"]);
+    expect(String(fetcher.mock.calls[2]![0])).toContain("/v1/sessions/sidebar/lookup");
     expect(() => client.session("../accounts")).toThrow();
   });
 

@@ -247,11 +247,16 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySupervisorLauncher: (input: LaunchPtySupervisorInput) => Promise<RemotePtySession>;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
+  private disposePromise: Promise<void> | null = null;
   /** Serialize dirty-session transactions; old JSON is migration input only. */
   private persistChain: Promise<void> = Promise.resolve();
 
   constructor(opts: SessionManagerOptions = {}) {
     super();
+    // Authenticated HTTP long polls attach one short-lived listener per
+    // request and remove it when the request settles. Concurrent clients can
+    // legitimately exceed EventEmitter's leak-oriented default of ten.
+    this.setMaxListeners(0);
     // 没装 tmux 就静默退回直接 spawn —— 托管是增强,不该变成硬依赖
     this.tmuxBin = opts.tmux ? tmux.tmuxPath() : null;
     this.tmuxConfigFile = this.tmuxBin && opts.tmux ? tmux.writeConfig(opts.tmux.home) : null;
@@ -1605,7 +1610,16 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * daemon 退出时只断开自己这一侧。tmux 托管下会话进程留在 tmux server 里,
    * 下次启动再 attach 回来 —— 这正是托管的意义,所以这里绝不能 killSession。
    */
-  async disposeAll(): Promise<void> {
+  disposeAll(): Promise<void> {
+    // Close the scheduling gate before the final flush starts. A provider or
+    // process-exit callback can otherwise enqueue a new debounce timer while
+    // that flush is awaiting the database, then run after the database closes.
+    this.shuttingDown = true;
+    this.disposePromise ??= this.disposeAllOnce();
+    return this.disposePromise;
+  }
+
+  private async disposeAllOnce(): Promise<void> {
     // 先保存“仍然存在”的集合,随后 dispose 产生的 done 状态不能把它们从磁盘抹掉。
     try { await this.flushPersistence(); }
     catch (error) {
@@ -1613,7 +1627,6 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       // it must not prevent detaching clients from independent owners.
       if (!this.databaseError) throw error;
     }
-    this.shuttingDown = true;
     // create() 返回时 tmux 子进程可能还在和 server 握手。极快地点击“重启”时若
     // 立刻杀 client,session 尚未登记就会丢失；最多等 750ms 让 supervisor 接棒。
     if (this.tmuxEnabled) {

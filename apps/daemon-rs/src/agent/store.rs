@@ -80,9 +80,17 @@ pub(crate) struct QueuedRow {
     pub text: String,
     pub created_at: i64,
     pub attachments: Vec<crate::agent::AttachmentInput>,
+    /// Present only for an internally queued cross-model fan-in report. The
+    /// child summaries remain claimed (not delivered) until this row starts a
+    /// real parent turn.
+    pub cross_model_claim_id: Option<String>,
 }
 
-pub(crate) type CrossModelFanIn = (String, Vec<(String, i64)>);
+pub(crate) struct CrossModelFanIn {
+    pub report: String,
+    pub claim_id: String,
+    pub children: Vec<(String, i64)>,
+}
 pub(crate) type ClaimedCrossModelCheck = (super::CrossModelCheck, String);
 
 const CROSS_MODEL_REPORT_BYTES: usize = 60_000;
@@ -102,6 +110,50 @@ pub(crate) fn truncate_utf8_bytes(value: &str, maximum: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+fn repeated_char_label(value: char) -> String {
+    match value {
+        '\n' => "\\n".into(),
+        '\r' => "\\r".into(),
+        '\t' => "\\t".into(),
+        ' ' => "space".into(),
+        other => other.to_string(),
+    }
+}
+
+fn collapse_repeated_char_runs(value: &str) -> String {
+    const MIN_RUN: usize = 120;
+    const HEAD: usize = 24;
+    const TAIL: usize = 8;
+
+    let mut output = String::with_capacity(value.len().min(4096));
+    let mut chars = value.chars().peekable();
+    while let Some(current) = chars.next() {
+        let mut count = 1usize;
+        while chars.peek() == Some(&current) {
+            chars.next();
+            count += 1;
+        }
+        if count >= MIN_RUN {
+            output.extend(std::iter::repeat_n(current, HEAD.min(count)));
+            output.push_str(&format!(
+                "...[连续重复 {} 个 `{}`]...",
+                count,
+                repeated_char_label(current)
+            ));
+            if count > HEAD {
+                output.extend(std::iter::repeat_n(current, TAIL.min(count - HEAD)));
+            }
+        } else {
+            output.extend(std::iter::repeat_n(current, count));
+        }
+    }
+    output
+}
+
+fn cross_model_report_text(value: &str, maximum: usize) -> String {
+    truncate_utf8_bytes(&collapse_repeated_char_runs(value), maximum)
 }
 
 pub(crate) fn cross_model_card_task(value: &str) -> String {
@@ -323,7 +375,7 @@ impl Store {
                         [child_session_id],
                     )?;
                     transaction.execute(
-                        "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
+                        "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,summary_claim_id=NULL,summary_claimed_at=NULL,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
                         params![task, run.turn + 1, crate::database::now(), child_session_id],
                     )?;
                     Ok(())
@@ -331,7 +383,7 @@ impl Store {
             )?;
         } else {
             self.connection.execute(
-                "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
+                "UPDATE cross_model_children SET task=?1,status='starting',result=NULL,summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,summary_claim_id=NULL,summary_claimed_at=NULL,task_generation=task_generation+1,task_turn=?2,updated_at=?3 WHERE child_session_id=?4",
                 params![task, run.turn + 1, crate::database::now(), child_session_id],
             )?;
         }
@@ -482,7 +534,7 @@ impl Store {
             [parent_session_id], |row| row.get(0),
         )?;
         let undelivered: i64 = self.connection.query_row(
-            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND status IN ('completed','failed','stopped')",
+            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND summary_claim_id IS NULL AND status IN ('completed','failed','stopped')",
             [parent_session_id], |row| row.get(0),
         )?;
         if undelivered == 0 {
@@ -492,7 +544,7 @@ impl Store {
         let mut rows = Vec::new();
         {
             let mut statement = transaction.prepare(
-                "SELECT child_session_id,task_generation,status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND status IN ('completed','failed','stopped') ORDER BY updated_at,child_session_id LIMIT ?2",
+                "SELECT child_session_id,task_generation,status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND summary_claim_id IS NULL AND status IN ('completed','failed','stopped') ORDER BY updated_at,child_session_id LIMIT ?2",
             )?;
             for row in statement.query_map(
                 params![parent_session_id, CROSS_MODEL_REPORT_CHILDREN as i64],
@@ -519,10 +571,12 @@ impl Store {
             .iter()
             .map(|(session_id, generation, ..)| (session_id.clone(), *generation))
             .collect::<Vec<_>>();
+        let claim_id = format!("cross-fan-in-{}", uuid::Uuid::new_v4().simple());
+        let claimed_at = crate::database::now();
         for (child_session_id, generation) in &claims {
             let claimed = transaction.execute(
-                "UPDATE cross_model_children SET summary_delivered=1,summary_delivered_at=?1,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=0",
-                params![crate::database::now(), parent_session_id, child_session_id, generation],
+                "UPDATE cross_model_children SET summary_claim_id=?1,summary_claimed_at=?2,updated_at=?2 WHERE parent_session_id=?3 AND child_session_id=?4 AND task_generation=?5 AND summary_delivered=0 AND summary_claim_id IS NULL",
+                params![claim_id, claimed_at, parent_session_id, child_session_id, generation],
             )?;
             if claimed != 1 {
                 transaction.rollback()?;
@@ -566,16 +620,16 @@ impl Store {
             let fixed = prefix.len() + separator.len() + suffix.len();
             let content_budget = section_budget.saturating_sub(fixed);
             let task_budget = content_budget.min(1_800).min(content_budget / 3);
-            let task = truncate_utf8_bytes(&task, task_budget);
+            let task = cross_model_report_text(&task, task_budget);
             let result = if result.is_empty() {
                 "（没有可用摘要）".to_owned()
             } else {
-                truncate_utf8_bytes(&result, content_budget.saturating_sub(task.len()))
+                cross_model_report_text(&result, content_budget.saturating_sub(task.len()))
             };
             report.push_str(&prefix);
             report.push_str(&task);
             report.push_str(separator);
-            report.push_str(&truncate_utf8_bytes(
+            report.push_str(&cross_model_report_text(
                 &result,
                 section_budget
                     .saturating_sub(prefix.len() + task.len() + separator.len() + suffix.len()),
@@ -583,7 +637,76 @@ impl Store {
             report.push_str(suffix);
         }
         debug_assert!(report.len() <= CROSS_MODEL_REPORT_BYTES);
-        Ok(Some((report, claims)))
+        Ok(Some(CrossModelFanIn {
+            report,
+            claim_id,
+            children: claims,
+        }))
+    }
+
+    /// Complete a reserved fan-in after its report has actually started a
+    /// parent turn (or was fully written to a PTY parent). Queued reports do
+    /// not reach this state merely because enqueueing succeeded.
+    pub(crate) fn mark_cross_model_fan_in_delivered(
+        &mut self,
+        parent_session_id: &str,
+        claim_id: &str,
+    ) -> Result<usize> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(claim_id)?;
+        let now = crate::database::now();
+        let changed = self.connection.execute(
+            "UPDATE cross_model_children SET summary_delivered=1,summary_delivered_at=?1,updated_at=?1 WHERE parent_session_id=?2 AND summary_claim_id=?3 AND summary_delivered=0",
+            params![now, parent_session_id, claim_id],
+        )?;
+        Ok(changed)
+    }
+
+    /// A provider launch failed after the parent prompt was persisted but
+    /// before the provider could consume it. Restore the queued claim so the
+    /// same report can be retried without becoming a false delivery.
+    pub(crate) fn rollback_cross_model_fan_in_delivery(
+        &mut self,
+        parent_session_id: &str,
+        claim_id: &str,
+    ) -> Result<usize> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(claim_id)?;
+        let now = crate::database::now();
+        let changed = self.connection.execute(
+            "UPDATE cross_model_children SET summary_delivered=0,summary_delivered_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND summary_claim_id=?3 AND summary_delivered=1 AND summary_acknowledged=0",
+            params![now, parent_session_id, claim_id],
+        )?;
+        Ok(changed)
+    }
+
+    pub(crate) fn release_cross_model_fan_in_claim(
+        &mut self,
+        parent_session_id: &str,
+        claim_id: &str,
+    ) -> Result<usize> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(claim_id)?;
+        let now = crate::database::now();
+        let changed = self.connection.execute(
+            "UPDATE cross_model_children SET summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND summary_claim_id=?3 AND summary_delivered=0",
+            params![now, parent_session_id, claim_id],
+        )?;
+        Ok(changed)
+    }
+
+    /// Claims with no durable queue row were interrupted before the report
+    /// reached its parent. This is called during startup recovery, before new
+    /// fan-in work begins, so those terminal results become retryable.
+    pub(crate) fn release_orphaned_cross_model_fan_in_claims(&mut self) -> Result<usize> {
+        let now = crate::database::now();
+        let changed = self.connection.execute(
+            "UPDATE cross_model_children SET summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 \
+             WHERE summary_delivered=0 AND summary_claim_id IS NOT NULL \
+             AND NOT EXISTS (SELECT 1 FROM agent_message_queue q WHERE q.cross_model_claim_id=cross_model_children.summary_claim_id)",
+            [now],
+        )?;
+        Ok(changed)
     }
 
     /// Persist a one-shot parent wakeup. The delay is represented as an
@@ -680,7 +803,7 @@ impl Store {
         {
             let mut statement = self.connection.prepare(
                 "SELECT child_session_id,task_generation,status,task,coalesce(result,'') \
-                 FROM cross_model_children WHERE parent_session_id=?1 \
+                 FROM cross_model_children WHERE parent_session_id=?1 AND status IN ('starting','running') \
                  ORDER BY updated_at DESC,child_session_id LIMIT ?2",
             )?;
             for row in statement.query_map(
@@ -703,10 +826,14 @@ impl Store {
             check.id, total, starting, running, completed, failed, stopped,
         );
         if rows.is_empty() {
-            report.push_str("当前主会话没有跨模型子 Agent。\n");
+            if total == 0 {
+                report.push_str("当前主会话没有跨模型子 Agent。\n");
+            } else {
+                report.push_str("当前没有仍在运行的子任务；已结束结果由 fan-in 单独交付，定时检查不重复列出已交付内容。\n");
+            }
         } else if total > rows.len() as i64 {
             report.push_str(&format!(
-                "以下仅列出最近更新的 {} 个子任务；汇总数量覆盖全部子任务。\n",
+                "以下仅列出仍在运行的 {} 个子任务；已结束结果由 fan-in 单独交付，汇总数量覆盖全部子任务。\n",
                 rows.len()
             ));
         }
@@ -727,16 +854,16 @@ impl Store {
             let fixed = prefix.len() + separator.len() + suffix.len();
             let content_budget = section_budget.saturating_sub(fixed);
             let task_budget = content_budget.min(1_800).min(content_budget / 3);
-            let task = truncate_utf8_bytes(&task, task_budget);
+            let task = cross_model_report_text(&task, task_budget);
             let result = if result.is_empty() {
                 "（尚无最终结果）".to_owned()
             } else {
-                truncate_utf8_bytes(&result, content_budget.saturating_sub(task.len()))
+                cross_model_report_text(&result, content_budget.saturating_sub(task.len()))
             };
             report.push_str(&prefix);
             report.push_str(&task);
             report.push_str(separator);
-            report.push_str(&truncate_utf8_bytes(
+            report.push_str(&cross_model_report_text(
                 &result,
                 section_budget
                     .saturating_sub(prefix.len() + task.len() + separator.len() + suffix.len()),
@@ -777,30 +904,34 @@ impl Store {
     pub(crate) fn release_cross_model_fan_in(
         &mut self,
         parent_session_id: &str,
+        claim_id: &str,
         claims: &[(String, i64)],
     ) -> Result<()> {
         crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(claim_id)?;
         let transaction = self.connection.transaction()?;
         for (child_session_id, generation) in claims {
             crate::database::validate_id(child_session_id)?;
             transaction.execute(
-                "UPDATE cross_model_children SET summary_delivered=0,summary_delivered_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=1",
-                params![crate::database::now(), parent_session_id, child_session_id, generation],
+                "UPDATE cross_model_children SET summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND task_generation=?4 AND summary_delivered=0 AND summary_claim_id=?5",
+                params![crate::database::now(), parent_session_id, child_session_id, generation, claim_id],
             )?;
         }
         transaction.commit()?;
         Ok(())
     }
 
-    /// Parents with fully-terminal children whose report has not yet reached
-    /// the parent.  This lets startup recovery retry a failed delivery even
-    /// after every individual child was already settled.
+    /// Active parents with fully-terminal children whose report has not yet
+    /// reached the parent. Archived parents retain their truthful pending
+    /// state but cannot accept an automatic turn.
     pub(crate) fn pending_cross_model_fan_in_parents(&self) -> Result<Vec<String>> {
         let mut statement = self.connection.prepare(
-            "SELECT parent_session_id FROM cross_model_children \
-             GROUP BY parent_session_id \
-             HAVING sum(summary_delivered=0 AND status IN ('completed','failed','stopped'))>0 \
-             ORDER BY min(created_at),parent_session_id",
+            "SELECT c.parent_session_id FROM cross_model_children c \
+             JOIN session_heads h ON h.id=c.parent_session_id \
+             WHERE h.lifecycle='active' \
+             GROUP BY c.parent_session_id \
+             HAVING sum(c.summary_delivered=0 AND c.summary_claim_id IS NULL AND c.status IN ('completed','failed','stopped'))>0 \
+             ORDER BY min(c.created_at),c.parent_session_id",
         )?;
         statement
             .query_map([], |row| row.get(0))?
@@ -820,6 +951,9 @@ impl Store {
             return Err(Error::NotFound);
         }
         if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+            return Err(Error::Conflict);
+        }
+        if !current.summary_delivered {
             return Err(Error::Conflict);
         }
         let now = crate::database::now();
@@ -845,10 +979,27 @@ impl Store {
             return Err(Error::Conflict);
         }
         let now = crate::database::now();
-        self.connection.execute(
-            "UPDATE cross_model_children SET summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3",
+        let transaction = self.connection.transaction()?;
+        let claim_id: Option<String> = transaction.query_row(
+            "SELECT summary_claim_id FROM cross_model_children WHERE parent_session_id=?1 AND child_session_id=?2",
+            params![parent_session_id, child_session_id],
+            |row| row.get(0),
+        )?;
+        if let Some(claim_id) = claim_id {
+            transaction.execute(
+                "DELETE FROM agent_message_queue WHERE cross_model_claim_id=?1",
+                [&claim_id],
+            )?;
+            transaction.execute(
+                "UPDATE cross_model_children SET summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 WHERE summary_claim_id=?2 AND summary_delivered=0",
+                params![now, claim_id],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE cross_model_children SET summary_delivered=0,summary_delivered_at=NULL,summary_acknowledged=0,summary_acknowledged_at=NULL,summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3",
             params![now, parent_session_id, child_session_id],
         )?;
+        transaction.commit()?;
         self.cross_model_child(child_session_id)
     }
 
@@ -1221,6 +1372,14 @@ impl Store {
                 tx.execute("UPDATE agent_runs SET active=0 WHERE session_id=?", [id])?;
                 // Queued text can never be delivered to a dead process, and
                 // pending approvals/questions must not survive archiving.
+                tx.execute(
+                    "UPDATE cross_model_children SET summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 \
+                     WHERE summary_delivered=0 AND summary_claim_id IN ( \
+                         SELECT cross_model_claim_id FROM agent_message_queue \
+                         WHERE session_id=?2 AND cross_model_claim_id IS NOT NULL \
+                     )",
+                    params![crate::database::now(), id],
+                )?;
                 tx.execute("DELETE FROM agent_message_queue WHERE session_id=?", [id])?;
                 tx.execute(
                     "UPDATE timeline_records SET revision=revision+1, \
@@ -1287,8 +1446,8 @@ impl Store {
         };
         let attachments = serde_json::to_string(&row.attachments).unwrap_or_else(|_| "[]".into());
         transaction.execute(
-            "INSERT INTO agent_message_queue(session_id,queue_id,position,kind,text,created_at,attachments) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO agent_message_queue(session_id,queue_id,position,kind,text,created_at,attachments,cross_model_claim_id) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![
                 session_id,
                 row.id,
@@ -1296,7 +1455,8 @@ impl Store {
                 row.kind,
                 row.text,
                 row.created_at,
-                attachments
+                attachments,
+                row.cross_model_claim_id,
             ],
         )?;
         transaction.commit()?;
@@ -1307,7 +1467,7 @@ impl Store {
     pub(crate) fn message_queue(&self, session_id: &str) -> Result<Vec<QueuedRow>> {
         crate::database::validate_id(session_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT queue_id,kind,text,created_at,attachments FROM agent_message_queue \
+            "SELECT queue_id,kind,text,created_at,attachments,cross_model_claim_id FROM agent_message_queue \
              WHERE session_id=?1 ORDER BY position ASC",
         )?;
         let rows = statement.query_map([session_id], |row| {
@@ -1317,6 +1477,7 @@ impl Store {
                 text: row.get(2)?,
                 created_at: row.get(3)?,
                 attachments: decode_attachments(&row.get::<_, String>(4)?),
+                cross_model_claim_id: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1327,7 +1488,7 @@ impl Store {
     /// count; `message_queue` returns a single session's full rows.
     pub(crate) fn message_queues(&self) -> Result<Vec<(String, Vec<QueuedRow>)>> {
         let mut statement = self.connection.prepare(
-            "SELECT q.session_id,q.queue_id,q.kind,q.text,q.created_at,q.attachments \
+            "SELECT q.session_id,q.queue_id,q.kind,q.text,q.created_at,q.attachments,q.cross_model_claim_id \
              FROM agent_message_queue q \
              JOIN session_heads h ON h.id=q.session_id \
              WHERE h.lifecycle='active' \
@@ -1343,6 +1504,7 @@ impl Store {
                     text: row.get(3)?,
                     created_at: row.get(4)?,
                     attachments: decode_attachments(&attachments_raw),
+                    cross_model_claim_id: row.get(6)?,
                 },
             ))
         })?;
@@ -1357,17 +1519,31 @@ impl Store {
         Ok(queues)
     }
 
-    /// Delete a queued message. NotFound when no such row exists.
+    /// Delete a user-authored queued message. Internal fan-in rows are bound to
+    /// durable delivery claims and must use redelivery/archive handling.
     pub(crate) fn remove_message(&mut self, session_id: &str, queue_id: &str) -> Result<()> {
         crate::database::validate_id(session_id)?;
         crate::database::validate_id(queue_id)?;
-        let changed = self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        let claim_id: Option<String> = transaction
+            .query_row(
+                "SELECT cross_model_claim_id FROM agent_message_queue WHERE session_id=?1 AND queue_id=?2",
+                rusqlite::params![session_id, queue_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        if claim_id.is_some() {
+            return Err(Error::Conflict);
+        }
+        let changed = transaction.execute(
             "DELETE FROM agent_message_queue WHERE session_id=?1 AND queue_id=?2",
             rusqlite::params![session_id, queue_id],
         )?;
         if changed != 1 {
             return Err(Error::NotFound);
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1377,12 +1553,17 @@ impl Store {
         crate::database::validate_id(session_id)?;
         crate::database::validate_id(queue_id)?;
         let transaction = self.connection.transaction()?;
-        let (text, created_at, attachments): (String, i64, String) = transaction
+        let (text, created_at, attachments, cross_model_claim_id): (
+            String,
+            i64,
+            String,
+            Option<String>,
+        ) = transaction
             .query_row(
-                "SELECT text,created_at,attachments FROM agent_message_queue \
+                "SELECT text,created_at,attachments,cross_model_claim_id FROM agent_message_queue \
                  WHERE session_id=?1 AND queue_id=?2",
                 rusqlite::params![session_id, queue_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or(Error::NotFound)?;
@@ -1396,9 +1577,9 @@ impl Store {
             |r| r.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO agent_message_queue(session_id,queue_id,position,kind,text,created_at,attachments) \
-             VALUES(?1,?2,?3,'guide',?4,?5,?6)",
-            rusqlite::params![session_id, queue_id, front, text, created_at, attachments],
+            "INSERT INTO agent_message_queue(session_id,queue_id,position,kind,text,created_at,attachments,cross_model_claim_id) \
+             VALUES(?1,?2,?3,'guide',?4,?5,?6,?7)",
+            rusqlite::params![session_id, queue_id, front, text, created_at, attachments, cross_model_claim_id],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1411,7 +1592,7 @@ impl Store {
         let transaction = self.connection.transaction()?;
         let row = transaction
             .query_row(
-                "SELECT queue_id,kind,text,created_at,attachments FROM agent_message_queue \
+                "SELECT queue_id,kind,text,created_at,attachments,cross_model_claim_id FROM agent_message_queue \
                  WHERE session_id=?1 ORDER BY position ASC LIMIT 1",
                 [session_id],
                 |row| {
@@ -1421,6 +1602,7 @@ impl Store {
                         text: row.get(2)?,
                         created_at: row.get(3)?,
                         attachments: decode_attachments(&row.get::<_, String>(4)?),
+                        cross_model_claim_id: row.get(5)?,
                     })
                 },
             )
@@ -1485,11 +1667,11 @@ mod tests {
             .complete_cross_model_child(&child, 1, "completed", Some("first result"))
             .unwrap();
 
-        let (first_report, first_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert!(first_report.contains("first task"));
-        assert!(first_report.contains("first result"));
-        assert!(first_report.contains(&format!("会话 {child}")));
-        assert_eq!(first_claim, vec![(child.clone(), 1)]);
+        let first = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(first.report.contains("first task"));
+        assert!(first.report.contains("first result"));
+        assert!(first.report.contains(&format!("会话 {child}")));
+        assert_eq!(first.children, vec![(child.clone(), 1)]);
         assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
 
         let (reopened, reactivated) = store
@@ -1504,13 +1686,12 @@ mod tests {
         store
             .complete_cross_model_child(&child, 2, "completed", Some("refined result"))
             .unwrap();
-        let (follow_up_report, follow_up_claim) =
-            store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert!(!follow_up_report.contains("first task"));
-        assert!(!follow_up_report.contains("first result"));
-        assert!(follow_up_report.contains("refine the answer"));
-        assert!(follow_up_report.contains("refined result"));
-        assert_eq!(follow_up_claim, vec![(child, 2)]);
+        let follow_up = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(!follow_up.report.contains("first task"));
+        assert!(!follow_up.report.contains("first result"));
+        assert!(follow_up.report.contains("refine the answer"));
+        assert!(follow_up.report.contains("refined result"));
+        assert_eq!(follow_up.children, vec![(child, 2)]);
     }
 
     #[test]
@@ -1529,21 +1710,56 @@ mod tests {
             .complete_cross_model_child(&first, 1, "completed", Some("first result"))
             .unwrap();
 
-        let (incremental, first_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert!(incremental.contains("增量 fan-in"));
-        assert!(incremental.contains("仍有 1 个子任务运行中"));
-        assert!(incremental.contains(&first));
-        assert!(!incremental.contains(&second));
-        assert_eq!(first_claim, vec![(first, 1)]);
+        let incremental = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(incremental.report.contains("增量 fan-in"));
+        assert!(incremental.report.contains("仍有 1 个子任务运行中"));
+        assert!(incremental.report.contains(&first));
+        assert!(!incremental.report.contains(&second));
+        assert_eq!(incremental.children, vec![(first, 1)]);
 
         store
             .complete_cross_model_child(&second, 1, "completed", Some("second result"))
             .unwrap();
-        let (final_report, second_claim) =
-            store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert!(final_report.contains("最终 fan-in"));
-        assert!(final_report.contains(&second));
-        assert_eq!(second_claim, vec![(second, 1)]);
+        let final_report = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(final_report.report.contains("最终 fan-in"));
+        assert!(final_report.report.contains(&second));
+        assert_eq!(final_report.children, vec![(second, 1)]);
+    }
+
+    #[test]
+    fn sidebar_session_page_excludes_cross_model_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+
+        let query = SessionQuery {
+            limit: Some(100),
+            ..SessionQuery::default()
+        };
+        let all = store.sessions(query.clone()).unwrap();
+        let sidebar = store.sidebar_sessions(query).unwrap();
+        assert!(all.items.iter().any(|session| session.id == child));
+        assert!(sidebar.items.iter().any(|session| session.id == parent));
+        assert!(!sidebar.items.iter().any(|session| session.id == child));
+        assert_eq!(sidebar.total, 1);
+        let lookup = store
+            .sidebar_lookup_sessions(SessionLookup {
+                ids: vec![parent.clone(), child.clone()],
+            })
+            .unwrap();
+        assert_eq!(
+            lookup
+                .items
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![parent.as_str()]
+        );
+        assert_eq!(lookup.missing_ids, vec![child]);
     }
 
     #[test]
@@ -1564,7 +1780,20 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].summary_delivered);
-        let (_report, claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        let claim = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        let claimed = store.cross_model_child(&child).unwrap();
+        assert!(!claimed.summary_delivered);
+        assert!(claimed.summary_delivered_at.is_none());
+        assert!(matches!(
+            store.acknowledge_cross_model_child(&parent, &child),
+            Err(Error::Conflict)
+        ));
+        assert_eq!(
+            store
+                .mark_cross_model_fan_in_delivered(&parent, &claim.claim_id)
+                .unwrap(),
+            1
+        );
         let delivered = store.cross_model_child(&child).unwrap();
         assert!(delivered.summary_delivered);
         assert!(delivered.summary_delivered_at.is_some());
@@ -1594,8 +1823,8 @@ mod tests {
         let redeliverable = store.cross_model_child(&child).unwrap();
         assert!(!redeliverable.summary_delivered);
         assert!(!redeliverable.summary_acknowledged);
-        let (_again, again_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert_eq!(claim, again_claim);
+        let again = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(claim.children, again.children);
     }
 
     #[test]
@@ -1734,13 +1963,67 @@ mod tests {
     }
 
     #[test]
-    fn schema_28_is_upgraded_with_cross_model_ack_columns() {
+    fn cross_model_check_lists_only_active_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let completed = active_child_session(&mut store, "completed child");
+        let running = active_child_session(&mut store, "running child");
+        store
+            .register_cross_model_child(
+                &completed,
+                &parent,
+                &"a".repeat(1_000),
+                "source",
+                "route",
+                "account",
+            )
+            .unwrap();
+        store
+            .complete_cross_model_child(&completed, 1, "completed", Some("old delivered result"))
+            .unwrap();
+        let fan_in = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        store
+            .mark_cross_model_fan_in_delivered(&parent, &fan_in.claim_id)
+            .unwrap();
+        store
+            .register_cross_model_child(
+                &running,
+                &parent,
+                "active task",
+                "source",
+                "route",
+                "account",
+            )
+            .unwrap();
+        store.mark_cross_model_child_running(&running).unwrap();
+
+        let check = store.schedule_cross_model_check(&parent, 1).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE cross_model_checks SET due_at=0 WHERE id=?1",
+                [&check.id],
+            )
+            .unwrap();
+        let (_claimed, report) = store.claim_due_cross_model_check(60_000).unwrap().unwrap();
+        assert!(report.contains("completed 1"));
+        assert!(report.contains("running 1"));
+        assert!(report.contains(&running));
+        assert!(report.contains("active task"));
+        assert!(!report.contains(&completed));
+        assert!(!report.contains("old delivered result"));
+        assert!(!report.contains(&"a".repeat(120)));
+    }
+
+    #[test]
+    fn schema_28_is_upgraded_with_cross_model_delivery_columns() {
         let directory = tempfile::tempdir().unwrap();
         {
             let store = Store::open(directory.path()).unwrap();
             store
                 .connection
-                .execute_batch("ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; PRAGMA user_version=28;")
+                .execute_batch("DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; PRAGMA user_version=28;")
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
@@ -1751,13 +2034,247 @@ mod tests {
         let columns: i64 = store
             .connection
             .query_row(
-                "SELECT count(*) FROM pragma_table_info('cross_model_children') WHERE name IN ('summary_delivered_at','summary_acknowledged','summary_acknowledged_at')",
+                "SELECT count(*) FROM pragma_table_info('cross_model_children') WHERE name IN ('summary_delivered_at','summary_acknowledged','summary_acknowledged_at','summary_claim_id','summary_claimed_at')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 29);
-        assert_eq!(columns, 3);
+        let queue_columns: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('agent_message_queue') WHERE name='cross_model_claim_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 30);
+        assert_eq!(columns, 5);
+        assert_eq!(queue_columns, 1);
+    }
+
+    #[test]
+    fn queued_fan_in_is_delivered_only_after_parent_turn_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = active_child_session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+
+        let claimed = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(!store.cross_model_child(&child).unwrap().summary_delivered);
+        let row = QueuedRow {
+            id: "fan-in-row".into(),
+            kind: "queue".into(),
+            text: claimed.report.clone(),
+            created_at: crate::database::now(),
+            attachments: Vec::new(),
+            cross_model_claim_id: Some(claimed.claim_id.clone()),
+        };
+        store.enqueue_message(&parent, &row, false).unwrap();
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
+
+        let popped = store.pop_message(&parent).unwrap().unwrap();
+        assert_eq!(popped.cross_model_claim_id, Some(claimed.claim_id.clone()));
+        assert!(!store.cross_model_child(&child).unwrap().summary_delivered);
+        assert_eq!(
+            store
+                .mark_cross_model_fan_in_delivered(&parent, &claimed.claim_id)
+                .unwrap(),
+            1
+        );
+        assert!(store.cross_model_child(&child).unwrap().summary_delivered);
+    }
+
+    #[test]
+    fn failed_parent_launch_rolls_delivery_back_to_the_same_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = active_child_session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+        let fan_in = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        store
+            .mark_cross_model_fan_in_delivered(&parent, &fan_in.claim_id)
+            .unwrap();
+        assert!(store.cross_model_child(&child).unwrap().summary_delivered);
+
+        assert_eq!(
+            store
+                .rollback_cross_model_fan_in_delivery(&parent, &fan_in.claim_id)
+                .unwrap(),
+            1
+        );
+        assert!(!store.cross_model_child(&child).unwrap().summary_delivered);
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
+        store
+            .release_cross_model_fan_in_claim(&parent, &fan_in.claim_id)
+            .unwrap();
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_some());
+    }
+
+    #[test]
+    fn removing_queued_fan_in_is_rejected_but_redelivery_releases_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = active_child_session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+
+        let first = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        store
+            .enqueue_message(
+                &parent,
+                &QueuedRow {
+                    id: "fan-in-row".into(),
+                    kind: "queue".into(),
+                    text: first.report,
+                    created_at: crate::database::now(),
+                    attachments: Vec::new(),
+                    cross_model_claim_id: Some(first.claim_id.clone()),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.remove_message(&parent, "fan-in-row"),
+            Err(Error::Conflict)
+        ));
+        assert_eq!(store.message_queue(&parent).unwrap().len(), 1);
+        store.reset_cross_model_delivery(&parent, &child).unwrap();
+        assert!(store.message_queue(&parent).unwrap().is_empty());
+
+        let retried = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(retried.children, vec![(child, 1)]);
+        assert_ne!(retried.claim_id, first.claim_id);
+    }
+
+    #[test]
+    fn archiving_parent_releases_queued_fan_in_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = active_child_session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+        let fan_in = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        store
+            .enqueue_message(
+                &parent,
+                &QueuedRow {
+                    id: "fan-in-row".into(),
+                    kind: "queue".into(),
+                    text: fan_in.report,
+                    created_at: crate::database::now(),
+                    attachments: Vec::new(),
+                    cross_model_claim_id: Some(fan_in.claim_id),
+                },
+                false,
+            )
+            .unwrap();
+
+        store.archive_agent_session(&parent, true).unwrap();
+        assert!(store.message_queue(&parent).unwrap().is_empty());
+        assert!(
+            !store
+                .pending_cross_model_fan_in_parents()
+                .unwrap()
+                .contains(&parent)
+        );
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_some());
+    }
+
+    #[test]
+    fn fan_in_can_be_reclaimed_after_full_parent_queue_frees_a_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = active_child_session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+        for index in 0..MAX_MESSAGE_QUEUE {
+            store
+                .enqueue_message(
+                    &parent,
+                    &QueuedRow {
+                        id: format!("queued-{index}"),
+                        kind: "queue".into(),
+                        text: format!("message {index}"),
+                        created_at: crate::database::now(),
+                        attachments: Vec::new(),
+                        cross_model_claim_id: None,
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+
+        let first = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        let fan_in_row = QueuedRow {
+            id: "fan-in-row".into(),
+            kind: "queue".into(),
+            text: first.report,
+            created_at: crate::database::now(),
+            attachments: Vec::new(),
+            cross_model_claim_id: Some(first.claim_id.clone()),
+        };
+        assert!(store.enqueue_message(&parent, &fan_in_row, false).is_err());
+        store
+            .release_cross_model_fan_in(&parent, &first.claim_id, &first.children)
+            .unwrap();
+
+        store.remove_message(&parent, "queued-0").unwrap();
+        let retried = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        let retry_row = QueuedRow {
+            cross_model_claim_id: Some(retried.claim_id),
+            text: retried.report,
+            ..fan_in_row
+        };
+        store.enqueue_message(&parent, &retry_row, false).unwrap();
+        assert_eq!(store.message_queue(&parent).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn startup_releases_claim_without_a_durable_queue_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+        store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+
+        assert_eq!(
+            store.release_orphaned_cross_model_fan_in_claims().unwrap(),
+            1
+        );
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_some());
     }
 
     #[test]
@@ -1775,7 +2292,7 @@ mod tests {
                 .complete_cross_model_child(child, 1, "completed", Some("done"))
                 .unwrap();
         }
-        let (_, original_claim) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        let original_claim = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
 
         let _ = store
             .reopen_cross_model_child(&parent, &first, "follow-up")
@@ -1784,13 +2301,13 @@ mod tests {
             .complete_cross_model_child(&first, 2, "completed", Some("new result"))
             .unwrap();
         store
-            .release_cross_model_fan_in(&parent, &original_claim)
+            .release_cross_model_fan_in(&parent, &original_claim.claim_id, &original_claim.children)
             .unwrap();
 
-        let (report, claimed) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert!(report.contains("second task"));
-        assert!(report.contains("follow-up"));
-        let mut claimed = claimed;
+        let claimed = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(claimed.report.contains("second task"));
+        assert!(claimed.report.contains("follow-up"));
+        let mut claimed = claimed.children;
         claimed.sort();
         let mut expected = vec![(first, 2), (second, 1)];
         expected.sort();
@@ -1918,10 +2435,38 @@ mod tests {
                 .unwrap();
             children.push(child);
         }
-        let (report, claims) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert!(report.len() <= CROSS_MODEL_REPORT_BYTES);
-        assert_eq!(claims.len(), children.len());
-        assert!(children.iter().all(|child| report.contains(child)));
+        let fan_in = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(fan_in.report.len() <= CROSS_MODEL_REPORT_BYTES);
+        assert_eq!(fan_in.children.len(), children.len());
+        assert!(children.iter().all(|child| fan_in.report.contains(child)));
+    }
+
+    #[test]
+    fn fan_in_collapses_repeated_filler_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(
+                &child,
+                &parent,
+                &"a".repeat(1_000),
+                "source",
+                "route",
+                "account",
+            )
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some(&"b".repeat(1_000)))
+            .unwrap();
+        let fan_in = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(fan_in.children, vec![(child.clone(), 1)]);
+        assert!(fan_in.report.contains(&child));
+        assert!(fan_in.report.contains("连续重复 1000 个 `a`"));
+        assert!(fan_in.report.contains("连续重复 1000 个 `b`"));
+        assert!(!fan_in.report.contains(&"a".repeat(120)));
+        assert!(!fan_in.report.contains(&"b".repeat(120)));
     }
 
     #[test]
@@ -1938,10 +2483,13 @@ mod tests {
                 .complete_cross_model_child(&child, 1, "completed", Some("done"))
                 .unwrap();
         }
-        let (_, first) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert_eq!(first.len(), 100);
-        let (_, second) = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
-        assert_eq!(second.len(), 1);
+        let first = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(first.children.len(), 100);
+        store
+            .mark_cross_model_fan_in_delivered(&parent, &first.claim_id)
+            .unwrap();
+        let second = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(second.children.len(), 1);
         assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
     }
 

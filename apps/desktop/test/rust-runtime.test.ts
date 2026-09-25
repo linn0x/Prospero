@@ -101,6 +101,36 @@ describe("RustRuntime CLI bridge", () => {
     expect(mocks.spawn).not.toHaveBeenCalled();
   });
 
+  it("retires an authenticated daemon whose runtime worker is unavailable", async () => {
+    const directory = mkdtempSync(resolve(tmpdir(), "prospero-rust-process-"));
+    const daemon = resolve(directory, "daemon");
+    mkdirSync(daemon, { recursive: true });
+    writeFileSync(resolve(daemon, "connection.json"), JSON.stringify({
+      apiVersion: 1,
+      pid: 424242,
+      baseUrl: "http://127.0.0.1:7424",
+      token: "f".repeat(64),
+    }));
+    chmodSync(resolve(daemon, "connection.json"), 0o600);
+    const binary = resolve(directory, "prosperod-rs");
+    writeFileSync(binary, "same-build");
+    const kill = vi.spyOn(process, "kill")
+      .mockImplementationOnce(() => true)
+      .mockImplementationOnce(() => { throw new Error("gone"); });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/health")) return new Response(JSON.stringify({ code: "unavailable" }), { status: 503 });
+      if (url.endsWith("/v1/shutdown") && init?.method === "POST") return new Response(JSON.stringify({ ok: true }), { status: 202 });
+      throw new Error(`Unexpected request ${url}`);
+    });
+    const processHost = new RustProcess(binary, daemon);
+
+    await expect(processHost.attach()).resolves.toBeUndefined();
+    expect(fetcher.mock.calls.some(([input]) => String(input).endsWith("/v1/shutdown"))).toBe(true);
+    expect(kill).toHaveBeenCalledWith(424242, 0);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
   it("defers a build handoff while runtime sessions are active", async () => {
     const directory = mkdtempSync(resolve(tmpdir(), "prospero-rust-process-"));
     const daemon = resolve(directory, "daemon");

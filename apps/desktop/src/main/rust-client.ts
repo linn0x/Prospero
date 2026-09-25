@@ -285,13 +285,19 @@ export class RustClient {
     await this.json(`/v1/shutdown${query}`, { method: "POST", signal });
   }
   sessions(query: SessionQuery, signal: AbortSignal | null = null): Promise<SessionPage> {
+    return this.sessionPage("/v1/sessions", query, signal);
+  }
+  sidebarSessions(query: SessionQuery, signal: AbortSignal | null = null): Promise<SessionPage> {
+    return this.sessionPage("/v1/sessions/sidebar", query, signal);
+  }
+  private sessionPage(path: string, query: SessionQuery, signal: AbortSignal | null): Promise<SessionPage> {
     const params = new URLSearchParams();
     if (query.limit != null) params.set("limit", String(query.limit));
     if (query.cursor) params.set("cursor", query.cursor);
     if (query.lifecycle) params.set("lifecycle", query.lifecycle);
     if (query.workspace != null) params.set("workspace", query.workspace);
     if (query.text != null) params.set("text", query.text);
-    return this.json(`/v1/sessions?${params}`, { signal });
+    return this.json(`${path}?${params}`, { signal });
   }
   summary(workspace?: string, signal: AbortSignal | null = null): Promise<SessionSummary> {
     const params = new URLSearchParams();
@@ -307,6 +313,10 @@ export class RustClient {
   lookup(ids: string[], signal: AbortSignal | null = null): Promise<SessionLookupResult> {
     if (ids.length > 100) throw new Error("Session lookup exceeds limit");
     return this.json("/v1/sessions/lookup", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: ids.map(id) }) });
+  }
+  sidebarLookup(ids: string[], signal: AbortSignal | null = null): Promise<SessionLookupResult> {
+    if (ids.length > 100) throw new Error("Session lookup exceeds limit");
+    return this.json("/v1/sessions/sidebar/lookup", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: ids.map(id) }) });
   }
   session(value: string, signal: AbortSignal | null = null): Promise<SessionHead> { return this.json(`/v1/sessions/${id(value)}`, { signal }); }
   rename(value: string, input: RenameSession, signal: AbortSignal | null = null): Promise<SessionHead> {
