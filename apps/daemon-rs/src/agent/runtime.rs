@@ -19,7 +19,17 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 use crate::worker::Database;
 
-const MAX_TURNS: usize = 32;
+/// Bounded structured-agent capacity shared by supervisors and workers.
+///
+/// Production orchestration may reserve 64 concurrent PSM supervisors while
+/// each live PSM starts a small number of stage workers.  The former limit of
+/// 32 was exhausted by 29 supervisors plus three repository workers, leaving
+/// every later worker permanently pending even though the HTTP and relay
+/// layers still reported healthy.  Keep a bounded pool, but size it to carry
+/// the 64-PSM wave plus one worker per PSM at peak; Controller-level worker
+/// budgets and daemon database/request semaphores continue to provide finer
+/// backpressure.
+pub(crate) const MAX_TURNS: usize = 128;
 const CROSS_MODEL_CHECK_LEASE_MILLIS: i64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
