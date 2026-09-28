@@ -24,6 +24,7 @@ import { StateStore } from "./state-store";
 import { RemoteHostStore } from "./remote-host-store";
 import { modelSourceRequest, modelSourceResult } from "../shared/model-sources";
 import { RemoteShellManager } from "./remote-shell-manager";
+import { TerminalStreamBridge } from "./terminal-stream-bridge";
 import { RemoteWorkspaces, RemoteWorkspaceStore } from "./remote-workspaces";
 import { remoteDirectoryRequest } from "../shared/remote-workspaces";
 import { ProjectTools } from "./project-tools";
@@ -112,6 +113,10 @@ const runtime = RUST_BACKEND ? new RustRuntime(store,
     ...(RUNTIME_PATH ? { PATH: RUNTIME_PATH } : {}),
   },
 ) : new DaemonRuntime(store);
+const terminalStreamBridge = new TerminalStreamBridge((sessionId) => {
+  if (!(runtime instanceof RustRuntime)) throw new Error("Terminal streaming is unavailable for this backend");
+  return runtime.createTerminalStreamSocket(sessionId);
+});
 let daemonStartRequest: Promise<{ ok: boolean; error?: string }> | undefined;
 function publishRuntimeSwitch(): void {
   store.setRuntimeSwitch(readRuntimeSwitch(RUNTIME_SWITCH_PATH, RUST_BACKEND ? "rust" : "legacy", backendSelection, {
@@ -376,6 +381,7 @@ function createWindow(): BrowserWindow {
       spellcheck: false,
     },
   });
+  const contents = window.webContents;
 
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-prevent-unload", event => {
@@ -388,8 +394,14 @@ function createWindow(): BrowserWindow {
     window.webContents.on("console-message", (details) => process.stderr.write(`[renderer:${details.level}] ${details.message}\n`));
   }
   window.webContents.on("will-navigate", (event) => event.preventDefault());
-  window.webContents.on("render-process-gone", () => sessionPageRequests.cancelAll());
-  window.webContents.once("destroyed", () => sessionPageRequests.cancelAll());
+  // A reload keeps the same WebContents instance.  Release its old stream
+  // lease before the replacement renderer can attach, rather than waiting for
+  // garbage collection to close the transferred port.
+  contents.on("did-start-navigation", (_event, _url, _inPlace, isMainFrame) => {
+    if (isMainFrame) terminalStreamBridge.closeAllForId(contents.id);
+  });
+  contents.on("render-process-gone", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); });
+  contents.once("destroyed", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); });
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   window.webContents.session.setPermissionCheckHandler(() => false);
   window.once("ready-to-show", () => { if (!START_HIDDEN) window.show(); });
@@ -404,6 +416,7 @@ function createWindow(): BrowserWindow {
     }
   });
   window.on("closed", () => {
+    terminalStreamBridge.closeAllForId(contents.id);
     if (mainWindow === window) mainWindow = undefined;
     if (!quitting && !store.settingsSnapshot().minimizeToTray) {
       quitting = true;
@@ -1028,6 +1041,18 @@ function installIpc(): void {
     if (!owner || owner.isDestroyed()) return;
     Menu.buildFromTemplate([{ role: "copy", enabled: options["copy"] }, { role: "paste", enabled: options["paste"] }]).popup({ window: owner });
   });
+  ipcMain.handle("terminal:stream:open", async (event, rawSessionId: unknown, rawRequestId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    const sessionId = requireId(rawSessionId, "终端会话");
+    const requestId = requireId(rawRequestId, "终端流请求");
+    // Older daemons retain the HTTP terminal view path.  This explicit health
+    // feature check prevents a missing route from being presented as a live stream.
+    if (!RUST_BACKEND) return { supported: false };
+    if (!(runtime instanceof RustRuntime)) throw new Error("Rust 服务尚未就绪，无法检查终端流功能");
+    if (!(await runtime.supportsTerminalStream(sessionId))) return { supported: false };
+    await terminalStreamBridge.open(event.sender, sessionId, requestId);
+    return { supported: true };
+  });
   ipcMain.handle("clipboard:write", (_event, value: unknown) => {
     if (typeof value !== "string") throw new Error("剪贴板内容无效");
     // 终端可能选中极长的输出,截断避免把几百 MB 塞进系统剪贴板。
@@ -1454,7 +1479,7 @@ function installIpc(): void {
   });
 }
 
-app.on("before-quit", () => { quitting = true; remoteShellManager.close(); });
+app.on("before-quit", () => { quitting = true; remoteShellManager.close(); if (mainWindow) terminalStreamBridge.closeAll(mainWindow.webContents); });
 app.on("window-all-closed", () => { /* The window close handler applies the background-running preference. */ });
 app.on("activate", () => {
   showMainWindow();

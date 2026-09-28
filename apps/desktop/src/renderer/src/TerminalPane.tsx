@@ -20,6 +20,8 @@ import { configureRustTerminalUnicode } from "./terminal-unicode";
 import { TerminalInputBuffer, TerminalInputQueue } from "./terminal-input-buffer";
 import { suppressDaemonTerminalQueries, writeTerminalEvents } from "./terminal-events";
 import { TerminalResizeCoordinator } from "./terminal-resize";
+import { TerminalStreamController, type TerminalStreamState } from "./terminal-stream-controller";
+import { TerminalStreamKind, type TerminalStreamFrame } from "../../shared/terminal-stream";
 import { readTerminalReadingState, saveTerminalReadingState } from "./workspace/terminal-reading-state";
 import {
   deleteTerminalSessionCache,
@@ -131,7 +133,11 @@ export function getTerminalEmptyFrameDelay(elapsedMs: number, eventStream = fals
 }
 
 export function terminalSessionIsReadOnly(status: string): boolean {
-  return ["idle", "completed", "done", "died"].includes(status);
+  return ["idle", "completed", "done", "died", "failed", "stopped", "cancelled", "exited", "killed"].includes(status);
+}
+
+export function terminalStreamCanControl(state: Pick<TerminalStreamState, "connected" | "syncing" | "controller" | "readOnly" | "exited">, status: string): boolean {
+  return !terminalSessionIsReadOnly(status) && state.connected && !state.syncing && state.controller && !state.readOnly && !state.exited;
 }
 
 export function canDeliverTerminalInteraction(
@@ -185,6 +191,11 @@ export function terminalBootstrapCursor(cachedCursor?: number): number {
   return typeof cachedCursor === "number" && Number.isSafeInteger(cachedCursor) && cachedCursor >= 0 ? cachedCursor : 0;
 }
 
+/** Hello dimensions are only a cold-start hint; replayed cells own their resize order. */
+export function terminalShouldApplyHelloDimensions(cursor: number | undefined, hasPresentedFrame: boolean): boolean {
+  return cursor === undefined && !hasPresentedFrame;
+}
+
 export function terminalNormalizeProposedSize(
   size: { cols: number; rows: number } | undefined,
 ): { cols: number; rows: number } | undefined {
@@ -234,6 +245,8 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   const { t } = useLocale();
   const tRef = useRef(t);
   tRef.current = t;
+  const sessionStatusRef = useRef(session.status);
+  sessionStatusRef.current = session.status;
   const readingStateRef = useRef(readTerminalReadingState(session.id));
   const isMac = navigator.platform.toLowerCase().includes("mac") || navigator.userAgent.includes("Macintosh");
   const shortcutHint = isMac
@@ -250,6 +263,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   const writeChain = useRef(Promise.resolve());
   const restoreReadyRef = useRef(Promise.resolve());
   const interactionQueue = useRef(new TerminalInputQueue());
+  const streamControllerRef = useRef<TerminalStreamController | undefined>(undefined);
   const pollGenerationRef = useRef(0);
   const stableBufferRef = useRef(true);
   const replayingRef = useRef(false);
@@ -257,11 +271,22 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   const connectedRef = useRef(false);
   const exitedRef = useRef(false);
   const needsFitRef = useRef(true);
+  const hasPresentedFrameRef = useRef(false);
   const readingRestoredRef = useRef(false);
   const resizeCoordinatorRef = useRef(new TerminalResizeCoordinator());
-  const readOnly = terminalSessionIsReadOnly(session.status);
+  const [streamMode, setStreamMode] = useState<"pending" | "stream" | "legacy">("pending");
+  const streamModeRef = useRef(streamMode);
+  streamModeRef.current = streamMode;
+  const [streamState, setStreamState] = useState<TerminalStreamState>({ connected: false, syncing: true, readOnly: false, exited: false, controller: false });
+  const streamStateRef = useRef(streamState);
+  streamStateRef.current = streamState;
+  const epochRef = useRef<string | undefined>(undefined);
+  const [streamReconnectNonce, setStreamReconnectNonce] = useState(0);
+  const [requiresFreshReload, setRequiresFreshReload] = useState(false);
+  const readOnly = terminalSessionIsReadOnly(session.status) || (streamMode === "stream" && streamState.readOnly);
+  const sessionEnded = terminalSessionIsReadOnly(session.status) || (streamMode === "stream" && streamState.exited);
   const readOnlyRef = useRef(readOnly);
-  readOnlyRef.current = readOnly || exitedRef.current;
+  readOnlyRef.current = readOnly || exitedRef.current || (streamMode === "stream" && !terminalStreamCanControl(streamState, session.status));
   const activeRef = useRef(active);
   activeRef.current = active;
   const [operationError, setOperationError] = useState<string>();
@@ -277,10 +302,19 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   const noticeTimerRef = useRef<number | undefined>(undefined);
   const historyNoticeRef = useRef(false);
   const queueInteraction = useCallback((message: TerminalInteraction, accepted = false): Promise<boolean> => {
+    // Choose transport at admission. A queued stream write must never become a
+    // legacy HTTP write merely because the pane unmounted or reattached.
+    const admittedMode = streamModeRef.current;
+    const admittedStream = streamControllerRef.current;
     const result = interactionQueue.current
       .enqueue(async () => {
         if (!canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current, accepted)) return false;
-        await window.prospero.interact(session.id, message);
+        if (admittedMode === "stream") {
+          if (!admittedStream || streamControllerRef.current !== admittedStream) throw new Error("Terminal stream attachment changed before interaction was sent");
+          if (message.type === "term.input") await admittedStream.input(terminalBytes(message.dataB64));
+          else await admittedStream.resize(message.cols, message.rows);
+        } else if (admittedMode === "legacy") await window.prospero.interact(session.id, message);
+        else return false;
         setOperationError(undefined);
         return true;
       }, message.type === "term.input" ? Math.ceil(message.dataB64.length * 3 / 4) : 0)
@@ -289,10 +323,14 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
           onMissingSession?.(session.id);
           return false;
         }
-        connectedRef.current = false;
-        if (terminalRef.current) terminalRef.current.options.disableStdin = true;
-        setConnected(false);
-        setSyncing(false);
+        // Stream connection state is owned by controller callbacks. An input
+        // Result rejection says nothing about whether output is still live.
+        if (admittedMode === "legacy") {
+          connectedRef.current = false;
+          if (terminalRef.current) terminalRef.current.options.disableStdin = true;
+          setConnected(false);
+          setSyncing(false);
+        }
         setOperationError(reportError(reason));
         return false;
       });
@@ -302,6 +340,9 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
     const terminal = terminalRef.current; const fit = fitRef.current;
     const element = host.current;
     if (!terminal || !fit || !activeRef.current || !element?.isConnected || element.clientWidth === 0 || element.clientHeight === 0) return;
+    // Observers preserve the host's grid exactly. They neither fit locally nor
+    // emit a ResizeRequest; only a controller may change live PTY geometry.
+    if (session.terminalMode === "events" && streamModeRef.current !== "legacy" && !streamStateRef.current.exited && !terminalStreamCanControl(streamStateRef.current, sessionStatusRef.current)) return;
     const proposed = terminalNormalizeProposedSize(fit.proposeDimensions());
     if (proposed && !stableBufferRef.current) {
       resizeCoordinatorRef.current.request(
@@ -359,6 +400,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
     if (!host.current) return;
     const cached = session.terminalMode === "events" ? undefined : loadTerminalSessionCache(session.id);
     exitedRef.current = false;
+    hasPresentedFrameRef.current = false;
     needsFitRef.current = true;
     const terminal = new Terminal({
       ...(cached ? { cols: cached.cols, rows: cached.rows } : {}),
@@ -688,6 +730,119 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   }, [fontFamily, fontSize, fitToHost]);
 
   useEffect(() => {
+    // Ended sessions have no live host to attach to. This is an explicit
+    // static-history route selected from session metadata, never a fallback
+    // after a stream error.
+    if (session.terminalMode !== "events" || terminalSessionIsReadOnly(session.status)) { setStreamMode("legacy"); return; }
+    let alive = true;
+    const requestId = crypto.randomUUID();
+    const applyState = (state: TerminalStreamState): void => {
+      if (!alive) return;
+      const wasSyncing = streamStateRef.current.syncing;
+      const wasController = streamStateRef.current.controller;
+      streamStateRef.current = state;
+      if (state.epoch) epochRef.current = state.epoch;
+      connectedRef.current = state.connected;
+      exitedRef.current = state.exited;
+      readOnlyRef.current = !terminalStreamCanControl(state, sessionStatusRef.current);
+      const terminal = terminalRef.current;
+      if (terminal) terminal.options.disableStdin = !activeRef.current || !state.connected || state.syncing || !state.controller || readOnlyRef.current;
+      setConnected(state.connected);
+      setSyncing(state.syncing);
+      setStreamState(state);
+      if ((wasSyncing || !wasController) && terminalStreamCanControl(state, sessionStatusRef.current)) {
+        fitToHost();
+        const settled = terminalRef.current;
+        if (settled) resizeCoordinatorRef.current.flush(
+          terminalStreamCanControl(state, sessionStatusRef.current),
+          size => queueInteraction({ type: "term.resize", ...size }),
+          size => settled.resize(size.cols, size.rows),
+        );
+        needsFitRef.current = false;
+      }
+    };
+    const controller = new TerminalStreamController({
+      sessionId: session.id,
+      cursor: () => cursorRef.current,
+      epoch: () => epochRef.current,
+      wantControl: true,
+      onState: applyState,
+      onHello: ({ cols, rows }) => {
+        const terminal = terminalRef.current;
+        // Hello dimensions bootstrap an empty cold screen only. A resume may
+        // already show retained cells; changing its geometry here would reflow
+        // those cells before the authoritative ordered Resize frame arrives.
+        if (terminal && terminalShouldApplyHelloDimensions(cursorRef.current, hasPresentedFrameRef.current) && (terminal.cols !== cols || terminal.rows !== rows)) terminal.resize(cols, rows);
+      },
+      consume: async (frame: TerminalStreamFrame) => {
+        // Stream attachments and a just-retired attachment share this chain.
+        // xterm writes are asynchronous; serializing them prevents a fresh
+        // snapshot/reset from racing a prior frame's completion callback.
+        const prior = writeChain.current;
+        const work = prior.then(async () => {
+        const terminal = terminalRef.current;
+        if (!terminal) throw new Error("Terminal was detached during stream write");
+        stableBufferRef.current = false;
+        suppressInputScrollRef.current = true;
+        try {
+          if (frame.kind === TerminalStreamKind.Resize) {
+            if (frame.payload.byteLength !== 4) throw new Error("Invalid terminal resize frame");
+            const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength);
+            terminal.resize(view.getUint16(0, false), view.getUint16(2, false));
+          } else {
+            if (frame.kind === TerminalStreamKind.Snapshot) { replayingRef.current = true; terminal.reset(); }
+            await new Promise<void>(done => terminal.write(frame.payload, done));
+            if (readingRestoredRef.current) restoreReadingState(terminal);
+            if (frame.kind === TerminalStreamKind.Snapshot) replayingRef.current = false;
+          }
+          cursorRef.current = frame.sequence;
+          hasPresentedFrameRef.current = true;
+          setHasPresentedFrame(true);
+          stableBufferRef.current = true;
+          if (!readingRestoredRef.current) { restoreReadingState(terminal); readingRestoredRef.current = true; }
+        } finally { suppressInputScrollRef.current = false; }
+        });
+        writeChain.current = work.catch(() => undefined);
+        await work;
+      },
+      onError: (message, _recoverable) => { if (alive) setConnectionError(message); },
+      onHistoryGap: message => { if (alive) { setConnectionError(message); setSyncing(false); setRequiresFreshReload(true); } },
+    });
+    streamControllerRef.current = controller;
+    const receivePort = (event: MessageEvent): void => {
+      const value = event.data as { type?: unknown; requestId?: unknown } | undefined;
+      if (event.source !== window || value?.type !== "terminal:port" || value.requestId !== requestId || !event.ports[0]) return;
+      const port = event.ports[0];
+      // Do not snapshot the resume cursor until an earlier attachment's xterm
+      // write has committed. Otherwise its late callback could advance the
+      // screen after this Attach has already requested replay.
+      void writeChain.current.then(() => {
+        if (alive && streamControllerRef.current === controller) {
+          streamModeRef.current = "stream";
+          setStreamMode("stream");
+          controller.attach(port);
+        }
+        else port.close();
+      });
+    };
+    window.addEventListener("message", receivePort);
+    void window.prospero.openTerminalStream(session.id, requestId).then(result => {
+      if (!alive) return;
+      if (!result.supported) { controller.close(); streamControllerRef.current = undefined; setStreamMode("legacy"); }
+      else setStreamMode("stream");
+    }).catch(reason => { if (alive) { setConnectionError(displayError(reason)); setStreamMode("stream"); } });
+    return () => {
+      alive = false;
+      window.removeEventListener("message", receivePort);
+      controller.close();
+      if (streamControllerRef.current === controller) streamControllerRef.current = undefined;
+    };
+  // A new attachment is authoritative; it must never resume from renderer cache.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.id, session.terminalMode, streamReconnectNonce]);
+
+  useEffect(() => {
+    if (streamMode !== "legacy") return;
     let active = true;
     let waitForOutput = false;
     let cachedState: string | undefined;
@@ -884,7 +1039,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       if (terminalRef.current) terminalRef.current.options.disableStdin = true;
       void window.prospero.cancelSessionView(session.id).catch(() => undefined);
     };
-  }, [onMissingSession, queueInteraction, session.id, fitToHost, restoreReadingState]);
+  }, [onMissingSession, queueInteraction, session.id, fitToHost, restoreReadingState, streamMode]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();
@@ -908,9 +1063,35 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
     searchRef.current?.clearDecorations();
     terminalRef.current?.focus();
   };
+  const acquireControl = (takeover: boolean): void => {
+    void streamControllerRef.current?.acquire(takeover).then(() => setOperationError(undefined)).catch(reason => setOperationError(reportError(reason)));
+  };
+  const releaseControl = (): void => {
+    void streamControllerRef.current?.release().then(() => setOperationError(undefined)).catch(reason => setOperationError(reportError(reason)));
+  };
+  const reconnectStream = (): void => {
+    if (requiresFreshReload) {
+      // A history gap or epoch change has no safe renderer-side continuation.
+      // The user explicitly chooses a fresh host snapshot; unknown input stays
+      // rejected by the old attachment and is never sent again.
+      void writeChain.current.then(() => {
+        cursorRef.current = undefined;
+        epochRef.current = undefined;
+        hasPresentedFrameRef.current = false;
+        terminalRef.current?.reset();
+        setHasPresentedFrame(false);
+        setRequiresFreshReload(false);
+        setConnectionError(undefined);
+        setStreamReconnectNonce(value => value + 1);
+      });
+      return;
+    }
+    setConnectionError(undefined);
+    setStreamReconnectNonce(value => value + 1);
+  };
 
   return <div className={bell ? "terminal-shell terminal-bell" : "terminal-shell"}>
-    <div className={connected && !readOnly ? "terminal-status is-quiet" : "terminal-status"} role="status" aria-live="polite"><span className={readOnly ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{readOnly ? t("会话已结束 · 只读", "Session ended · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
+    <div className={connected && !readOnly && streamMode === "legacy" ? "terminal-status is-quiet" : "terminal-status"} role="status" aria-live="polite"><span className={sessionEnded ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{sessionEnded ? t("会话已结束 · 只读", "Session ended · Read only") : streamMode === "stream" && connected && !streamState.controller ? t("正在观察 · 只读", "Observing · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("流已断开", "Stream disconnected")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span>{streamMode === "stream" && !sessionEnded && <span className="terminal-control">{!connected ? <button type="button" onClick={reconnectStream}>{requiresFreshReload ? t("重新载入画面", "Reload screen") : t("重新连接", "Reconnect")}</button> : streamState.controller ? <button type="button" onClick={releaseControl}>{t("释放控制", "Release control")}</button> : <><button type="button" onClick={() => acquireControl(false)}>{t("请求控制", "Request control")}</button><button type="button" onClick={() => acquireControl(true)}>{t("接管", "Take over")}</button></>}</span>}</div>
     {findOpen && <div className="terminal-find">
       <input
         ref={findInputRef}

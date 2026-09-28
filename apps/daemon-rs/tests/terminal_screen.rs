@@ -50,3 +50,30 @@ fn legal_wide_resize_keeps_snapshot_content() {
     assert!(restored.contains("before"));
     assert!(restored.contains("wide"));
 }
+
+#[test]
+fn snapshot_normalizes_truecolor_and_tab_controls_for_xterm() {
+    let mut screen = Screen::new(TerminalSize { cols: 16, rows: 2 });
+    screen.process(b"\x1b[38:2:10:20:30mred\x1b[0m\x1b[3g\x1b[5G\x1bH\x1b[1G");
+    let ansi = String::from_utf8(
+        STANDARD
+            .decode(screen.snapshot(7).unwrap().data_b64)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(ansi.contains("\x1b[38;2;10;20;30m"), "{ansi:?}");
+    assert!(!ansi.contains("38:2:10:20:30"), "{ansi:?}");
+    assert!(ansi.contains("\x1bH"), "{ansi:?}");
+    assert!(!ansi.contains('W'), "{ansi:?}");
+}
+
+#[test]
+fn protected_cells_and_selective_erase_refuse_snapshot() {
+    let mut protected = Screen::new(TerminalSize { cols: 16, rows: 2 });
+    protected.process(b"\x1b[1\"qprotected");
+    assert!(protected.snapshot(8).is_err());
+
+    let mut selective = Screen::new(TerminalSize { cols: 16, rows: 2 });
+    selective.process(b"text\x1b[?2K");
+    assert!(selective.snapshot(9).is_err());
+}

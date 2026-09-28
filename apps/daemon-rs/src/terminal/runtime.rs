@@ -649,6 +649,12 @@ impl Terminals {
     pub async fn resize(&self, id: &str, size: TerminalSize) -> Result<()> {
         self.terminal(id)?.resize(size).await
     }
+    pub(crate) fn host(&self, id: &str) -> Result<Option<super::host::Host>> {
+        Ok(self.terminal(id)?.host())
+    }
+    pub(crate) fn local(&self, id: &str) -> Result<Option<Terminal>> {
+        Ok(self.terminal(id)?.local())
+    }
     pub async fn close(&self, id: &str) -> Result<()> {
         self.terminal(id)?.stop().await
     }

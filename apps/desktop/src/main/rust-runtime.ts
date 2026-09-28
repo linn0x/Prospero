@@ -8,6 +8,8 @@ import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, Sessi
 import type { FilePreview, GitHistoryEntry, GitMutation, ProjectFile, ProjectGitStatus } from "../shared/project-tools";
 import { StateStore } from "./state-store";
 import { TerminalRecovery } from "./terminal-recovery";
+import type WebSocket from "ws";
+import { TERMINAL_STREAM_V1_CAPABILITY } from "../shared/terminal-stream";
 import { RustProcess, type RustConnection } from "./rust-process";
 import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } from "./rust-orchestration";
 
@@ -338,6 +340,12 @@ export class RustRuntime {
   }
 
   get managed(): boolean { return this.process.managed; }
+  createTerminalStreamSocket(id: string): WebSocket { return this.current().client.createTerminalStreamSocket(id); }
+  async supportsTerminalStream(id: string): Promise<boolean> {
+    const client = this.current().client;
+    if (!(await client.health()).capabilities.includes(TERMINAL_STREAM_V1_CAPABILITY)) return false;
+    return (await client.terminalStreamCapabilities(id)).supported;
+  }
   describeRuntime(): string { return this.process.binary; }
 
   start(): Promise<{ ok: boolean; error?: string }> {
