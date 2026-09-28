@@ -319,6 +319,11 @@ impl Api {
             .route("/v1/terminals/{id}/input", post(terminal_input))
             .route("/v1/terminals/{id}/resize", post(terminal_resize))
             .route("/v1/terminals/{id}/close", post(terminal_close))
+            .route("/v1/terminals/{id}/stream", get(terminal_stream))
+            .route(
+                "/v1/terminals/{id}/stream-capabilities",
+                get(terminal_stream_capabilities),
+            )
             .route("/v1/sessions", get(sessions))
             .route("/v1/sessions/sidebar", get(sidebar_sessions))
             .route("/v1/sessions/sidebar/lookup", post(sidebar_lookup))
@@ -3587,6 +3592,7 @@ fn health_capabilities() -> Vec<String> {
         "terminal.windows.direct",
         "terminal.output.page",
         "terminal.snapshot",
+        "terminal.stream.v1",
         "events.replay",
         "events.stream",
         "agent.account.api.models",
@@ -5762,6 +5768,107 @@ async fn terminal_close(
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     api.terminals.close(&id).await?;
     Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn terminal_stream_capabilities(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<JsonValue>, ApiError> {
+    let supported = api
+        .terminals
+        .host(&id)?
+        .is_none_or(|host| host.supports_stream());
+    Ok(Json(json!({"supported": supported})))
+}
+
+/// v1 binary terminal stream.  The select loop never awaits PTY input while
+/// holding the socket receive side, so Applied/Release/Close remain live under
+/// a blocked PTY writer.
+async fn terminal_stream(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.max_message_size(crate::terminal::stream::MAX_PAYLOAD + crate::terminal::stream::HEADER)
+        .max_frame_size(crate::terminal::stream::MAX_PAYLOAD + crate::terminal::stream::HEADER)
+        .on_upgrade(move |socket| async move {
+            let result = match api.terminals.host(&id) {
+                Ok(Some(host)) => proxy_hosted_terminal_stream(host, socket).await,
+                Ok(None) => serve_terminal_stream(api, id, socket).await,
+                Err(error) => Err(error),
+            };
+            let _ = result;
+        })
+}
+
+async fn proxy_hosted_terminal_stream(
+    host: crate::terminal::host::Host,
+    socket: WebSocket,
+) -> Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = host
+        .stream_url()
+        .into_client_request()
+        .map_err(|_| Error::Closed)?;
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", host.token())
+            .parse()
+            .map_err(|_| Error::Closed)?,
+    );
+    use tokio_tungstenite::tungstenite::{Message as UpMessage, protocol::WebSocketConfig};
+    let mut config = WebSocketConfig::default();
+    config.max_message_size =
+        Some(crate::terminal::stream::MAX_PAYLOAD + crate::terminal::stream::HEADER);
+    config.max_frame_size = config.max_message_size;
+    config.max_write_buffer_size =
+        2 * (crate::terminal::stream::MAX_PAYLOAD + crate::terminal::stream::HEADER);
+    let (upstream, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?
+    .map_err(|_| Error::Closed)?;
+    let (mut client_tx, mut client_rx) = socket.split();
+    let (mut host_tx, mut host_rx) = upstream.split();
+    macro_rules! forward {
+        ($sink:expr, $message:expr) => {
+            tokio::time::timeout(Duration::from_secs(5), $sink.send($message))
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(|_| Error::Closed)?
+        };
+    }
+    loop {
+        tokio::select! {
+            client = client_rx.next() => match client {
+                Some(Ok(Message::Binary(bytes))) => forward!(host_tx, UpMessage::Binary(bytes)),
+                Some(Ok(Message::Ping(bytes))) => forward!(client_tx, Message::Pong(bytes)),
+                Some(Ok(Message::Pong(_))) => {},
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => return Err(Error::Invalid("terminal stream requires binary frames".into())),
+                Some(Err(_)) => break,
+            },
+            remote = host_rx.next() => match remote {
+                Some(Ok(UpMessage::Binary(bytes))) => forward!(client_tx, Message::Binary(bytes)),
+                Some(Ok(UpMessage::Ping(bytes))) => forward!(host_tx, UpMessage::Pong(bytes)),
+                Some(Ok(UpMessage::Pong(_))) => {},
+                Some(Ok(UpMessage::Close(_))) | None => break,
+                Some(Ok(_)) => return Err(Error::Invalid("invalid terminal owner stream".into())),
+                Some(Err(_)) => return Err(Error::Closed),
+            },
+        }
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(1), host_tx.close()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
+    Ok(())
+}
+
+async fn serve_terminal_stream(api: Api, id: String, socket: WebSocket) -> Result<()> {
+    let terminal = api.terminals.local(&id)?.ok_or(Error::NotFound)?;
+    crate::terminal::stream_session::serve(socket, terminal).await
 }
 
 #[derive(serde::Deserialize)]

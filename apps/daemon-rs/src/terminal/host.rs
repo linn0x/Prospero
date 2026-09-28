@@ -4,6 +4,7 @@
 use super::*;
 use crate::auth::Token;
 use crate::server::ApiError;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, State},
@@ -36,8 +37,18 @@ pub(crate) struct Host {
     url: String,
     token: String,
     client: reqwest::Client,
+    stream_supported: bool,
 }
 impl Host {
+    pub fn supports_stream(&self) -> bool {
+        self.stream_supported
+    }
+    pub fn stream_url(&self) -> String {
+        format!("{}/stream", self.url.replacen("http://", "ws://", 1))
+    }
+    pub fn token(&self) -> &str {
+        &self.token
+    }
     pub async fn attach(directory: PathBuf) -> Result<Self> {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -71,11 +82,12 @@ impl Host {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|_| Error::Closed)?;
-        let host = Self {
+        let mut host = Self {
             directory,
             url: connection.base_url.trim_end_matches('/').to_owned(),
             token: connection.token,
             client,
+            stream_supported: false,
         };
         let identity: serde_json::Value = host.get("identity").await?;
         if identity["version"] != 1
@@ -83,6 +95,11 @@ impl Host {
         {
             return Err(Error::Unauthorized);
         }
+        host.stream_supported = identity["capabilities"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str() == Some("terminal.stream.v1"))
+        });
         Ok(host)
     }
 
@@ -274,6 +291,14 @@ async fn auth(
     }
     Ok(next.run(request).await)
 }
+
+async fn host_stream(State(owner): State<Owner>, ws: WebSocketUpgrade) -> Response {
+    ws.max_message_size(super::stream::MAX_PAYLOAD + super::stream::HEADER)
+        .max_frame_size(super::stream::MAX_PAYLOAD + super::stream::HEADER)
+        .on_upgrade(move |socket| async move {
+            let _ = super::stream_session::serve(socket, owner.terminal).await;
+        })
+}
 #[derive(Deserialize)]
 struct Checkpoint {
     after: Option<i64>,
@@ -350,9 +375,10 @@ pub fn run(directory: PathBuf) -> Result<()> {
                 .route(
                     "/identity",
                     get(|State(o): State<Owner>| async move {
-                        Json(serde_json::json!({"id":o.id,"version":1}))
+                        Json(serde_json::json!({"id":o.id,"version":1,"capabilities":["terminal.stream.v1"]}))
                     }),
                 )
+                .route("/stream", get(host_stream))
                 .route(
                     "/output",
                     get(
@@ -405,6 +431,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
                     "/input",
                     post(
                         |State(o): State<Owner>, Json(i): Json<TerminalInput>| async move {
+                            if !o.terminal.legacy_control_allowed()? { return Err(ApiError(Error::Conflict)); }
                             o.terminal
                                 .input(i)
                                 .await
@@ -417,6 +444,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
                     "/resize",
                     post(
                         |State(o): State<Owner>, Json(s): Json<TerminalSize>| async move {
+                            if !o.terminal.legacy_control_allowed()? { return Err(ApiError(Error::Conflict)); }
                             o.terminal
                                 .resize(s)
                                 .await
@@ -657,6 +685,7 @@ mod tests {
                 .unwrap();
         });
         let host = Host {
+            stream_supported: false,
             directory: tempfile::tempdir().unwrap().path().to_owned(),
             url: format!("http://{address}"),
             token: "token".into(),
@@ -699,6 +728,7 @@ mod tests {
         });
         let directory = tempfile::tempdir().unwrap();
         let host = Host {
+            stream_supported: false,
             directory: directory.path().to_owned(),
             url: format!("http://{address}"),
             token: "token".into(),

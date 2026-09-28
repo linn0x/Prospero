@@ -1,5 +1,7 @@
 import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
+import WebSocket from "ws";
+import { TERMINAL_STREAM_HEADER_BYTES, TERMINAL_STREAM_MAX_PAYLOAD_BYTES } from "../shared/terminal-stream";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, AttachmentChunk, CreateAgentSession, CreateCrossModelChild, CrossModelChild, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
@@ -130,6 +132,17 @@ export class RustClient {
   }
   terminalClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/terminals/${id(value)}/close`, { method: "POST", signal });
+  }
+  /** This is main-process-only: callers never receive the bearer token. */
+  createTerminalStreamSocket(value: string): WebSocket {
+    const endpoint = new URL(`/v1/terminals/${id(value)}/stream`, this.base);
+    endpoint.protocol = "ws:";
+    return new WebSocket(endpoint, { headers: { authorization: `Bearer ${this.token}` }, maxPayload: TERMINAL_STREAM_HEADER_BYTES + TERMINAL_STREAM_MAX_PAYLOAD_BYTES, perMessageDeflate: false, handshakeTimeout: 7_000 });
+  }
+  async terminalStreamCapabilities(value: string, signal: AbortSignal | null = null): Promise<{ supported: boolean }> {
+    const result = await this.json<{ supported?: unknown }>(`/v1/terminals/${id(value)}/stream-capabilities`, { signal });
+    if (typeof result.supported !== "boolean") throw new Error("Invalid daemon response");
+    return { supported: result.supported };
   }
   createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
     return this.json("/v1/agent-sessions", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });

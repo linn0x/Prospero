@@ -43,6 +43,17 @@ describe("Rust desktop API boundary", () => {
     expect(() => client.session("../accounts")).toThrow();
   });
 
+  it("checks per-terminal stream support only after the daemon advertises v1", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ capabilities: ["terminal.stream.v1"] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ supported: false })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    expect((await client.health()).capabilities).toContain("terminal.stream.v1");
+    await expect(client.terminalStreamCapabilities("fixture")).resolves.toEqual({ supported: false });
+    expect(String(fetcher.mock.calls[1]![0])).toBe("http://127.0.0.1:12345/v1/terminals/fixture/stream-capabilities");
+    expect(fetcher.mock.calls[1]![1]?.headers).toMatchObject({ authorization: `Bearer ${token}` });
+  });
+
   it("requests usage with optional session id", async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({ type: "usage.result", available: false, windows: [], accounts: [] })));
     const client = new RustClient("http://127.0.0.1:12345", token, fetcher);

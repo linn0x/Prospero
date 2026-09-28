@@ -290,12 +290,16 @@ enum Control {
 }
 
 struct Inner {
+    epoch: String,
     sender: mpsc::Sender<Control>,
     output: Arc<Mutex<Output>>,
     notifier: watch::Sender<u64>,
     changed: watch::Receiver<u64>,
     stop: Arc<AtomicBool>,
     wake: native::Wake,
+    controller: Mutex<Option<String>>,
+    controller_changed: watch::Sender<u64>,
+    stream_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Inner {
@@ -315,6 +319,56 @@ impl Drop for Inner {
 pub struct Terminal(Arc<Inner>);
 
 impl Terminal {
+    pub fn epoch(&self) -> &str {
+        &self.0.epoch
+    }
+    pub fn controller(&self) -> Result<Option<String>> {
+        Ok(self.0.controller.lock().map_err(|_| Error::Closed)?.clone())
+    }
+    pub fn acquire_controller(&self, client: &str, takeover: bool) -> Result<bool> {
+        let mut c = self.0.controller.lock().map_err(|_| Error::Closed)?;
+        if c.is_none() || c.as_deref() == Some(client) || takeover {
+            if c.as_deref() != Some(client) {
+                *c = Some(client.into());
+                self.0
+                    .controller_changed
+                    .send_modify(|value| *value = value.wrapping_add(1));
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn release_controller(&self, client: &str) -> Result<bool> {
+        let mut c = self.0.controller.lock().map_err(|_| Error::Closed)?;
+        if c.as_deref() == Some(client) {
+            *c = None;
+            self.0
+                .controller_changed
+                .send_modify(|value| *value = value.wrapping_add(1));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn legacy_control_allowed(&self) -> Result<bool> {
+        Ok(self
+            .0
+            .controller
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .is_none())
+    }
+    pub(crate) fn controller_changes(&self) -> watch::Receiver<u64> {
+        self.0.controller_changed.subscribe()
+    }
+    pub(crate) fn stream_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.0
+            .stream_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)
+    }
     pub(crate) async fn wait_output(&self, after: i64) {
         let mut changed = self.0.changed.clone();
         loop {
@@ -419,6 +473,12 @@ impl Terminal {
     }
 
     pub async fn input(&self, input: TerminalInput) -> Result<()> {
+        self.input_authorized(input, None).await
+    }
+    pub async fn input_as(&self, client: &str, input: TerminalInput) -> Result<()> {
+        self.input_authorized(input, Some(client)).await
+    }
+    async fn input_authorized(&self, input: TerminalInput, client: Option<&str>) -> Result<()> {
         if input.data_b64.len() > INPUT_BYTES.div_ceil(3) * 4 {
             return Err(Error::Invalid("terminal input exceeds limit".into()));
         }
@@ -429,7 +489,7 @@ impl Terminal {
             return Err(Error::Invalid("invalid terminal input length".into()));
         }
         let result = self
-            .control(|reply| Control::Input(bytes, reply), None)
+            .control(|reply| Control::Input(bytes, reply), None, client)
             .await;
         if result.is_ok() {
             if let Ok(mut output) = self.0.output.lock() {
@@ -441,10 +501,17 @@ impl Terminal {
     }
 
     pub async fn resize(&self, size: TerminalSize) -> Result<()> {
+        self.resize_authorized(size, None).await
+    }
+    pub async fn resize_as(&self, client: &str, size: TerminalSize) -> Result<()> {
+        self.resize_authorized(size, Some(client)).await
+    }
+    async fn resize_authorized(&self, size: TerminalSize, client: Option<&str>) -> Result<()> {
         let size = validate_size(size)?;
         self.control(
             |reply| Control::Resize(size, reply),
             Some(Duration::from_secs(1)),
+            client,
         )
         .await
     }
@@ -453,15 +520,25 @@ impl Terminal {
         &self,
         build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control,
         timeout: Option<Duration>,
+        client: Option<&str>,
     ) -> Result<()> {
         if self.0.stop.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
         let (reply, receiver) = oneshot::channel();
-        self.0.sender.try_send(build(reply)).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => Error::Busy,
-            mpsc::error::TrySendError::Closed(_) => Error::Closed,
-        })?;
+        {
+            // Ownership check and queue admission share the same lock with
+            // takeover. Commands accepted before takeover may finish; stale
+            // commands arriving afterwards never enter the PTY queue.
+            let owner = self.0.controller.lock().map_err(|_| Error::Closed)?;
+            if owner.as_deref() != client {
+                return Err(Error::Conflict);
+            }
+            self.0.sender.try_send(build(reply)).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::Busy,
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })?;
+        }
         self.0.wake();
         if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, receiver)
@@ -502,6 +579,8 @@ pub use native::spawn;
 
 pub mod runtime;
 mod store;
+pub mod stream;
+pub(crate) mod stream_session;
 
 #[cfg(test)]
 mod tests {

@@ -55,12 +55,16 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
     let stop = Arc::new(AtomicBool::new(false));
     let (changed, updates) = watch::channel(0);
     let terminal = Terminal(Arc::new(Inner {
+        epoch: uuid::Uuid::new_v4().to_string(),
         sender,
         output: output.clone(),
         notifier: changed.clone(),
         changed: updates,
         stop: stop.clone(),
         wake,
+        controller: Mutex::new(None),
+        controller_changed: watch::channel(0).0,
+        stream_slots: Arc::new(tokio::sync::Semaphore::new(16)),
     }));
     let (ready, started) = std::sync::mpsc::sync_channel(1);
     let reader_stop = stop.clone();
@@ -467,12 +471,16 @@ mod tests {
         let (notifier, changed) = watch::channel(0);
         let (wake_sender, _wake_receiver) = std::sync::mpsc::sync_channel(1);
         Terminal(Arc::new(Inner {
+            epoch: "test-epoch".into(),
             sender,
             output: Arc::new(Mutex::new(Output::new(TerminalSize { cols: 80, rows: 24 }))),
             notifier,
             changed,
             stop: Arc::new(AtomicBool::new(false)),
             wake: Wake(wake_sender),
+            controller: Mutex::new(None),
+            controller_changed: watch::channel(0).0,
+            stream_slots: Arc::new(tokio::sync::Semaphore::new(16)),
         }))
     }
 

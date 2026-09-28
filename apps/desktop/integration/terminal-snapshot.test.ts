@@ -22,6 +22,8 @@ describe("Rust terminal checkpoints restored into the existing xterm", () => {
   for (const [name, before, after] of [
     ["Claude color-scheme notification mode", "\x1b[?2031h\x1b]10;?\x07\x1b]11;?\x1b\\\x1b[?2004h中文 shell", "\x1b[?2031l\r\nnext"],
     ["Unicode and color", "\x1b[31m中文 🦀\x1b[0m", " next"],
+    ["truecolor dump remains exact", "\x1b[38;2;10;20;30mRGB\x1b[48;2;50;60;70mBG", " next"],
+    ["custom tab stops survive a checkpoint", "\x1b[3g\x1b[5G\x1bH\x1b[1G", "\tTAB"],
     ["alternate screen and saved primary cursor", "primary\x1b[?1049h\x1b[2;5Halternate", "\x1b[?1049l next"],
     ["scroll margins and origin", "first\x1b[2;6r\x1b[?6h\x1b[3;2Hmiddle", "\r\nnext\r\nlast"],
     ["saved cursor and attributes", "\x1b[32mfirst\x1b7\x1b[5;4H\x1b[31msecond", "\x1b8restored"],
