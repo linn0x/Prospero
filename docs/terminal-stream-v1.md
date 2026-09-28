@@ -1,5 +1,8 @@
 # Terminal stream v1 implementation contract
 
+Known recovery defect: real Codex sessions can return `history_gap` and a null
+snapshot after history pruning. See [evidence and follow-up](terminal-stream-known-issues.md).
+
 Scope: Rust daemon + Electron desktop. Keep the existing terminal engine and
 SQLite schema initially. Do not install or restart the daily application during
 development. Existing HTTP management and legacy view routes remain available.
