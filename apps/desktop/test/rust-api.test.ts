@@ -7,6 +7,23 @@ const token = "a".repeat(64);
 const head: SessionHead = { id: "fixture", agent: "codex", kind: "structured", title: "Example", workspace: "/synthetic", lifecycle: "archived", status: "completed", createdAt: 1, updatedAt: 1, revision: 1 };
 
 describe("Rust desktop API boundary", () => {
+  it("waits for terminal input acknowledgement without the generic RPC deadline, but remains cancellable", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+      await new Promise<void>((_done, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }));
+      return new Response("{}");
+    });
+    try {
+      const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+      const pending = client.terminalInput("fixture", Uint8Array.of(97), controller.signal);
+      expect(timeout).not.toHaveBeenCalled();
+      expect(fetcher.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally { timeout.mockRestore(); }
+  });
   it.each(["https://example.invalid", "http://example.invalid", "http://127.0.0.1/path", "http://user@127.0.0.1", "http://127.0.0.1?token=fixture"])("rejects a non-local or credential-bearing daemon address", value => {
     expect(() => new RustClient(value, token)).toThrow();
   });
@@ -24,6 +41,17 @@ describe("Rust desktop API boundary", () => {
     await client.sidebarLookup(["fixture"]);
     expect(String(fetcher.mock.calls[2]![0])).toContain("/v1/sessions/sidebar/lookup");
     expect(() => client.session("../accounts")).toThrow();
+  });
+
+  it("checks per-terminal stream support only after the daemon advertises v1", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ capabilities: ["terminal.stream.v1"] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ supported: false })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    expect((await client.health()).capabilities).toContain("terminal.stream.v1");
+    await expect(client.terminalStreamCapabilities("fixture")).resolves.toEqual({ supported: false });
+    expect(String(fetcher.mock.calls[1]![0])).toBe("http://127.0.0.1:12345/v1/terminals/fixture/stream-capabilities");
+    expect(fetcher.mock.calls[1]![1]?.headers).toMatchObject({ authorization: `Bearer ${token}` });
   });
 
   it("requests usage with optional session id", async () => {

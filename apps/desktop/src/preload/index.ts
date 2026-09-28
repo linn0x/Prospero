@@ -16,6 +16,17 @@ ipcRenderer.on("appearance:changed", (_event, value: WindowAppearance) => applyA
 void ipcRenderer.invoke("appearance:get").then(applyAppearance).catch(() => { /* Retain opaque fallback. */ });
 document.addEventListener("DOMContentLoaded", () => { if (appearance) applyAppearance(appearance); }, { once: true });
 
+ipcRenderer.on("terminal:port", (event, value: unknown) => {
+  if (!value || typeof value !== "object" || typeof (value as { requestId?: unknown }).requestId !== "string") return;
+  const port = event.ports[0];
+  if (!port) return;
+  const requestId = (value as { requestId: string }).requestId;
+  if (!/^[A-Za-z0-9._:-]{1,160}$/.test(requestId)) { try { port.close(); } catch {} return; }
+  // The renderer matches its own nonce and checks event.source === window.
+  // Only the port crosses this boundary; the socket and bearer token stay main-only.
+  window.postMessage({ type: "terminal:port", requestId: (value as { requestId: string }).requestId }, "*", [port]);
+});
+
 const api: DesktopApi = {
   listProjectFiles: (root, path) => ipcRenderer.invoke("project-tools:list", root, path),
   readProjectFile: (root, path) => ipcRenderer.invoke("project-tools:read", root, path),
@@ -38,6 +49,7 @@ const api: DesktopApi = {
   openExternal: (url: string) => ipcRenderer.invoke("external:open", url),
   readClipboard: () => ipcRenderer.invoke("clipboard:read"),
   openTerminalContextMenu: options => ipcRenderer.invoke("terminal:context-menu", options),
+  openTerminalStream: (sessionId, requestId) => ipcRenderer.invoke("terminal:stream:open", sessionId, requestId),
   writeClipboard: (value: string) => ipcRenderer.invoke("clipboard:write", value),
   getSnapshot: () => ipcRenderer.invoke("snapshot:get"),
   subscribeSnapshot(listener) {

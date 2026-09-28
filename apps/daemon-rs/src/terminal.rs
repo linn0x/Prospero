@@ -83,7 +83,7 @@ impl Output {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
-        self.screen.process(bytes);
+        let responses = self.terminal_query_responses(bytes);
         self.push(
             TerminalEvent::Output {
                 data_b64: STANDARD.encode(bytes),
@@ -91,7 +91,7 @@ impl Output {
             bytes.len(),
         );
         self.update_output_activity(bytes);
-        self.terminal_query_responses(bytes)
+        responses
     }
 
     fn mark_activity(&mut self, now: i64) {
@@ -168,47 +168,72 @@ impl Output {
         let carry_len = self.query_carry.len();
         let mut text = std::mem::take(&mut self.query_carry);
         text.extend_from_slice(bytes);
-        self.query_carry = text[text.len().saturating_sub(8)..].to_vec();
-
+        let mut queries = Vec::new();
+        // Match normalized numeric parameters, as xterm's public parser hooks
+        // do (e.g. CSI 0006 n is still a cursor-position query).
+        for start in 0..text.len().saturating_sub(2) {
+            if text[start] != 0x1b || !matches!(text[start + 1], b'[' | b']') {
+                continue;
+            }
+            let mut end = start + 2;
+            while end < text.len() && text[end].is_ascii_digit() {
+                end += 1;
+            }
+            let parameter = text[start + 2..end].iter().try_fold(0_u32, |value, digit| {
+                value.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
+            });
+            let kind = match (text[start + 1], parameter, text.get(end)) {
+                (b'[', Some(6), Some(b'n')) => Some((end + 1, 0)),
+                (b'[', Some(0), Some(b'c')) => Some((end + 1, 1)),
+                (b']', Some(10 | 11), Some(b';')) if text.get(end + 1) == Some(&b'?') => {
+                    Some((end + 2, if parameter == Some(10) { 2 } else { 3 }))
+                }
+                _ => None,
+            };
+            if let Some((end, kind)) = kind.filter(|(end, _)| *end > carry_len) {
+                queries.push((end, kind));
+            }
+        }
+        queries.sort_unstable();
         let mut responses = Vec::new();
-        scan_terminal_query(
-            &text,
-            carry_len,
-            b"\x1b[6n",
-            || {
-                let (row, col) = self.screen.cursor_position();
-                format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
-            },
-            &mut responses,
-        );
-        scan_terminal_query(
-            &text,
-            carry_len,
-            b"\x1b[c",
-            || b"\x1b[?6c".to_vec(),
-            &mut responses,
-        );
-        scan_terminal_query(
-            &text,
-            carry_len,
-            b"\x1b[0c",
-            || b"\x1b[?6c".to_vec(),
-            &mut responses,
-        );
-        scan_terminal_query(
-            &text,
-            carry_len,
-            b"\x1b]10;?",
-            || b"\x1b]10;rgb:c0c0/caca/f5f5\x1b\\".to_vec(),
-            &mut responses,
-        );
-        scan_terminal_query(
-            &text,
-            carry_len,
-            b"\x1b]11;?",
-            || b"\x1b]11;rgb:1a1a/1b1b/2626\x1b\\".to_vec(),
-            &mut responses,
-        );
+        let mut processed = carry_len;
+        for (end, kind) in queries {
+            let current_end = end.min(text.len());
+            if current_end > processed {
+                self.screen.process(&text[processed..current_end]);
+                processed = current_end;
+            }
+            responses.push(match kind {
+                0 => {
+                    let (row, col) = self.screen.cursor_position();
+                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                }
+                1 => b"\x1b[?6c".to_vec(),
+                2 => b"\x1b]10;rgb:c0c0/caca/f5f5\x1b\\".to_vec(),
+                _ => b"\x1b]11;rgb:1a1a/1b1b/2626\x1b\\".to_vec(),
+            });
+        }
+        if processed < text.len() {
+            self.screen.process(&text[processed..]);
+        }
+        let tail = text
+            .iter()
+            .rposition(|byte| *byte == 0x1b)
+            .filter(|start| text.len() - start <= 8192)
+            .filter(|start| {
+                let suffix = &text[*start + 1..];
+                match suffix.first() {
+                    Some(b'[') => suffix[1..].iter().all(u8::is_ascii_digit),
+                    Some(b']') => suffix[1..]
+                        .strip_suffix(b";")
+                        .unwrap_or(&suffix[1..])
+                        .iter()
+                        .all(u8::is_ascii_digit),
+                    _ => false,
+                }
+            })
+            .unwrap_or_else(|| text.len().saturating_sub(8));
+        self.query_carry = text[tail..].to_vec();
         responses
     }
 
@@ -250,24 +275,6 @@ pub(crate) struct TerminalActivity {
     pub exited: bool,
 }
 
-fn scan_terminal_query(
-    text: &[u8],
-    carry_len: usize,
-    pattern: &[u8],
-    response: impl Fn() -> Vec<u8>,
-    responses: &mut Vec<Vec<u8>>,
-) {
-    for index in text
-        .windows(pattern.len())
-        .enumerate()
-        .filter_map(|(index, window)| (window == pattern).then_some(index))
-    {
-        if index + pattern.len() > carry_len {
-            responses.push(response());
-        }
-    }
-}
-
 fn output_looks_idle(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     let lower = text.to_ascii_lowercase();
@@ -283,12 +290,16 @@ enum Control {
 }
 
 struct Inner {
+    epoch: String,
     sender: mpsc::Sender<Control>,
     output: Arc<Mutex<Output>>,
     notifier: watch::Sender<u64>,
     changed: watch::Receiver<u64>,
     stop: Arc<AtomicBool>,
     wake: native::Wake,
+    controller: Mutex<Option<String>>,
+    controller_changed: watch::Sender<u64>,
+    stream_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Inner {
@@ -308,6 +319,56 @@ impl Drop for Inner {
 pub struct Terminal(Arc<Inner>);
 
 impl Terminal {
+    pub fn epoch(&self) -> &str {
+        &self.0.epoch
+    }
+    pub fn controller(&self) -> Result<Option<String>> {
+        Ok(self.0.controller.lock().map_err(|_| Error::Closed)?.clone())
+    }
+    pub fn acquire_controller(&self, client: &str, takeover: bool) -> Result<bool> {
+        let mut c = self.0.controller.lock().map_err(|_| Error::Closed)?;
+        if c.is_none() || c.as_deref() == Some(client) || takeover {
+            if c.as_deref() != Some(client) {
+                *c = Some(client.into());
+                self.0
+                    .controller_changed
+                    .send_modify(|value| *value = value.wrapping_add(1));
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn release_controller(&self, client: &str) -> Result<bool> {
+        let mut c = self.0.controller.lock().map_err(|_| Error::Closed)?;
+        if c.as_deref() == Some(client) {
+            *c = None;
+            self.0
+                .controller_changed
+                .send_modify(|value| *value = value.wrapping_add(1));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn legacy_control_allowed(&self) -> Result<bool> {
+        Ok(self
+            .0
+            .controller
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .is_none())
+    }
+    pub(crate) fn controller_changes(&self) -> watch::Receiver<u64> {
+        self.0.controller_changed.subscribe()
+    }
+    pub(crate) fn stream_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.0
+            .stream_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)
+    }
     pub(crate) async fn wait_output(&self, after: i64) {
         let mut changed = self.0.changed.clone();
         loop {
@@ -412,6 +473,12 @@ impl Terminal {
     }
 
     pub async fn input(&self, input: TerminalInput) -> Result<()> {
+        self.input_authorized(input, None).await
+    }
+    pub async fn input_as(&self, client: &str, input: TerminalInput) -> Result<()> {
+        self.input_authorized(input, Some(client)).await
+    }
+    async fn input_authorized(&self, input: TerminalInput, client: Option<&str>) -> Result<()> {
         if input.data_b64.len() > INPUT_BYTES.div_ceil(3) * 4 {
             return Err(Error::Invalid("terminal input exceeds limit".into()));
         }
@@ -421,7 +488,9 @@ impl Terminal {
         if bytes.is_empty() || bytes.len() > INPUT_BYTES {
             return Err(Error::Invalid("invalid terminal input length".into()));
         }
-        let result = self.control(|reply| Control::Input(bytes, reply)).await;
+        let result = self
+            .control(|reply| Control::Input(bytes, reply), None, client)
+            .await;
         if result.is_ok() {
             if let Ok(mut output) = self.0.output.lock() {
                 output.mark_activity(crate::database::now());
@@ -432,27 +501,54 @@ impl Terminal {
     }
 
     pub async fn resize(&self, size: TerminalSize) -> Result<()> {
+        self.resize_authorized(size, None).await
+    }
+    pub async fn resize_as(&self, client: &str, size: TerminalSize) -> Result<()> {
+        self.resize_authorized(size, Some(client)).await
+    }
+    async fn resize_authorized(&self, size: TerminalSize, client: Option<&str>) -> Result<()> {
         let size = validate_size(size)?;
-        self.control(|reply| Control::Resize(size, reply)).await
+        self.control(
+            |reply| Control::Resize(size, reply),
+            Some(Duration::from_secs(1)),
+            client,
+        )
+        .await
     }
 
     async fn control(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control,
+        timeout: Option<Duration>,
+        client: Option<&str>,
     ) -> Result<()> {
         if self.0.stop.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
         let (reply, receiver) = oneshot::channel();
-        self.0.sender.try_send(build(reply)).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => Error::Busy,
-            mpsc::error::TrySendError::Closed(_) => Error::Closed,
-        })?;
+        {
+            // Ownership check and queue admission share the same lock with
+            // takeover. Commands accepted before takeover may finish; stale
+            // commands arriving afterwards never enter the PTY queue.
+            let owner = self.0.controller.lock().map_err(|_| Error::Closed)?;
+            if owner.as_deref() != client {
+                return Err(Error::Conflict);
+            }
+            self.0.sender.try_send(build(reply)).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::Busy,
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })?;
+        }
         self.0.wake();
-        tokio::time::timeout(Duration::from_secs(1), receiver)
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|_| Error::Closed)?
+        if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, receiver)
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(|_| Error::Closed)??;
+        } else {
+            receiver.await.map_err(|_| Error::Closed)??;
+        }
+        Ok(())
     }
 
     pub fn stop(&self) {
@@ -483,6 +579,8 @@ pub use native::spawn;
 
 pub mod runtime;
 mod store;
+pub mod stream;
+pub(crate) mod stream_session;
 
 #[cfg(test)]
 mod tests {
@@ -495,6 +593,45 @@ mod tests {
         assert!(output.activity(crate::database::now()).busy_since.is_some());
         output.write("\r\n\u{276f}\r\n".as_bytes());
         assert_eq!(output.activity(crate::database::now()).busy_since, None);
+    }
+
+    #[test]
+    fn dsr_response_uses_cursor_at_query_position() {
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        let responses = output.write(b"abc\x1b[6nxyz");
+        assert_eq!(responses, vec![b"\x1b[1;4R".to_vec()]);
+    }
+
+    #[test]
+    fn split_terminal_query_is_answered_once() {
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        assert!(output.write(b"abc\x1b[").is_empty());
+        assert_eq!(output.write(b"6n"), vec![b"\x1b[1;4R".to_vec()]);
+    }
+
+    #[test]
+    fn numeric_query_parameters_match_renderer_normalization_across_chunks() {
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        let mut responses = Vec::new();
+        for byte in b"abc\x1b[00000000000000000006nxyz\x1b[0000000000000000c\x1b]000000000010;?\x07"
+        {
+            responses.extend(output.write(&[*byte]));
+        }
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b[1;4R".to_vec(),
+                b"\x1b[?6c".to_vec(),
+                b"\x1b]10;rgb:c0c0/caca/f5f5\x1b\\".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalized_numeric_terminal_queries_are_answered() {
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        assert_eq!(output.write(b"x\x1b[06n"), vec![b"\x1b[1;2R".to_vec()]);
+        assert_eq!(output.write(b"\x1b[00c"), vec![b"\x1b[?6c".to_vec()]);
     }
 }
 

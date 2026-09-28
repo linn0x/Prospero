@@ -3,3 +3,8 @@
 .terminal-shell > .terminal-status { position: absolute; z-index: 2; right: 10px; bottom: 6px; min-height: 22px; border: 1px solid #2a2c3d; border-radius: 5px; pointer-events: none; }
 .terminal-shell > .terminal-status.is-quiet { width: 1px; height: 1px; min-height: 0; padding: 0; border: 0; overflow: hidden; clip-path: inset(50%); }
 .terminal-shell > .terminal-status .terminal-shortcut { display: none; }
+.terminal-shell > .terminal-status .terminal-control { display: inline-flex; gap: 4px; margin-left: 7px; pointer-events: auto; }
+.terminal-shell > .terminal-status .terminal-control button { padding: 1px 5px; border: 1px solid #3b4261; border-radius: 3px; background: #1f2335; color: inherit; font: inherit; cursor: pointer; }
+.terminal-shell > .terminal-status .terminal-control button:hover { border-color: #7aa2f7; }
+/* Live ownership actions belong above the screen, away from the shell prompt. */
+.terminal-shell > .terminal-status:has(.terminal-control) { top: 6px; bottom: auto; pointer-events: none; }

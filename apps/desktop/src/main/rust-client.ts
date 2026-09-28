@@ -1,5 +1,7 @@
 import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
+import WebSocket from "ws";
+import { TERMINAL_STREAM_HEADER_BYTES, TERMINAL_STREAM_MAX_PAYLOAD_BYTES } from "../shared/terminal-stream";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, AttachmentChunk, CreateAgentSession, CreateCrossModelChild, CrossModelChild, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
@@ -52,10 +54,12 @@ export class RustClient {
     this.base = url.origin;
   }
 
-  private async response(path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<Response> {
+  private async response(path: string, init: RequestInit & { timeoutMs?: number | null } = {}): Promise<Response> {
     const { timeoutMs = 7000, ...requestInit } = init;
+    const deadline = timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs);
+    const signal = requestInit.signal && deadline ? AbortSignal.any([requestInit.signal, deadline]) : requestInit.signal ?? deadline ?? null;
     try {
-      return await this.fetcher(this.base + path, { ...requestInit, redirect: "error", signal: requestInit.signal ? AbortSignal.any([requestInit.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs), headers: { ...requestInit.headers, authorization: `Bearer ${this.token}` } });
+      return await this.fetcher(this.base + path, { ...requestInit, redirect: "error", signal, headers: { ...requestInit.headers, authorization: `Bearer ${this.token}` } });
     } catch { if (requestInit.signal?.aborted) throw new DOMException("Request cancelled", "AbortError"); throw new Error("无法连接本机 Rust 服务"); }
     }
 
@@ -77,7 +81,7 @@ export class RustClient {
     return output;
   }
 
-  private async json<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  private async json<T>(path: string, init?: RequestInit & { timeoutMs?: number | null }): Promise<T> {
     const response = await this.response(path, init);
     const text = new TextDecoder().decode(await this.bytes(response));
     let result: unknown;
@@ -119,13 +123,26 @@ export class RustClient {
   }
   terminalInput(value: string, bytes: Uint8Array, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     if (!bytes.length || bytes.length > 8192) throw new Error("Terminal input exceeds limit");
-    return this.json(`/v1/terminals/${id(value)}/input`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ dataB64: Buffer.from(bytes).toString("base64") }) });
+    // A healthy child may temporarily stop reading stdin. Wait for the writer
+    // acknowledgement; a generic RPC deadline cannot safely retry partial input.
+    return this.json(`/v1/terminals/${id(value)}/input`, { method: "POST", signal, timeoutMs: null, headers: { "content-type": "application/json" }, body: JSON.stringify({ dataB64: Buffer.from(bytes).toString("base64") }) });
   }
   terminalResize(value: string, size: TerminalSize, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/terminals/${id(value)}/resize`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(size) });
   }
   terminalClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/terminals/${id(value)}/close`, { method: "POST", signal });
+  }
+  /** This is main-process-only: callers never receive the bearer token. */
+  createTerminalStreamSocket(value: string): WebSocket {
+    const endpoint = new URL(`/v1/terminals/${id(value)}/stream`, this.base);
+    endpoint.protocol = "ws:";
+    return new WebSocket(endpoint, { headers: { authorization: `Bearer ${this.token}` }, maxPayload: TERMINAL_STREAM_HEADER_BYTES + TERMINAL_STREAM_MAX_PAYLOAD_BYTES, perMessageDeflate: false, handshakeTimeout: 7_000 });
+  }
+  async terminalStreamCapabilities(value: string, signal: AbortSignal | null = null): Promise<{ supported: boolean }> {
+    const result = await this.json<{ supported?: unknown }>(`/v1/terminals/${id(value)}/stream-capabilities`, { signal });
+    if (typeof result.supported !== "boolean") throw new Error("Invalid daemon response");
+    return { supported: result.supported };
   }
   createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
     return this.json("/v1/agent-sessions", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
