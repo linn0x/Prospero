@@ -1,4 +1,4 @@
-import { TerminalMouseToggle } from "./TerminalMouseToggle";
+import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_EVENT } from "./TerminalMouseToggle";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import type { DesktopSnapshot, SessionInfo } from "../../../shared/types";
@@ -11,7 +11,18 @@ const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ de
 
 export function DockTerminal({ session, root = session.cwd, snapshot, active = true }: { session: SessionInfo; root?: string; snapshot: DesktopSnapshot; active?: boolean }) {
   const { t } = useLocale();
-  const [localSelection, setLocalSelection] = useState(true);
+  const [localSelection, setLocalSelection] = useState(readTerminalMousePreference);
+  useEffect(() => {
+    const sync = (event: Event): void => {
+      if (event.type === "storage" && (event as StorageEvent).key !== "prospero.terminal.mouse-mode") return;
+      const custom = (event as CustomEvent<unknown>).detail;
+      if (typeof custom === "boolean") setLocalSelection(custom);
+      else if (event.type === "storage") setLocalSelection(readTerminalMousePreference());
+    };
+    window.addEventListener(TERMINAL_MOUSE_MODE_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => { window.removeEventListener(TERMINAL_MOUSE_MODE_EVENT, sync); window.removeEventListener("storage", sync); };
+  }, []);
   const [shell, setShell] = useState<SessionInfo>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();

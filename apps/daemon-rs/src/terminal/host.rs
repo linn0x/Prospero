@@ -4,6 +4,7 @@
 use super::*;
 use crate::auth::Token;
 use crate::server::ApiError;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, State},
@@ -36,8 +37,18 @@ pub(crate) struct Host {
     url: String,
     token: String,
     client: reqwest::Client,
+    stream_supported: bool,
 }
 impl Host {
+    pub fn supports_stream(&self) -> bool {
+        self.stream_supported
+    }
+    pub fn stream_url(&self) -> String {
+        format!("{}/stream", self.url.replacen("http://", "ws://", 1))
+    }
+    pub fn token(&self) -> &str {
+        &self.token
+    }
     pub async fn attach(directory: PathBuf) -> Result<Self> {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -68,14 +79,15 @@ impl Host {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|_| Error::Closed)?;
-        let host = Self {
+        let mut host = Self {
             directory,
             url: connection.base_url.trim_end_matches('/').to_owned(),
             token: connection.token,
             client,
+            stream_supported: false,
         };
         let identity: serde_json::Value = host.get("identity").await?;
         if identity["version"] != 1
@@ -83,6 +95,11 @@ impl Host {
         {
             return Err(Error::Unauthorized);
         }
+        host.stream_supported = identity["capabilities"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str() == Some("terminal.stream.v1"))
+        });
         Ok(host)
     }
 
@@ -223,21 +240,26 @@ impl Host {
         serde_json::from_slice(&bytes).map_err(Error::from)
     }
     pub async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.response(self.client.get(format!("{}/{path}", self.url)))
-            .await
+        self.response(
+            self.client
+                .get(format!("{}/{path}", self.url))
+                .timeout(Duration::from_secs(8)),
+        )
+        .await
     }
     pub async fn post<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        let result: Result<bool> = self
-            .response(self.client.post(format!("{}/{path}", self.url)).json(body))
-            .await;
+        let request = self.client.post(format!("{}/{path}", self.url)).json(body);
+        let request = if path == "input" {
+            request
+        } else {
+            request.timeout(Duration::from_secs(8))
+        };
+        // Input acknowledgement may wait behind PTY backpressure. Cancellation
+        // belongs to the caller; a transport timeout must not close the host.
+        let result: Result<bool> = self.response(request).await;
         match result {
             Ok(_) => Ok(()),
             Err(Error::Closed | Error::Timeout | Error::Json(_)) if path == "input" => {
-                // An acknowledgement may have been lost after bytes reached
-                // the PTY. Do not invite replay of an ambiguous input batch.
-                let _: Result<bool> = self
-                    .response(self.client.post(format!("{}/close", self.url)).json(&true))
-                    .await;
                 Err(Error::TerminalInput)
             }
             Err(error) => Err(error),
@@ -268,6 +290,14 @@ async fn auth(
         return Err(ApiError(Error::Unauthorized));
     }
     Ok(next.run(request).await)
+}
+
+async fn host_stream(State(owner): State<Owner>, ws: WebSocketUpgrade) -> Response {
+    ws.max_message_size(super::stream::MAX_PAYLOAD + super::stream::HEADER)
+        .max_frame_size(super::stream::MAX_PAYLOAD + super::stream::HEADER)
+        .on_upgrade(move |socket| async move {
+            let _ = super::stream_session::serve(socket, owner.terminal).await;
+        })
 }
 #[derive(Deserialize)]
 struct Checkpoint {
@@ -345,9 +375,10 @@ pub fn run(directory: PathBuf) -> Result<()> {
                 .route(
                     "/identity",
                     get(|State(o): State<Owner>| async move {
-                        Json(serde_json::json!({"id":o.id,"version":1}))
+                        Json(serde_json::json!({"id":o.id,"version":1,"capabilities":["terminal.stream.v1"]}))
                     }),
                 )
+                .route("/stream", get(host_stream))
                 .route(
                     "/output",
                     get(
@@ -400,6 +431,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
                     "/input",
                     post(
                         |State(o): State<Owner>, Json(i): Json<TerminalInput>| async move {
+                            if !o.terminal.legacy_control_allowed()? { return Err(ApiError(Error::Conflict)); }
                             o.terminal
                                 .input(i)
                                 .await
@@ -412,6 +444,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
                     "/resize",
                     post(
                         |State(o): State<Owner>, Json(s): Json<TerminalSize>| async move {
+                            if !o.terminal.legacy_control_allowed()? { return Err(ApiError(Error::Conflict)); }
                             o.terminal
                                 .resize(s)
                                 .await
@@ -634,5 +667,84 @@ mod tests {
             Host::attach(root.path().to_owned()).await,
             Err(Error::Unauthorized)
         ));
+    }
+
+    #[tokio::test]
+    async fn input_transport_has_no_request_timeout_but_keeps_connect_bound() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(8_200)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4\r\nconnection: close\r\n\r\ntrue")
+                .await
+                .unwrap();
+        });
+        let host = Host {
+            stream_supported: false,
+            directory: tempfile::tempdir().unwrap().path().to_owned(),
+            url: format!("http://{address}"),
+            token: "token".into(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        };
+        let result = host
+            .input(TerminalInput {
+                data_b64: "eA==".into(),
+            })
+            .await;
+        assert!(result.is_ok());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_input_reply_does_not_close_or_replay_the_terminal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("POST /input "));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+            drop(socket);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "no automatic close or replay after an ambiguous reply"
+            );
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let host = Host {
+            stream_supported: false,
+            directory: directory.path().to_owned(),
+            url: format!("http://{address}"),
+            token: "token".into(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        };
+        assert!(matches!(
+            host.input(TerminalInput {
+                data_b64: "eA==".into()
+            })
+            .await,
+            Err(Error::TerminalInput)
+        ));
+        server.await.unwrap();
     }
 }

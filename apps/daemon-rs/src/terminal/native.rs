@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::time::Instant;
 
@@ -19,6 +20,14 @@ enum ReaderEvent {
     Output(Vec<u8>),
     Closed,
 }
+
+struct PendingWrite {
+    bytes: Vec<u8>,
+    offset: usize,
+    reply: Option<oneshot::Sender<Result<()>>>,
+}
+const PENDING_WRITE_BYTES: usize = 1024 * 1024;
+const RESPONSE_RESERVE_BYTES: usize = 128 * 1024;
 
 fn pty_size(size: TerminalSize) -> PtySize {
     PtySize {
@@ -46,12 +55,16 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
     let stop = Arc::new(AtomicBool::new(false));
     let (changed, updates) = watch::channel(0);
     let terminal = Terminal(Arc::new(Inner {
+        epoch: uuid::Uuid::new_v4().to_string(),
         sender,
         output: output.clone(),
         notifier: changed.clone(),
         changed: updates,
         stop: stop.clone(),
         wake,
+        controller: Mutex::new(None),
+        controller_changed: watch::channel(0).0,
+        stream_slots: Arc::new(tokio::sync::Semaphore::new(16)),
     }));
     let (ready, started) = std::sync::mpsc::sync_channel(1);
     let reader_stop = stop.clone();
@@ -108,6 +121,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
             let mut exit_code = None;
             let mut signalled = false;
             let mut output_closed = false;
+            let mut pending_input = VecDeque::<PendingWrite>::new();
             #[cfg(target_os = "macos")]
             let mut exit_probe = Instant::now();
             #[cfg(target_os = "macos")]
@@ -138,18 +152,26 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                     }
                 }
                 let mut read_any = false;
-                for event in output_receiver.try_iter().take(4) {
-                    match event {
-                        ReaderEvent::Wake => {
-                            read_any = true;
+                drain_pending_input(writer.as_mut(), &stop, &mut pending_input);
+                if pending_bytes(&pending_input) <= PENDING_WRITE_BYTES - RESPONSE_RESERVE_BYTES {
+                    for event in output_receiver.try_iter().take(4) {
+                        match event {
+                            ReaderEvent::Wake => {
+                                read_any = true;
+                            }
+                            ReaderEvent::Output(bytes) => {
+                                read_any = true;
+                                accept_output(&output, &changed, &mut pending_input, &bytes);
+                            }
+                            ReaderEvent::Closed => {
+                                output_closed = true;
+                                stop.store(true, Ordering::Release);
+                            }
                         }
-                        ReaderEvent::Output(bytes) => {
-                            read_any = true;
-                            accept_output(&output, &changed, writer.as_mut(), &stop, &bytes);
-                        }
-                        ReaderEvent::Closed => {
-                            output_closed = true;
-                            stop.store(true, Ordering::Release);
+                        if pending_bytes(&pending_input)
+                            > PENDING_WRITE_BYTES - RESPONSE_RESERVE_BYTES
+                        {
+                            break;
                         }
                     }
                 }
@@ -176,18 +198,19 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                     handle_control(
                         control,
                         pair.master.as_ref(),
-                        &mut writer,
                         &mut current_size,
                         &output,
                         &changed,
-                        &stop,
+                        &mut pending_input,
                     );
                 }
-                if !read_any {
+                if !read_any
+                    && pending_bytes(&pending_input) <= PENDING_WRITE_BYTES - RESPONSE_RESERVE_BYTES
+                {
                     match output_receiver.recv_timeout(Duration::from_millis(20)) {
                         Ok(ReaderEvent::Wake) => {}
                         Ok(ReaderEvent::Output(bytes)) => {
-                            accept_output(&output, &changed, writer.as_mut(), &stop, &bytes);
+                            accept_output(&output, &changed, &mut pending_input, &bytes);
                         }
                         Ok(ReaderEvent::Closed) => {
                             output_closed = true;
@@ -199,6 +222,10 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                             stop.store(true, Ordering::Release);
                         }
                     }
+                } else if !read_any {
+                    // Responses are backpressured as well as user input. Do
+                    // not busy-spin while the child temporarily cannot read.
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             }
             if !exiting && child.try_wait().ok().flatten().is_none() {
@@ -226,8 +253,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
 fn accept_output(
     output: &Arc<Mutex<Output>>,
     changed: &watch::Sender<u64>,
-    writer: &mut dyn Write,
-    stop: &AtomicBool,
+    pending: &mut VecDeque<PendingWrite>,
     bytes: &[u8],
 ) {
     let responses = if let Ok(mut output) = output.lock() {
@@ -237,30 +263,45 @@ fn accept_output(
     };
     changed.send_modify(|v| *v = v.wrapping_add(1));
     for response in responses {
-        if write_input(writer, &response, stop).is_err() {
-            stop.store(true, Ordering::Release);
-            break;
-        }
+        pending.push_back(PendingWrite {
+            bytes: response,
+            offset: 0,
+            reply: None,
+        });
     }
+}
+
+fn pending_bytes(pending: &VecDeque<PendingWrite>) -> usize {
+    pending
+        .iter()
+        .map(|item| item.bytes.len() - item.offset)
+        .sum()
 }
 
 fn handle_control(
     control: Control,
     master: &dyn MasterPty,
-    writer: &mut dyn Write,
     current_size: &mut TerminalSize,
     output: &Arc<Mutex<Output>>,
     changed: &watch::Sender<u64>,
-    stop: &AtomicBool,
+    pending_input: &mut VecDeque<PendingWrite>,
 ) {
     match control {
         Control::Input(bytes, reply) => {
             if !reply.is_closed() {
-                let result = write_input(writer, &bytes, stop);
-                if result.is_err() {
-                    stop.store(true, Ordering::Release);
+                let queued = pending_input
+                    .iter()
+                    .map(|item| item.bytes.len() - item.offset)
+                    .sum::<usize>();
+                if queued + bytes.len() > PENDING_WRITE_BYTES {
+                    let _ = reply.send(Err(Error::Busy));
+                } else {
+                    pending_input.push_back(PendingWrite {
+                        bytes,
+                        offset: 0,
+                        reply: Some(reply),
+                    });
                 }
-                let _ = reply.send(result.map_err(|_| Error::TerminalInput));
             }
         }
         Control::Resize(size, reply) => {
@@ -281,6 +322,40 @@ fn handle_control(
                 };
                 let _ = reply.send(result);
             }
+        }
+    }
+}
+
+fn drain_pending_input(
+    writer: &mut dyn Write,
+    stop: &AtomicBool,
+    pending: &mut VecDeque<PendingWrite>,
+) {
+    for _ in 0..8 {
+        let Some(item) = pending.front_mut() else {
+            return;
+        };
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        match writer.write(&item.bytes[item.offset..]) {
+            Ok(0) => {
+                stop.store(true, Ordering::Release);
+                return;
+            }
+            Ok(count) => item.offset += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(_) => {
+                stop.store(true, Ordering::Release);
+                return;
+            }
+        }
+        if item.offset == item.bytes.len() {
+            if let Some(reply) = item.reply.take() {
+                let _ = reply.send(Ok(()));
+            }
+            pending.pop_front();
         }
     }
 }
@@ -366,44 +441,46 @@ fn processes() -> Vec<i32> {
     }
 }
 
-fn write_input(writer: &mut dyn Write, bytes: &[u8], stop: &AtomicBool) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_millis(200);
-    let mut offset = 0;
-    while offset < bytes.len() {
-        if stop.load(Ordering::Acquire) {
-            return Err(Error::Closed);
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Timeout);
-        }
-        match writer.write(&bytes[offset..]) {
-            Ok(0) => return Err(Error::Closed),
-            Ok(count) => offset += count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2))
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PartialWriter {
+        output: Vec<u8>,
+        limit: usize,
+        blocked: bool,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.blocked {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let count = bytes.len().min(self.limit);
+            self.output.extend_from_slice(&bytes[..count]);
+            self.blocked = true;
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn fixture() -> Terminal {
         let (sender, _receiver) = mpsc::channel(32);
         let (notifier, changed) = watch::channel(0);
         let (wake_sender, _wake_receiver) = std::sync::mpsc::sync_channel(1);
         Terminal(Arc::new(Inner {
+            epoch: "test-epoch".into(),
             sender,
             output: Arc::new(Mutex::new(Output::new(TerminalSize { cols: 80, rows: 24 }))),
             notifier,
             changed,
             stop: Arc::new(AtomicBool::new(false)),
             wake: Wake(wake_sender),
+            controller: Mutex::new(None),
+            controller_changed: watch::channel(0).0,
+            stream_slots: Arc::new(tokio::sync::Semaphore::new(16)),
         }))
     }
 
@@ -452,5 +529,24 @@ mod tests {
         wake.signal();
         assert!(matches!(receiver.try_recv(), Ok(ReaderEvent::Wake)));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_writer_keeps_unwritten_suffix_on_partial_would_block() {
+        let stop = AtomicBool::new(false);
+        let mut pending = VecDeque::from([PendingWrite {
+            bytes: b"abcdef".to_vec(),
+            offset: 0,
+            reply: None,
+        }]);
+        let mut writer = PartialWriter {
+            output: Vec::new(),
+            limit: 2,
+            blocked: false,
+        };
+        drain_pending_input(&mut writer, &stop, &mut pending);
+        assert_eq!(writer.output, b"ab");
+        assert_eq!(pending.front().map(|item| item.offset), Some(2));
+        assert_eq!(pending.front().unwrap().bytes, b"abcdef");
     }
 }

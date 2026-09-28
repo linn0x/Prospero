@@ -18,6 +18,7 @@ import { DockSlot } from "./DockSlot";
 import { SessionToolbar } from "./SessionToolbar";
 import { retainTerminalIds } from "./retained-terminals";
 import { sessionLabel } from "./session-presentation";
+import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_EVENT } from "./TerminalMouseToggle";
 
 const ChatPane = lazy(() => import("../ChatPane").then((module) => ({ default: module.ChatPane })));
 const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
@@ -35,7 +36,13 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   const root = session ? text(dispatch?.["worktreePath"], session.cwd) : selectedRoot || snapshot.projects[0] || "";
   const { width: effectiveWidth, maxWidth, overlay } = workspaceDockLayout(available, autoWidth ? available * .48 : width);
   const [dock, setDock] = useState<DockState>(() => sessionDockState(readDockPreferences().sessions.find((item) => item.id === dockId)?.state, trajectory));
-  const [localSelection, setLocalSelection] = useState(true);
+  const [localSelection, setLocalSelection] = useState(readTerminalMousePreference);
+  useEffect(() => {
+    const sync = (event: Event): void => { if (event.type === "storage" && (event as StorageEvent).key !== "prospero.terminal.mouse-mode") return; const value = (event as CustomEvent<unknown>).detail; if (typeof value === "boolean") setLocalSelection(value); else if (event.type === "storage") setLocalSelection(readTerminalMousePreference()); };
+    window.addEventListener(TERMINAL_MOUSE_MODE_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => { window.removeEventListener(TERMINAL_MOUSE_MODE_EVENT, sync); window.removeEventListener("storage", sync); };
+  }, []);
   const [trajectoryHost, setTrajectoryHost] = useState<HTMLDivElement | null>(null);
   const [dockContainer] = useState(() => {
     if (typeof document === "undefined") return null;
@@ -123,6 +130,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
     <div className={cn("workspace-grid", visible && !overlay && "has-dock")} style={{ "--context-dock-width": `${effectiveWidth}px` } as CSSProperties}>
       <main id={active ? "workspace-session-panel" : undefined} role="tabpanel" aria-labelledby={chromeVisible && session ? `workspace-tab-${session.id}` : undefined} aria-label={focus && session ? sessionLabel(session) : undefined} className="workspace-primary">
         {toolbar}
+        {focus && session?.kind === "pty" && <div className="workspace-focus-controls"><TerminalMouseToggle localSelection={localSelection} onChange={setLocalSelection} /></div>}
         <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载会话…", "Loading session…")}</div>}>
           {!session ? empty : session.kind === "pty" ? <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
         </Suspense>

@@ -350,6 +350,8 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   openExternal(url: string): Promise<{ ok: boolean }>;
   readClipboard(): Promise<string>;
   openTerminalContextMenu(options: { copy: boolean; paste: boolean }): Promise<void>;
+  /** Opens an authenticated v1 attachment. Its port is delivered as a window message keyed by requestId. */
+  openTerminalStream(sessionId: string, requestId: string): Promise<{ supported: boolean }>;
   writeClipboard(value: string): Promise<{ ok: boolean }>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   createCrossModelChild(sessionId: string, input: { sourceId: string; routeId: string; revision: number; agent: "codex" | "claude" | "opencode"; task: string; title?: string }): Promise<JsonObject>;
