@@ -25,7 +25,7 @@ it("reconnects a fresh desktop to the same live PTY after history pruning and co
   configureRustTerminalUnicode(original); configureRustTerminalUnicode(restored);
   let recovery: TerminalRecovery | undefined;
   try {
-    child=spawn(resolve("../../target/release/prosperod-rs"),["serve","--data-dir",dir],{stdio:["ignore","pipe","pipe"]});
+    child=spawn(process.env.PROSPERO_TEST_DAEMON || resolve("../../target/release/prosperod-rs"),["serve","--data-dir",dir],{stdio:["ignore","pipe","pipe"]});
     await new Promise<void>((done,fail)=>{let output="";const timer=setTimeout(()=>fail(new Error("daemon startup timeout")),10000);child!.once("exit",()=>{clearTimeout(timer);fail(new Error("daemon exited"));});child!.stdout!.on("data",b=>{output+=b;if(output.includes('"event":"ready"')){clearTimeout(timer);done();}});});
     connection=JSON.parse(await readFile(resolve(dir,"connection.json"),"utf8"));
     const c=connection!;

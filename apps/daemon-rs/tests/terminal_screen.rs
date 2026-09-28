@@ -30,8 +30,23 @@ fn malformed_utf8_is_processed_and_oversized_screens_are_refused() {
     screen.process(&vec![0xff; 16384]);
     assert!(screen.snapshot(1).is_ok());
     screen.resize(TerminalSize {
+        cols: 3000,
+        rows: 1000,
+    });
+    assert!(screen.snapshot(2).is_err());
+}
+
+#[test]
+fn legal_wide_resize_keeps_snapshot_content() {
+    let mut screen = Screen::new(TerminalSize { cols: 80, rows: 24 });
+    screen.process(b"before");
+    screen.resize(TerminalSize {
         cols: 500,
         rows: 300,
     });
-    assert!(screen.snapshot(2).is_err());
+    screen.process(b"wide");
+    let snapshot = screen.snapshot(2).unwrap();
+    let restored = String::from_utf8(STANDARD.decode(snapshot.data_b64).unwrap()).unwrap();
+    assert!(restored.contains("before"));
+    assert!(restored.contains("wide"));
 }

@@ -44,6 +44,16 @@ describe("terminal paste ownership", () => {
     dispose(); target.dispatchEvent(pasteEvent("disposed"));
     expect(terminal.paste).not.toHaveBeenCalled();
   });
+  it("reports non-text clipboard content instead of silently dropping it", () => {
+    const target = new EventTarget(); const terminal = { paste: vi.fn() }; const nonText = vi.fn();
+    const dispose = bindTerminalPaste(target, terminal, () => true, undefined, undefined, nonText);
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: { types: ["image/png"], getData: () => "" } });
+    target.dispatchEvent(event);
+    expect(nonText).toHaveBeenCalledOnce();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    dispose();
+  });
 
   it("uses the real xterm paste path for line endings and bracketed paste, without adding Enter", async () => {
     const terminal = new Terminal();

@@ -78,6 +78,8 @@
 .dock-terminal > .terminal-shell { flex: 1; min-height: 0; }
 .dock-terminal-toolbar { display: flex; align-items: center; justify-content: space-between; min-height: 28px; gap: 6px; padding: 4px 8px; color: var(--muted-foreground); font-size: var(--ui-text-caption); }
 .dock-terminal-toolbar > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-focus-controls { display: flex; flex: none; min-height: 34px; align-items: center; justify-content: flex-end; padding: 3px 10px; border-bottom: 1px solid var(--border); background: var(--background); }
+.workspace-focus-controls:hover, .workspace-focus-controls:focus-within { opacity: 1; }
 .dock-terminal .terminal-toolbar { min-height: 30px; }
 @container workspace-primary (max-width: 640px) { .session-toolbar-identity small { display: none; } }
 @container workspace-primary (max-width: 480px) { .session-toolbar-identity > span:not(.status-mark) { display: none; } }
