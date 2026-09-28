@@ -6,6 +6,18 @@ pub(crate) enum Handle {
     Hosted(host::Host),
 }
 impl Handle {
+    pub fn local(&self) -> Option<Terminal> {
+        match self {
+            Self::Local(t) => Some(t.clone()),
+            _ => None,
+        }
+    }
+    pub fn host(&self) -> Option<host::Host> {
+        match self {
+            Self::Hosted(h) => Some(h.clone()),
+            _ => None,
+        }
+    }
     pub fn lost(&self) -> bool {
         matches!(self, Self::Hosted(h) if host::owner_alive(&h.directory).is_ok_and(|alive| !alive))
     }

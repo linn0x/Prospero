@@ -212,6 +212,15 @@ impl Screen {
     }
 
     fn input_modes(&mut self, sequence: &str) {
+        // avt retains protected cells, but its dump does not restore DECSCA or
+        // selective erase semantics in xterm. Refuse a misleading checkpoint.
+        if sequence.starts_with("\x1b[")
+            && ((sequence.ends_with("\"q") && sequence[2..].contains('"'))
+                || (sequence.starts_with("\x1b[?")
+                    && (sequence.ends_with('J') || sequence.ends_with('K'))))
+        {
+            self.compatible = false;
+        }
         if let Some(value) = sequence.strip_prefix("\x1b]") {
             let code = value.split(';').next().unwrap_or("");
             let color_query = value.starts_with("10;?") || value.starts_with("11;?");
@@ -268,7 +277,7 @@ impl Screen {
             .as_ref()
             .filter(|_| self.compatible)
             .ok_or_else(|| Error::Invalid("terminal state cannot be checkpointed yet".into()))?;
-        let mut ansi = terminal.dump();
+        let mut ansi = normalize_xterm_dump(&terminal.dump());
         for mode in &self.modes {
             ansi.push_str(&format!("\x1b[?{mode}h"));
         }
@@ -287,5 +296,99 @@ impl Screen {
             size: self.size,
             data_b64: STANDARD.encode(bytes),
         })
+    }
+}
+
+/// avt emits colon truecolor without the optional colour-space field and CTC
+/// tab controls. These dump forms are not replayed correctly by xterm.
+/// Parse only complete CSI controls emitted by a dump; ordinary text is never
+/// rewritten.
+fn normalize_xterm_dump(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"\x1b[") {
+            let start = index;
+            index += 2;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_digit() || bytes[index] == b';' || bytes[index] == b':')
+            {
+                index += 1;
+            }
+            if index < bytes.len() {
+                let final_byte = bytes[index];
+                let params = &source[start + 2..index];
+                if !(0x40..=0x7e).contains(&final_byte) {
+                    // Unknown intermediates/pending text are not a complete
+                    // control we can normalize. Keep UTF-8 boundaries intact.
+                    out.push_str(&source[start..index]);
+                    continue;
+                }
+                index += 1;
+                if final_byte == b'm' {
+                    let fixed = params
+                        .split(';')
+                        .map(|part| {
+                            let fields: Vec<_> = part.split(':').collect();
+                            if fields.len() == 5
+                                && matches!(fields[0], "38" | "48")
+                                && fields[1] == "2"
+                                && fields[2..].iter().all(|v| v.parse::<u8>().is_ok())
+                            {
+                                format!("{};2;{};{};{}", fields[0], fields[2], fields[3], fields[4])
+                            } else {
+                                part.to_owned()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    out.push_str("\x1b[");
+                    out.push_str(&fixed);
+                    out.push('m');
+                    continue;
+                }
+                if final_byte == b'W' {
+                    match params {
+                        "0" | "" => out.push_str("\x1bH"),
+                        "2" => out.push_str("\x1b[0g"),
+                        "5" => out.push_str("\x1b[3g"),
+                        _ => {
+                            out.push_str(&source[start..index]);
+                        }
+                    }
+                    continue;
+                }
+                out.push_str(&source[start..index]);
+                continue;
+            }
+            out.push_str(&source[start..]);
+            break;
+        }
+        let next = source[index..].chars().next().expect("valid UTF-8");
+        out.push(next);
+        index += next.len_utf8();
+    }
+    out
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::normalize_xterm_dump;
+
+    #[test]
+    fn only_complete_dump_controls_are_rewritten() {
+        assert_eq!(
+            normalize_xterm_dump("x\x1b[38:2:10:20:30my"),
+            "x\x1b[38;2;10;20;30my"
+        );
+        assert_eq!(
+            normalize_xterm_dump("\x1b[2W\x1b[5W\x1b[0W"),
+            "\x1b[0g\x1b[3g\x1bH"
+        );
+        assert_eq!(
+            normalize_xterm_dump("text 38:2:10:20:30 and \x1b[9W"),
+            "text 38:2:10:20:30 and \x1b[9W"
+        );
     }
 }
