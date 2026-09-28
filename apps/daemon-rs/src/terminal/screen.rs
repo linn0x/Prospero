@@ -5,6 +5,11 @@ use unicode_width::UnicodeWidthChar;
 use super::*;
 
 const MAX_CELLS: usize = 2_048_000;
+// Reserve a fixed history budget for the largest supported viewport:
+// 500 cols * (2 * 300 rows + 3400 history lines) = 2,000,000 cells.
+// This avoids the old width-dependent 10,000-line budget disabling snapshots
+// around 204 columns while keeping the screen within MAX_CELLS.
+const MAX_SCROLLBACK_LINES: usize = 3_400;
 const MAX_PENDING: usize = 8192;
 const MAX_SNAPSHOT: usize = 1024 * 1024;
 
@@ -45,16 +50,19 @@ pub struct Screen {
 }
 
 impl Screen {
-    pub fn new(size: TerminalSize) -> Self {
+    fn build_terminal(size: TerminalSize) -> Option<avt::Vt> {
         let cells = usize::from(size.cols) * usize::from(size.rows) * 2;
-        let terminal = (cells <= MAX_CELLS).then(|| {
+        (cells <= MAX_CELLS).then(|| {
             avt::Vt::builder()
                 .size(size.cols.into(), size.rows.into())
-                .scrollback_limit(((MAX_CELLS - cells) / usize::from(size.cols)).min(10_000))
+                .scrollback_limit(MAX_SCROLLBACK_LINES)
                 .build()
-        });
+        })
+    }
+
+    pub fn new(size: TerminalSize) -> Self {
         Self {
-            terminal,
+            terminal: Self::build_terminal(size),
             size,
             escape: Escape::Ground,
             pending: String::new(),
@@ -69,11 +77,15 @@ impl Screen {
 
     pub fn resize(&mut self, size: TerminalSize) {
         self.size = size;
-        if usize::from(size.cols) * (usize::from(size.rows) * 2 + 10_000) > MAX_CELLS {
+        let too_large = usize::from(size.cols) * usize::from(size.rows) * 2 > MAX_CELLS;
+        if too_large {
             self.terminal = None;
-        }
-        if let Some(terminal) = &mut self.terminal {
+        } else if let Some(terminal) = &mut self.terminal {
             terminal.resize(size.cols.into(), size.rows.into());
+        } else {
+            // A previous oversized resize is reversible. Recreate the parser
+            // when the viewport is small enough again so snapshots recover.
+            self.terminal = Self::build_terminal(size);
         }
     }
 

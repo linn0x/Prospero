@@ -52,10 +52,12 @@ export class RustClient {
     this.base = url.origin;
   }
 
-  private async response(path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<Response> {
+  private async response(path: string, init: RequestInit & { timeoutMs?: number | null } = {}): Promise<Response> {
     const { timeoutMs = 7000, ...requestInit } = init;
+    const deadline = timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs);
+    const signal = requestInit.signal && deadline ? AbortSignal.any([requestInit.signal, deadline]) : requestInit.signal ?? deadline ?? null;
     try {
-      return await this.fetcher(this.base + path, { ...requestInit, redirect: "error", signal: requestInit.signal ? AbortSignal.any([requestInit.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs), headers: { ...requestInit.headers, authorization: `Bearer ${this.token}` } });
+      return await this.fetcher(this.base + path, { ...requestInit, redirect: "error", signal, headers: { ...requestInit.headers, authorization: `Bearer ${this.token}` } });
     } catch { if (requestInit.signal?.aborted) throw new DOMException("Request cancelled", "AbortError"); throw new Error("无法连接本机 Rust 服务"); }
     }
 
@@ -77,7 +79,7 @@ export class RustClient {
     return output;
   }
 
-  private async json<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  private async json<T>(path: string, init?: RequestInit & { timeoutMs?: number | null }): Promise<T> {
     const response = await this.response(path, init);
     const text = new TextDecoder().decode(await this.bytes(response));
     let result: unknown;
@@ -119,7 +121,9 @@ export class RustClient {
   }
   terminalInput(value: string, bytes: Uint8Array, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     if (!bytes.length || bytes.length > 8192) throw new Error("Terminal input exceeds limit");
-    return this.json(`/v1/terminals/${id(value)}/input`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ dataB64: Buffer.from(bytes).toString("base64") }) });
+    // A healthy child may temporarily stop reading stdin. Wait for the writer
+    // acknowledgement; a generic RPC deadline cannot safely retry partial input.
+    return this.json(`/v1/terminals/${id(value)}/input`, { method: "POST", signal, timeoutMs: null, headers: { "content-type": "application/json" }, body: JSON.stringify({ dataB64: Buffer.from(bytes).toString("base64") }) });
   }
   terminalResize(value: string, size: TerminalSize, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/terminals/${id(value)}/resize`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(size) });
