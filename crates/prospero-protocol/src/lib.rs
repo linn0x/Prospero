@@ -10,7 +10,10 @@ pub const MAX_PAGE_BYTES: usize = 1024 * 1024;
 pub const CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_EVENT_BYTES: usize = 16 * 1024;
 pub const EVENT_RETENTION: i64 = 10_000;
-pub const DATABASE_QUEUE_CAPACITY: usize = 128;
+// High-fanout orchestration can complete many agent turns at once. Keep the
+// single SQLite writer, but absorb that bounded completion burst instead of
+// rejecting worker.start/control requests while the writer drains it.
+pub const DATABASE_QUEUE_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]

@@ -10,7 +10,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-pub const MAX_CONNECTIONS: usize = 64;
+// A 128-turn daemon needs headroom for worker streams plus concurrent control,
+// relay and health requests. The previous 64-connection listener serialized
+// control traffic below the advertised structured-turn capacity.
+pub const MAX_CONNECTIONS: usize = 192;
 
 pub struct LimitedListener {
     listener: TcpListener,
