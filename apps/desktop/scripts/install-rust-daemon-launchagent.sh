@@ -91,6 +91,15 @@ write_plist() {
   mv "$tmp" "$plist"
 }
 
+wait_unloaded() {
+  tries=0
+  while launchctl print "$service" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 50 ] || { echo "timed out unloading $service" >&2; exit 1; }
+    sleep 0.1
+  done
+}
+
 print_json() {
   printf '{"ok":true,"label":"%s","plist":"%s","dataDir":"%s","service":"%s"}\n' "$label" "$plist" "$data_dir" "$service"
 }
@@ -100,9 +109,12 @@ case "$command" in
     [ -x "$binary" ] || { echo "missing Rust daemon binary: $binary" >&2; exit 1; }
     write_plist
     launchctl bootout "$service" >/dev/null 2>&1 || true
+    wait_unloaded
     launchctl bootstrap "$domain" "$plist"
     launchctl enable "$service"
-    launchctl kickstart -k "$service"
+    # RunAtLoad starts the freshly bootstrapped service. A second synchronous
+    # kickstart -k can race that start, wait forever, or terminate a healthy
+    # daemon before it publishes status.json.
     print_json
     ;;
   uninstall)

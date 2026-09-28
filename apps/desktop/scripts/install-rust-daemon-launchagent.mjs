@@ -110,9 +110,15 @@ function install() {
   writeFileSync(plist, plistBody(), { encoding: "utf8", mode: 0o600 });
   chmodSync(plist, 0o600);
   tryRun("launchctl", ["bootout", service]);
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (tryRun("launchctl", ["print", service]).status !== 0) break;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    if (attempt === 49) throw new Error(`Timed out unloading ${service}`);
+  }
   run("launchctl", ["bootstrap", domain, plist]);
   run("launchctl", ["enable", service]);
-  run("launchctl", ["kickstart", "-k", service]);
+  // RunAtLoad owns the initial start. Avoid a second synchronous kickstart
+  // racing the just-bootstrapped daemon.
   print({ ok: true, label, plist, dataDir, service });
 }
 
