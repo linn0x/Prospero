@@ -6,6 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../shared/terminal-typography";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -17,7 +18,9 @@ import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, termin
 import { terminalBytes } from "./terminal-bytes";
 import { configureRustTerminalUnicode } from "./terminal-unicode";
 import { TerminalInputBuffer, TerminalInputQueue } from "./terminal-input-buffer";
-import { writeTerminalEvents } from "./terminal-events";
+import { suppressDaemonTerminalQueries, writeTerminalEvents } from "./terminal-events";
+import { TerminalResizeCoordinator } from "./terminal-resize";
+import { readTerminalReadingState, saveTerminalReadingState } from "./workspace/terminal-reading-state";
 import {
   deleteTerminalSessionCache,
   loadTerminalSessionCache,
@@ -231,6 +234,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   const { t } = useLocale();
   const tRef = useRef(t);
   tRef.current = t;
+  const readingStateRef = useRef(readTerminalReadingState(session.id));
   const isMac = navigator.platform.toLowerCase().includes("mac") || navigator.userAgent.includes("Macintosh");
   const shortcutHint = isMac
     ? t("拖动选中（应用交互模式下按住 ⌥） · ⌘C/⌘V 复制粘贴 · ⌘F 查找 · ⌘K 清屏", "Drag to select (hold ⌥ in application mode) · ⌘C/⌘V copy and paste · ⌘F find · ⌘K clear")
@@ -249,9 +253,12 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   const pollGenerationRef = useRef(0);
   const stableBufferRef = useRef(true);
   const replayingRef = useRef(false);
+  const suppressInputScrollRef = useRef(false);
   const connectedRef = useRef(false);
   const exitedRef = useRef(false);
   const needsFitRef = useRef(true);
+  const readingRestoredRef = useRef(false);
+  const resizeCoordinatorRef = useRef(new TerminalResizeCoordinator());
   const readOnly = terminalSessionIsReadOnly(session.status);
   const readOnlyRef = useRef(readOnly);
   readOnlyRef.current = readOnly || exitedRef.current;
@@ -261,10 +268,11 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
   const [connectionError, setConnectionError] = useState<string>();
   const [connected, setConnected] = useState(false);
   const [syncing, setSyncing] = useState(true);
+  const [hasPresentedFrame, setHasPresentedFrame] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [bell, setBell] = useState(false);
-  const [findOpen, setFindOpen] = useState(false);
-  const [findText, setFindText] = useState("");
+  const [findOpen, setFindOpen] = useState(() => Boolean(readingStateRef.current.find));
+  const [findText, setFindText] = useState(() => readingStateRef.current.find);
   const findInputRef = useRef<HTMLInputElement>(null);
   const noticeTimerRef = useRef<number | undefined>(undefined);
   const historyNoticeRef = useRef(false);
@@ -294,11 +302,52 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
     const terminal = terminalRef.current; const fit = fitRef.current;
     const element = host.current;
     if (!terminal || !fit || !activeRef.current || !element?.isConnected || element.clientWidth === 0 || element.clientHeight === 0) return;
-    fitTerminalViewport(terminal, fit, {
-      events: session.terminalMode === "events", connected: connectedRef.current,
-      readOnly: readOnlyRef.current, replaying: replayingRef.current, stable: stableBufferRef.current,
-    }, size => { void queueInteraction({ type: "term.resize", ...size }); });
+    const proposed = terminalNormalizeProposedSize(fit.proposeDimensions());
+    if (proposed && !stableBufferRef.current) {
+      resizeCoordinatorRef.current.request(
+        proposed,
+        false,
+        false,
+        () => undefined,
+        size => terminal.resize(size.cols, size.rows),
+      );
+      return;
+    }
+    // An exited PTY cannot accept a daemon resize, but its local viewport can
+    // still adapt when the dock or font changes.
+    if (readOnlyRef.current) {
+      const prior = suppressInputScrollRef.current;
+      suppressInputScrollRef.current = true;
+      try {
+        resizeCoordinatorRef.current.flush(false, () => undefined, size => terminal.resize(size.cols, size.rows));
+        fit.fit();
+      } finally { suppressInputScrollRef.current = prior; }
+      return;
+    }
+    const prior = suppressInputScrollRef.current;
+    suppressInputScrollRef.current = true;
+    try {
+      fitTerminalViewport(terminal, fit, {
+        events: session.terminalMode === "events", connected: connectedRef.current,
+        readOnly: readOnlyRef.current, replaying: replayingRef.current, stable: stableBufferRef.current,
+      }, size => resizeCoordinatorRef.current.request(
+        size,
+        stableBufferRef.current,
+        connectedRef.current && !readOnlyRef.current,
+        next => queueInteraction({ type: "term.resize", ...next }),
+        next => terminal.resize(next.cols, next.rows),
+      ));
+    } finally { suppressInputScrollRef.current = prior; }
   }, [queueInteraction, session.terminalMode]);
+  const restoreReadingState = useCallback((terminal: Terminal): void => {
+    const state = readingStateRef.current;
+    const smooth = terminal.options.smoothScrollDuration;
+    terminal.options.smoothScrollDuration = 0;
+    try {
+      if (state.followBottom) terminal.scrollToBottom();
+      else terminal.scrollToLine(state.viewport);
+    } finally { if (smooth !== undefined) terminal.options.smoothScrollDuration = smooth; }
+  }, []);
   /// 提示统一走这里:直接 setNotice 的话没有定时清除,那条提示会一直挂在屏幕上。
   const showNotice = useCallback((message: string): void => {
     setNotice(message);
@@ -367,6 +416,27 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
     fitRef.current = fit;
     searchRef.current = search;
     terminal.open(host.current);
+    // WebGL is substantially cheaper for long scrollback. If the GPU context
+    // disappears (driver reset, suspend, remote desktop), xterm's DOM renderer
+    // remains the reliable fallback.
+    let webgl: WebglAddon | undefined;
+    try {
+      webgl = new WebglAddon();
+      terminal.loadAddon(webgl);
+      webgl.onContextLoss(() => { webgl?.dispose(); webgl = undefined; });
+    } catch {
+      webgl?.dispose();
+      webgl = undefined;
+    }
+    const disposeDaemonQueries = session.terminalMode === "events"
+      ? suppressDaemonTerminalQueries(terminal.parser)
+      : () => {};
+    const scrollDisposable = terminal.onScroll(() => {
+      if (!readingRestoredRef.current || replayingRef.current || suppressInputScrollRef.current) return;
+      const viewport = terminal.buffer.active.viewportY;
+      const followBottom = viewport >= terminal.buffer.active.baseY;
+      readingStateRef.current = saveTerminalReadingState(session.id, { viewport, followBottom });
+    });
     const mouseHost = host.current;
     const selectLocally = (event: MouseEvent) => preferLocalTerminalSelection(event, isMac, localSelectionRef.current, terminal.modes.mouseTrackingMode);
     mouseHost.addEventListener("mousedown", selectLocally, true);
@@ -383,9 +453,11 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       stableBufferRef.current = false;
       restoreReadyRef.current = new Promise<void>((done) => {
         terminal.write(cached.serialized, () => {
-          if (terminalRef.current === terminal) {
+            if (terminalRef.current === terminal) {
             replayingRef.current = false;
             stableBufferRef.current = true;
+            restoreReadingState(terminal);
+            readingRestoredRef.current = true;
             setSyncing(true);
             fitToHost();
             fitVisibleSoon();
@@ -405,25 +477,37 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
     }
 
     let bellTimer: number | undefined;
+    const scrollForUserInput = (): void => {
+      if (!activeRef.current || !connectedRef.current || readOnlyRef.current || replayingRef.current) return;
+      readingStateRef.current = saveTerminalReadingState(session.id, { viewport: terminal.buffer.active.baseY, followBottom: true });
+      terminal.scrollToBottom();
+    };
+    // IME commits do not necessarily emit onKey. These events originate in
+    // the input textarea, unlike onData which also carries parser replies.
+    mouseHost.addEventListener("input", scrollForUserInput, true);
+    mouseHost.addEventListener("compositionend", scrollForUserInput, true);
     const inputBuffer = new TerminalInputBuffer(value => queueInteraction({ type: "term.input", dataB64: toBase64(value) }, true));
     const queueInputText = (value: string): Promise<boolean> => {
       if (!activeRef.current || !canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current)) return Promise.resolve(false);
+      scrollForUserInput();
       void inputBuffer.flush();
       return queueInteraction({ type: "term.input", dataB64: toBase64(value) }, true);
     };
     const inputDisposable = terminal.onData((value) => {
       if (replayingRef.current || !activeRef.current || !connectedRef.current) return;
-      if (terminalInputShouldScrollToBottom(value)) terminal.scrollToBottom();
       inputBuffer.append(value);
     });
     const canPaste = (): boolean => activeRef.current && connectedRef.current && !readOnlyRef.current && !replayingRef.current && terminalRef.current === terminal && !terminal.options.disableStdin;
     const pasteBlocked = (): void => showNotice(readOnlyRef.current
       ? t("会话已结束，终端为只读", "The session has ended; the terminal is read-only")
       : t("终端尚未就绪，请连接后再粘贴", "The terminal is not ready; paste after connecting"));
+    const pasteNonText = (): void => showNotice(t("终端只支持粘贴纯文本", "The terminal only accepts plain text paste"));
     const disposePaste = bindTerminalPaste(host.current, terminal, canPaste, pasteBlocked, () => {
       setOperationError(undefined);
+      scrollForUserInput();
       void inputBuffer.flush();
-    });
+    }, pasteNonText);
+    const keyDisposable = terminal.onKey(scrollForUserInput);
     terminal.attachCustomKeyEventHandler((event) => {
       const action = terminalShortcutAction(event, isMac);
       if (action === "paste") {
@@ -497,7 +581,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       // ResizeObserver tick; users noticed wheel scroll returning only after
       // Cmd+Shift+F changed the dock size. Probe on wheel and perform the same
       // fit path opportunistically before xterm translates the wheel event.
-      if (session.terminalMode !== "events" && !replayingRef.current && host.current?.getClientRects().length) {
+      if (!replayingRef.current && host.current?.getClientRects().length) {
         const now = performance.now();
         if (now - lastWheelRefit > 250 && terminalProposedSizeDiffers(terminal.cols, terminal.rows, fit.proposeDimensions())) {
           lastWheelRefit = now;
@@ -542,11 +626,17 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       window.removeEventListener("focus", refitOnFocus);
       document.removeEventListener("visibilitychange", refitOnFocus);
       inputDisposable.dispose();
+      keyDisposable.dispose();
+      scrollDisposable.dispose();
       disposePaste();
+      disposeDaemonQueries();
       osc52Disposable.dispose();
       bellDisposable.dispose();
       mouseHost.removeEventListener("mousedown", selectLocally, true);
+      mouseHost.removeEventListener("input", scrollForUserInput, true);
+      mouseHost.removeEventListener("compositionend", scrollForUserInput, true);
       terminal.dispose();
+      resizeCoordinatorRef.current.clear();
       connectedRef.current = false;
       stableBufferRef.current = false;
       restoreReadyRef.current = Promise.resolve();
@@ -555,7 +645,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       serializeRef.current = undefined;
       cursorRef.current = undefined;
     };
-  }, [isMac, queueInteraction, showNotice, fitToHost]);
+  }, [isMac, queueInteraction, showNotice, fitToHost, restoreReadingState]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -644,6 +734,12 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
             if (cursor !== undefined) {
               connectedRef.current = true;
               stableBufferRef.current = true;
+              const settled = terminalRef.current;
+              if (settled) resizeCoordinatorRef.current.flush(
+                !readOnlyRef.current,
+                size => queueInteraction({ type: "term.resize", ...size }),
+                size => settled.resize(size.cols, size.rows),
+              );
               if (needsFitRef.current) { fitToHost(); needsFitRef.current = false; }
               if (terminalRef.current) terminalRef.current.options.disableStdin = !activeRef.current || readOnlyRef.current;
               setConnected(true);
@@ -672,8 +768,13 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
             const bootstrap = cursor === undefined || historyTruncated;
             writeChain.current = writeChain.current.then(async () => {
               if (!isCurrent() || !target || terminalRef.current !== target) return;
-              if (bootstrap) { replayingRef.current = true; target.reset(); target.resize(number(frame["cols"], 120), number(frame["rows"], 40)); }
-              await writeTerminalEvents(target, frame["events"], isCurrent);
+              suppressInputScrollRef.current = true;
+              try {
+                if (bootstrap) { replayingRef.current = true; target.reset(); target.resize(number(frame["cols"], 120), number(frame["rows"], 40)); }
+                await writeTerminalEvents(target, frame["events"], isCurrent);
+                if (readingRestoredRef.current) restoreReadingState(target);
+              }
+              finally { suppressInputScrollRef.current = false; }
               if (frame["caughtUp"] !== false) replayingRef.current = false;
             });
           } else if (mode === "delta") {
@@ -696,7 +797,12 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
                   Math.max(5, number(frame["rows"], target.rows)),
                 );
               }
-              target.write(output, done);
+              suppressInputScrollRef.current = true;
+              target.write(output, () => {
+                if (readingRestoredRef.current) restoreReadingState(target);
+                suppressInputScrollRef.current = false;
+                done();
+              });
             }));
           } else {
             deleteTerminalSessionCache(session.id);
@@ -705,10 +811,13 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
             stableBufferRef.current = false;
             writeChain.current = writeChain.current.then(() => new Promise<void>((done) => {
               if (!isCurrent() || !target || terminalRef.current !== target) { done(); return; }
+              suppressInputScrollRef.current = true;
               replayingRef.current = true;
               target.reset();
               target.resize(Math.max(20, number(frame["cols"], 120)), Math.max(5, number(frame["rows"], 40)));
               target.write(ansi, () => {
+                if (readingRestoredRef.current) restoreReadingState(target);
+                suppressInputScrollRef.current = false;
                 if (isCurrent()) replayingRef.current = false;
                 done();
               });
@@ -718,10 +827,20 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
           if (!isCurrent()) break;
           cursorRef.current = seq;
           stableBufferRef.current = true;
-          scheduleCache();
           connectedRef.current = frame["caughtUp"] !== false;
+          const settled = terminalRef.current;
+          if (settled) resizeCoordinatorRef.current.flush(
+            connectedRef.current && !readOnlyRef.current,
+            size => queueInteraction({ type: "term.resize", ...size }),
+            size => settled.resize(size.cols, size.rows),
+          );
+          scheduleCache();
           const current = terminalRef.current;
           if (current) {
+            if (!readingRestoredRef.current && connectedRef.current) {
+              restoreReadingState(current);
+              readingRestoredRef.current = true;
+            }
             current.options.disableStdin = !activeRef.current || readOnlyRef.current || !connectedRef.current;
             if ((mode === "snapshot" || bootstrapDelta || needsFitRef.current) && connectedRef.current && host.current?.getClientRects().length) {
               fitToHost();
@@ -729,6 +848,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
             }
           }
           setConnected(connectedRef.current);
+          if (connectedRef.current) setHasPresentedFrame(true);
           setSyncing(!connectedRef.current);
           setConnectionError(undefined);
           if (frame["exited"] === true && frame["caughtUp"] !== false) break;
@@ -764,7 +884,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       if (terminalRef.current) terminalRef.current.options.disableStdin = true;
       void window.prospero.cancelSessionView(session.id).catch(() => undefined);
     };
-  }, [onMissingSession, queueInteraction, session.id, fitToHost]);
+  }, [onMissingSession, queueInteraction, session.id, fitToHost, restoreReadingState]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();
@@ -797,7 +917,11 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
         autoFocus
         value={findText}
         placeholder={t("在终端中查找", "Find in terminal")}
-        onChange={(event) => setFindText(event.target.value)}
+        onChange={(event) => {
+          const value = event.target.value;
+          setFindText(value);
+          readingStateRef.current = saveTerminalReadingState(session.id, { find: value });
+        }}
         onKeyDown={(event) => {
           if (event.nativeEvent.isComposing || event.keyCode === 229) return;
           if (event.key === "Escape") { event.preventDefault(); closeFind(); return; }
@@ -808,7 +932,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, loc
       <button type="button" onClick={() => runFind(false)} aria-label={t("下一个", "Next")}>↓</button>
       <button type="button" onClick={closeFind} aria-label={t("关闭查找", "Close find")}>✕</button>
     </div>}
-    <div ref={host} className="terminal-host" style={{ visibility: syncing ? "hidden" : undefined }} aria-busy={syncing} onContextMenu={event => {
+    <div ref={host} className="terminal-host" style={{ visibility: syncing && !hasPresentedFrame ? "hidden" : undefined }} aria-busy={syncing} onContextMenu={event => {
       event.preventDefault();
       const terminal = terminalRef.current;
       if (terminal) void window.prospero.openTerminalContextMenu({ copy: terminal.hasSelection(), paste: connectedRef.current && !readOnlyRef.current && !replayingRef.current && !terminal.options.disableStdin }).catch(reason => setOperationError(reportError(reason)));

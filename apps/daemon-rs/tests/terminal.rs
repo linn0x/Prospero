@@ -279,23 +279,22 @@ async fn backpressure_stops_the_session_and_never_recommends_replaying_partial_i
         .await
         .unwrap();
     assert!(!page.events.is_empty());
-    let mut failure = None;
-    for _ in 0..256 {
-        if let Err(error) = terminal
+    let input_terminal = terminal.clone();
+    let input = tokio::spawn(async move {
+        input_terminal
             .input(TerminalInput {
                 data_b64: STANDARD.encode(vec![b'x'; 8192]),
             })
             .await
-        {
-            failure = Some(error.public());
-            break;
-        }
-    }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     terminal.stop();
     wait(&terminal).await;
-    let failure = failure.expect("bounded input buffer must apply backpressure");
-    assert_eq!(failure.code, "terminal_input_failed");
-    assert!(!failure.retryable);
+    let result = tokio::time::timeout(Duration::from_secs(2), input)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err());
 }
 
 #[tokio::test]

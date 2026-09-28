@@ -16,6 +16,8 @@
     "test": "vitest run --dir test",
     "check:chrome": "npm run build && electron scripts/check-window-chrome.cjs",
     "check:chat": "npm run build && electron scripts/check-chat.cjs",
+    "check:terminal": "npm run build && electron scripts/check-terminal.cjs",
+    "check:terminal:performance": "electron scripts/check-terminal-performance.cjs",
     "check:project-tools": "npm run build && electron scripts/check-project-tools.cjs",
     "check:packaged-rust": "node scripts/smoke-packaged-runtime.cjs",
     "pack": "npm run build && electron-builder --dir",

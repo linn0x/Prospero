@@ -68,7 +68,7 @@ impl Host {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|_| Error::Closed)?;
         let host = Self {
@@ -223,21 +223,26 @@ impl Host {
         serde_json::from_slice(&bytes).map_err(Error::from)
     }
     pub async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.response(self.client.get(format!("{}/{path}", self.url)))
-            .await
+        self.response(
+            self.client
+                .get(format!("{}/{path}", self.url))
+                .timeout(Duration::from_secs(8)),
+        )
+        .await
     }
     pub async fn post<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        let result: Result<bool> = self
-            .response(self.client.post(format!("{}/{path}", self.url)).json(body))
-            .await;
+        let request = self.client.post(format!("{}/{path}", self.url)).json(body);
+        let request = if path == "input" {
+            request
+        } else {
+            request.timeout(Duration::from_secs(8))
+        };
+        // Input acknowledgement may wait behind PTY backpressure. Cancellation
+        // belongs to the caller; a transport timeout must not close the host.
+        let result: Result<bool> = self.response(request).await;
         match result {
             Ok(_) => Ok(()),
             Err(Error::Closed | Error::Timeout | Error::Json(_)) if path == "input" => {
-                // An acknowledgement may have been lost after bytes reached
-                // the PTY. Do not invite replay of an ambiguous input batch.
-                let _: Result<bool> = self
-                    .response(self.client.post(format!("{}/close", self.url)).json(&true))
-                    .await;
                 Err(Error::TerminalInput)
             }
             Err(error) => Err(error),
@@ -634,5 +639,82 @@ mod tests {
             Host::attach(root.path().to_owned()).await,
             Err(Error::Unauthorized)
         ));
+    }
+
+    #[tokio::test]
+    async fn input_transport_has_no_request_timeout_but_keeps_connect_bound() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(8_200)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4\r\nconnection: close\r\n\r\ntrue")
+                .await
+                .unwrap();
+        });
+        let host = Host {
+            directory: tempfile::tempdir().unwrap().path().to_owned(),
+            url: format!("http://{address}"),
+            token: "token".into(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        };
+        let result = host
+            .input(TerminalInput {
+                data_b64: "eA==".into(),
+            })
+            .await;
+        assert!(result.is_ok());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_input_reply_does_not_close_or_replay_the_terminal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("POST /input "));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+            drop(socket);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "no automatic close or replay after an ambiguous reply"
+            );
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let host = Host {
+            directory: directory.path().to_owned(),
+            url: format!("http://{address}"),
+            token: "token".into(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        };
+        assert!(matches!(
+            host.input(TerminalInput {
+                data_b64: "eA==".into()
+            })
+            .await,
+            Err(Error::TerminalInput)
+        ));
+        server.await.unwrap();
     }
 }

@@ -20,7 +20,7 @@ export function allowNativeTerminalPaste(event: Pick<KeyboardEvent, "preventDefa
   return allowed;
 }
 
-export function bindTerminalPaste(target: EventTarget, terminal: { paste(text: string): void }, canPaste: () => boolean, blocked: () => void = () => {}, pasted: () => void = () => {}): () => void {
+export function bindTerminalPaste(target: EventTarget, terminal: { paste(text: string): void }, canPaste: () => boolean, blocked: () => void = () => {}, pasted: () => void = () => {}, nonText: () => void = () => {}): () => void {
   const handle = (raw: Event): void => {
     const event = raw as ClipboardEvent;
     const cancelled = event.defaultPrevented;
@@ -28,9 +28,9 @@ export function bindTerminalPaste(target: EventTarget, terminal: { paste(text: s
     if (cancelled) return;
     if (!canPaste()) { blocked(); return; }
     const text = event.clipboardData?.getData("text/plain");
-    if (!text) return;
-    terminal.paste(text);
+    if (!text) { if (event.clipboardData?.types?.length) nonText(); return; }
     pasted();
+    terminal.paste(text);
   };
   target.addEventListener("paste", handle, { capture: true });
   return () => target.removeEventListener("paste", handle, { capture: true });
