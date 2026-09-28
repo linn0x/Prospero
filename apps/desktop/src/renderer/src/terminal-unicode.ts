@@ -1,5 +1,6 @@
 import { TERMINAL_WIDTH_0, TERMINAL_WIDTH_2 } from "@prospero/protocol/rust-daemon";
 import type { Terminal } from "@xterm/xterm";
+import { configureTerminalUtf8 } from "./terminal-utf8";
 
 function contains(ranges: readonly (readonly [number, number])[], value: number): boolean {
   let left = 0; let right = ranges.length;
@@ -14,6 +15,7 @@ function contains(ranges: readonly (readonly [number, number])[], value: number)
 }
 
 export function configureRustTerminalUnicode(terminal: Terminal): void {
+  configureTerminalUtf8(terminal);
   const wcwidth = (value: number): 0 | 1 | 2 => contains(TERMINAL_WIDTH_0, value) ? 0 : contains(TERMINAL_WIDTH_2, value) ? 2 : 1;
   terminal.unicode.register({ version: "prospero-rust-1", wcwidth, charProperties: (value, preceding) => {
     const width = wcwidth(value); const previousWidth = (preceding >> 1) & 3;

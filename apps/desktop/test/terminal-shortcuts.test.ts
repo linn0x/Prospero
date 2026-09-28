@@ -9,7 +9,9 @@ import {
   terminalInputShouldScrollToBottom,
   terminalNormalizeProposedSize,
   terminalProposedSizeDiffers,
+  terminalShouldApplyHelloDimensions,
   terminalSessionIsReadOnly,
+  terminalStreamCanControl,
   terminalShortcutAction,
 } from "../src/renderer/src/TerminalPane";
 
@@ -44,6 +46,12 @@ describe("terminal clipboard shortcuts", () => {
     expect(terminalBootstrapCursor(-1)).toBe(0);
   });
 
+  it("does not reflow a resumed terminal from Hello dimensions", () => {
+    expect(terminalShouldApplyHelloDimensions(undefined, false)).toBe(true);
+    expect(terminalShouldApplyHelloDimensions(42, false)).toBe(false);
+    expect(terminalShouldApplyHelloDimensions(undefined, true)).toBe(false);
+  });
+
   it("detects stale terminal geometry before tmux wheel handling", () => {
     expect(terminalNormalizeProposedSize(undefined)).toBeUndefined();
     expect(terminalNormalizeProposedSize({ cols: 1, rows: 1 })).toEqual({ cols: 20, rows: 5 });
@@ -67,6 +75,14 @@ describe("terminal clipboard shortcuts", () => {
     expect(canDeliverTerminalInteraction(false, false, true)).toBe(true);
     expect(canDeliverTerminalInteraction(false, false)).toBe(false);
     expect(canDeliverTerminalInteraction(true, true, true)).toBe(false);
+  });
+
+  it("requires Ready-connected controller state before enabling stream interaction", () => {
+    const base = { connected: true, syncing: false, controller: true, readOnly: false, exited: false };
+    expect(terminalStreamCanControl(base, "running")).toBe(true);
+    expect(terminalStreamCanControl({ ...base, syncing: true }, "running")).toBe(false);
+    expect(terminalStreamCanControl({ ...base, controller: false }, "running")).toBe(false);
+    expect(terminalStreamCanControl(base, "done")).toBe(false);
   });
 
   it("uses native Command shortcuts on macOS without swallowing Control-C", () => {
