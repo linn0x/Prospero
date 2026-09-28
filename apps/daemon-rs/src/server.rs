@@ -153,7 +153,7 @@ impl Api {
             projection_writer: Arc::new(tokio::sync::Mutex::new(())),
             changes: changes.clone(),
             stopping: watch::channel(false).0,
-            requests: Arc::new(Semaphore::new(32)),
+            requests: Arc::new(Semaphore::new(128)),
             streams: Arc::new(Semaphore::new(16)),
             terminal_reads: Arc::new(Semaphore::new(16)),
             terminal_snapshots: Arc::new(Semaphore::new(2)),
