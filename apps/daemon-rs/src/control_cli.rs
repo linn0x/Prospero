@@ -181,6 +181,29 @@ impl ControlClient {
                 .get("code")
                 .and_then(Value::as_str)
                 .unwrap_or("request_failed");
+            if code == "busy" && value.get("resource").and_then(Value::as_str).is_some() {
+                return Err(Error::Backpressure(crate::error::ResourceBackpressure {
+                    retry_after_ms: value
+                        .get("retryAfterMs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(100),
+                    operation: value
+                        .get("operation")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request")
+                        .into(),
+                    resource: value["resource"].as_str().unwrap().into(),
+                    queue_depth: value.get("queueDepth").and_then(Value::as_u64).unwrap_or(0)
+                        as usize,
+                    queue_capacity: value
+                        .get("queueCapacity")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize,
+                    side_effect_committed: value
+                        .get("sideEffectCommitted")
+                        .and_then(Value::as_bool),
+                }));
+            }
             return Err(Error::Feature(
                 code.into(),
                 format!(
@@ -656,6 +679,33 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                 client.get("/v1/tasks").await
             }
         }
+        "task.activities" => {
+            let run_id = required_id(&params, "runId")?;
+            client
+                .post(
+                    &format!("/v1/runs/{}/task-activities", path_component(&run_id)),
+                    json!({"taskIds": string_list(&params, "taskIds")?}),
+                )
+                .await
+        }
+        "worker.start.get" => {
+            let id = required_id(&params, "operationId")?;
+            client
+                .get(&format!(
+                    "/v1/workers/start-operations/{}",
+                    path_component(&id)
+                ))
+                .await
+        }
+        "worker.start.cancel" => {
+            let id = required_id(&params, "operationId")?;
+            client
+                .delete(
+                    &format!("/v1/workers/start-operations/{}", path_component(&id)),
+                    None,
+                )
+                .await
+        }
         "task.get" => {
             let task_id = required_id(&params, "taskId")?;
             client
@@ -706,7 +756,15 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
         }
         "worker.start" => client
             .post(
-                "/v1/workers/start",
+                if params
+                    .get("queued")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "/v1/workers/start?queued=true"
+                } else {
+                    "/v1/workers/start"
+                },
                 strip_empty(
                     json!({
                     "taskId": required_id(&params, "taskId")?,
@@ -717,6 +775,8 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                     "approvalPolicy": optional_text(&params, "approvalPolicy"),
                     "skills": string_list(&params, "skills")?,
                     "accountId": optional_text(&params, "accountId"),
+                    "pluginId": optional_text(&params, "pluginId"),
+                    "profileId": optional_text(&params, "profileId"),
                     "operationId": optional_text(&params, "operationId"),
                     }),
                     &[],

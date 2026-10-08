@@ -13,6 +13,10 @@ use ts_rs::TS;
 
 use crate::error::{Error, Result};
 
+pub use codex::{
+    AppServerDiagnostic, AppServerDiagnosticPage, app_server_diagnostics,
+    app_server_diagnostics_page,
+};
 pub use runtime::Agents;
 pub use store::{ApprovalPolicy, PermissionMode};
 pub(crate) use usage::{NATIVE_CODEX_ID, native_codex_environment, read_native_codex_models};

@@ -1008,6 +1008,15 @@ impl Store {
         input: CreateAgentSession,
         policy: ApprovalPolicy,
     ) -> Result<SessionHead> {
+        self.create_agent_session_with_id(input, policy, None)
+    }
+
+    pub(crate) fn create_agent_session_with_id(
+        &mut self,
+        input: CreateAgentSession,
+        policy: ApprovalPolicy,
+        id: Option<String>,
+    ) -> Result<SessionHead> {
         let mode = match input.mode.as_deref() {
             Some(value) => PermissionMode::from_wire(value)?,
             None => PermissionMode::Default,
@@ -1032,13 +1041,14 @@ impl Store {
             }
         };
         let agent = input.agent;
-        self.create_session_with(
+        self.create_session_with_id(
             CreateSession {
                 agent,
                 kind: SessionKind::Structured,
                 title: input.title,
                 workspace: input.workspace,
             },
+            id,
             |tx, head| {
                 tx.execute(
                     "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id,agent_preset) \
@@ -2023,7 +2033,7 @@ mod tests {
             let store = Store::open(directory.path()).unwrap();
             store
                 .connection
-                .execute_batch("DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; PRAGMA user_version=28;")
+                .execute_batch("DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; DROP TABLE orch_worker_starts; DROP TABLE timeline_checkpoints; PRAGMA user_version=28;")
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
@@ -2047,7 +2057,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, 32);
         assert_eq!(columns, 5);
         assert_eq!(queue_columns, 1);
     }

@@ -152,6 +152,10 @@ impl Client {
         self.get("v1/health", &[]).await
     }
 
+    pub async fn diagnostics(&self) -> Result<serde_json::Value, Error> {
+        self.get("v1/diagnostics", &[]).await
+    }
+
     pub async fn create_agent(&self, input: &AgentSessionCreate) -> Result<SessionHead, Error> {
         self.post("v1/agent-sessions", input).await
     }

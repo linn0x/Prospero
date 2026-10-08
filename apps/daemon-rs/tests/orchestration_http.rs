@@ -3,8 +3,12 @@
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use prosperod_rs::agent::{ApprovalPolicy, CreateAgentSession};
 use prosperod_rs::auth::Token;
-use prosperod_rs::protocol::{AgentKind, CreateSession, SessionKind};
+use prosperod_rs::error::Error;
+use prosperod_rs::protocol::{
+    AgentKind, CreateSession, MessageRole, SessionKind, TimelineBody, TimelineWrite,
+};
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
 use serde_json::{Value, json};
@@ -595,6 +599,188 @@ async fn recovery_route_reports_settled_and_resumed_dispatches() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(report["settled"], json!([]));
     assert_eq!(report["resumed"], json!([]));
+}
+
+#[tokio::test]
+async fn task_activity_route_batches_order_dependencies_progress_and_validation() {
+    let (_directory, api) = fixture().await;
+    let (status, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let run_id = created["run"]["id"].as_str().unwrap().to_owned();
+    let task_a = created["idMap"]["a"].as_str().unwrap().to_owned();
+    let task_b = created["idMap"]["b"].as_str().unwrap().to_owned();
+    let session = api
+        .database
+        .call(|store| {
+            store.create_agent_session(
+                CreateAgentSession {
+                    agent: AgentKind::Codex,
+                    title: "activity worker".into(),
+                    workspace: "/w".into(),
+                    auto_approve: true,
+                    mode: None,
+                    model: None,
+                    effort: None,
+                    account_id: None,
+                    resume: None,
+                    agent_preset: None,
+                },
+                ApprovalPolicy::Auto,
+            )
+        })
+        .await
+        .unwrap();
+    let (status, dispatched) = send(
+        &api,
+        "POST",
+        &format!("/v1/tasks/{task_a}/dispatch"),
+        Some(json!({"sessionId": session.id.clone()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dispatched}");
+    let session_id = session.id.clone();
+    api.database
+        .call(move |store| {
+            store.write_timeline(
+                &session_id,
+                TimelineWrite {
+                    id: "http-answer".into(),
+                    turn_id: "turn1".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::Message {
+                        role: MessageRole::Assistant,
+                        final_answer: true,
+                        attachments: Vec::new(),
+                    },
+                    text: "working".into(),
+                    replace: false,
+                    subagent_id: None,
+                },
+            )?;
+            store.write_timeline(
+                &session_id,
+                TimelineWrite {
+                    id: "http-turn-end".into(),
+                    turn_id: "turn1".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::TurnEnd {
+                        finish: "completed".into(),
+                        diffs: Vec::new(),
+                    },
+                    text: String::new(),
+                    replace: false,
+                    subagent_id: None,
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (status, activity) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/task-activities"),
+        Some(json!({"taskIds": [task_b.clone(), task_a.clone()]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activity}");
+    assert_eq!(activity["activities"][0]["task"]["id"], task_b);
+    assert_eq!(activity["activities"][0]["deps"][0]["taskId"], task_a);
+    assert_eq!(activity["activities"][1]["task"]["id"], task_a);
+    assert_eq!(activity["activities"][1]["taskStatus"], "dispatched");
+    assert_eq!(activity["activities"][1]["dispatchState"], "starting");
+    assert_eq!(activity["activities"][1]["durableSessionStatus"], "active");
+    assert_eq!(activity["activities"][1]["turnFinish"], "completed");
+    assert!(activity["activities"][1]["lastOutputAt"].is_number());
+    assert!(activity["activities"][1]["lastProgressAt"].is_number());
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/task-activities"),
+        Some(json!({"taskIds": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, other) = send(
+        &api,
+        "POST",
+        "/v1/runs/graph",
+        Some(json!({
+            "objective": "other run",
+            "operationId": "http-activity-other",
+            "nodes": [{"clientId": "other", "title": "Other", "spec": "other"}]
+        })),
+    )
+    .await;
+    let other_task = other["idMap"]["other"].as_str().unwrap();
+    let (status, _) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/task-activities"),
+        Some(json!({"taskIds": [other_task]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn saturated_read_pool_does_not_block_control_writes_or_fresh_reads() {
+    let (_directory, api) = fixture().await;
+    let mut releases = Vec::new();
+    let mut ready = Vec::new();
+    let mut readers = Vec::new();
+    for index in 0..2 {
+        let database = api.database.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        ready.push(started_rx);
+        readers.push(tokio::spawn(async move {
+            database
+                .read(format!("test.held-read-{index}"), move |store| {
+                    store.list_runs()?;
+                    let _ = started.send(());
+                    wait.recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|_| Error::Timeout)?;
+                    Ok(())
+                })
+                .await
+        }));
+    }
+    for started in ready {
+        started.await.unwrap();
+    }
+    let (status, created) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        send(
+            &api,
+            "POST",
+            "/v1/runs/graph",
+            Some(json!({
+                "objective": "write while reads are held",
+                "operationId": "read-pool-write",
+                "nodes": [{"clientId": "task", "title": "Task", "spec": "work"}]
+            })),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let run_id = created["run"]["id"].as_str().unwrap().to_owned();
+    releases.remove(0).send(()).unwrap();
+    let (status, snapshot) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        send(&api, "GET", &format!("/v1/runs/{run_id}"), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+    assert_eq!(snapshot["run"]["id"], run_id);
+    releases.remove(0).send(()).unwrap();
+    for reader in readers {
+        reader.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]

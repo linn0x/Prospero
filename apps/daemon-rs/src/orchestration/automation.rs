@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::worker::Database;
 
 use super::gitops::{create_worktree, repo_root, worktree_default_path};
-use super::workers::start_worker;
+use super::start::start_worker;
 use super::{
     AutomationState, AutomationWorkspace, RegisterWorktree, Run, RunAutomation, RunStatus,
     StartAutomation, StartWorker, TaskStatus, WorktreeAssetKind,
@@ -295,6 +295,8 @@ pub async fn tick_automation(database: &Database, agents: &Agents, run_id: &str)
         skills: Vec::new(),
         approval_policy: Some(automation.approval_policy.clone()),
         account_id: automation.account_id.clone(),
+        plugin_id: None,
+        profile_id: None,
         operation_id: Some(format!("automation-{run_id}-{}", next.id)),
     };
     if let Err(error) = start_worker(database, agents, input).await {

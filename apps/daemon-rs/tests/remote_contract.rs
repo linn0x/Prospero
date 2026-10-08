@@ -132,10 +132,15 @@ async fn health_dto_reports_rust_http_contract() {
     assert_eq!(body["activeRuntimeSessions"], 0);
     assert_eq!(
         body["databaseQueueCapacity"],
-        json!(DATABASE_QUEUE_CAPACITY)
+        json!(DATABASE_QUEUE_CAPACITY + 64)
     );
     assert_eq!(body["database"]["alive"], true);
-    assert_eq!(body["database"]["queueDepth"], 0);
+    assert!(body["database"]["queueDepth"].as_u64().is_some());
+    assert_eq!(
+        body["database"]["backgroundQueueCapacity"],
+        DATABASE_QUEUE_CAPACITY
+    );
+    assert_eq!(body["database"]["controlQueueCapacity"], 64);
     assert!(body["database"]["lastError"].is_null());
     assert_eq!(body["persistence"]["structured"], true);
     assert_eq!(body["persistence"]["pty"], false); // Api::new uses the owned in-process test backend.

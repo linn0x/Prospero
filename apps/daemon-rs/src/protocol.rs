@@ -48,6 +48,13 @@ pub fn typescript() -> String {
         crate::relay::RelayRuntimeDeviceStatus::decl(&config),
         crate::relay::RelayRuntimeStatus::decl(&config),
         DatabaseHealth::decl(&config),
+        RuntimeHealthStatus::decl(&config),
+        ControlPlaneHealth::decl(&config),
+        DatabasePressureMetrics::decl(&config),
+        ReadPoolHealth::decl(&config),
+        ReadPoolMetrics::decl(&config),
+        ResourceLatency::decl(&config),
+        ResourceErrorSummary::decl(&config),
         HealthPersistence::decl(&config),
         Health::decl(&config),
         RenameSession::decl(&config),
@@ -166,6 +173,18 @@ pub fn typescript() -> String {
         crate::orchestration::StartWorker::decl(&config),
         crate::orchestration::StopWorker::decl(&config),
         crate::orchestration::WorkerStartOutcome::decl(&config),
+        crate::orchestration::WorkerStartOperation::decl(&config),
+        crate::orchestration::WorkerStartPhase::decl(&config),
+        crate::orchestration::WorkerStartSideEffectState::decl(&config),
+        crate::orchestration::WorkerStartSubmission::decl(&config),
+        crate::orchestration::WorkerStartSubmissionStatus::decl(&config),
+        crate::orchestration::DurableSessionStatus::decl(&config),
+        crate::orchestration::DurableAgentState::decl(&config),
+        crate::orchestration::TaskActivityDependency::decl(&config),
+        crate::orchestration::TaskActivityQuery::decl(&config),
+        crate::orchestration::TaskActivity::decl(&config),
+        crate::orchestration::TaskActivities::decl(&config),
+        crate::orchestration::DispatchActivityHealth::decl(&config),
         crate::orchestration::InspectWorktree::decl(&config),
         crate::orchestration::CleanupWorktree::decl(&config),
         crate::skills::Skill::decl(&config),
@@ -260,3 +279,8 @@ pub fn typescript() -> String {
     output.push_str(&crate::terminal::screen::width_tables());
     output
 }
+
+pub use prospero_protocol_rs::{
+    ControlPlaneHealth, DatabasePressureMetrics, ReadPoolHealth, ReadPoolMetrics,
+    ResourceErrorSummary, ResourceLatency, RuntimeHealthStatus,
+};

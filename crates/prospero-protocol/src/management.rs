@@ -428,6 +428,12 @@ pub struct PluginServiceView {
     pub command: Option<Vec<String>>,
     pub cwd: Option<String>,
     pub log_files: PluginServiceLogFiles,
+    #[serde(default)]
+    pub runtime_health: crate::RuntimeHealthStatus,
+    #[serde(default)]
+    pub degraded_reasons: Vec<String>,
+    #[serde(default)]
+    pub recent_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

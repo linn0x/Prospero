@@ -34,7 +34,7 @@ use crate::agent::{
 };
 use crate::auth::Token;
 use crate::database::Store;
-use crate::error::{Error, Result};
+use crate::error::{Error, ResourceBackpressure, Result};
 use crate::orchestration::{
     self, AbandonDispatch, AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun,
     CreateGate, CreateRun, CreateRunGraph, CreateTask, DeleteRun, DispatchTask, InspectWorktree,
@@ -80,6 +80,10 @@ pub struct Api {
     changes: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
     requests: Arc<Semaphore>,
+    health_requests: Arc<Semaphore>,
+    control_requests: Arc<Semaphore>,
+    diagnostics_requests: Arc<Semaphore>,
+    control_health: Arc<Mutex<ControlPlaneHealth>>,
     streams: Arc<Semaphore>,
     terminal_reads: Arc<Semaphore>,
     terminal_snapshots: Arc<Semaphore>,
@@ -154,6 +158,10 @@ impl Api {
             changes: changes.clone(),
             stopping: watch::channel(false).0,
             requests: Arc::new(Semaphore::new(128)),
+            health_requests: Arc::new(Semaphore::new(4)),
+            control_requests: Arc::new(Semaphore::new(16)),
+            diagnostics_requests: Arc::new(Semaphore::new(1)),
+            control_health: Arc::new(Mutex::new(ControlPlaneHealth::default())),
             streams: Arc::new(Semaphore::new(16)),
             terminal_reads: Arc::new(Semaphore::new(16)),
             terminal_snapshots: Arc::new(Semaphore::new(2)),
@@ -176,7 +184,83 @@ impl Api {
                 schedule_api.publish();
             }
         });
+        let monitor = shared_api.clone();
+        tokio::spawn(async move {
+            monitor.monitor_control_health().await;
+        });
         shared_api
+    }
+
+    async fn monitor_control_health(&self) {
+        let mut stopped = self.stopping.subscribe();
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let stale_after = std::env::var("PROSPERO_STALE_DISPATCH_MS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(6 * 60 * 60 * 1000);
+        loop {
+            tokio::select! {
+                _ = stopped.changed() => break,
+                _ = interval.tick() => {}
+            }
+            if *stopped.borrow() || !self.database.health().alive {
+                break;
+            }
+            let sample = tokio::time::timeout(
+                Duration::from_secs(1),
+                self.database
+                    .call_control("dispatch.reconcile", move |store| {
+                        let report = store.recover_dispatches()?;
+                        let activity = store.dispatch_activity_health(
+                            crate::database::now().saturating_sub(stale_after),
+                        )?;
+                        let queued: i64 = store.connection.query_row(
+                            "SELECT count(*) FROM orch_worker_starts WHERE phase='queued'",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        Ok((activity, queued, !report.settled.is_empty()))
+                    }),
+            )
+            .await
+            .unwrap_or(Err(Error::Timeout));
+            match sample {
+                Ok((activity, queued, changed)) => {
+                    if let Ok(mut health) = self.control_health.lock() {
+                        health.stale_dispatch_count = activity.stale_dispatch_count;
+                        health.terminal_misalignment_count = activity.terminal_misalignment_count;
+                        health.queued_start_count = queued;
+                        health.sampled_at = Some(crate::database::now());
+                        health.sampling_error = None;
+                    }
+                    if changed {
+                        self.publish();
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut health) = self.control_health.lock() {
+                        health.sampling_error = Some(error.to_string());
+                    }
+                }
+            }
+            let services =
+                tokio::time::timeout(Duration::from_secs(2), self.plugin_services.list()).await;
+            if let Ok(Ok(services)) = services
+                && let Ok(mut health) = self.control_health.lock()
+            {
+                health.unhealthy_plugin_services = services
+                    .items
+                    .iter()
+                    .filter(|service| {
+                        service.configured
+                            && (service.health == crate::plugins::PluginServiceHealth::Unhealthy
+                                || service.status == crate::plugins::PluginServiceStatus::Failed)
+                    })
+                    .count();
+            }
+        }
     }
 
     pub fn with_remote_ws_handshake_timeout(mut self, timeout: Duration) -> Self {
@@ -192,6 +276,7 @@ impl Api {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/health", get(health))
+            .route("/v1/diagnostics", get(diagnostics))
             .route("/v1/devices", get(device_list))
             .route("/v1/devices/{id}", delete(device_revoke))
             .route("/v1/pairings", post(pairing_create))
@@ -378,6 +463,7 @@ impl Api {
             .route("/v1/runs/graph/apply", post(apply_task_graph))
             .route("/v1/runs/{id}", get(run_snapshot).delete(delete_run))
             .route("/v1/runs/{id}/ready", get(ready_tasks))
+            .route("/v1/runs/{id}/task-activities", post(task_activities))
             .route("/v1/runs/{id}/complete", post(complete_run))
             .route("/v1/runs/{id}/abandon", post(abandon_run))
             .route(
@@ -397,6 +483,10 @@ impl Api {
             .route("/v1/tasks/{id}/fail", post(fail_task))
             .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
             .route("/v1/workers/start", post(start_worker_route))
+            .route(
+                "/v1/workers/start-operations/{id}",
+                get(worker_start_operation).delete(cancel_worker_start_operation),
+            )
             .route("/v1/workers/stop", post(stop_worker_route))
             .route("/v1/worktrees", get(list_worktrees))
             .route("/v1/worktrees/{id}", get(worktree_asset_route))
@@ -599,6 +689,14 @@ impl Api {
         let _ = stopped.changed().await;
     }
 
+    async fn call_control<T, F>(&self, name: &'static str, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    {
+        self.database.call_control(name, operation).await
+    }
+
     async fn call<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send + 'static,
@@ -634,14 +732,23 @@ impl IntoResponse for ApiError {
             | Error::InUse
             | Error::ApiTestBusy
             | Error::ApiTestInFlight => StatusCode::CONFLICT,
-            Error::Busy | Error::Closed | Error::DatabaseUnavailable(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Error::Busy
+            | Error::Backpressure(_)
+            | Error::Closed
+            | Error::DatabaseUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Error::DatabaseOperationFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(self.0.public())).into_response()
+        let body = self.0.public();
+        let retry_after = body.retry_after_ms;
+        let mut response = (status, Json(body)).into_response();
+        if let Some(delay) = retry_after
+            && let Ok(value) = delay.div_ceil(1000).max(1).to_string().parse()
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        response
     }
 }
 
@@ -660,13 +767,34 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
     {
         return ApiError(Error::Unauthorized).into_response();
     }
-    let Ok(_permit) = api.requests.clone().try_acquire_owned() else {
-        return ApiError(Error::Busy).into_response();
-    };
     let path = request.uri().path();
+    let (requests, capacity, resource) = match path {
+        "/v1/health" => (&api.health_requests, 4, "health_requests"),
+        "/v1/diagnostics" => (&api.diagnostics_requests, 1, "diagnostics_requests"),
+        _ if request.method() == axum::http::Method::POST && control_request(path) => {
+            (&api.control_requests, 16, "control_requests")
+        }
+        _ => (&api.requests, 128, "http_requests"),
+    };
+    let operation = request_operation(request.method().as_str(), path);
+    let Ok(_permit) = requests.clone().try_acquire_owned() else {
+        api.database.record_rejection(&operation, resource);
+        api.database
+            .record_recent_error(&operation, resource, "HTTP request capacity exhausted");
+        return ApiError(Error::Backpressure(ResourceBackpressure {
+            retry_after_ms: 250,
+            operation,
+            resource: resource.into(),
+            queue_depth: capacity,
+            queue_capacity: capacity,
+            side_effect_committed: Some(false),
+        }))
+        .into_response();
+    };
     let request_timeout = if request.method() == axum::http::Method::POST
         && (matches!(path, "/v1/terminals" | "/v1/agent-sessions")
             || path.starts_with("/v1/agent-sessions/")
+            || path == "/v1/workers/start"
             || (path.starts_with("/v1/schedules/") && path.ends_with("/run")))
     {
         Duration::from_secs(180)
@@ -677,9 +805,20 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
     } else {
         Duration::from_secs(10)
     };
-    let mut response = match tokio::time::timeout(request_timeout, next.run(request)).await {
-        Ok(response) => response,
-        Err(_) => ApiError(Error::Timeout).into_response(),
+    let terminal_input = request.method() == axum::http::Method::POST
+        && request
+            .uri()
+            .path()
+            .strip_prefix("/v1/terminals/")
+            .and_then(|path| path.strip_suffix("/input"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    let mut response = if terminal_input {
+        next.run(request).await
+    } else {
+        match tokio::time::timeout(request_timeout, next.run(request)).await {
+            Ok(response) => response,
+            Err(_) => ApiError(Error::Timeout).into_response(),
+        }
     };
     response
         .headers_mut()
@@ -690,12 +829,53 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
     response
 }
 
+fn control_request(path: &str) -> bool {
+    matches!(path, "/v1/workers/stop" | "/v1/shutdown")
+        || ((path.starts_with("/v1/tasks/") || path.starts_with("/v1/runs/"))
+            && ["/complete", "/fail", "/cancel", "/abandon"]
+                .iter()
+                .any(|suffix| path.ends_with(suffix)))
+        || ((path.starts_with("/v1/terminals/") || path.starts_with("/v1/agent-sessions/"))
+            && ["/close", "/interrupt"]
+                .iter()
+                .any(|suffix| path.ends_with(suffix)))
+}
+
+fn request_operation(method: &str, path: &str) -> String {
+    match path {
+        "/v1/workers/start" => "worker.start".into(),
+        "/v1/workers/stop" => "worker.stop".into(),
+        _ if method == "POST" && path.starts_with("/v1/tasks/") && path.ends_with("/complete") => {
+            "task.complete".into()
+        }
+        _ if method == "POST" && path.starts_with("/v1/tasks/") && path.ends_with("/fail") => {
+            "task.fail".into()
+        }
+        _ => format!("http.{}", method.to_ascii_lowercase()),
+    }
+}
+
 const WS_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 const REMOTE_WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn remote_ws(State(api): State<Api>, ws: WebSocketUpgrade) -> Response {
     let Ok(permit) = api.streams.clone().try_acquire_owned() else {
-        return ApiError(Error::Busy).into_response();
+        api.database
+            .record_rejection("websocket.open", "websocket_streams");
+        api.database.record_recent_error(
+            "websocket.open",
+            "websocket_streams",
+            "WebSocket stream capacity exhausted",
+        );
+        return ApiError(Error::Backpressure(ResourceBackpressure {
+            retry_after_ms: 1000,
+            operation: "websocket.open".into(),
+            resource: "websocket_streams".into(),
+            queue_depth: 16,
+            queue_capacity: 16,
+            side_effect_committed: Some(false),
+        }))
+        .into_response();
     };
     ws.max_message_size(WS_MAX_PAYLOAD)
         .max_frame_size(WS_MAX_PAYLOAD)
@@ -1890,6 +2070,14 @@ async fn remote_orchestration_control(
                     .map(str::to_owned),
                 account_id: message
                     .get("accountId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                plugin_id: message
+                    .get("pluginId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                profile_id: message
+                    .get("profileId")
                     .and_then(JsonValue::as_str)
                     .map(str::to_owned),
                 operation_id: message
@@ -3269,9 +3457,87 @@ fn remote_error_code(error: &Error) -> &'static str {
 }
 
 async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, ApiError> {
-    api.terminals.check()?;
-    api.agents.check()?;
+    Ok(Json(runtime_health(&api).await?))
+}
+
+async fn runtime_health(api: &Api) -> Result<Health> {
     let database = api.database.health();
+    let metrics = api.database.metrics();
+    let mut database_health: DatabaseHealth =
+        serde_json::from_value(serde_json::to_value(&database)?)?;
+    database_health.metrics = serde_json::from_value(serde_json::to_value(&metrics)?)?;
+    let mut control = api
+        .control_health
+        .lock()
+        .map_err(|_| Error::Closed)?
+        .clone();
+    control.http_requests_active = 128 - api.requests.available_permits();
+    control.http_requests_capacity = 128;
+    control.control_requests_active = 16 - api.control_requests.available_permits();
+    control.control_requests_capacity = 16;
+    control.agent_sessions_active = api.agents.count();
+    control.agent_sessions_capacity = api.agents.capacity();
+    control.terminal_sessions_active = api.terminals.count();
+    control.terminal_sessions_capacity = 16;
+    control.start_rejections_recent = api.database.recent_rejections("worker.start")
+        + api.database.recent_rejections("agent.create");
+    let mut reasons = Vec::new();
+    if database.degraded {
+        reasons.push("db_backlog_sustained".into());
+    }
+    if !database.readers.alive {
+        reasons.push("db_readers_unavailable".into());
+    } else if database.readers.degraded {
+        reasons.push("db_read_backlog".into());
+    }
+    if metrics
+        .recent_rejected_by_resource
+        .iter()
+        .any(|(resource, count)| resource.starts_with("database") && *count > 0)
+    {
+        reasons.push("db_queue_full_recent".into());
+    }
+    if control.start_rejections_recent > 0 {
+        reasons.push("start_rejections_recent".into());
+    }
+    if metrics
+        .recent_rejected_by_resource
+        .get("http_requests")
+        .copied()
+        .unwrap_or(0)
+        > 0
+    {
+        reasons.push("http_capacity_rejections_recent".into());
+    }
+    if control.stale_dispatch_count > 0 {
+        reasons.push("stale_dispatches".into());
+    }
+    if control.terminal_misalignment_count > 0 {
+        reasons.push("terminal_misalignment".into());
+    }
+    if control.queued_start_count > 0 {
+        reasons.push("queued_starts".into());
+    }
+    if control.unhealthy_plugin_services > 0 {
+        reasons.push("plugin_service_unhealthy".into());
+    }
+    if control.sampling_error.is_some() {
+        reasons.push("control_health_sample_failed".into());
+    }
+    if control
+        .sampled_at
+        .is_some_and(|sampled| crate::database::now().saturating_sub(sampled) > 30_000)
+    {
+        reasons.push("control_health_sample_stale".into());
+    }
+    let status = if !database.alive || api.terminals.check().is_err() || api.agents.check().is_err()
+    {
+        RuntimeHealthStatus::Unhealthy
+    } else if reasons.is_empty() {
+        RuntimeHealthStatus::Healthy
+    } else {
+        RuntimeHealthStatus::Degraded
+    };
     let relay = match api
         .relay_status
         .get()
@@ -3282,32 +3548,40 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             let home = api.database.directory().to_owned();
             tokio::task::spawn_blocking(move || crate::relay::relay_status_from_home(&home, false))
                 .await
-                .map_err(|_| ApiError(Error::Closed))?
+                .map_err(|_| Error::Closed)?
         }
     };
     let mut capabilities = health_capabilities();
     if api.terminals.detached() {
         capabilities.push("terminal.detached-host.v1".into());
     }
-    Ok(Json(Health {
+    Ok(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
         daemon_version: env!("CARGO_PKG_VERSION").into(),
         build_id: api.build_id.to_string(),
         active_runtime_sessions: api.terminals.count() + api.agents.count(),
-        database_queue_capacity: DATABASE_QUEUE_CAPACITY,
-        database: DatabaseHealth {
-            alive: database.alive,
-            queue_depth: database.queue_depth,
-            last_error: database.last_error,
-        },
+        status,
+        degraded_reasons: reasons,
+        control,
+        database_queue_capacity: database.background_queue_capacity
+            + database.control_queue_capacity,
+        database: database_health,
         capabilities,
         persistence: HealthPersistence {
             pty: api.terminals.detached(),
             structured: true,
         },
         relay,
-    }))
+    })
+}
+
+async fn diagnostics(State(api): State<Api>) -> JsonResult<JsonValue> {
+    let health = runtime_health(&api).await?;
+    let processes = crate::agent::app_server_diagnostics_page(api.database.directory()).await?;
+    Ok(Json(
+        json!({"health": health, "appServers": processes.items, "appServersTruncated": processes.truncated}),
+    ))
 }
 
 #[derive(serde::Serialize)]
@@ -3583,6 +3857,10 @@ fn health_capabilities() -> Vec<String> {
         "session.timeline",
         "agent.claude",
         "orchestration.dag",
+        "orchestration.worker-start-operations.v1",
+        "orchestration.task-activities.v1",
+        "health.control-pressure.v1",
+        "database.concurrent-reads.v1",
         "terminal.pty",
         #[cfg(unix)]
         "terminal.unix",
@@ -4009,7 +4287,10 @@ async fn agent_suggestions(
         return Err(ApiError(Error::Invalid("invalid suggestion query".into())));
     }
     let workspace = api
-        .call(move |store| Ok(store.session(&id)?.workspace))
+        .database
+        .read("sessions.workspace", move |store| {
+            Ok(store.session(&id)?.workspace)
+        })
         .await?;
     let needle = query.query.clone();
     let items =
@@ -5274,12 +5555,13 @@ async fn agent_subagent_send(
 async fn session_workspace(api: &Api, id: &str) -> Result<std::path::PathBuf> {
     crate::database::validate_id(id)?;
     let id = id.to_owned();
-    api.call(move |store| {
-        store
-            .session(&id)
-            .map(|session| std::path::PathBuf::from(session.workspace))
-    })
-    .await
+    api.database
+        .read("sessions.workspace", move |store| {
+            store
+                .session(&id)
+                .map(|session| std::path::PathBuf::from(session.workspace))
+        })
+        .await
 }
 
 async fn workspace_summary(
@@ -5897,7 +6179,11 @@ async fn sessions(
     query: std::result::Result<Query<SessionQuery>, axum::extract::rejection::QueryRejection>,
 ) -> std::result::Result<Json<SessionPage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid session query".into()))?;
-    Ok(Json(api.call(move |store| store.sessions(query)).await?))
+    Ok(Json(
+        api.database
+            .read("sessions.list", move |store| store.sessions(query))
+            .await?,
+    ))
 }
 
 async fn sidebar_sessions(
@@ -5906,7 +6192,11 @@ async fn sidebar_sessions(
 ) -> std::result::Result<Json<SessionPage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid session query".into()))?;
     Ok(Json(
-        api.call(move |store| store.sidebar_sessions(query)).await?,
+        api.database
+            .read("sessions.sidebar", move |store| {
+                store.sidebar_sessions(query)
+            })
+            .await?,
     ))
 }
 
@@ -5915,7 +6205,10 @@ async fn sidebar_lookup(
     Json(input): Json<SessionLookup>,
 ) -> std::result::Result<Json<SessionLookupResult>, ApiError> {
     Ok(Json(
-        api.call(move |store| store.sidebar_lookup_sessions(input))
+        api.database
+            .read("sessions.sidebar.lookup", move |store| {
+                store.sidebar_lookup_sessions(input)
+            })
             .await?,
     ))
 }
@@ -5924,7 +6217,11 @@ async fn session(
     State(api): State<Api>,
     Path(id): Path<String>,
 ) -> std::result::Result<Json<SessionHead>, ApiError> {
-    Ok(Json(api.call(move |store| store.session(&id)).await?))
+    Ok(Json(
+        api.database
+            .read("sessions.get", move |store| store.session(&id))
+            .await?,
+    ))
 }
 
 async fn timeline(
@@ -5934,7 +6231,9 @@ async fn timeline(
 ) -> std::result::Result<Json<TimelinePage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid timeline query".into()))?;
     Ok(Json(
-        api.call(move |store| store.timeline(&id, query)).await?,
+        api.database
+            .read("timeline.page", move |store| store.timeline(&id, query))
+            .await?,
     ))
 }
 
@@ -5945,7 +6244,10 @@ async fn timeline_lookup(
 ) -> std::result::Result<Json<TimelineLookupResult>, ApiError> {
     let Json(body) = body.map_err(|_| Error::Invalid("invalid timeline lookup".into()))?;
     Ok(Json(
-        api.call(move |store| store.timeline_lookup(&id, body.ids))
+        api.database
+            .read("timeline.lookup", move |store| {
+                store.timeline_lookup(&id, body.ids)
+            })
             .await?,
     ))
 }
@@ -5957,7 +6259,10 @@ async fn timeline_text(
 ) -> std::result::Result<Json<TimelineTextPage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid body query".into()))?;
     Ok(Json(
-        api.call(move |store| store.timeline_text(&id, &record, query))
+        api.database
+            .read("timeline.text", move |store| {
+                store.timeline_text(&id, &record, query)
+            })
             .await?,
     ))
 }
@@ -5974,7 +6279,10 @@ async fn summary(
 ) -> std::result::Result<Json<SessionSummary>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid summary query".into()))?;
     Ok(Json(
-        api.call(move |store| store.session_summary(query.workspace.as_deref()))
+        api.database
+            .read("sessions.summary", move |store| {
+                store.session_summary(query.workspace.as_deref())
+            })
             .await?,
     ))
 }
@@ -5984,7 +6292,11 @@ async fn workspaces(
     query: std::result::Result<Query<WorkspaceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> std::result::Result<Json<WorkspacePage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid workspace query".into()))?;
-    Ok(Json(api.call(move |store| store.workspaces(query)).await?))
+    Ok(Json(
+        api.database
+            .read("workspaces.list", move |store| store.workspaces(query))
+            .await?,
+    ))
 }
 
 async fn lookup(
@@ -5993,7 +6305,9 @@ async fn lookup(
 ) -> std::result::Result<Json<SessionLookupResult>, ApiError> {
     let Json(input) = body.map_err(|_| Error::Invalid("invalid lookup request".into()))?;
     Ok(Json(
-        api.call(move |store| store.lookup_sessions(input)).await?,
+        api.database
+            .read("sessions.lookup", move |store| store.lookup_sessions(input))
+            .await?,
     ))
 }
 
@@ -6026,14 +6340,15 @@ async fn events(
 ) -> std::result::Result<Json<EventPage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid event query".into()))?;
     Ok(Json(
-        api.call(move |store| {
-            store.events(
-                &query.scope,
-                query.after_seq.unwrap_or(0),
-                query.limit.unwrap_or(100),
-            )
-        })
-        .await?,
+        api.database
+            .read("events.page", move |store| {
+                store.events(
+                    &query.scope,
+                    query.after_seq.unwrap_or(0),
+                    query.limit.unwrap_or(100),
+                )
+            })
+            .await?,
     ))
 }
 
@@ -6058,7 +6373,10 @@ async fn contents(
 ) -> std::result::Result<Json<ContentPage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid content list query".into()))?;
     Ok(Json(
-        api.call(move |store| store.contents(&id, query.cursor, query.limit.unwrap_or(100)))
+        api.database
+            .read("contents.list", move |store| {
+                store.contents(&id, query.cursor, query.limit.unwrap_or(100))
+            })
             .await?,
     ))
 }
@@ -6070,7 +6388,10 @@ async fn content(
 ) -> std::result::Result<Response, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid content query".into()))?;
     let bytes = api
-        .call(move |store| store.content(&id, &content, query.offset))
+        .database
+        .read("contents.read", move |store| {
+            store.content(&id, &content, query.offset)
+        })
         .await?;
     let next = query.offset + bytes.len() as i64;
     Ok((
@@ -6122,7 +6443,10 @@ async fn subscribe(
     let cursor = query.after_seq.unwrap_or(0);
     let changed = api.changes.subscribe();
     let stopped = api.stopping.subscribe();
-    api.call(move |store| store.events(&scope, cursor, 1))
+    api.database
+        .read("events.subscribe.init", move |store| {
+            store.events(&scope, cursor, 1)
+        })
         .await?;
     let state = Subscription {
         api,
@@ -6160,7 +6484,10 @@ async fn subscribe(
             let cursor = state.cursor;
             match state
                 .api
-                .call(move |store| store.events(&scope, cursor, 32))
+                .database
+                .read("events.subscribe.poll", move |store| {
+                    store.events(&scope, cursor, 32)
+                })
                 .await
             {
                 Ok(page) if page.resync_required => {
@@ -6202,7 +6529,11 @@ async fn subscribe(
 type JsonResult<T> = std::result::Result<Json<T>, ApiError>;
 
 async fn list_runs(State(api): State<Api>) -> JsonResult<Vec<orchestration::Run>> {
-    Ok(Json(api.call(|store| store.list_runs()).await?))
+    Ok(Json(
+        api.database
+            .read("runs.list", |store| store.list_runs())
+            .await?,
+    ))
 }
 
 async fn schedule_list(State(api): State<Api>) -> JsonResult<Vec<ScheduledAgentTask>> {
@@ -6287,14 +6618,20 @@ async fn plugin_list(State(api): State<Api>) -> JsonResult<PublicPluginDiscovery
 }
 
 async fn plugin_service_status(State(api): State<Api>) -> JsonResult<PluginServiceList> {
-    Ok(Json(api.plugin_services.list().await?))
+    let mut services = api.plugin_services.list().await?;
+    let health = runtime_health(&api).await?;
+    for service in &mut services.items {
+        annotate_service_health(service, &health);
+    }
+    Ok(Json(services))
 }
 
 async fn plugin_service_start(
     State(api): State<Api>,
     Path((plugin, service)): Path<(String, String)>,
 ) -> JsonResult<PluginServiceView> {
-    let result = api.plugin_services.start(&plugin, &service).await?;
+    let mut result = api.plugin_services.start(&plugin, &service).await?;
+    annotate_service_health(&mut result, &runtime_health(&api).await?);
     api.publish();
     Ok(Json(result))
 }
@@ -6303,7 +6640,8 @@ async fn plugin_service_stop(
     State(api): State<Api>,
     Path((plugin, service)): Path<(String, String)>,
 ) -> JsonResult<PluginServiceView> {
-    let result = api.plugin_services.stop(&plugin, &service).await?;
+    let mut result = api.plugin_services.stop(&plugin, &service).await?;
+    annotate_service_health(&mut result, &runtime_health(&api).await?);
     api.publish();
     Ok(Json(result))
 }
@@ -6312,7 +6650,8 @@ async fn plugin_service_restart(
     State(api): State<Api>,
     Path((plugin, service)): Path<(String, String)>,
 ) -> JsonResult<PluginServiceView> {
-    let result = api.plugin_services.restart(&plugin, &service).await?;
+    let mut result = api.plugin_services.restart(&plugin, &service).await?;
+    annotate_service_health(&mut result, &runtime_health(&api).await?);
     api.publish();
     Ok(Json(result))
 }
@@ -6321,9 +6660,51 @@ async fn plugin_service_health(
     State(api): State<Api>,
     Path((plugin, service)): Path<(String, String)>,
 ) -> JsonResult<PluginServiceView> {
-    let result = api.plugin_services.check_health(&plugin, &service).await?;
+    let mut result = api.plugin_services.check_health(&plugin, &service).await?;
+    annotate_service_health(&mut result, &runtime_health(&api).await?);
     api.publish();
     Ok(Json(result))
+}
+
+fn annotate_service_health(service: &mut PluginServiceView, health: &Health) {
+    service.degraded_reasons = health
+        .degraded_reasons
+        .iter()
+        .filter(|reason| reason.as_str() != "plugin_service_unhealthy")
+        .cloned()
+        .collect();
+    service.recent_errors = service
+        .health_error
+        .iter()
+        .chain(service.last_error.iter())
+        .cloned()
+        .collect();
+    service.recent_errors.extend(
+        health
+            .database
+            .metrics
+            .recent_errors
+            .iter()
+            .rev()
+            .filter(|error| {
+                crate::database::now().saturating_sub(error.at_ms.min(i64::MAX as u64) as i64)
+                    <= 60_000
+            })
+            .take(8)
+            .map(|error| format!("{}: {}", error.resource, error.message)),
+    );
+    if service.health == crate::plugins::PluginServiceHealth::Unhealthy
+        || service.status == crate::plugins::PluginServiceStatus::Failed
+    {
+        service.degraded_reasons.push("service_unhealthy".into());
+    }
+    service.runtime_health = if health.status == RuntimeHealthStatus::Unhealthy {
+        RuntimeHealthStatus::Unhealthy
+    } else if service.degraded_reasons.is_empty() {
+        RuntimeHealthStatus::Healthy
+    } else {
+        RuntimeHealthStatus::Degraded
+    };
 }
 
 async fn create_run(
@@ -6374,7 +6755,11 @@ async fn run_snapshot(
     State(api): State<Api>,
     Path(id): Path<String>,
 ) -> JsonResult<orchestration::RunSnapshot> {
-    Ok(Json(api.call(move |store| store.run_snapshot(&id)).await?))
+    Ok(Json(
+        api.database
+            .read("runs.snapshot", move |store| store.run_snapshot(&id))
+            .await?,
+    ))
 }
 
 async fn ready_tasks(
@@ -6382,7 +6767,9 @@ async fn ready_tasks(
     Path(id): Path<String>,
 ) -> JsonResult<Vec<orchestration::Task>> {
     Ok(Json(
-        api.call(move |store| store.list_ready_tasks(&id)).await?,
+        api.database
+            .read("tasks.ready", move |store| store.list_ready_tasks(&id))
+            .await?,
     ))
 }
 
@@ -6464,13 +6851,20 @@ async fn list_tasks(
 ) -> JsonResult<Vec<orchestration::Task>> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid task query".into()))?;
     Ok(Json(
-        api.call(move |store| store.list_tasks(query.run_id.as_deref()))
+        api.database
+            .read("tasks.list", move |store| {
+                store.list_tasks(query.run_id.as_deref())
+            })
             .await?,
     ))
 }
 
 async fn task(State(api): State<Api>, Path(id): Path<String>) -> JsonResult<orchestration::Task> {
-    Ok(Json(api.call(move |store| store.task(&id)).await?))
+    Ok(Json(
+        api.database
+            .read("tasks.get", move |store| store.task(&id))
+            .await?,
+    ))
 }
 
 async fn create_task(
@@ -6493,7 +6887,7 @@ async fn cancel_task(
         Err(_) => "cancelled by user".into(),
     };
     let task = api
-        .call(move |store| store.cancel_task(&id, &reason))
+        .call_control("task.cancel", move |store| store.cancel_task(&id, &reason))
         .await?;
     api.publish();
     Ok(Json(task))
@@ -6503,7 +6897,9 @@ async fn retry_task(
     State(api): State<Api>,
     Path(id): Path<String>,
 ) -> JsonResult<orchestration::Task> {
-    let task = api.call(move |store| store.retry_task(&id)).await?;
+    let task = api
+        .call_control("task.retry", move |store| store.retry_task(&id))
+        .await?;
     api.publish();
     Ok(Json(task))
 }
@@ -6553,57 +6949,86 @@ async fn settle_task_delivery(
     let body = input.body;
     let task_id_owned = task_id.to_owned();
     let (task, session_id, kick_run) = api
-        .call(move |store| {
-            let current = store.task(&task_id_owned)?;
-            let target = if success {
-                orchestration::TaskStatus::Done
+        .call_control(
+            if success {
+                "task.complete"
             } else {
-                orchestration::TaskStatus::Failed
-            };
-            if current.status == target {
-                return Ok((current, None, None));
-            }
-            let dispatch = store
-                .live_dispatch_for_task(&task_id_owned)?
-                .ok_or_else(|| {
-                    Error::Feature(
-                        "worker_dispatch_not_found".into(),
-                        "the task has no live worker dispatch".into(),
-                    )
-                })?;
-            if actor
-                .as_deref()
-                .is_some_and(|actor| actor != dispatch.session_id)
-            {
-                return Err(Error::Forbidden);
-            }
-            let outcome = store.settle_dispatch(&dispatch.id, success, &body)?;
-            if let Some(coordinator) = store.orch_run(&outcome.task.run_id)?.coordinator_session_id
-                && actor.as_deref().is_some_and(|actor| actor != coordinator)
-            {
-                let label = if success { "完成" } else { "失败" };
-                let _ = store.post_message(orchestration::PostMessage {
-                    run_id: outcome.task.run_id.clone(),
-                    from: actor.clone().unwrap_or_default(),
-                    to: coordinator,
-                    kind: orchestration::MessageType::Report,
-                    subject: format!("任务{label}: {}", outcome.task.title),
-                    body: outcome.task.result.clone().unwrap_or_default(),
-                    thread_id: None,
-                    task_id: Some(outcome.task.id.clone()),
-                })?;
-            }
-            Ok((
-                outcome.task,
-                Some(dispatch.session_id),
-                Some(outcome.dispatch.run_id),
-            ))
-        })
+                "task.fail"
+            },
+            move |store| {
+                let current = store.task(&task_id_owned)?;
+                let target = if success {
+                    orchestration::TaskStatus::Done
+                } else {
+                    orchestration::TaskStatus::Failed
+                };
+                if current.status == target {
+                    let session_id = store
+                        .latest_dispatch_for_task(&task_id_owned)?
+                        .map(|dispatch| dispatch.session_id);
+                    return Ok((current, session_id, None));
+                }
+                let dispatch = store
+                    .live_dispatch_for_task(&task_id_owned)?
+                    .ok_or_else(|| {
+                        Error::Feature(
+                            "worker_dispatch_not_found".into(),
+                            "the task has no live worker dispatch".into(),
+                        )
+                    })?;
+                if actor
+                    .as_deref()
+                    .is_some_and(|actor| actor != dispatch.session_id)
+                {
+                    return Err(Error::Forbidden);
+                }
+                let outcome = store.settle_dispatch(&dispatch.id, success, &body)?;
+                if let Some(coordinator) =
+                    store.orch_run(&outcome.task.run_id)?.coordinator_session_id
+                    && actor.as_deref().is_some_and(|actor| actor != coordinator)
+                {
+                    let label = if success { "完成" } else { "失败" };
+                    let _ = store.post_message(orchestration::PostMessage {
+                        run_id: outcome.task.run_id.clone(),
+                        from: actor.clone().unwrap_or_default(),
+                        to: coordinator,
+                        kind: orchestration::MessageType::Report,
+                        subject: format!("任务{label}: {}", outcome.task.title),
+                        body: outcome.task.result.clone().unwrap_or_default(),
+                        thread_id: None,
+                        task_id: Some(outcome.task.id.clone()),
+                    })?;
+                }
+                Ok((
+                    outcome.task,
+                    Some(dispatch.session_id),
+                    Some(outcome.dispatch.run_id),
+                ))
+            },
+        )
         .await?;
     if let Some(session_id) = session_id {
         let agents = api.agents.clone();
+        let database = api.database.clone();
         tokio::spawn(async move {
-            let _ = agents.close(&session_id).await;
+            loop {
+                match agents.close(&session_id).await {
+                    Ok(()) | Err(Error::NotFound) => break,
+                    Err(Error::Backpressure(_) | Error::Busy | Error::Timeout)
+                        if database.health().alive =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(250)).await
+                    }
+                    Err(error) => {
+                        database.record_recent_error(
+                            "worker.close",
+                            "agent_sessions",
+                            &error.to_string(),
+                        );
+                        break;
+                    }
+                }
+            }
         });
     }
     if let Some(run_id) = kick_run {
@@ -6619,7 +7044,7 @@ async fn dispatch_task(
 ) -> JsonResult<orchestration::SettleOutcome> {
     let Json(request) = body.map_err(|_| Error::Invalid("invalid dispatch request".into()))?;
     let outcome = api
-        .call(move |store| {
+        .call_control("worker.dispatch", move |store| {
             store.dispatch_task(
                 &id,
                 &request.session_id,
@@ -6636,14 +7061,142 @@ async fn dispatch_task(
 
 async fn start_worker_route(
     State(api): State<Api>,
+    headers: HeaderMap,
+    Query(options): Query<WorkerStartOptions>,
     body: std::result::Result<Json<StartWorker>, axum::extract::rejection::JsonRejection>,
-) -> JsonResult<orchestration::WorkerStartOutcome> {
+) -> std::result::Result<Response, ApiError> {
     let Json(input) = body.map_err(|_| Error::Invalid("invalid worker start request".into()))?;
-    let outcome = orchestration::start_worker(&api.database, &api.agents, input)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(175);
+    let submission = orchestration::submit_worker_start(&api.database, &api.agents, input)
         .await
         .map_err(worker_start_error)?;
+    let id = submission.operation.operation_id.clone();
+    let respond_async = options.queued
+        || headers
+            .get("prefer")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|item| item.trim().eq_ignore_ascii_case("respond-async"))
+            });
+    let mut operation = submission.operation;
+    loop {
+        match operation.phase {
+            orchestration::WorkerStartPhase::Running => {
+                api.publish();
+                let outcome = operation.outcome.ok_or(Error::Closed)?;
+                return Ok(Json(outcome).into_response());
+            }
+            orchestration::WorkerStartPhase::Failed
+            | orchestration::WorkerStartPhase::Cancelled
+            | orchestration::WorkerStartPhase::DeliveryUnknown => {
+                return Ok((StatusCode::CONFLICT, Json(json!({"code": operation.error_code.as_deref().unwrap_or("worker_start_failed"), "message": operation.error, "retryable": false, "operationId": operation.operation_id, "sideEffectState": operation.side_effect_state, "sideEffectCommitted": operation.side_effect_committed, "operation": operation}))).into_response());
+            }
+            _ if respond_async => {
+                let status = if operation.phase == orchestration::WorkerStartPhase::Queued {
+                    "queued"
+                } else {
+                    "in_progress"
+                };
+                let mut response = (StatusCode::ACCEPTED, Json(json!({"status": status, "operationId": operation.operation_id, "sideEffectState": operation.side_effect_state, "sideEffectCommitted": operation.side_effect_committed, "operation": operation, "retryAfterMs": 250}))).into_response();
+                response
+                    .headers_mut()
+                    .insert("retry-after", "1".parse().unwrap());
+                response.headers_mut().insert(
+                    "location",
+                    format!("/v1/workers/start-operations/{id}")
+                        .parse()
+                        .map_err(|_| Error::Invalid("invalid operation id".into()))?,
+                );
+                return Ok(response);
+            }
+            _ if tokio::time::Instant::now() >= deadline => {
+                return Ok(worker_start_timeout_response(&id, operation));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(worker_start_timeout_response(&id, operation));
+        }
+        match tokio::time::timeout(
+            remaining,
+            orchestration::get_worker_start(&api.database, &id),
+        )
+        .await
+        {
+            Err(_) => return Ok(worker_start_timeout_response(&id, operation)),
+            Ok(Ok(current)) => operation = current,
+            Ok(Err(Error::Backpressure(pressure))) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !remaining.is_zero() {
+                    tokio::time::sleep(
+                        Duration::from_millis(pressure.retry_after_ms.max(1)).min(remaining),
+                    )
+                    .await;
+                }
+            }
+            Ok(Err(error)) => return Err(error.into()),
+        }
+    }
+}
+
+fn worker_start_timeout_response(
+    id: &str,
+    operation: orchestration::WorkerStartOperation,
+) -> Response {
+    let mut response = (StatusCode::GATEWAY_TIMEOUT, Json(json!({"code":"worker_start_timeout", "message":"worker start is still in progress", "retryable":true, "operationId":operation.operation_id, "sideEffectState":"unknown", "sideEffectCommitted":null, "operation":operation, "retryAfterMs":250}))).into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", "1".parse().unwrap());
+    if let Ok(location) = format!("/v1/workers/start-operations/{id}").parse() {
+        response.headers_mut().insert("location", location);
+    }
+    response
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkerStartOptions {
+    #[serde(default)]
+    queued: bool,
+}
+
+async fn worker_start_operation(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::WorkerStartOperation> {
+    Ok(Json(
+        orchestration::get_worker_start(&api.database, &id).await?,
+    ))
+}
+
+async fn cancel_worker_start_operation(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::WorkerStartOperation> {
+    let operation = orchestration::cancel_worker_start(&api.database, &id).await?;
     api.publish();
-    Ok(Json(outcome))
+    Ok(Json(operation))
+}
+
+async fn task_activities(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<
+        Json<orchestration::TaskActivityQuery>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> JsonResult<orchestration::TaskActivities> {
+    let Json(query) = body.map_err(|_| Error::Invalid("invalid task activity request".into()))?;
+    Ok(Json(
+        api.database
+            .read("task.activities", move |store| {
+                store.task_activities(&id, query)
+            })
+            .await?,
+    ))
 }
 
 fn worker_start_error(error: Error) -> Error {
@@ -6672,7 +7225,10 @@ async fn list_worktrees(
 ) -> JsonResult<Vec<orchestration::WorktreeAsset>> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid worktree query".into()))?;
     Ok(Json(
-        api.call(move |store| store.list_worktree_assets(query.run_id.as_deref()))
+        api.database
+            .read("worktrees.list", move |store| {
+                store.list_worktree_assets(query.run_id.as_deref())
+            })
             .await?,
     ))
 }
@@ -6682,7 +7238,9 @@ async fn worktree_asset_route(
     Path(id): Path<String>,
 ) -> JsonResult<orchestration::WorktreeAsset> {
     Ok(Json(
-        api.call(move |store| store.worktree_asset(&id)).await?,
+        api.database
+            .read("worktrees.get", move |store| store.worktree_asset(&id))
+            .await?,
     ))
 }
 
@@ -6717,7 +7275,10 @@ async fn list_dispatches(
 ) -> JsonResult<Vec<orchestration::Dispatch>> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid dispatch query".into()))?;
     Ok(Json(
-        api.call(move |store| store.list_dispatches(query.run_id.as_deref()))
+        api.database
+            .read("dispatches.list", move |store| {
+                store.list_dispatches(query.run_id.as_deref())
+            })
             .await?,
     ))
 }
@@ -6726,7 +7287,11 @@ async fn dispatch(
     State(api): State<Api>,
     Path(id): Path<String>,
 ) -> JsonResult<orchestration::Dispatch> {
-    Ok(Json(api.call(move |store| store.dispatch(&id)).await?))
+    Ok(Json(
+        api.database
+            .read("dispatches.get", move |store| store.dispatch(&id))
+            .await?,
+    ))
 }
 
 async fn dispatch_running(
@@ -6747,7 +7312,9 @@ async fn settle_dispatch(
 ) -> JsonResult<orchestration::SettleOutcome> {
     let Json(request) = body.map_err(|_| Error::Invalid("invalid settle request".into()))?;
     let outcome = api
-        .call(move |store| store.settle_dispatch(&id, request.success, &request.outcome))
+        .call_control("dispatch.settle", move |store| {
+            store.settle_dispatch(&id, request.success, &request.outcome)
+        })
         .await?;
     orchestration::kick_automation(&api.database, &api.agents, &outcome.task.run_id).await;
     api.publish();
@@ -6775,7 +7342,9 @@ async fn abandon_dispatch(
         }
     };
     let outcome = api
-        .call(move |store| store.abandon_dispatch(&id, &reason, final_status))
+        .call_control("dispatch.abandon", move |store| {
+            store.abandon_dispatch(&id, &reason, final_status)
+        })
         .await?;
     api.publish();
     Ok(Json(outcome))
@@ -6809,7 +7378,10 @@ async fn list_gates(
         Some(_) => return Err(Error::Invalid("invalid gate status".into()).into()),
     };
     Ok(Json(
-        api.call(move |store| store.list_gates(query.run_id.as_deref(), status))
+        api.database
+            .read("gates.list", move |store| {
+                store.list_gates(query.run_id.as_deref(), status)
+            })
             .await?,
     ))
 }
@@ -6834,7 +7406,10 @@ async fn list_messages(
 ) -> JsonResult<Vec<orchestration::OrchMessage>> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid message query".into()))?;
     Ok(Json(
-        api.call(move |store| store.list_messages(query.run_id.as_deref()))
+        api.database
+            .read("messages.list", move |store| {
+                store.list_messages(query.run_id.as_deref())
+            })
             .await?,
     ))
 }
@@ -6862,7 +7437,10 @@ async fn unread_messages(
 ) -> JsonResult<Vec<orchestration::OrchMessage>> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid unread query".into()))?;
     Ok(Json(
-        api.call(move |store| store.unread_messages(&query.recipient, query.run_id.as_deref()))
+        api.database
+            .read("messages.unread", move |store| {
+                store.unread_messages(&query.recipient, query.run_id.as_deref())
+            })
             .await?,
     ))
 }
@@ -6890,6 +7468,386 @@ async fn mark_message_answered(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn worker_start_timeout_does_not_restate_a_stale_side_effect_snapshot() {
+        use super::*;
+        use axum::body::to_bytes;
+        let operation = orchestration::WorkerStartOperation {
+            operation_id: "timeout-operation".into(),
+            phase: orchestration::WorkerStartPhase::Queued,
+            task_id: "task-timeout".into(),
+            run_id: "run-timeout".into(),
+            agent: AgentKind::Claude,
+            account_id: None,
+            worktree_path: None,
+            asset_id: None,
+            session_id: None,
+            dispatch_id: None,
+            outcome: None,
+            error: None,
+            error_code: None,
+            side_effect_state: orchestration::WorkerStartSideEffectState::None,
+            side_effect_committed: Some(false),
+            retry_after_ms: Some(100),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let response = worker_start_timeout_response("timeout-operation", operation);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.headers()["location"],
+            "/v1/workers/start-operations/timeout-operation"
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["sideEffectState"], "unknown");
+        assert!(body["sideEffectCommitted"].is_null());
+        assert_eq!(body["operation"]["sideEffectState"], "none");
+        assert_eq!(body["operation"]["sideEffectCommitted"], false);
+        assert_eq!(body["operation"]["updatedAt"], 1);
+    }
+
+    #[tokio::test]
+    async fn queued_worker_start_can_be_queried_and_cancelled_without_a_session() {
+        use super::*;
+        use axum::body::{Body, to_bytes};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().to_path_buf()).await.unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+        for index in 0..128 {
+            api.agents
+                .create(CreateAgentSession {
+                    agent: AgentKind::Claude,
+                    title: format!("occupied {index}"),
+                    workspace: root.path().to_string_lossy().into_owned(),
+                    auto_approve: false,
+                    mode: None,
+                    model: None,
+                    effort: None,
+                    agent_preset: None,
+                    account_id: None,
+                    resume: None,
+                })
+                .await
+                .unwrap();
+        }
+        let task_id = database
+            .call(|store| {
+                let graph = store.create_run_graph(CreateRunGraph {
+                    objective: "queued admission".into(),
+                    coordinator_session_id: None,
+                    operation_id: "queued-test-graph".into(),
+                    nodes: ["async", "sync"]
+                        .into_iter()
+                        .map(|id| orchestration::GraphNodeInput {
+                            client_id: id.into(),
+                            title: id.into(),
+                            spec: "work".into(),
+                            skills: Vec::new(),
+                            deps: Vec::new(),
+                            parent_id: None,
+                        })
+                        .collect(),
+                })?;
+                Ok((graph.id_map["async"].clone(), graph.id_map["sync"].clone()))
+            })
+            .await
+            .unwrap();
+        let (async_task_id, sync_task_id) = task_id;
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            api.router().oneshot(axum::http::Request::builder().method("POST").uri("/v1/workers/start")
+                .header("authorization", format!("Bearer {}", "a".repeat(64))).header("content-type", "application/json").header("prefer", "respond-async")
+                .body(Body::from(json!({"taskId":async_task_id,"operationId":"queued-test-start","agent":"claude","cwd":root.path(),"worktree":"none"}).to_string())).unwrap()),
+        ).await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.headers()["location"],
+            "/v1/workers/start-operations/queued-test-start"
+        );
+        let body: JsonValue =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["operation"]["phase"], "queued");
+        assert_eq!(body["sideEffectCommitted"], false);
+        for method in ["GET", "DELETE"] {
+            let response = api
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/v1/workers/start-operations/queued-test-start")
+                        .header("authorization", format!("Bearer {}", "a".repeat(64)))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: JsonValue =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                body["phase"],
+                if method == "GET" {
+                    "queued"
+                } else {
+                    "cancelled"
+                }
+            );
+            assert!(body["sessionId"].is_null());
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/workers/start")
+            .header("authorization", format!("Bearer {}", "a".repeat(64)))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"taskId":sync_task_id,"operationId":"sync-test-start","agent":"claude","cwd":root.path(),"worktree":"none"}).to_string(),
+            ))
+            .unwrap();
+        let router = api.router();
+        let waiting = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!waiting.is_finished());
+        let cancelled = api
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/workers/start-operations/sync-test-start")
+                    .header("authorization", format!("Bearer {}", "a".repeat(64)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let response = waiting.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: JsonValue =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["code"], "cancelled");
+        assert_eq!(body["operationId"], "sync-test-start");
+        assert_eq!(api.agents.count(), 128);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_remains_available_when_http_admission_is_full() {
+        use super::*;
+        use axum::body::{Body, to_bytes};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().to_path_buf()).await.unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+        let held = api.requests.clone().acquire_many_owned(128).await.unwrap();
+        let diagnostic_held = api
+            .diagnostics_requests
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/workers/start")
+            .header("authorization", format!("Bearer {}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let response = api.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key("retry-after"));
+        let body: JsonValue =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["code"], "busy");
+        assert_eq!(body["resource"], "http_requests");
+        assert_eq!(body["operation"], "worker.start");
+        assert_eq!(body["sideEffectCommitted"], false);
+        assert!(body["retryAfterMs"].as_u64().unwrap() > 0);
+        let request = axum::http::Request::builder()
+            .uri("/v1/health")
+            .header("authorization", format!("Bearer {}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), api.router().oneshot(request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: JsonValue =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["control"]["startRejectionsRecent"], 1);
+        assert!(
+            !body["degradedReasons"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("db_queue_full_recent"))
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/workers/stop")
+            .header("authorization", format!("Bearer {}", "a".repeat(64)))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"taskId":"missing-task"}).to_string()))
+            .unwrap();
+        let response = api.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        drop(held);
+        drop(diagnostic_held);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_distinguishes_read_pool_pressure_from_writer_pressure() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open_with_options(
+            root.path().to_path_buf(),
+            None,
+            crate::worker::DatabaseOptions {
+                reader_threads: 1,
+                read_queue_capacity: 1,
+                read_waiter_capacity: 1,
+                read_enqueue_timeout: Duration::from_millis(20),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let db = database.clone();
+        let running = tokio::spawn(async move {
+            db.read("test.read.block", move |_| {
+                let _ = entered.send(());
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        ready.await.unwrap();
+        let db = database.clone();
+        let queued = tokio::spawn(async move { db.read("test.read.queued", |_| Ok(())).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while database.health().readers.queued == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(database.read("test.read.rejected", |_| Ok(())).await, Err(Error::Backpressure(pressure)) if pressure.resource == "database.read_queue")
+        );
+        let health = tokio::time::timeout(Duration::from_secs(1), runtime_health(&api))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(health.database.alive);
+        assert!(!health.database.degraded);
+        assert!(health.database.readers.alive);
+        assert!(health.database.readers.degraded);
+        assert_eq!(health.database.readers.reader_count, 1);
+        assert_eq!(health.database.readers.inflight, 1);
+        assert_eq!(health.database.readers.queued, 1);
+        assert_eq!(health.database.metrics.readers.rejected_total, 1);
+        assert_eq!(health.database.metrics.database_rejected_total, 0);
+        assert_eq!(
+            health
+                .database
+                .metrics
+                .rejected_by_resource
+                .get("database.read_queue"),
+            Some(&1)
+        );
+        assert_eq!(health.status, RuntimeHealthStatus::Degraded);
+        assert!(health.degraded_reasons.contains(&"db_read_backlog".into()));
+        release.send(()).unwrap();
+        running.await.unwrap().unwrap();
+        queued.await.unwrap().unwrap();
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_sustained_database_pressure_without_waiting_for_database() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open_with_options(
+            root.path().to_path_buf(),
+            None,
+            crate::worker::DatabaseOptions {
+                degraded_queue_depth: 1,
+                recovered_queue_depth: 0,
+                overload_duration: Duration::from_millis(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let db = database.clone();
+        let task = tokio::spawn(async move {
+            db.call_background("event.append", move |_| {
+                let _ = started.send(());
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        ready.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let sample = tokio::time::timeout(Duration::from_millis(500), runtime_health(&api))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.status, RuntimeHealthStatus::Degraded);
+        assert!(
+            sample
+                .degraded_reasons
+                .contains(&"db_backlog_sustained".into())
+        );
+        assert_eq!(sample.database.inflight, 1);
+        release.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        database.call(|_| Ok(())).await.unwrap();
+        let sample = runtime_health(&api).await.unwrap();
+        assert!(!sample.database.degraded);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_plugin_process_exposes_control_plane_degradation() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().to_path_buf()).await.unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+        database.record_rejection("worker.start", "agent_sessions");
+        database.record_recent_error(
+            "worker.start",
+            "agent_sessions",
+            "agent sessions are at capacity",
+        );
+        let health = runtime_health(&api).await.unwrap();
+        let mut service: PluginServiceView = serde_json::from_value(json!({
+            "pluginId":"example", "serviceId":"crawler", "mode":"manual", "status":"running", "pid":123,
+            "updatedAt":0, "health":"healthy", "restartCount":0, "configKey":"test", "configured":true,
+            "logFiles":{"stdout":"/tmp/stdout","stderr":"/tmp/stderr"}
+        })).unwrap();
+        annotate_service_health(&mut service, &health);
+        assert_eq!(service.health, crate::plugins::PluginServiceHealth::Healthy);
+        assert_eq!(service.runtime_health, RuntimeHealthStatus::Degraded);
+        assert!(
+            service
+                .degraded_reasons
+                .contains(&"start_rejections_recent".into())
+        );
+        assert!(!service.recent_errors.is_empty());
+        database.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn saturated_account_requests_fail_fast_instead_of_waiting_on_the_outer_permit() {
         use super::*;

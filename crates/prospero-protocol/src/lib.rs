@@ -264,6 +264,12 @@ pub struct Health {
     #[serde(default)]
     pub build_id: String,
     pub active_runtime_sessions: usize,
+    #[serde(default)]
+    pub status: RuntimeHealthStatus,
+    #[serde(default)]
+    pub degraded_reasons: Vec<String>,
+    #[serde(default)]
+    pub control: ControlPlaneHealth,
     pub database_queue_capacity: usize,
     #[serde(default)]
     pub database: DatabaseHealth,
@@ -273,13 +279,130 @@ pub struct Health {
     pub relay: Option<RelayRuntimeStatus>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHealthStatus {
+    #[default]
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
+pub struct ControlPlaneHealth {
+    pub http_requests_active: usize,
+    pub http_requests_capacity: usize,
+    pub control_requests_active: usize,
+    pub control_requests_capacity: usize,
+    pub agent_sessions_active: usize,
+    pub agent_sessions_capacity: usize,
+    pub terminal_sessions_active: usize,
+    pub terminal_sessions_capacity: usize,
+    #[ts(type = "number")]
+    pub queued_start_count: i64,
+    #[ts(type = "number")]
+    pub stale_dispatch_count: i64,
+    #[ts(type = "number")]
+    pub terminal_misalignment_count: i64,
+    #[ts(type = "number")]
+    pub start_rejections_recent: u64,
+    pub unhealthy_plugin_services: usize,
+    #[ts(type = "number | null")]
+    pub sampled_at: Option<i64>,
+    pub sampling_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
 pub struct DatabaseHealth {
+    pub readers: ReadPoolHealth,
     pub alive: bool,
+    pub degraded: bool,
     pub queue_depth: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: usize,
+    pub queued: usize,
+    pub inflight: usize,
+    pub high_watermark: usize,
+    #[ts(type = "number")]
+    pub oldest_queued_age_ms: u64,
+    pub control_queue_depth: usize,
+    pub control_queue_capacity: usize,
+    pub background_queue_depth: usize,
+    pub background_queue_capacity: usize,
+    pub metrics: DatabasePressureMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DatabasePressureMetrics {
+    pub readers: ReadPoolMetrics,
+    #[ts(type = "number")]
+    pub database_rejected_total: u64,
+    #[ts(type = "Record<string, number>")]
+    pub database_rejected_by_operation: std::collections::BTreeMap<String, u64>,
+    pub queue_latency: ResourceLatency,
+    pub execution_latency: ResourceLatency,
+    #[ts(type = "number")]
+    pub rejected_total: u64,
+    #[ts(type = "Record<string, number>")]
+    pub rejected_by_operation: std::collections::BTreeMap<String, u64>,
+    #[ts(type = "Record<string, number>")]
+    pub rejected_by_resource: std::collections::BTreeMap<String, u64>,
+    pub recent_errors: Vec<ResourceErrorSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReadPoolHealth {
+    pub alive: bool,
+    pub degraded: bool,
+    pub reader_count: usize,
+    pub alive_readers: usize,
+    pub waiting: usize,
+    pub queued: usize,
+    pub inflight: usize,
+    pub queue_capacity: usize,
+    pub waiter_capacity: usize,
+    pub high_watermark: usize,
+    #[ts(type = "number")]
+    pub oldest_queued_age_ms: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReadPoolMetrics {
+    pub queue_latency: ResourceLatency,
+    pub execution_latency: ResourceLatency,
+    #[ts(type = "number")]
+    pub rejected_total: u64,
+    #[ts(type = "Record<string, number>")]
+    pub rejected_by_operation: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResourceLatency {
+    pub samples: usize,
+    #[ts(type = "number")]
+    pub p50_ms: u64,
+    #[ts(type = "number")]
+    pub p95_ms: u64,
+    #[ts(type = "number")]
+    pub p99_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResourceErrorSummary {
+    #[ts(type = "number")]
+    pub at_ms: u64,
+    pub operation: String,
+    pub resource: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

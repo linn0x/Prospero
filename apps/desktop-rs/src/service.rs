@@ -60,9 +60,22 @@ pub async fn attach_or_start() -> Result<Client, String> {
 }
 
 pub async fn diagnostics() -> Result<String, String> {
-    tokio::task::spawn_blocking(diagnostics_sync)
+    let local = tokio::task::spawn_blocking(diagnostics_sync)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())??;
+    let runtime = match Client::from_home(&default_daemon_home()) {
+        Ok(client) => {
+            match tokio::time::timeout(Duration::from_secs(5), client.diagnostics()).await {
+                Ok(Ok(value)) => serde_json::to_string_pretty(&value).unwrap_or_default(),
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "Runtime diagnostics timed out".into(),
+            }
+        }
+        Err(error) => error.to_string(),
+    };
+    Ok(redact(&format!(
+        "{local}\n\nRuntime diagnostics\n{runtime}"
+    )))
 }
 
 fn diagnostics_sync() -> Result<String, String> {

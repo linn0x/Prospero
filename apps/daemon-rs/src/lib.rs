@@ -12,6 +12,7 @@ pub mod plugins;
 pub mod project;
 pub mod protocol;
 mod queries;
+mod reader;
 pub mod relay;
 pub mod remote_crypto;
 pub mod schedules;

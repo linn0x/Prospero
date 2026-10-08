@@ -388,3 +388,40 @@ fn streamed_previews_preserve_spaces_and_split_escape_sequences() {
         fragments.concat()
     );
 }
+
+#[test]
+fn v31_migration_does_not_invent_timeline_checkpoint_timestamps() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let id = session(&mut store);
+    store
+        .write_timeline(&id, write("historic", 0, "historic output"))
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    connection
+        .execute_batch("DROP TABLE timeline_checkpoints; PRAGMA user_version=31;")
+        .unwrap();
+    drop(connection);
+    let mut store = Store::open(directory.path()).unwrap();
+    let connection = Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    let checkpoint_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM timeline_checkpoints WHERE session_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(checkpoint_count, 0);
+    store
+        .write_timeline(&id, write("current", 0, "current output"))
+        .unwrap();
+    let checkpoint_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM timeline_checkpoints WHERE session_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(checkpoint_count, 1);
+}

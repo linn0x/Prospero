@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use prosperod_rs::error::Error;
 use prosperod_rs::protocol::DATABASE_QUEUE_CAPACITY;
-use prosperod_rs::worker::Database;
+use prosperod_rs::worker::{Database, DatabaseOptions};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -174,6 +174,169 @@ async fn overload_waits_for_database_queue_capacity() {
         call.await.unwrap();
     }
     overflow.await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn overload_is_bounded_and_reports_structured_pressure() {
+    let directory = TempDir::new().unwrap();
+    let database = Database::open_with_options(
+        directory.path().to_path_buf(),
+        None,
+        DatabaseOptions {
+            background_queue_capacity: 1,
+            background_waiter_capacity: 1,
+            background_enqueue_timeout: Duration::from_millis(40),
+            degraded_queue_depth: 2,
+            recovered_queue_depth: 0,
+            overload_duration: Duration::ZERO,
+            ..DatabaseOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (release, barrier) = std::sync::mpsc::channel();
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let clone = database.clone();
+    let blocker = tokio::spawn(async move {
+        clone
+            .call_background("test.blocker", move |_| {
+                let _ = started.send(());
+                barrier.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            })
+            .await
+    });
+    waiting.await.unwrap();
+    let clone = database.clone();
+    let queued =
+        tokio::spawn(async move { clone.call_background("test.queued", |_| Ok(())).await });
+    while database.health().queued != 1 {
+        tokio::task::yield_now().await;
+    }
+    let clone = database.clone();
+    let timed_out =
+        tokio::spawn(async move { clone.call_background("test.timeout", |_| Ok(())).await });
+    while database.health().waiting != 1 {
+        tokio::task::yield_now().await;
+    }
+    let error = database
+        .call_background("test.rejected", |_| Ok(()))
+        .await
+        .unwrap_err();
+    let body = error.public();
+    assert_eq!(body.code, "busy");
+    assert_eq!(body.operation.as_deref(), Some("test.rejected"));
+    assert_eq!(body.side_effect_committed, Some(false));
+    let Error::Backpressure(pressure) = error else {
+        panic!("expected resource backpressure");
+    };
+    assert_eq!(pressure.operation, "test.rejected");
+    assert_eq!(pressure.resource, "database.background_queue");
+    assert_eq!(pressure.queue_capacity, 1);
+    assert_eq!(pressure.side_effect_committed, Some(false));
+    assert!(database.health().degraded);
+    assert!(matches!(
+        timed_out.await.unwrap(),
+        Err(Error::Backpressure(_))
+    ));
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    queued.await.unwrap().unwrap();
+    let health = database.health();
+    assert_eq!(health.waiting, 0);
+    assert_eq!(health.queued, 0);
+    assert_eq!(health.inflight, 0);
+    assert!(!health.degraded);
+    let metrics = database.metrics();
+    assert_eq!(metrics.database_rejected_total, 2);
+    assert_eq!(metrics.database_rejected_by_operation["test.rejected"], 1);
+    assert_eq!(metrics.rejected_total, 2);
+    assert_eq!(metrics.rejected_by_operation["test.rejected"], 1);
+    assert_eq!(metrics.rejected_by_operation["test.timeout"], 1);
+    assert_eq!(metrics.recent_rejected_total, 2);
+    assert_eq!(database.recent_rejections("test."), 2);
+    assert_eq!(metrics.recent_errors.len(), 2);
+    assert!(metrics.high_watermark >= 3);
+    assert_eq!(Error::Busy.public().retry_after_ms, Some(100));
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_capacity_is_reserved_and_weighted_fairly() {
+    let directory = TempDir::new().unwrap();
+    let database = Database::open_with_options(
+        directory.path().to_path_buf(),
+        None,
+        DatabaseOptions {
+            background_queue_capacity: 4,
+            control_queue_capacity: 4,
+            control_weight: 2,
+            degraded_queue_depth: 100,
+            ..DatabaseOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (release, barrier) = std::sync::mpsc::channel();
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let clone = database.clone();
+    let blocker = tokio::spawn(async move {
+        clone
+            .call_background("test.blocker", move |_| {
+                let _ = started.send(());
+                barrier.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            })
+            .await
+    });
+    waiting.await.unwrap();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut calls = Vec::new();
+    for label in ["c1", "c2", "c3", "c4"] {
+        let clone = database.clone();
+        let order = order.clone();
+        calls.push(tokio::spawn(async move {
+            clone
+                .call_control(format!("test.{label}"), move |_| {
+                    order.lock().unwrap().push(label);
+                    Ok(())
+                })
+                .await
+        }));
+    }
+    for label in ["b1", "b2"] {
+        let clone = database.clone();
+        let order = order.clone();
+        calls.push(tokio::spawn(async move {
+            clone
+                .call_background(format!("test.{label}"), move |_| {
+                    order.lock().unwrap().push(label);
+                    Ok(())
+                })
+                .await
+        }));
+    }
+    while database.health().queued != 6 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(database.health().control_queue_depth, 4);
+    assert_eq!(database.health().background_queue_depth, 3);
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    {
+        let order = order.lock().unwrap();
+        assert_eq!(order.len(), 6);
+        assert!(order[0].starts_with('c'));
+        assert!(order[1].starts_with('c'));
+        assert!(order[2].starts_with('b'));
+        assert!(order[3].starts_with('c'));
+        assert!(order[4].starts_with('c'));
+        assert!(order[5].starts_with('b'));
+    }
     database.shutdown().await.unwrap();
 }
 

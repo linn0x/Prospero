@@ -338,39 +338,83 @@ async fn exit_while_daemon_is_down_is_archived_on_reattach_and_host_is_private()
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hosted_input_backpressure_keeps_non_retryable_failure_contract() {
+async fn hosted_input_cancellation_requires_explicit_close_without_replay() {
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path()).await;
-    let head = daemon.post("/v1/terminals", json!({"title":"backpressure","workspace":root.path(),"size":{"cols":80,"rows":24},"agent":"custom","command":"stty raw -echo; printf READY; sleep 30"})).await;
+    let reader = root.path().join("reader.py");
+    let received = root.path().join("received.bin");
+    std::fs::write(
+        &reader,
+        format!(
+            "import os,time\ntime.sleep(3)\nos.set_blocking(0,False)\ndata=bytearray()\ndeadline=time.monotonic()+1\nwhile time.monotonic()<deadline:\n try:\n  chunk=os.read(0,65536)\n  if chunk:\n   data.extend(chunk)\n   deadline=time.monotonic()+0.2\n  else:\n   break\n except BlockingIOError:\n  time.sleep(0.01)\nopen({},'wb').write(data)\nprint('COUNT:'+str(len(data)),flush=True)\n",
+            serde_json::to_string(&received.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+    let command = format!(
+        "stty raw -echo; printf READY; python3 '{}'; sleep 30",
+        reader.display()
+    );
+    let head = daemon.post("/v1/terminals", json!({"title":"backpressure","workspace":root.path(),"size":{"cols":80,"rows":24},"agent":"custom","command":command})).await;
     let id = head["id"].as_str().unwrap();
     let directory = root.path().join("terminal-hosts").join(id);
     let info: Value =
         serde_json::from_slice(&std::fs::read(directory.join("host.json")).unwrap()).unwrap();
-    let _cleanup = HostCleanup {
-        pid: info["pid"].as_i64().unwrap() as i32,
-        directory,
-    };
+    let pid = info["pid"].as_i64().unwrap() as i32;
+    let _cleanup = HostCleanup { pid, directory };
     daemon.output(id, "READY").await;
     let body = json!({"dataB64":STANDARD.encode(vec![b'x';8192])});
-    let mut failed = false;
+    let mut completed = 0;
+    let mut cancelled = false;
     for _ in 0..64 {
-        let response = daemon
+        let request = daemon
             .client
             .post(format!("{}/v1/terminals/{id}/input", daemon.url))
             .bearer_auth(&daemon.token)
             .json(&body)
-            .send()
-            .await
-            .unwrap();
-        if !response.status().is_success() {
-            let error: Value = response.json().await.unwrap();
-            assert_eq!(error["code"], "terminal_input_failed");
-            assert_eq!(error["retryable"], false);
-            failed = true;
-            break;
+            .send();
+        match tokio::time::timeout(Duration::from_millis(500), request).await {
+            Ok(Ok(response)) => {
+                assert!(response.status().is_success());
+                completed += 1;
+            }
+            Ok(Err(error)) => panic!("input request failed before caller cancellation: {error}"),
+            Err(_) => {
+                cancelled = true;
+                break;
+            }
         }
     }
-    assert!(failed, "input must not buffer without a bound");
+    assert!(
+        cancelled,
+        "input acknowledgement must eventually remain pending"
+    );
+    let expected = (completed + 1) * 8192;
+    daemon.output(id, &format!("COUNT:{expected}")).await;
+    let bytes = std::fs::read(&received).unwrap();
+    assert_eq!(bytes.len(), expected);
+    assert!(bytes.iter().all(|byte| *byte == b'x'));
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    daemon.close(id).await;
+    let response = daemon
+        .client
+        .post(format!("{}/v1/terminals/{id}/input", daemon.url))
+        .bearer_auth(&daemon.token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["code"], "terminal_input_failed");
+    assert_eq!(error["retryable"], false);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[cfg(windows)]
