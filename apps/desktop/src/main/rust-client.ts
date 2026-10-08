@@ -1,6 +1,7 @@
 import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
 import WebSocket from "ws";
+import { setTimeout as delay } from "node:timers/promises";
 import { TERMINAL_STREAM_HEADER_BYTES, TERMINAL_STREAM_MAX_PAYLOAD_BYTES } from "../shared/terminal-stream";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
@@ -14,7 +15,7 @@ import type {
   Run, DeleteRun, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, Skill, SkillSuggestion,
   ScheduleCreate, ScheduleRunResult, ScheduleUpdate, ScheduledAgentTask,
   StartAutomation, StartWorker, StopWorker, Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection,
-  WorkerStartOutcome,
+  WorkerStartOutcome, WorkerStartOperation, WorkerStartSubmission, TaskActivities,
 } from "@prospero/protocol/rust-daemon";
 
 
@@ -42,6 +43,12 @@ function id(value: string): string {
 function scheduleId(value: string): string {
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(value)) throw new Error("Invalid schedule id");
   return value;
+}
+
+export class RustBackpressureError extends Error {
+  constructor(readonly retryAfterMs: number, readonly resource: string | null) {
+    super(resource ? `服务繁忙（${resource}），请稍后重试` : "服务繁忙，请稍后重试");
+  }
 }
 
 export class RustClient {
@@ -90,7 +97,10 @@ export class RustClient {
       const code = result && typeof result === "object" ? (result as { code?: unknown }).code : undefined;
       if (code === "conflict") throw new Error("记录已变更，请刷新后重试");
       if (code === "in_use") throw new Error("该账号仍有活跃会话，请先关闭后再删除");
-      if (code === "busy") throw new Error("服务繁忙，请稍后重试");
+      if (code === "busy") {
+        const pressure = result as { retryAfterMs?: unknown; resource?: unknown };
+        throw new RustBackpressureError(typeof pressure.retryAfterMs === "number" ? Math.max(100, Math.min(5000, pressure.retryAfterMs)) : 250, typeof pressure.resource === "string" ? pressure.resource : null);
+      }
       const detail = result && typeof result === "object" ? (result as { message?: unknown }).message : undefined;
       const suffix = typeof detail === "string" && detail.trim() ? `：${detail.trim()}` : "";
       throw new Error(`Rust 服务请求失败（${response.status}）${suffix}`);
@@ -407,8 +417,34 @@ export class RustClient {
   retryTask(value: string, signal: AbortSignal | null = null): Promise<Task> {
     return this.json(`/v1/tasks/${id(value)}/retry`, { method: "POST", signal });
   }
-  startWorker(input: StartWorker, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<WorkerStartOutcome> {
-    return this.json("/v1/workers/start", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  async startWorker(input: StartWorker, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<WorkerStartOutcome> {
+    const deadline = Date.now() + timeoutMs;
+    const result = await this.json<WorkerStartOutcome | WorkerStartSubmission>("/v1/workers/start", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json", prefer: "respond-async" }, body: JSON.stringify(input) });
+    if (!("operation" in result)) return result;
+    let operation = result.operation;
+    for (;;) {
+      signal?.throwIfAborted();
+      if (operation.phase === "running" && operation.outcome) return operation.outcome;
+      if (["failed", "cancelled", "delivery_unknown"].includes(operation.phase)) throw new Error(operation.error ?? `Worker start ${operation.phase}`);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`Worker start is still pending (${operation.operationId}); query its operation before retrying`);
+      await delay(Math.min(250, remaining), undefined, { signal: signal ?? undefined });
+      try {
+        operation = await this.json(`/v1/workers/start-operations/${id(operation.operationId)}`, { signal, timeoutMs: Math.max(1, deadline - Date.now()) });
+      } catch (error) {
+        if (!(error instanceof RustBackpressureError)) throw error;
+        await delay(Math.min(error.retryAfterMs, Math.max(1, deadline - Date.now())), undefined, { signal: signal ?? undefined });
+      }
+    }
+  }
+  workerStartOperation(operationId: string, signal: AbortSignal | null = null): Promise<WorkerStartOperation> {
+    return this.json(`/v1/workers/start-operations/${id(operationId)}`, { signal });
+  }
+  cancelWorkerStart(operationId: string, signal: AbortSignal | null = null): Promise<WorkerStartOperation> {
+    return this.json(`/v1/workers/start-operations/${id(operationId)}`, { method: "DELETE", signal });
+  }
+  taskActivities(runId: string, taskIds: string[], signal: AbortSignal | null = null): Promise<TaskActivities> {
+    return this.json(`/v1/runs/${id(runId)}/task-activities`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ taskIds }) });
   }
   stopWorker(input: StopWorker, signal: AbortSignal | null = null): Promise<SettleOutcome> {
     return this.json("/v1/workers/stop", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });

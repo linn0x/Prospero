@@ -100,6 +100,21 @@ fn safe_owner(id: &str) -> String {
     slug
 }
 
+fn clone_timeline_writes(writes: &[TimelineWrite]) -> Vec<TimelineWrite> {
+    writes
+        .iter()
+        .map(|write| TimelineWrite {
+            id: write.id.clone(),
+            turn_id: write.turn_id.clone(),
+            expected_revision: write.expected_revision,
+            body: write.body.clone(),
+            text: write.text.clone(),
+            replace: write.replace,
+            subagent_id: write.subagent_id.clone(),
+        })
+        .collect()
+}
+
 fn attachment_path(
     data: &Path,
     session_id: &str,
@@ -305,7 +320,6 @@ struct Session {
     /// Serializes drain loops so only the turn that just finished chains the
     /// queued turns (mirrors the legacy `drainingQueue` guard).
     draining: Mutex<()>,
-    /// Concurrency slot; released when the session entry is dropped.
     #[allow(dead_code)]
     permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
 }
@@ -317,6 +331,7 @@ struct State {
     /// cannot overtake an earlier incremental batch.
     fan_in_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     slots: Arc<Semaphore>,
+    worker_start_scheduler: AtomicBool,
     closed: AtomicBool,
     failed: AtomicBool,
     changed: watch::Sender<u64>,
@@ -356,6 +371,7 @@ impl Agents {
             entries: Mutex::new(HashMap::new()),
             fan_in_locks: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(MAX_TURNS)),
+            worker_start_scheduler: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             changed: watch::channel(0).0,
@@ -708,6 +724,29 @@ impl Agents {
         }
     }
 
+    pub fn capacity(&self) -> usize {
+        MAX_TURNS
+    }
+
+    pub(crate) fn claim_worker_start_scheduler(&self) -> bool {
+        !self.0.closed.load(Ordering::Acquire)
+            && self
+                .0
+                .worker_start_scheduler
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub(crate) fn release_worker_start_scheduler(&self) {
+        self.0
+            .worker_start_scheduler
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn worker_starts_closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
     pub fn check(&self) -> Result<()> {
         if self.0.failed.load(Ordering::Acquire) {
             Err(Error::Closed)
@@ -717,6 +756,23 @@ impl Agents {
     }
 
     pub async fn create(&self, input: CreateAgentSession) -> Result<SessionHead> {
+        self.create_inner(input, None).await
+    }
+
+    pub async fn create_with_id(
+        &self,
+        input: CreateAgentSession,
+        id: String,
+    ) -> Result<SessionHead> {
+        crate::database::validate_id(&id)?;
+        self.create_inner(input, Some(id)).await
+    }
+
+    async fn create_inner(
+        &self,
+        input: CreateAgentSession,
+        id: Option<String>,
+    ) -> Result<SessionHead> {
         crate::database::validate_text(&input.title, 512, false)?;
         if input.workspace.len() > 4096 || input.workspace.trim().is_empty() {
             return Err(Error::Invalid("invalid workspace".into()));
@@ -740,12 +796,24 @@ impl Agents {
             .to_str()
             .ok_or_else(|| Error::Invalid("workspace must be Unicode".into()))?
             .to_owned();
-        let permit = self
-            .0
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Busy)?;
+        let permit = self.0.slots.clone().try_acquire_owned().map_err(|_| {
+            self.0
+                .database
+                .record_rejection("agent.create", "agent_sessions");
+            self.0.database.record_recent_error(
+                "agent.create",
+                "agent_sessions",
+                "Agent session capacity exhausted",
+            );
+            Error::Backpressure(crate::error::ResourceBackpressure {
+                retry_after_ms: 1000,
+                operation: "agent.create".into(),
+                resource: "agent_sessions".into(),
+                queue_depth: self.count(),
+                queue_capacity: MAX_TURNS,
+                side_effect_committed: Some(false),
+            })
+        })?;
         let policy = if input.auto_approve {
             ApprovalPolicy::Auto
         } else {
@@ -787,7 +855,7 @@ impl Agents {
                     let profile = self
                         .0
                         .database
-                        .call(move |store| {
+                        .call_control("agent.create", move |store| {
                             Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile)
                         })
                         .await?;
@@ -813,7 +881,9 @@ impl Agents {
             let profile = self
                 .0
                 .database
-                .call(move |store| Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile))
+                .call_control("agent.create", move |store| {
+                    Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile)
+                })
                 .await?;
             match profile.as_ref().map(|profile| profile.protocol()) {
                 Some("openai_chat_completions") => {}
@@ -851,7 +921,7 @@ impl Agents {
         let head = self
             .0
             .database
-            .call(move |store| {
+            .call_control("agent.create", move |store| {
                 if let Some(account_id) = create.account_id.as_deref() {
                     if let Some(message) =
                         crate::accounts::source_bound_launch_error(&database, account_id)?
@@ -912,7 +982,7 @@ impl Agents {
                         }
                     }
                 }
-                store.create_agent_session(create, policy)
+                store.create_agent_session_with_id(create, policy, id)
             })
             .await?;
         let (ended, _) = watch::channel(());
@@ -1130,13 +1200,19 @@ impl Agents {
             .call(move |store| store.cross_model_child_needs_reactivation(&parent_id, &child_id))
             .await?;
         let permit = if needs_reactivation {
-            Some(
+            Some(self.0.slots.clone().try_acquire_owned().map_err(|_| {
                 self.0
-                    .slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| Error::Busy)?,
-            )
+                    .database
+                    .record_rejection("agent.follow_up", "agent_sessions");
+                Error::Backpressure(crate::error::ResourceBackpressure {
+                    retry_after_ms: 1000,
+                    operation: "agent.follow_up".into(),
+                    resource: "agent_sessions".into(),
+                    queue_depth: self.count(),
+                    queue_capacity: MAX_TURNS,
+                    side_effect_committed: Some(false),
+                })
+            })?)
         } else {
             None
         };
@@ -1712,11 +1788,13 @@ impl Agents {
             attachments.to_vec(),
         )
         .await?;
-        let id = id.to_owned();
-        self.0
-            .database
-            .call(move |store| store.append_agent_records(&id, vec![write]))
-            .await
+        let result = self.append_timeline_resilient(id, &[write], None).await;
+        if let Err(error) = &result
+            && !matches!(error, Error::Closed)
+        {
+            self.0.failed.store(true, Ordering::Release);
+        }
+        result
     }
 
     async fn expand_prompt(&self, workspace: &str, prompt: &str) -> Result<String> {
@@ -1745,7 +1823,7 @@ impl Agents {
             let id = id.to_owned();
             self.0
                 .database
-                .call(move |store| {
+                .call_control("session.launch", move |store| {
                     let run = store.agent_run(&id)?;
                     if !run.active {
                         return Err(Error::Conflict);
@@ -1758,14 +1836,18 @@ impl Agents {
             let id = id.to_owned();
             self.0
                 .database
-                .call(move |store| store.begin_agent_turn(&id))
+                .call_control("session.turn_start", move |store| {
+                    store.begin_agent_turn(&id)
+                })
                 .await?
         };
         let workspace = {
             let id = id.to_owned();
             self.0
                 .database
-                .call(move |store| Ok(store.session(&id)?.workspace))
+                .call_control("session.launch", move |store| {
+                    Ok(store.session(&id)?.workspace)
+                })
                 .await?
         };
         // Expand @file/$skill mentions for the CLI while the stored user
@@ -1796,12 +1878,14 @@ impl Agents {
             replace: false,
             subagent_id: None,
         };
+        if let Err(error) = self
+            .append_timeline_resilient(id, &[user_write], Some("session.launch"))
+            .await
         {
-            let id = id.to_owned();
-            self.0
-                .database
-                .call(move |store| store.append_agent_records(&id, vec![user_write]))
-                .await?;
+            if !matches!(error, Error::Closed) {
+                self.0.failed.store(true, Ordering::Release);
+            }
+            return Err(error);
         }
         let api_profile =
             Self::account_api_profile(&self.0.database, run.account_id.clone()).await?;
@@ -1903,22 +1987,20 @@ impl Agents {
                         subagent_id: None,
                     },
                 ];
-                let _ = {
-                    let id = id.to_owned();
-                    self.0
-                        .database
-                        .call(move |store| store.append_agent_records(&id, terminal))
-                        .await
-                };
-                let _ = {
-                    let id = id.to_owned();
-                    self.0
-                        .database
-                        .call(move |store| {
-                            store.finish_agent_turn_status(&id, SessionStatus::Failed)
-                        })
-                        .await
-                };
+                if let Err(storage) = self
+                    .append_timeline_resilient(id, &terminal, Some("event.turn_terminal"))
+                    .await
+                    && !matches!(storage, Error::Closed)
+                {
+                    self.0.failed.store(true, Ordering::Release);
+                }
+                if let Err(storage) = self
+                    .finish_turn_status_resilient(id, SessionStatus::Failed)
+                    .await
+                    && !matches!(storage, Error::Closed)
+                {
+                    self.0.failed.store(true, Ordering::Release);
+                }
                 self.publish();
                 return Err(error);
             }
@@ -2024,6 +2106,70 @@ impl Agents {
         });
     }
 
+    async fn append_timeline_resilient(
+        &self,
+        id: &str,
+        writes: &[TimelineWrite],
+        control_operation: Option<&str>,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let id = id.to_owned();
+            let batch = clone_timeline_writes(writes);
+            let result = if let Some(operation) = control_operation {
+                self.0
+                    .database
+                    .call_control(operation, move |store| {
+                        store.append_agent_records(&id, batch)
+                    })
+                    .await
+            } else {
+                self.0
+                    .database
+                    .call_background("event.timeline", move |store| {
+                        store.append_agent_records(&id, batch)
+                    })
+                    .await
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn set_native_id_resilient(&self, id: &str, turn: i64, native_id: &str) -> Result<()> {
+        loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let id = id.to_owned();
+            let native_id = native_id.to_owned();
+            let result = self
+                .0
+                .database
+                .call_control("session.native_id", move |store| {
+                    store.set_agent_native_id(&id, turn, &native_id)
+                })
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn drain_error(&self, id: &str, turn: i64, message: &str) {
         let write = TimelineWrite {
             id: format!("turn{turn}-drain-error"),
@@ -2034,12 +2180,7 @@ impl Agents {
             replace: false,
             subagent_id: None,
         };
-        let id = id.to_owned();
-        let _ = self
-            .0
-            .database
-            .call(move |store| store.append_agent_records(&id, vec![write]))
-            .await;
+        let _ = self.append_timeline_resilient(id, &[write], None).await;
         self.publish();
     }
 
@@ -2103,7 +2244,14 @@ impl Agents {
         {
             let mut waiter = handle.compact.lock().await;
             if waiter.is_some() {
-                return Err(Error::Busy);
+                return Err(Error::Backpressure(crate::error::ResourceBackpressure {
+                    retry_after_ms: 1000,
+                    operation: "agent.compact".into(),
+                    resource: "agent_compaction".into(),
+                    queue_depth: 1,
+                    queue_capacity: 1,
+                    side_effect_committed: Some(false),
+                }));
             }
             let (sender, receiver) = oneshot::channel();
             *waiter = Some(sender);
@@ -2163,21 +2311,16 @@ impl Agents {
 
         macro_rules! flush {
             () => {{
-                let writes = std::mem::take(&mut pending);
-                if !writes.is_empty() {
-                    let result = self
-                        .0
-                        .database
-                        .call({
-                            let id = id.clone();
-                            move |store| store.append_agent_records(&id, writes)
-                        })
-                        .await;
+                if !pending.is_empty() {
+                    let result = self.append_timeline_resilient(&id, &pending, None).await;
                     if let Err(error) = result {
-                        self.0.failed.store(true, Ordering::Release);
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
                         failure = Some(error.to_string());
                         break;
                     }
+                    pending.clear();
                 }
             }};
         }
@@ -2190,19 +2333,16 @@ impl Agents {
             match event {
                 AdapterEvent::NativeId(native_id) => {
                     if !native_persisted {
-                        native_persisted = true;
-                        let result = {
-                            let id = id.clone();
-                            let native = native_id;
-                            self.0
-                                .database
-                                .call(move |store| store.set_agent_native_id(&id, turn, &native))
-                                .await
-                        };
-                        if result.is_err() {
-                            failure = result.err().map(|error| error.to_string());
+                        if let Err(error) =
+                            self.set_native_id_resilient(&id, turn, &native_id).await
+                        {
+                            if !matches!(error, Error::Closed) {
+                                self.0.failed.store(true, Ordering::Release);
+                            }
+                            failure = Some(error.to_string());
                             break;
                         }
+                        native_persisted = true;
                     }
                 }
                 AdapterEvent::SubagentStarted {
@@ -2455,21 +2595,21 @@ impl Agents {
                         replace: false,
                         subagent_id: None,
                     };
-                    let result = self
-                        .0
-                        .database
-                        .call({
-                            let id = id.clone();
-                            move |store| store.append_agent_records(&id, vec![write])
-                        })
-                        .await;
-                    if result.is_err() {
-                        failure = result.err().map(|error| error.to_string());
+                    if let Err(error) = self.append_timeline_resilient(&id, &[write], None).await {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
                         break;
                     }
-                    self.set_status(&id, SessionStatus::WaitingPermission)
-                        .await
-                        .ok();
+                    if let Err(error) = self.set_status(&id, SessionStatus::WaitingPermission).await
+                    {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
+                        break;
+                    }
                 }
                 AdapterEvent::Question {
                     subagent,
@@ -2530,19 +2670,20 @@ impl Agents {
                         replace: false,
                         subagent_id: None,
                     };
-                    let result = self
-                        .0
-                        .database
-                        .call({
-                            let id = id.clone();
-                            move |store| store.append_agent_records(&id, vec![write])
-                        })
-                        .await;
-                    if result.is_err() {
-                        failure = result.err().map(|error| error.to_string());
+                    if let Err(error) = self.append_timeline_resilient(&id, &[write], None).await {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
                         break;
                     }
-                    self.set_status(&id, SessionStatus::WaitingInput).await.ok();
+                    if let Err(error) = self.set_status(&id, SessionStatus::WaitingInput).await {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
+                        break;
+                    }
                 }
                 AdapterEvent::Compact { ok, message } => {
                     if let Some(waiter) = handle.compact.lock().await.take() {
@@ -2642,13 +2783,15 @@ impl Agents {
             replace: false,
             subagent_id: None,
         });
-        let _ = {
-            let id = id.clone();
-            self.0
-                .database
-                .call(move |store| store.append_agent_records(&id, terminal))
-                .await
-        };
+        if let Err(error) = self
+            .append_timeline_resilient(&id, &terminal, Some("event.turn_terminal"))
+            .await
+        {
+            if !matches!(error, Error::Closed) {
+                self.0.failed.store(true, Ordering::Release);
+            }
+            return;
+        }
         let status = if failure.is_some() {
             SessionStatus::Failed
         } else {
@@ -2656,15 +2799,14 @@ impl Agents {
         };
         // Skip the write (and publish) when the session was archived while the
         // turn was still running; archival owns the terminal status then.
-        let updated = {
-            let id = id.clone();
-            self.0
-                .database
-                .call(move |store| store.finish_agent_turn_status(&id, status))
-                .await
-        };
-        if updated.unwrap_or(false) {
-            self.publish();
+        let updated = self.finish_turn_status_resilient(&id, status).await;
+        match updated {
+            Ok(true) => self.publish(),
+            Ok(false) | Err(Error::Closed) => {}
+            Err(_) => {
+                self.0.failed.store(true, Ordering::Release);
+                return;
+            }
         }
         // A cross-model child is a full independent session.  Once its first
         // assigned task settles, persist its outcome and rewrite the parent
@@ -2745,27 +2887,65 @@ impl Agents {
     }
 
     async fn set_status(&self, id: &str, status: SessionStatus) -> Result<SessionHead> {
-        let head = self
-            .0
-            .database
-            .call({
-                let id = id.to_owned();
-                move |store| {
-                    let head = store.session(&id)?;
-                    store.update_session(
-                        &id,
-                        UpdateSession {
-                            revision: head.revision,
-                            title: None,
-                            lifecycle: None,
-                            status: Some(status),
-                        },
-                    )
+        let head = loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let result = self
+                .0
+                .database
+                .call_control("session.status", {
+                    let id = id.to_owned();
+                    move |store| {
+                        let head = store.session(&id)?;
+                        if head.lifecycle == SessionLifecycle::Archived {
+                            return Err(Error::Closed);
+                        }
+                        store.update_session(
+                            &id,
+                            UpdateSession {
+                                revision: head.revision,
+                                title: None,
+                                lifecycle: None,
+                                status: Some(status),
+                            },
+                        )
+                    }
+                })
+                .await;
+            match result {
+                Ok(head) => break head,
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-            })
-            .await?;
+                Err(error) => return Err(error),
+            }
+        };
         self.publish();
         Ok(head)
+    }
+
+    async fn finish_turn_status_resilient(&self, id: &str, status: SessionStatus) -> Result<bool> {
+        loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let id = id.to_owned();
+            let result = self
+                .0
+                .database
+                .call_control("session.turn_finish", move |store| {
+                    store.finish_agent_turn_status(&id, status)
+                })
+                .await;
+            match result {
+                Ok(updated) => return Ok(updated),
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn publish(&self) {
@@ -3100,7 +3280,9 @@ impl Agents {
         };
         let data = database.directory().to_owned();
         database
-            .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+            .call_control("session.account_profile", move |store| {
+                Ok(store.managed_snapshot_row(&data, &id)?.api_profile)
+            })
             .await
     }
 
@@ -3117,7 +3299,7 @@ impl Agents {
         };
         let data = database.directory().to_owned();
         let record = database
-            .call({
+            .call_control("session.account_environment", {
                 let data = data.clone();
                 let id = id.clone();
                 move |store| store.managed_snapshot_row(&data, &id)
@@ -3810,7 +3992,9 @@ impl Agents {
         let archived = id.to_owned();
         self.0
             .database
-            .call(move |store| store.archive_agent_session(&archived, true))
+            .call_control("agent.close", move |store| {
+                store.archive_agent_session(&archived, true)
+            })
             .await?;
         if let Ok(entry) = self.session_entry(id).await {
             if let Some(handle) = entry.handle.lock().await.take() {
@@ -3828,8 +4012,16 @@ impl Agents {
                 let mut ended = entry.ended.subscribe();
                 let _ = tokio::time::timeout(Duration::from_secs(3), ended.changed()).await;
             }
+            entry.permit.lock().await.take();
             self.0.entries.lock().await.remove(id);
         }
+        let archived = id.to_owned();
+        self.0
+            .database
+            .call_control("dispatch.reconcile", move |store| {
+                store.reconcile_dispatch_session(&archived)
+            })
+            .await?;
         self.publish();
         Ok(())
     }
@@ -3841,7 +4033,7 @@ impl Agents {
         let ids: Vec<String> = self
             .0
             .database
-            .call(|store| {
+            .call_control("agent.close", |store| {
                 let mut statement = store.connection.prepare(
                     "SELECT session_id FROM agent_runs WHERE active=1 ORDER BY session_id",
                 )?;
@@ -3855,7 +4047,9 @@ impl Agents {
             let id = id.clone();
             self.0
                 .database
-                .call(move |store| store.archive_agent_session(&id, true))
+                .call_control("agent.close", move |store| {
+                    store.archive_agent_session(&id, true)
+                })
                 .await?;
         }
         Ok(ids.len())
@@ -3962,4 +4156,46 @@ fn bounded_text(mut text: String) -> String {
     }
     text.truncate(end);
     text
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn late_status_update_does_not_change_an_archived_session() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let head = agents
+            .create(CreateAgentSession {
+                agent: AgentKind::Claude,
+                title: "late status".into(),
+                workspace: root.path().to_string_lossy().into_owned(),
+                auto_approve: false,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id: None,
+                resume: None,
+            })
+            .await
+            .unwrap();
+        agents.close(&head.id).await.unwrap();
+        assert!(matches!(
+            agents
+                .set_status(&head.id, SessionStatus::WaitingInput)
+                .await,
+            Err(Error::Closed)
+        ));
+        assert!(agents.check().is_ok());
+        let current = database
+            .read("test.closed_session", move |store| store.session(&head.id))
+            .await
+            .unwrap();
+        assert_eq!(current.lifecycle, SessionLifecycle::Archived);
+        assert_eq!(current.status, SessionStatus::Failed);
+        database.shutdown().await.unwrap();
+    }
 }

@@ -7,6 +7,35 @@ const token = "a".repeat(64);
 const head: SessionHead = { id: "fixture", agent: "codex", kind: "structured", title: "Example", workspace: "/synthetic", lifecycle: "archived", status: "completed", createdAt: 1, updatedAt: 1, revision: 1 };
 
 describe("Rust desktop API boundary", () => {
+  it("polls an accepted worker start without submitting another launch", async () => {
+    const outcome = { task: { id: "task-1" }, dispatch: { id: "dispatch-1" }, sessionId: "session-1", worktree: null };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "queued", operation: { operationId: "operation-1", phase: "queued" } }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ operationId: "operation-1", phase: "running", outcome })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    const input = { taskId: "task-1", cwd: "/synthetic", agent: "codex", worktree: "none", skills: [], approvalPolicy: "standard", accountId: null, operationId: "operation-1" } as const;
+    await expect(client.startWorker({ ...input, skills: [] })).resolves.toEqual(outcome);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0]![1]?.headers).toMatchObject({ prefer: "respond-async" });
+    expect(String(fetcher.mock.calls[1]![0])).toMatch(/\/v1\/workers\/start-operations\/operation-1$/);
+    expect(fetcher.mock.calls[1]![1]?.method).toBeUndefined();
+  });
+
+  it("does not retry a worker launch whose delivery is unknown", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ status: "delivery_unknown", operation: { operationId: "operation-1", phase: "delivery_unknown", error: "Delivery requires reconciliation" } }), { status: 202 }));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await expect(client.startWorker({ taskId: "task-1", cwd: "/synthetic", agent: "codex", worktree: "none", skills: [], approvalPolicy: "standard", accountId: null, operationId: "operation-1" })).rejects.toThrow("Delivery requires reconciliation");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("reads task activities in a single run-scoped request", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ activities: [] })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await expect(client.taskActivities("run-1", ["task-1", "task-2"])).resolves.toEqual({ activities: [] });
+    expect(String(fetcher.mock.calls[0]![0])).toMatch(/\/v1\/runs\/run-1\/task-activities$/);
+    expect(fetcher.mock.calls[0]![1]?.body).toBe(JSON.stringify({ taskIds: ["task-1", "task-2"] }));
+  });
+
   it("waits for terminal input acknowledgement without the generic RPC deadline, but remains cancellable", async () => {
     const controller = new AbortController();
     const timeout = vi.spyOn(AbortSignal, "timeout");

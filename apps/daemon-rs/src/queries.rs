@@ -67,6 +67,10 @@ impl Store {
     }
 
     pub fn session_summary(&self, workspace: Option<&str>) -> Result<SessionSummary> {
+        self.read_snapshot(|| self.session_summary_inner(workspace))
+    }
+
+    fn session_summary_inner(&self, workspace: Option<&str>) -> Result<SessionSummary> {
         if let Some(workspace) = workspace {
             validate_text(workspace, 4096, false)?;
         }
@@ -97,6 +101,10 @@ impl Store {
     }
 
     pub fn workspaces(&self, query: WorkspaceQuery) -> Result<WorkspacePage> {
+        self.read_snapshot(|| self.workspaces_inner(query))
+    }
+
+    fn workspaces_inner(&self, query: WorkspaceQuery) -> Result<WorkspacePage> {
         let limit = page_limit(query.limit)?;
         if let Some(cursor) = &query.cursor {
             validate_text(cursor, 4096, false)?;
@@ -148,6 +156,10 @@ impl Store {
     }
 
     pub fn lookup_sessions(&self, input: SessionLookup) -> Result<SessionLookupResult> {
+        self.read_snapshot(|| self.lookup_sessions_inner(input))
+    }
+
+    fn lookup_sessions_inner(&self, input: SessionLookup) -> Result<SessionLookupResult> {
         if input.ids.len() > 100 {
             return Err(Error::Invalid("lookup limit must be at most 100".into()));
         }
@@ -175,34 +187,36 @@ impl Store {
     }
 
     pub fn sidebar_lookup_sessions(&self, input: SessionLookup) -> Result<SessionLookupResult> {
-        let result = self.lookup_sessions(input)?;
-        let mut items = Vec::with_capacity(result.items.len());
-        let mut missing_ids = result.missing_ids;
-        for head in result.items {
-            let child: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1)",
-                [&head.id],
-                |row| row.get(0),
-            )?;
-            if child {
-                missing_ids.push(head.id);
-            } else {
-                items.push(head);
+        self.read_snapshot(|| {
+            let result = self.lookup_sessions_inner(input)?;
+            let mut items = Vec::with_capacity(result.items.len());
+            let mut missing_ids = result.missing_ids;
+            for head in result.items {
+                let child: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1)",
+                    [&head.id],
+                    |row| row.get(0),
+                )?;
+                if child {
+                    missing_ids.push(head.id);
+                } else {
+                    items.push(head);
+                }
             }
-        }
-        Ok(SessionLookupResult {
-            items,
-            missing_ids,
-            latest_seq: result.latest_seq,
+            Ok(SessionLookupResult {
+                items,
+                missing_ids,
+                latest_seq: result.latest_seq,
+            })
         })
     }
 
     pub fn sessions(&self, query: SessionQuery) -> Result<SessionPage> {
-        self.sessions_filtered(query, false)
+        self.read_snapshot(|| self.sessions_filtered(query, false))
     }
 
     pub fn sidebar_sessions(&self, query: SessionQuery) -> Result<SessionPage> {
-        self.sessions_filtered(query, true)
+        self.read_snapshot(|| self.sessions_filtered(query, true))
     }
 
     fn sessions_filtered(

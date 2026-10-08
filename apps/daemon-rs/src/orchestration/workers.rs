@@ -18,26 +18,11 @@ use super::gitops::{
     WorktreeCreate, create_worktree, delete_branch, inspect_asset, remove_worktree, repo_root,
     worktree_default_path,
 };
-use super::store::{OperationReplay, fingerprint};
 use super::*;
 use crate::agent::{Agents, CreateAgentSession};
 use crate::database::{now, validate_text};
 use crate::error::{Error, Result};
 use crate::worker::Database;
-
-fn to_base36(mut value: u128) -> String {
-    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    if value == 0 {
-        return "0".into();
-    }
-    let mut out = Vec::new();
-    while value > 0 {
-        out.push(DIGITS[(value % 36) as usize]);
-        value /= 36;
-    }
-    out.reverse();
-    String::from_utf8(out).unwrap_or_default()
-}
 
 fn worker_prompt(
     task: &Task,
@@ -87,10 +72,11 @@ fn canonical(path: &Path) -> PathBuf {
 /// disk resource is indexed even if the next step crashes) → agent session →
 /// dispatch row + task `dispatched` in one transaction → worker brief →
 /// dispatch `running`.
-pub async fn start_worker(
+pub(super) async fn launch_worker_start(
     database: &Database,
     agents: &Agents,
     input: StartWorker,
+    operation_id: &str,
 ) -> Result<WorkerStartOutcome> {
     validate_text(&input.cwd, 4096, false)?;
     if !Path::new(&input.cwd).is_absolute() {
@@ -139,7 +125,9 @@ pub async fn start_worker(
             let data = database.directory().to_owned();
             let id = id.to_owned();
             let record = database
-                .call(move |store| store.managed_snapshot_row(&data, &id))
+                .call_control("worker.start.account", move |store| {
+                    store.managed_snapshot_row(&data, &id)
+                })
                 .await?;
             if input.agent == crate::protocol::AgentKind::Opencode {
                 match record
@@ -158,42 +146,17 @@ pub async fn start_worker(
             Some(record.id)
         }
     };
-    let operation_id = match &input.operation_id {
-        Some(id) => {
-            crate::database::validate_id(id)?;
-            Some(id.clone())
-        }
-        None => None,
-    };
-    let request_fingerprint = fingerprint(
-        "worker.start",
-        &serde_json::json!({
-            "taskId": input.task_id,
-            "cwd": input.cwd,
-            "worktree": input.worktree,
-        }),
-    );
-    if let Some(id) = &operation_id {
-        let replay = {
-            let id = id.clone();
-            let fp = request_fingerprint.clone();
-            database
-                .call(move |store| store.probe_operation::<WorkerStartOutcome>(&id, &fp))
-                .await?
-        };
-        if let OperationReplay::Replay(outcome) = replay {
-            return Ok(outcome);
-        }
-    }
-
-    // Load the task and owning run.
     let task = {
         let id = input.task_id.clone();
-        database.call(move |store| store.task(&id)).await?
+        database
+            .call_control("worker.start.task", move |store| store.task(&id))
+            .await?
     };
     let run = {
         let id = task.run_id.clone();
-        database.call(move |store| store.orch_run(&id)).await?
+        database
+            .call_control("worker.start.run", move |store| store.orch_run(&id))
+            .await?
     };
     if run.status != RunStatus::Active {
         return Err(Error::Invalid(
@@ -203,9 +166,7 @@ pub async fn start_worker(
     if matches!(
         run.automation.as_ref().map(|automation| automation.state),
         Some(AutomationState::Running)
-    ) && !operation_id
-        .as_deref()
-        .is_some_and(|id| id.starts_with("automation-"))
+    ) && !operation_id.starts_with("automation-")
     {
         return Err(Error::Invalid(
             "任务图正在自动执行；请先暂停，再编辑或手工派发".into(),
@@ -216,14 +177,31 @@ pub async fn start_worker(
     let mut asset: Option<WorktreeAsset> = None;
     let worker_cwd = if mode == "new" {
         let cwd = input.cwd.clone();
-        let stamp = to_base36(now() as u128);
+        let stamp = super::store::fingerprint("worker.start.worktree", &operation_id);
         let name = format!("worker-{}-{}", task.id, stamp);
         let branch = format!("prospero/{}/{}/{}", task.run_id, task.id, stamp);
-        let created = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, String)> {
+        let planned = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, String)> {
             let repo = repo_root(Path::new(&cwd))?.ok_or_else(|| {
                 Error::Invalid(format!("{cwd} 不在 git 仓库中，不能创建 worktree"))
             })?;
             let path = worktree_default_path(&repo, &name);
+            Ok((canonical(&repo), path, branch))
+        })
+        .await
+        .map_err(|_| Error::Closed)??;
+        let (repo, path, branch) = planned;
+        {
+            let id = operation_id.to_owned();
+            let repo = repo.to_string_lossy().into_owned();
+            let path = path.to_string_lossy().into_owned();
+            let branch = branch.clone();
+            database
+                .call_control("worker.start.plan_worktree", move |store| {
+                    store.plan_worker_start_worktree(&id, &repo, &path, &branch)
+                })
+                .await?;
+        }
+        let created = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, String)> {
             create_worktree(
                 &repo,
                 &WorktreeCreate {
@@ -237,20 +215,24 @@ pub async fn start_worker(
         .map_err(|_| Error::Closed)??;
         let (repo, path, branch) = created;
         let registered = {
+            let operation_id = operation_id.to_owned();
             let run_id = task.run_id.clone();
             let task_id = task.id.clone();
             let repo_text = repo.to_string_lossy().into_owned();
             let path_text = path.to_string_lossy().into_owned();
             database
-                .call(move |store| {
-                    store.register_worktree_asset(RegisterWorktree {
-                        kind: WorktreeAssetKind::Worker,
-                        run_id,
-                        task_id: Some(task_id),
-                        repo: repo_text,
-                        path: path_text,
-                        branch: Some(branch),
-                    })
+                .call_control("worker.start.record_worktree", move |store| {
+                    store.record_worker_start_worktree(
+                        &operation_id,
+                        RegisterWorktree {
+                            kind: WorktreeAssetKind::Worker,
+                            run_id,
+                            task_id: Some(task_id),
+                            repo: repo_text,
+                            path: path_text,
+                            branch: Some(branch),
+                        },
+                    )
                 })
                 .await?
         };
@@ -293,7 +275,9 @@ pub async fn start_worker(
                         error_message(&error)
                     );
                     let _ = database
-                        .call(move |store| store.preserve_worktree_asset(&id, Some(&message)))
+                        .call_control("worker.start.preserve_worktree", move |store| {
+                            store.preserve_worktree_asset(&id, Some(&message))
+                        })
                         .await;
                 }
                 return Err(error);
@@ -311,19 +295,32 @@ pub async fn start_worker(
             raw
         }
     };
+    let session_id = super::start::worker_session_id(operation_id);
+    {
+        let operation_id = operation_id.to_owned();
+        let session_id = session_id.clone();
+        database
+            .call_control("worker.start.plan_session", move |store| {
+                store.plan_worker_start_session(&operation_id, &session_id)
+            })
+            .await?;
+    }
     let head = match agents
-        .create(CreateAgentSession {
-            agent: input.agent,
-            title,
-            workspace: worker_cwd.clone(),
-            auto_approve: policy,
-            mode: None,
-            model: None,
-            effort: None,
-            agent_preset: None,
-            account_id,
-            resume: None,
-        })
+        .create_with_id(
+            CreateAgentSession {
+                agent: input.agent,
+                title,
+                workspace: worker_cwd.clone(),
+                auto_approve: policy,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id,
+                resume: None,
+            },
+            session_id.clone(),
+        )
         .await
     {
         Ok(head) => head,
@@ -335,27 +332,54 @@ pub async fn start_worker(
                     error_message(&error)
                 );
                 let _ = database
-                    .call(move |store| store.preserve_worktree_asset(&id, Some(&message)))
+                    .call_control("worker.start.preserve_worktree", move |store| {
+                        store.preserve_worktree_asset(&id, Some(&message))
+                    })
                     .await;
             }
             return Err(error);
         }
     };
+    let recorded_session = {
+        let operation_id = operation_id.to_owned();
+        let session_id = head.id.clone();
+        database
+            .call_control("worker.start.record_session", move |store| {
+                store.record_worker_start_session(&operation_id, &session_id)
+            })
+            .await
+    };
+    if let Err(error) = recorded_session {
+        let _ = agents.close(&head.id).await;
+        if let Some(asset) = &asset {
+            let id = asset.id.clone();
+            let message = format!(
+                "worker 会话登记失败；已保留工作树和分支：{}",
+                error_message(&error)
+            );
+            let _ = database
+                .call_control("worker.start.preserve_worktree", move |store| {
+                    store.preserve_worktree_asset(&id, Some(&message))
+                })
+                .await;
+        }
+        return Err(error);
+    }
 
     // ── Dispatch row + asset link (one transaction) ────────────────────────
     let outcome = {
         let task_id = task.id.clone();
+        let operation_id = operation_id.to_owned();
         let session_id = head.id.clone();
         let worktree_path = asset.as_ref().map(|value| value.path.clone());
-        let asset_id = asset.as_ref().map(|value| value.id.clone());
         database
-            .call(move |store| {
-                let outcome =
-                    store.dispatch_task(&task_id, &session_id, None, worktree_path.as_deref())?;
-                if let Some(asset_id) = &asset_id {
-                    store.link_worktree_dispatch(asset_id, &outcome.dispatch.id)?;
-                }
-                Ok(outcome)
+            .call_control("worker.start.commit_dispatch", move |store| {
+                store.commit_worker_start_dispatch(
+                    &operation_id,
+                    &task_id,
+                    &session_id,
+                    worktree_path.as_deref(),
+                )
             })
             .await
     };
@@ -371,7 +395,9 @@ pub async fn start_worker(
                     error_message(&error)
                 );
                 let _ = database
-                    .call(move |store| store.preserve_worktree_asset(&id, Some(&message)))
+                    .call_control("worker.start.preserve_worktree", move |store| {
+                        store.preserve_worktree_asset(&id, Some(&message))
+                    })
                     .await;
             }
             return Err(error);
@@ -386,57 +412,31 @@ pub async fn start_worker(
         run.coordinator_session_id.as_deref(),
         &skill_names,
     );
+    {
+        let operation_id = operation_id.to_owned();
+        database
+            .call_control("worker.start.delivery", move |store| {
+                store.mark_worker_start_delivering(&operation_id)
+            })
+            .await?;
+    }
     if let Err(error) = agents.send(&head.id, prompt, None, Vec::new()).await {
         let reason = format!("worker prompt delivery failed: {}", error_message(&error));
         let _ = agents.close(&head.id).await;
-        let dispatch_id = outcome.dispatch.id.clone();
-        let task_id = outcome.task.id.clone();
+        let operation_id = operation_id.to_owned();
         let _ = database
-            .call(move |store| {
-                store.abandon_dispatch(&dispatch_id, &reason, TaskStatus::Failed)?;
-                store.task(&task_id)
+            .call_control("worker.start.delivery_failed", move |store| {
+                store.fail_worker_start_delivery(&operation_id, &reason)
             })
             .await;
         return Err(error);
     }
-    let dispatch_id = outcome.dispatch.id.clone();
-    let dispatch = {
-        let id = dispatch_id.clone();
-        database
-            .call(move |store| {
-                let current = store.dispatch(&id)?;
-                if current.state == DispatchState::Starting {
-                    store.set_dispatch_running(&id)
-                } else {
-                    // A very fast manual delivery can already have settled it.
-                    Ok(current)
-                }
-            })
-            .await?
-    };
-
-    if asset.is_some() {
-        let id = asset.as_ref().expect("asset present").id.clone();
-        let refreshed = database
-            .call(move |store| store.worktree_asset(&id))
-            .await?;
-        asset = Some(refreshed);
-    }
-    let result = WorkerStartOutcome {
-        task: outcome.task,
-        dispatch,
-        session_id: head.id.clone(),
-        worktree: asset,
-    };
-    if let Some(id) = &operation_id {
-        let id = id.clone();
-        let fp = request_fingerprint;
-        let frozen = result.clone();
-        database
-            .call(move |store| store.remember_operation(&id, &fp, &frozen))
-            .await?;
-    }
-    Ok(result)
+    let operation_id = operation_id.to_owned();
+    database
+        .call_control("worker.start.complete", move |store| {
+            store.complete_worker_start(&operation_id)
+        })
+        .await
 }
 
 /// Stop a live worker: kill its agent session and converge the dispatch to
@@ -466,30 +466,38 @@ pub async fn stop_worker(
     let live = {
         let id = input.task_id.clone();
         database
-            .call(move |store| store.live_dispatch_for_task(&id))
+            .call_control("worker.stop.live_dispatch", move |store| {
+                store.live_dispatch_for_task(&id)
+            })
             .await?
     };
     let Some(dispatch) = live else {
         // Idempotent replay shape: nothing live to stop.
         let task_id = input.task_id.clone();
-        let task = database.call(move |store| store.task(&task_id)).await?;
-        let run_id = task.run_id.clone();
-        let dispatches = database
-            .call(move |store| store.list_dispatches(Some(&run_id)))
+        let task = database
+            .call_control("worker.stop.task", move |store| store.task(&task_id))
             .await?;
-        let dispatch = dispatches
-            .into_iter()
-            .filter(|candidate| candidate.task_id == task.id)
-            .max_by_key(|candidate| candidate.started_at)
+        let task_id = task.id.clone();
+        let dispatch = database
+            .call_control("worker.stop.dispatch", move |store| {
+                store.latest_dispatch_for_task(&task_id)
+            })
+            .await?
             .ok_or(Error::NotFound)?;
+        match agents.close(&dispatch.session_id).await {
+            Ok(()) | Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
         return Ok(SettleOutcome { task, dispatch });
     };
-    agents.close(&dispatch.session_id).await?;
     let dispatch_id = dispatch.id.clone();
     let reason_text = reason.clone();
     let outcome = database
-        .call(move |store| store.abandon_dispatch(&dispatch_id, &reason_text, final_status))
+        .call_control("worker.stop.settle", move |store| {
+            store.abandon_dispatch(&dispatch_id, &reason_text, final_status)
+        })
         .await?;
+    agents.close(&dispatch.session_id).await?;
     Ok(outcome)
 }
 
@@ -695,7 +703,7 @@ fn asset_state(state: WorktreeAssetState) -> &'static str {
     }
 }
 
-fn error_message(error: &Error) -> String {
+pub(super) fn error_message(error: &Error) -> String {
     match error {
         Error::Invalid(message) => message.clone(),
         other => other.to_string(),

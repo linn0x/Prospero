@@ -3876,14 +3876,29 @@ impl Desktop {
                             text(format!("{} / {}", service.plugin_id, service.service_id))
                                 .size(theme::TEXT_BODY)
                                 .width(Fill),
-                            text(format!("{:?} · {:?}", service.status, service.health))
-                                .size(theme::TEXT_CAPTION)
-                                .color(if running {
+                            text(format!(
+                                "{:?} · {:?} · {:?}",
+                                service.status, service.health, service.runtime_health
+                            ))
+                            .size(theme::TEXT_CAPTION)
+                            .color(
+                                if service.runtime_health
+                                    != prospero_protocol_rs::RuntimeHealthStatus::Healthy
+                                {
+                                    tokens.danger
+                                } else if running {
                                     tokens.success
                                 } else {
                                     tokens.muted
-                                }),
+                                }
+                            ),
                         ],
+                        text(service.degraded_reasons.join(" · "))
+                            .size(theme::TEXT_CAPTION)
+                            .color(tokens.danger),
+                        text(service.recent_errors.join("\n"))
+                            .size(theme::TEXT_CAPTION)
+                            .color(tokens.muted),
                         row![
                             button(if running { "停止" } else { "启动" }).on_press(
                                 Message::PluginAction {

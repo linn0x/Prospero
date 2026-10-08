@@ -1,14 +1,17 @@
 //! Stage 7 acceptance tests: indexed readiness, idempotent dispatch, gates,
 //! collaboration messages and set-based crash recovery.
 
+use prosperod_rs::agent::{ApprovalPolicy, CreateAgentSession};
 use prosperod_rs::database::Store;
 use prosperod_rs::error::Error;
 use prosperod_rs::orchestration::{
     ApplyTaskGraph, CreateGate, CreateRunGraph, DispatchState, GateStatus, GraphNodeInput,
-    MarkMessages, MessageType, PostMessage, RunStatus, TaskStatus, can_transition, find_cycle,
+    MarkMessages, MessageType, PostMessage, RunStatus, TaskActivityQuery, TaskStatus,
+    can_transition, find_cycle,
 };
 use prosperod_rs::protocol::{
-    AgentKind, CreateSession, SessionKind, SessionLifecycle, UpdateSession,
+    AgentKind, CreateSession, MessageRole, SessionKind, SessionLifecycle, SessionStatus,
+    TimelineBody, TimelineWrite, UpdateSession,
 };
 use rusqlite::params;
 use std::collections::HashMap;
@@ -409,7 +412,7 @@ fn abandon_preserves_an_explicit_done_delivery() {
 }
 
 #[test]
-fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
+fn recovery_abandons_orphans_without_promoting_live_starts_and_is_idempotent() {
     let directory = TempDir::new().unwrap();
     let mut store = Store::open(directory.path()).unwrap();
 
@@ -453,8 +456,6 @@ fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
         .unwrap();
     assert_eq!(d_missing.dispatch.state, DispatchState::Starting);
 
-    // Run C: a still-'starting' dispatch whose session survived. It must be
-    // promoted to running, not abandoned.
     let (run_c, c) = make_run(&mut store, "op-graph-recover-c", chain(1));
     let d_live_start = store
         .dispatch_task(&c["n0"], &live_session.id, None, None)
@@ -478,16 +479,13 @@ fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
         .unwrap();
     drop(connection);
 
-    // One set-based pass settles both orphans and resumes the live start.
     let report = store.recover_dispatches().unwrap();
     let mut settled: Vec<String> = report.settled.iter().map(|d| d.id.clone()).collect();
     settled.sort();
     let mut expected_settled = vec![d1.dispatch.id.clone(), d_missing.dispatch.id.clone()];
     expected_settled.sort();
     assert_eq!(settled, expected_settled);
-    assert_eq!(report.resumed.len(), 1);
-    assert_eq!(report.resumed[0].id, d_live_start.dispatch.id);
-    assert_eq!(report.resumed[0].state, DispatchState::Running);
+    assert!(report.resumed.is_empty());
 
     assert_eq!(store.task(&a["n1"]).unwrap().status, TaskStatus::Failed);
     assert_eq!(store.task(&b["n0"]).unwrap().status, TaskStatus::Failed);
@@ -501,6 +499,9 @@ fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
         DispatchState::Abandoned
     );
     assert_eq!(store.task(&a["n0"]).unwrap().status, TaskStatus::Done);
+    let health = store.dispatch_activity_health(i64::MAX).unwrap();
+    assert_eq!(health.stale_dispatch_count, 1);
+    assert_eq!(health.terminal_misalignment_count, 0);
 
     // Re-running the pass changes nothing: recovery is idempotent.
     let again = store.recover_dispatches().unwrap();
@@ -519,9 +520,244 @@ fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
     );
     assert_eq!(
         reopened.dispatch(&d_live_start.dispatch.id).unwrap().state,
-        DispatchState::Running
+        DispatchState::Starting
     );
     let _ = (run_a, run_b, run_c);
+}
+
+#[test]
+fn active_completed_turn_stays_dispatched_until_explicit_settlement() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let session = store
+        .create_agent_session(
+            CreateAgentSession {
+                agent: AgentKind::Codex,
+                title: "worker".into(),
+                workspace: "/w".into(),
+                auto_approve: true,
+                mode: None,
+                model: None,
+                effort: None,
+                account_id: None,
+                resume: None,
+                agent_preset: None,
+            },
+            ApprovalPolicy::Auto,
+        )
+        .unwrap();
+    let (run_id, ids) = make_run(&mut store, "op-completed-turn", chain(1));
+    let dispatch = store
+        .dispatch_task(&ids["n0"], &session.id, None, None)
+        .unwrap();
+    store.set_dispatch_running(&dispatch.dispatch.id).unwrap();
+    store
+        .update_session(
+            &session.id,
+            UpdateSession {
+                revision: session.revision,
+                title: None,
+                lifecycle: None,
+                status: Some(SessionStatus::Completed),
+            },
+        )
+        .unwrap();
+    let report = store.recover_dispatches().unwrap();
+    assert!(report.settled.is_empty());
+    assert_eq!(
+        store.task(&ids["n0"]).unwrap().status,
+        TaskStatus::Dispatched
+    );
+    assert_eq!(
+        store.dispatch(&dispatch.dispatch.id).unwrap().state,
+        DispatchState::Running
+    );
+    let _ = run_id;
+}
+
+#[test]
+fn archived_structured_session_fails_dispatch_and_preserves_explicit_delivery() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let create = || CreateAgentSession {
+        agent: AgentKind::Codex,
+        title: "worker".into(),
+        workspace: "/w".into(),
+        auto_approve: true,
+        mode: None,
+        model: None,
+        effort: None,
+        account_id: None,
+        resume: None,
+        agent_preset: None,
+    };
+    let failed_session = store
+        .create_agent_session(create(), ApprovalPolicy::Auto)
+        .unwrap();
+    let delivered_session = store
+        .create_agent_session(create(), ApprovalPolicy::Auto)
+        .unwrap();
+    let (_, failed_ids) = make_run(&mut store, "op-archive-failed", chain(1));
+    let (_, delivered_ids) = make_run(&mut store, "op-archive-delivered", chain(1));
+    let failed = store
+        .dispatch_task(&failed_ids["n0"], &failed_session.id, None, None)
+        .unwrap();
+    let delivered = store
+        .dispatch_task(&delivered_ids["n0"], &delivered_session.id, None, None)
+        .unwrap();
+    let connection = raw(&directory);
+    connection
+        .execute(
+            "UPDATE orch_tasks SET status='done',result='explicit delivery' WHERE id=?1",
+            [&delivered_ids["n0"]],
+        )
+        .unwrap();
+    drop(connection);
+    store
+        .archive_agent_session(&failed_session.id, true)
+        .unwrap();
+    store
+        .archive_agent_session(&delivered_session.id, false)
+        .unwrap();
+    let report = store.recover_dispatches().unwrap();
+    assert_eq!(report.settled.len(), 2);
+    assert_eq!(
+        store.task(&failed_ids["n0"]).unwrap().status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        store.dispatch(&failed.dispatch.id).unwrap().state,
+        DispatchState::Abandoned
+    );
+    assert_eq!(
+        store.task(&delivered_ids["n0"]).unwrap().status,
+        TaskStatus::Done
+    );
+    assert_eq!(
+        store.dispatch(&delivered.dispatch.id).unwrap().state,
+        DispatchState::Succeeded
+    );
+}
+
+#[test]
+fn task_activity_batch_preserves_order_dependencies_and_progress() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let session = store
+        .create_agent_session(
+            CreateAgentSession {
+                agent: AgentKind::Codex,
+                title: "worker".into(),
+                workspace: "/w".into(),
+                auto_approve: true,
+                mode: None,
+                model: None,
+                effort: None,
+                account_id: None,
+                resume: None,
+                agent_preset: None,
+            },
+            ApprovalPolicy::Auto,
+        )
+        .unwrap();
+    let (run_id, ids) = make_run(&mut store, "op-activity", chain(2));
+    store
+        .dispatch_task(&ids["n0"], &session.id, None, None)
+        .unwrap();
+    store
+        .write_timeline(
+            &session.id,
+            TimelineWrite {
+                id: "answer".into(),
+                turn_id: "turn1".into(),
+                expected_revision: 0,
+                body: TimelineBody::Message {
+                    role: MessageRole::Assistant,
+                    final_answer: true,
+                    attachments: Vec::new(),
+                },
+                text: "done".into(),
+                replace: false,
+                subagent_id: None,
+            },
+        )
+        .unwrap();
+    store
+        .write_timeline(
+            &session.id,
+            TimelineWrite {
+                id: "turn-end".into(),
+                turn_id: "turn1".into(),
+                expected_revision: 0,
+                body: TimelineBody::TurnEnd {
+                    finish: "completed".into(),
+                    diffs: Vec::new(),
+                },
+                text: String::new(),
+                replace: false,
+                subagent_id: None,
+            },
+        )
+        .unwrap();
+    store
+        .update_session(
+            &session.id,
+            UpdateSession {
+                revision: session.revision,
+                title: None,
+                lifecycle: None,
+                status: Some(SessionStatus::Failed),
+            },
+        )
+        .unwrap();
+    let result = store
+        .task_activities(
+            &run_id,
+            TaskActivityQuery {
+                task_ids: vec![ids["n1"].clone(), ids["n0"].clone()],
+            },
+        )
+        .unwrap();
+    assert_eq!(result.activities[0].task.id, ids["n1"]);
+    assert_eq!(result.activities[0].deps[0].task_id, ids["n0"]);
+    assert_eq!(result.activities[1].task.id, ids["n0"]);
+    assert_eq!(
+        result.activities[1].turn_finish.as_deref(),
+        Some("completed")
+    );
+    assert!(result.activities[1].last_output_at.is_some());
+    assert!(result.activities[1].last_progress_at.is_some());
+    assert_eq!(
+        result.activities[1].terminal_hint.as_deref(),
+        Some("latest worker turn failed; session remains active")
+    );
+    let health = store.dispatch_activity_health(i64::MAX).unwrap();
+    assert_eq!(health.stale_dispatch_count, 1);
+    assert_eq!(health.terminal_misalignment_count, 0);
+
+    let (other_run, other) = make_run(&mut store, "op-activity-other", chain(1));
+    assert!(matches!(
+        store.task_activities(
+            &run_id,
+            TaskActivityQuery {
+                task_ids: vec![other["n0"].clone()],
+            },
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        store.task_activities(&other_run, TaskActivityQuery { task_ids: vec![] },),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        store.task_activities(
+            &run_id,
+            TaskActivityQuery {
+                task_ids: vec![ids["n0"].clone(); 201],
+            },
+        ),
+        Err(Error::Invalid(_))
+    ));
 }
 
 #[test]
@@ -804,7 +1040,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, 32);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -1042,7 +1278,7 @@ fn v8_database_is_migrated_forward_to_current_schema() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, 32);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
@@ -1072,7 +1308,7 @@ fn v9_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        30
+        32
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -1131,7 +1367,7 @@ fn v10_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        30
+        32
     );
     let mode: String = connection
         .query_row(
@@ -1191,7 +1427,7 @@ fn v11_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        30
+        32
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1288,7 +1524,7 @@ fn v12_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        30
+        32
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1386,7 +1622,7 @@ fn v13_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        30
+        32
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -1474,7 +1710,7 @@ fn v14_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        30
+        32
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -1582,7 +1818,7 @@ fn v15_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        30
+        32
     );
     let has_engine_validation_column: i64 = connection
         .query_row(

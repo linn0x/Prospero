@@ -15,7 +15,7 @@ use prosperod_rs::{
         CreateTerminal, TerminalEvent, TerminalInput, TerminalQuery, TerminalSize,
         runtime::Terminals,
     },
-    worker::Database,
+    worker::{Database, DatabaseOptions},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -108,6 +108,141 @@ async fn stable_checkpoint_count(connection: &rusqlite::Connection) -> i64 {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+async fn transient_database_backpressure_does_not_fail_a_live_terminal() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open_with_options(
+        directory.path().into(),
+        None,
+        DatabaseOptions {
+            background_queue_capacity: 1,
+            background_waiter_capacity: 4,
+            background_enqueue_timeout: Duration::from_millis(30),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let runtime = Terminals::new(database.clone());
+    let mut request = input(&workspace);
+    request.agent = Some(prosperod_rs::protocol::AgentKind::Custom);
+    request.command = Some("while :; do printf tick; sleep 0.05; done".into());
+    let head = runtime.create(request).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let clone = database.clone();
+    let blocker = tokio::spawn(async move {
+        clone
+            .call_control("test.block", move |_| {
+                let _ = started.send(());
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .await
+    });
+    ready.await.unwrap();
+    let clone = database.clone();
+    let queued = tokio::spawn(async move { clone.call_background("test.fill", |_| Ok(())).await });
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(database.metrics().database_rejected_total > 0);
+    assert!(runtime.check().is_ok());
+    assert_eq!(runtime.count(), 1);
+    assert!(
+        !runtime
+            .read(head.id.clone(), TerminalQuery::default())
+            .await
+            .unwrap()
+            .exited
+    );
+    runtime.close(&head.id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(runtime.check().is_ok());
+    assert_eq!(runtime.count(), 1);
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    queued.await.unwrap().unwrap();
+    settled(&runtime).await;
+    assert!(runtime.check().is_ok());
+    let id = head.id;
+    assert_eq!(
+        database
+            .call(move |store| Ok(store.session(&id)?.lifecycle))
+            .await
+            .unwrap(),
+        SessionLifecycle::Archived
+    );
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_activity_resumes_after_database_backpressure() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open_with_options(
+        directory.path().into(),
+        None,
+        DatabaseOptions {
+            background_queue_capacity: 1,
+            background_waiter_capacity: 4,
+            background_enqueue_timeout: Duration::from_millis(30),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let runtime = Terminals::new(database.clone());
+    let mut request = input(&workspace);
+    request.agent = Some(prosperod_rs::protocol::AgentKind::Custom);
+    request.command = Some("sleep 0.8; printf 'working\\n'; sleep 30".into());
+    let head = runtime.create(request).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let clone = database.clone();
+    let blocker = tokio::spawn(async move {
+        clone
+            .call_control("test.block", move |_| {
+                let _ = started.send(());
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .await
+    });
+    ready.await.unwrap();
+    let clone = database.clone();
+    let queued = tokio::spawn(async move { clone.call_background("test.fill", |_| Ok(())).await });
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(database.metrics().database_rejected_total > 0);
+    assert!(runtime.check().is_ok());
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    queued.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let id = head.id.clone();
+            if database
+                .call(move |store| Ok(store.session(&id)?.busy_since))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime.close(&head.id).await.unwrap();
+    settled(&runtime).await;
+    assert!(runtime.check().is_ok());
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -580,7 +715,7 @@ async fn caps_active_processes_and_shutdown_releases_every_slot() {
     assert_eq!(runtime.count(), 16);
     assert!(matches!(
         runtime.create(input(&workspace)).await,
-        Err(Error::Busy)
+        Err(Error::Backpressure(pressure)) if pressure.resource == "terminal_sessions" && pressure.queue_capacity == 16 && pressure.side_effect_committed == Some(false)
     ));
     runtime.shutdown().await.unwrap();
     assert_eq!(runtime.count(), 0);

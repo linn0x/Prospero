@@ -15,7 +15,7 @@ use prosperod_rs::{
     auth::Token,
     protocol::{MessageRole, TimelineBody, TimelineQuery},
     server::Api,
-    worker::Database,
+    worker::{Database, DatabaseOptions},
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -98,6 +98,12 @@ def result(error=None, reason=None, input_tokens=None, output_tokens=None, cost_
 
 if scenario == "chat":
     text_block("hello from fake claude")
+    result()
+elif scenario == "backpressure":
+    open(os.path.join(cwd, "provider_started"), "w").close()
+    while not os.path.exists(os.path.join(cwd, "release_provider")):
+        time.sleep(0.01)
+    text_block("pressure recovered")
     result()
 elif scenario == "usage":
     text_block("usage counted")
@@ -483,8 +489,8 @@ async fn wait_until_process_exits(pid: i32) {
 #[cfg(unix)]
 fn spawn_process_group_sleep() -> std::process::Child {
     use std::os::unix::process::CommandExt;
-    let mut command = std::process::Command::new("sh");
-    command.arg("-c").arg("sleep 30");
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg("30");
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
@@ -521,6 +527,10 @@ struct Harness {
 
 impl Harness {
     async fn new(scenario: &str) -> Self {
+        Self::new_with_options(scenario, DatabaseOptions::default()).await
+    }
+
+    async fn new_with_options(scenario: &str, options: DatabaseOptions) -> Self {
         let data = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
         std::fs::write(workspace.path().join("scenario"), scenario).unwrap();
@@ -534,7 +544,9 @@ impl Harness {
         unsafe {
             std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
         }
-        let database = Database::open(data.path().to_path_buf()).await.unwrap();
+        let database = Database::open_with_options(data.path().to_path_buf(), None, options)
+            .await
+            .unwrap();
         let agents = Agents::new(database.clone());
         Self {
             _data: data,
@@ -671,6 +683,120 @@ async fn single_turn_streams_into_timeline() {
         harness.status(&head.id).await,
         prosperod_rs::protocol::SessionStatus::Idle
     );
+}
+
+#[tokio::test]
+async fn timeline_backpressure_retries_without_loss_or_duplicate_terminal_records() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new_with_options(
+        "backpressure",
+        DatabaseOptions {
+            background_queue_capacity: 1,
+            background_waiter_capacity: 1,
+            background_enqueue_timeout: Duration::from_millis(20),
+            degraded_queue_depth: 2,
+            recovered_queue_depth: 0,
+            overload_duration: Duration::ZERO,
+            ..DatabaseOptions::default()
+        },
+    )
+    .await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "pressure".into(), None, Vec::new())
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !harness.workspace.path().join("provider_started").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    loop {
+        let raw = rusqlite::Connection::open(harness._data.path().join("prospero.sqlite")).unwrap();
+        let native: Option<String> = raw
+            .query_row(
+                "SELECT native_id FROM agent_runs WHERE session_id=?1",
+                [&head.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if native.as_deref() == Some("native-1") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let blocker_database = harness.database.clone();
+    let blocker = tokio::spawn(async move {
+        blocker_database
+            .call_background("test.timeline.blocker", move |_| {
+                let _ = entered.send(());
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .await
+    });
+    waiting.await.unwrap();
+    let queued_database = harness.database.clone();
+    let queued = tokio::spawn(async move {
+        queued_database
+            .call_background("test.timeline.queued", |_| Ok(()))
+            .await
+    });
+    while harness.database.health().queued == 0 {
+        tokio::task::yield_now().await;
+    }
+    std::fs::write(harness.workspace.path().join("release_provider"), "go").unwrap();
+    while harness.database.recent_rejections("event.timeline") == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    harness.agents.check().unwrap();
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    queued.await.unwrap().unwrap();
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
+            })
+        })
+        .await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, body, preview)| {
+                matches!(
+                    body,
+                    TimelineBody::Message {
+                        role: MessageRole::Assistant,
+                        ..
+                    }
+                ) && preview == "pressure recovered"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|(_, body, _)| matches!(body, TimelineBody::Error))
+    );
+    assert_eq!(
+        harness.status(&head.id).await,
+        prosperod_rs::protocol::SessionStatus::Idle
+    );
+    harness.agents.check().unwrap();
 }
 
 #[tokio::test]
@@ -846,9 +972,10 @@ async fn recovery_kills_stale_codex_app_server_lease_and_thread_lock() {
     std::fs::write(
         &lease,
         json!({
-            "version": 1,
+            "version": 2,
             "ownerPid": 999_999_999_u32,
             "childPid": pid,
+            "childIdentity": String::from_utf8(std::process::Command::new("/bin/ps").env("LC_ALL", "C").args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "command="]).output().unwrap().stdout).unwrap().trim(),
             "processGroup": pid,
             "threadId": "thread-stale",
         })

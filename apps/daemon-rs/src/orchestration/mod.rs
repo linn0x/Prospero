@@ -7,8 +7,10 @@
 //! not satisfy the edge, so a chain whose premise disappeared never silently
 //! starts on a half-built foundation.
 
+mod activity;
 mod automation;
 mod gitops;
+mod start;
 mod store;
 mod workers;
 
@@ -17,13 +19,20 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub use activity::{
+    DispatchActivityHealth, DurableAgentState, DurableSessionStatus, TaskActivities, TaskActivity,
+    TaskActivityDependency, TaskActivityQuery,
+};
 pub use automation::{kick_automation, pause_automation, start_automation, tick_automation};
 pub use gitops::{
     WorktreeCreate, create_worktree, inspect_asset, remove_worktree, repo_root,
     worktree_default_path,
 };
+pub use start::{
+    cancel_worker_start, get_worker_start, recover_worker_starts, start_worker, submit_worker_start,
+};
 pub use store::{RecoveryReport, SettleOutcome};
-pub use workers::{cleanup_worktree, inspect_worktree, start_worker, stop_worker};
+pub use workers::{cleanup_worktree, inspect_worktree, stop_worker};
 
 pub use prospero_protocol_rs::{
     AutomationState, AutomationWorkspace, CancelTask, Dispatch, DispatchState, Gate, GateStatus,
@@ -87,7 +96,7 @@ pub struct GraphNodeInput {
     pub parent_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateRunGraph {
     pub objective: String,
@@ -177,7 +186,7 @@ pub struct StartAutomation {
     pub cwd: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartWorker {
     pub task_id: String,
@@ -194,8 +203,99 @@ pub struct StartWorker {
     pub approval_policy: Option<String>,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub profile_id: Option<String>,
     #[serde(default)]
     pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStartPhase {
+    Queued,
+    Preparing,
+    WorktreeCreated,
+    SessionCreated,
+    DispatchCommitted,
+    Delivering,
+    DeliveryUnknown,
+    Running,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStartSideEffectState {
+    None,
+    Committed,
+    Unknown,
+}
+
+impl WorkerStartPhase {
+    pub fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::DeliveryUnknown | Self::Running | Self::Failed | Self::Cancelled
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerStartOperation {
+    pub operation_id: String,
+    pub phase: WorkerStartPhase,
+    pub task_id: String,
+    pub run_id: String,
+    pub agent: crate::protocol::AgentKind,
+    #[ts(type = "string | null")]
+    pub account_id: Option<String>,
+    #[ts(type = "string | null")]
+    pub worktree_path: Option<String>,
+    #[ts(type = "string | null")]
+    pub asset_id: Option<String>,
+    #[ts(type = "string | null")]
+    pub session_id: Option<String>,
+    #[ts(type = "string | null")]
+    pub dispatch_id: Option<String>,
+    #[ts(type = "WorkerStartOutcome | null")]
+    pub outcome: Option<WorkerStartOutcome>,
+    #[ts(type = "string | null")]
+    pub error: Option<String>,
+    #[ts(type = "string | null")]
+    pub error_code: Option<String>,
+    pub side_effect_state: WorkerStartSideEffectState,
+    #[ts(type = "boolean | null")]
+    pub side_effect_committed: Option<bool>,
+    #[ts(type = "number | null")]
+    pub retry_after_ms: Option<u64>,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStartSubmissionStatus {
+    Started,
+    Queued,
+    InProgress,
+    Failed,
+    Cancelled,
+    DeliveryUnknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerStartSubmission {
+    pub status: WorkerStartSubmissionStatus,
+    pub operation: WorkerStartOperation,
 }
 
 fn default_worker_agent() -> crate::protocol::AgentKind {

@@ -184,6 +184,12 @@ pub struct PluginServiceView {
     pub command: Option<Vec<String>>,
     pub cwd: Option<String>,
     pub log_files: PluginServiceLogFiles,
+    #[serde(default)]
+    pub runtime_health: crate::protocol::RuntimeHealthStatus,
+    #[serde(default)]
+    pub degraded_reasons: Vec<String>,
+    #[serde(default)]
+    pub recent_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2154,6 +2160,9 @@ fn view_for(
         restart_count: state.restart_count,
         next_restart_at: state.next_restart_at,
         config_key: state.config_key,
+        runtime_health: crate::protocol::RuntimeHealthStatus::Healthy,
+        degraded_reasons: Vec::new(),
+        recent_errors: Vec::new(),
         configured: true,
         plugin_root: Some(plugin.root.clone()),
         command: Some(service.command.clone()),
@@ -2181,6 +2190,9 @@ fn orphan_view(store: &PluginServiceStore, state: PluginServiceState) -> PluginS
         restart_count: state.restart_count,
         next_restart_at: state.next_restart_at,
         config_key: state.config_key,
+        runtime_health: crate::protocol::RuntimeHealthStatus::Healthy,
+        degraded_reasons: Vec::new(),
+        recent_errors: Vec::new(),
         configured: false,
         plugin_root: None,
         command: None,
@@ -2404,6 +2416,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    static PLUGIN_PROCESS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn service_mode(
         id: &str,
         mode: PluginServiceMode,
@@ -2617,6 +2631,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn start_returns_after_spawn_without_waiting_for_health() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
@@ -2638,6 +2653,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn exited_service_can_restart_after_supervisor_recreation() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
@@ -2673,6 +2689,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn restart_spawns_replacement_before_old_exit_completes() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(
@@ -2703,6 +2720,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn slow_stop_does_not_block_another_service_start() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let slow = script(
@@ -2747,6 +2765,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stale_list_snapshot_cannot_resurrect_stopped_generation() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
@@ -2782,6 +2801,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn auto_service_respawns_with_persisted_backoff() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
@@ -2821,9 +2841,8 @@ mod tests {
         supervisor.stop_all().await;
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn auto_restart_backoff_is_bounded() {
+    #[test]
+    fn auto_restart_backoff_is_bounded() {
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(&root, "service.sh", "#!/bin/sh\nexit 1\n");
@@ -2836,31 +2855,37 @@ mod tests {
                 None,
             )],
         );
-        let supervisor =
-            PluginServiceSupervisor::with_policy(directory.path().to_path_buf(), policy());
-        supervisor.start("test-plugin", "worker").await.unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let state = supervisor
-                .0
-                .store
-                .get("test-plugin", "worker")
-                .unwrap()
-                .unwrap();
-            if state.restart_count > supervisor.0.policy.restart_limit {
-                assert_eq!(state.status, PluginServiceStatus::Exited);
-                assert_eq!(state.next_restart_at, None);
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let discovered = discover_prospero_plugins(directory.path());
+        let manifest = &discovered.plugins[0];
+        let service = &manifest.services[0];
+        let policy = policy();
+        let mut state = stopped_state(manifest, service);
+        for expected in 1..=policy.restart_limit {
+            let before = now();
+            let restart = restart_schedule(&state, &policy);
+            let after = now();
+            let delay = policy.restart_delays[(expected - 1) as usize].as_millis() as i64;
+            assert_eq!(restart.0, expected);
+            assert!(
+                restart
+                    .1
+                    .is_some_and(|next| { (before + delay..=after + delay).contains(&next) })
+            );
+            assert!(restart.2.is_some());
+            state.restart_count = restart.0;
+            state.next_restart_at = restart.1;
+            state.restart_window_started_at = restart.2;
         }
-        supervisor.stop_all().await;
+        let terminal = restart_schedule(&state, &policy);
+        assert_eq!(terminal.0, policy.restart_limit + 1);
+        assert_eq!(terminal.1, None);
+        assert_eq!(terminal.2, state.restart_window_started_at);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn manual_service_does_not_auto_respawn() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
@@ -2883,6 +2908,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn health_failures_restart_only_auto_services() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(&root, "service.sh", "#!/bin/sh\nsleep 30\n");
@@ -2914,6 +2940,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stop_terminates_the_complete_process_group() {
+        let _serial = PLUGIN_PROCESS_SERIAL.lock().await;
         let directory = TempDir::new().unwrap();
         let root = plugin(directory.path(), Vec::new());
         let command = script(

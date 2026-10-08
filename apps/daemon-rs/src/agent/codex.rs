@@ -6,7 +6,7 @@
 //! streamed assistant/reasoning text and completion) so Codex structured
 //! sessions no longer fall back to the legacy daemon boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
-const APP_SERVER_LEASE_VERSION: i64 = 1;
+const APP_SERVER_LEASE_VERSION: i64 = 2;
 
 type StderrTail = Arc<Mutex<String>>;
 
@@ -353,12 +353,173 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    pid > 1 && unsafe { libc::kill(pid as i32, 0) == 0 }
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .ok()
+        .map(|output| {
+            !String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(true)
 }
 
 #[cfg(not(unix))]
 fn process_alive(_pid: u32) -> bool {
     false
+}
+
+#[cfg(unix)]
+fn process_identity(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("/bin/ps")
+        .env("LC_ALL", "C")
+        .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "command="])
+        .output()
+        .ok()?;
+    let identity = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !identity.is_empty()).then_some(identity)
+}
+
+#[cfg(not(unix))]
+fn process_identity(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn process_group_members(pgid: u32) -> Option<Vec<u32>> {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()
+    else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let pid = parts.next()?.parse::<u32>().ok()?;
+                let group = parts.next()?.parse::<u32>().ok()?;
+                let state = parts.next()?;
+                (group == pgid && !state.starts_with('Z')).then_some(pid)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(unix)]
+fn group_alive(pgid: u32) -> bool {
+    process_group_members(pgid).is_none_or(|members| !members.is_empty())
+}
+
+#[cfg(not(unix))]
+fn group_alive(_pgid: u32) -> bool {
+    true
+}
+
+#[cfg(unix)]
+struct VerifiedProcessGroup {
+    pgid: u32,
+    members: Vec<(u32, String)>,
+}
+
+#[cfg(unix)]
+impl VerifiedProcessGroup {
+    fn capture(leader: u32, expected: &str) -> Option<Self> {
+        if process_identity(leader).as_deref() != Some(expected)
+            || unsafe { libc::getpgid(leader as i32) } != leader as i32
+        {
+            return None;
+        }
+        let members = process_group_members(leader)?
+            .into_iter()
+            .filter_map(|pid| process_identity(pid).map(|identity| (pid, identity)))
+            .collect::<Vec<_>>();
+        members
+            .iter()
+            .any(|(pid, identity)| *pid == leader && identity == expected)
+            .then_some(Self {
+                pgid: leader,
+                members,
+            })
+    }
+
+    fn still_owned(&self) -> bool {
+        self.members.iter().any(|(pid, identity)| {
+            process_alive(*pid)
+                && unsafe { libc::getpgid(*pid as i32) } == self.pgid as i32
+                && process_identity(*pid).as_ref() == Some(identity)
+        })
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            libc::kill(-(self.pgid as i32), libc::SIGTERM);
+        }
+        for _ in 0..10 {
+            if !group_alive(self.pgid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.still_owned() {
+            unsafe {
+                libc::kill(-(self.pgid as i32), libc::SIGKILL);
+            }
+        }
+        for _ in 0..10 {
+            if !group_alive(self.pgid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn safe_lease_directory(home: &Path) -> Option<PathBuf> {
+    existing_safe_dir(home)?;
+    existing_safe_dir(&home.join(".prospero"))?;
+    existing_safe_dir(&app_server_lease_dir(home))
+}
+
+fn read_lease(home: &Path, path: &Path) -> Option<Value> {
+    let directory = safe_lease_directory(home)?;
+    if path.parent()?.canonicalize().ok()? != directory {
+        return None;
+    }
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16384 {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let child = safe_pid(value.get("childPid"))?;
+    safe_pid(value.get("ownerPid"))?;
+    if value.get("version").and_then(Value::as_i64) != Some(APP_SERVER_LEASE_VERSION)
+        || safe_pid(value.get("processGroup")) != Some(child)
+        || path.file_stem()?.to_str()?.parse::<u32>().ok()? != child
+    {
+        return None;
+    }
+    match value.get("threadId") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(thread)) => crate::database::validate_id(thread).ok()?,
+        Some(_) => return None,
+    }
+    Some(value)
 }
 
 fn codex_home_from_environment(environment: &[(String, String)]) -> Option<PathBuf> {
@@ -382,8 +543,21 @@ fn owned_codex_home_from_environment(
     environment: &[(String, String)],
 ) -> Option<PathBuf> {
     let requested_home = codex_home_from_environment(environment)?;
+    let canonical_data = data.canonicalize().ok()?;
+    let relative = requested_home
+        .strip_prefix(data)
+        .or_else(|_| requested_home.strip_prefix(&canonical_data))
+        .ok()?;
+    let data = canonical_data;
+    let mut cursor = data.clone();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+        cursor.push(component);
+        existing_safe_dir(&cursor)?;
+    }
     let home = existing_safe_dir(&requested_home)?;
-    let data = data.canonicalize().ok()?;
     let roots = data.join("agent-accounts");
     let native_home = roots
         .join("codex-usage")
@@ -409,11 +583,14 @@ fn thread_writer_lock(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
     if crate::database::validate_id(thread_id).is_err() {
         return None;
     }
-    Some(
-        codex_home
-            .join("thread-writer-locks")
-            .join(format!("{thread_id}.lock")),
-    )
+    let directory = existing_safe_dir(&codex_home.join("thread-writer-locks"))?;
+    let lock = directory.join(format!("{thread_id}.lock"));
+    if std::fs::symlink_metadata(&lock)
+        .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return None;
+    }
+    Some(lock)
 }
 
 fn cleanup_thread_writer_lock(codex_home: Option<&Path>, thread_id: &str) {
@@ -436,6 +613,7 @@ fn lease_json(child_pid: u32, thread_id: Option<&str>) -> Value {
         "version": APP_SERVER_LEASE_VERSION,
         "ownerPid": std::process::id(),
         "childPid": child_pid,
+        "childIdentity": process_identity(child_pid),
         "processGroup": child_pid,
         "threadId": thread_id,
         "createdAt": crate::database::now(),
@@ -487,74 +665,324 @@ fn update_app_server_lease(path: &Path, child_pid: u32, thread_id: &str) {
 }
 
 fn cleanup_stale_app_servers_in_home(codex_home: &Path) -> usize {
-    let directory = app_server_lease_dir(codex_home);
+    let Some(directory) = safe_lease_directory(codex_home) else {
+        return 0;
+    };
     let Ok(entries) = std::fs::read_dir(&directory) else {
         return 0;
     };
     let mut cleaned = 0;
-    for entry in entries.filter_map(std::result::Result::ok) {
+    for entry in entries.filter_map(std::result::Result::ok).take(1024) {
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            let _ = std::fs::remove_file(&path);
+        let Some(value) = read_lease(codex_home, &path) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            let _ = std::fs::remove_file(&path);
+        let Some(owner_pid) = safe_pid(value.get("ownerPid")) else {
             continue;
         };
-        let owner_pid = safe_pid(value.get("ownerPid"));
-        if owner_pid == Some(std::process::id()) {
+        if process_alive(owner_pid) {
             continue;
         }
-        if owner_pid.is_some_and(process_alive) {
+        let Some(child_pid) = safe_pid(value.get("childPid")) else {
             continue;
-        }
-        if let Some(pgid) =
-            safe_pid(value.get("processGroup")).or_else(|| safe_pid(value.get("childPid")))
+        };
+        if value
+            .get("threadId")
+            .and_then(Value::as_str)
+            .is_some_and(|thread_id| thread_writer_lock(codex_home, thread_id).is_none())
         {
-            kill_process_group(pgid);
-            cleaned += 1;
+            continue;
+        }
+        if process_alive(child_pid) {
+            let Some(expected) = value.get("childIdentity").and_then(Value::as_str) else {
+                continue;
+            };
+            #[cfg(unix)]
+            {
+                let Some(group) = VerifiedProcessGroup::capture(child_pid, expected) else {
+                    continue;
+                };
+                group.terminate();
+            }
+            #[cfg(not(unix))]
+            let _ = expected;
+        }
+        if group_alive(child_pid) {
+            continue;
         }
         if let Some(thread_id) = value.get("threadId").and_then(Value::as_str) {
+            if other_thread_lease_alive(codex_home, thread_id, child_pid) {
+                continue;
+            }
             cleanup_thread_writer_lock(Some(codex_home), thread_id);
         }
-        let _ = std::fs::remove_file(&path);
+        if std::fs::remove_file(&path).is_ok() {
+            cleaned += 1;
+        }
     }
     cleaned
+}
+
+fn other_thread_lease_alive(home: &Path, thread_id: &str, child_pid: u32) -> bool {
+    let Some(directory) = safe_lease_directory(home) else {
+        return true;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return true;
+    };
+    entries.filter_map(std::result::Result::ok).any(|entry| {
+        let Some(value) = read_lease(home, &entry.path()) else {
+            return true;
+        };
+        let pid = safe_pid(value.get("childPid"));
+        pid != Some(child_pid)
+            && value.get("threadId").and_then(Value::as_str) == Some(thread_id)
+            && pid.is_some_and(process_alive)
+    })
+}
+
+pub(crate) async fn preflight_app_servers(
+    data: &Path,
+    environment: &[(String, String)],
+) -> Result<()> {
+    if let Some(home) = owned_codex_home_from_environment(data, environment) {
+        tokio::task::spawn_blocking(move || cleanup_stale_app_servers_in_home(&home))
+            .await
+            .map_err(|_| Error::Closed)?;
+    }
+    Ok(())
+}
+
+fn owned_homes(data: &Path) -> Vec<PathBuf> {
+    let roots = data.join("agent-accounts");
+    let mut homes = vec![
+        roots
+            .join("codex-usage")
+            .join(super::usage::NATIVE_CODEX_ID)
+            .join("home"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(roots.join("codex")) {
+        homes.extend(
+            entries
+                .filter_map(std::result::Result::ok)
+                .take(1024)
+                .map(|entry| entry.path()),
+        );
+    }
+    homes
+        .into_iter()
+        .filter_map(|home| {
+            owned_codex_home_from_environment(
+                data,
+                &[("CODEX_HOME".into(), home.to_string_lossy().into_owned())],
+            )
+        })
+        .collect()
+}
+
+fn diagnostic_homes(data: &Path, deadline: std::time::Instant) -> (Vec<PathBuf>, bool) {
+    let roots = data.join("agent-accounts");
+    let native = roots
+        .join("codex-usage")
+        .join(super::usage::NATIVE_CODEX_ID)
+        .join("home");
+    let mut homes = owned_codex_home_from_environment(
+        data,
+        &[("CODEX_HOME".into(), native.to_string_lossy().into_owned())],
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    let mut truncated = false;
+    if let Ok(entries) = std::fs::read_dir(roots.join("codex")) {
+        for entry in entries {
+            if homes.len() >= 256 || std::time::Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            if let Some(home) = owned_codex_home_from_environment(
+                data,
+                &[("CODEX_HOME".into(), path.to_string_lossy().into_owned())],
+            ) {
+                homes.push(home);
+            }
+        }
+    }
+    (homes, truncated)
 }
 
 pub(crate) async fn cleanup_stale_app_servers(data: &Path) -> Result<usize> {
     let data = data.to_owned();
     tokio::task::spawn_blocking(move || {
-        let roots = data.join("agent-accounts");
-        let mut homes = vec![
-            roots
-                .join("codex-usage")
-                .join(super::usage::NATIVE_CODEX_ID)
-                .join("home"),
-        ];
-        let managed = roots.join("codex");
-        if let Ok(entries) = std::fs::read_dir(&managed) {
-            for entry in entries.filter_map(std::result::Result::ok) {
-                let path = entry.path();
-                if std::fs::symlink_metadata(&path)
-                    .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-                    .unwrap_or(false)
-                {
-                    homes.push(path);
-                }
-            }
-        }
-        Ok(homes
+        Ok(owned_homes(&data)
             .into_iter()
             .map(|home| cleanup_stale_app_servers_in_home(&home))
             .sum())
     })
     .await
     .map_err(|_| Error::Closed)?
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppServerDiagnostic {
+    pub codex_home: String,
+    pub lease_path: Option<String>,
+    pub owner_pid: Option<u32>,
+    pub child_pid: Option<u32>,
+    pub thread_id: Option<String>,
+    pub owner_alive: bool,
+    pub child_alive: bool,
+    pub identity_matches: bool,
+    pub lock_present: bool,
+    pub state: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppServerDiagnosticPage {
+    pub items: Vec<AppServerDiagnostic>,
+    pub truncated: bool,
+}
+
+pub async fn app_server_diagnostics_page(data: &Path) -> Result<AppServerDiagnosticPage> {
+    let data = data.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let mut scanned = 0;
+        let (homes, mut truncated) = diagnostic_homes(&data, deadline);
+        let mut results = Vec::new();
+        for home in homes {
+            if scanned >= 256 || std::time::Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
+            let mut leased_threads = HashSet::new();
+            if let Some(directory) = safe_lease_directory(&home)
+                && let Ok(entries) = std::fs::read_dir(directory)
+            {
+                for entry in entries {
+                    if scanned >= 256 || std::time::Instant::now() >= deadline {
+                        truncated = true;
+                        break;
+                    }
+                    scanned += 1;
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let lease = read_lease(&home, &path);
+                    let owner = lease
+                        .as_ref()
+                        .and_then(|value| safe_pid(value.get("ownerPid")));
+                    let child = lease
+                        .as_ref()
+                        .and_then(|value| safe_pid(value.get("childPid")));
+                    let thread_id = lease
+                        .as_ref()
+                        .and_then(|value| value.get("threadId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(thread_id) = thread_id.as_ref() {
+                        leased_threads.insert(thread_id.clone());
+                    }
+                    let owner_alive = owner.is_some_and(process_alive);
+                    let child_alive = child.is_some_and(process_alive);
+                    let expected = lease
+                        .as_ref()
+                        .and_then(|value| value.get("childIdentity"))
+                        .and_then(Value::as_str);
+                    let identity_matches = expected.is_some()
+                        && child.and_then(process_identity).as_deref() == expected;
+                    let lock_present = thread_id
+                        .as_deref()
+                        .and_then(|id| thread_writer_lock(&home, id))
+                        .is_some_and(|path| path.exists());
+                    results.push(AppServerDiagnostic {
+                        codex_home: home.to_string_lossy().into_owned(),
+                        lease_path: Some(path.to_string_lossy().into_owned()),
+                        owner_pid: owner,
+                        child_pid: child,
+                        thread_id,
+                        owner_alive,
+                        child_alive,
+                        identity_matches,
+                        lock_present,
+                        state: if lease.is_none() {
+                            "unverified"
+                        } else if owner_alive {
+                            "owned"
+                        } else if child_alive && !identity_matches {
+                            "identity_mismatch"
+                        } else {
+                            "stale"
+                        }
+                        .into(),
+                    });
+                }
+            }
+            if let Some(directory) = existing_safe_dir(&home.join("thread-writer-locks"))
+                && let Ok(entries) = std::fs::read_dir(directory)
+            {
+                for entry in entries {
+                    if scanned >= 256 || std::time::Instant::now() >= deadline {
+                        truncated = true;
+                        break;
+                    }
+                    scanned += 1;
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || path.extension().and_then(|value| value.to_str()) != Some("lock")
+                    {
+                        continue;
+                    }
+                    let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    if crate::database::validate_id(thread_id).is_err()
+                        || leased_threads.contains(thread_id)
+                    {
+                        continue;
+                    }
+                    results.push(AppServerDiagnostic {
+                        codex_home: home.to_string_lossy().into_owned(),
+                        lease_path: None,
+                        owner_pid: None,
+                        child_pid: None,
+                        thread_id: Some(thread_id.into()),
+                        owner_alive: false,
+                        child_alive: false,
+                        identity_matches: false,
+                        lock_present: true,
+                        state: "unowned_lock".into(),
+                    });
+                }
+            }
+        }
+        Ok(AppServerDiagnosticPage {
+            items: results,
+            truncated,
+        })
+    })
+    .await
+    .map_err(|_| Error::Closed)?
+}
+
+pub async fn app_server_diagnostics(data: &Path) -> Result<Vec<AppServerDiagnostic>> {
+    Ok(app_server_diagnostics_page(data).await?.items)
 }
 
 #[derive(Clone)]
@@ -571,9 +999,6 @@ impl AppServerCleanup {
         environment: &[(String, String)],
     ) -> Result<Self> {
         let codex_home = owned_codex_home_from_environment(data, environment);
-        if let Some(home) = codex_home.as_ref() {
-            cleanup_stale_app_servers_in_home(home);
-        }
         let lease_path = match codex_home.as_ref() {
             Some(home) => Some(write_app_server_lease(home, child_pid)?),
             None => None,
@@ -592,7 +1017,14 @@ impl AppServerCleanup {
     }
 
     pub(crate) fn cleanup_thread_lock(&self, thread_id: &str) {
-        cleanup_thread_writer_lock(self.codex_home.as_deref(), thread_id);
+        if process_alive(self.child_pid) {
+            return;
+        }
+        if let Some(home) = self.codex_home.as_deref()
+            && !other_thread_lease_alive(home, thread_id, self.child_pid)
+        {
+            cleanup_thread_writer_lock(Some(home), thread_id);
+        }
     }
 
     pub(crate) async fn terminate(&self, child: &mut Child) {
@@ -607,23 +1039,100 @@ impl AppServerCleanup {
     }
 }
 
-pub(crate) fn cleanup_thread_lock_for_environment(
-    data: &Path,
-    environment: &[(String, String)],
-    thread_id: &str,
-) {
-    cleanup_thread_writer_lock(
-        owned_codex_home_from_environment(data, environment).as_deref(),
-        thread_id,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn env_for(home: &Path) -> Vec<(String, String)> {
         vec![("CODEX_HOME".into(), home.to_string_lossy().into_owned())]
+    }
+
+    #[cfg(unix)]
+    fn cleanup_home() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".prospero/app-server-leases")).unwrap();
+        std::fs::create_dir_all(home.join("thread-writer-locks")).unwrap();
+        (root, home)
+    }
+
+    #[cfg(unix)]
+    fn process_group() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn process_group_with_term_ignoring_descendant(directory: &Path) -> (std::process::Child, u32) {
+        use std::os::unix::process::CommandExt;
+
+        let script = r#"import subprocess,sys,time
+subprocess.Popen([sys.executable,'-c','import os,pathlib,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path("grandchild").write_text(str(os.getpid())); time.sleep(30)'])
+while True: time.sleep(1)
+"#;
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", script]).current_dir(directory);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let path = directory.join("grandchild");
+        for _ in 0..200 {
+            if let Ok(pid) = std::fs::read_to_string(&path) {
+                return (child, pid.parse().unwrap());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        kill_process_group(child.id());
+        let _ = child.wait();
+        panic!("grandchild did not start");
+    }
+
+    #[cfg(unix)]
+    fn write_test_lease(
+        home: &Path,
+        child_pid: u32,
+        owner_pid: u32,
+        identity: Value,
+        thread_id: Value,
+    ) -> PathBuf {
+        let path = app_server_lease_dir(home).join(format!("{child_pid}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "version": APP_SERVER_LEASE_VERSION,
+                "ownerPid": owner_pid,
+                "childPid": child_pid,
+                "childIdentity": identity,
+                "processGroup": child_pid,
+                "threadId": thread_id,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn stop_process_group(child: &mut std::process::Child) {
+        kill_process_group(child.id());
+        child.wait().unwrap();
     }
 
     #[test]
@@ -675,6 +1184,201 @@ mod tests {
 
         assert!(owned_codex_home_from_environment(data.path(), &env_for(&link)).is_none());
     }
+
+    #[tokio::test]
+    async fn diagnostics_report_unowned_lock_without_removing_it() {
+        let data = tempfile::TempDir::new().unwrap();
+        let home = data
+            .path()
+            .join("agent-accounts")
+            .join("codex-usage")
+            .join(super::super::usage::NATIVE_CODEX_ID)
+            .join("home");
+        std::fs::create_dir_all(home.join("thread-writer-locks")).unwrap();
+        let lock = home.join("thread-writer-locks/thread-unowned.lock");
+        std::fs::write(&lock, []).unwrap();
+        let diagnostics = app_server_diagnostics(data.path()).await.unwrap();
+        let diagnostic = diagnostics
+            .iter()
+            .find(|value| value.thread_id.as_deref() == Some("thread-unowned"))
+            .unwrap();
+        assert_eq!(diagnostic.state, "unowned_lock");
+        assert!(diagnostic.lease_path.is_none());
+        assert!(diagnostic.lock_present);
+        assert!(lock.exists());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_page_caps_total_scanned_entries() {
+        let data = tempfile::TempDir::new().unwrap();
+        let locks = data
+            .path()
+            .join("agent-accounts")
+            .join("codex-usage")
+            .join(super::super::usage::NATIVE_CODEX_ID)
+            .join("home/thread-writer-locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        for index in 0..257 {
+            std::fs::write(locks.join(format!("thread-{index}.lock")), []).unwrap();
+        }
+        let page = app_server_diagnostics_page(data.path()).await.unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.items.len(), 256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_preserves_live_owner_and_identity_mismatch() {
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let identity = process_identity(pid).unwrap();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            std::process::id(),
+            json!(identity),
+            json!("thread-live"),
+        );
+        let lock = home.join("thread-writer-locks/thread-live.lock");
+        std::fs::write(&lock, []).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        assert!(lock.exists());
+        std::fs::write(
+            &lease,
+            serde_json::to_vec(&json!({
+                "version": APP_SERVER_LEASE_VERSION,
+                "ownerPid": 999_999_999_u32,
+                "childPid": pid,
+                "childIdentity": "wrong identity",
+                "processGroup": pid,
+                "threadId": "thread-live",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        assert!(lock.exists());
+        stop_process_group(&mut child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_preserves_malformed_lease() {
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let identity = process_identity(pid).unwrap();
+        let lease = write_test_lease(&home, pid, 999_999_999, json!(identity), json!(42));
+        let lock = home.join("thread-writer-locks/thread-malformed.lock");
+        std::fs::write(&lock, []).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        assert!(lock.exists());
+        let no_extension = lease.with_extension("");
+        std::fs::rename(&lease, &no_extension).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(no_extension.exists());
+        assert!(lock.exists());
+        stop_process_group(&mut child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_preserves_unsafe_thread_locks() {
+        use std::os::unix::fs::symlink;
+
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            999_999_999,
+            json!(process_identity(pid).unwrap()),
+            json!("thread-unsafe"),
+        );
+        let locks = home.join("thread-writer-locks");
+        std::fs::remove_dir(&locks).unwrap();
+        let target = tempfile::TempDir::new().unwrap();
+        symlink(target.path(), &locks).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        std::fs::remove_file(&locks).unwrap();
+        std::fs::create_dir(&locks).unwrap();
+        symlink(
+            target.path().join("target"),
+            locks.join("thread-unsafe.lock"),
+        )
+        .unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        stop_process_group(&mut child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_terminates_verified_child_and_removes_lock() {
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            999_999_999,
+            json!(process_identity(pid).unwrap()),
+            json!("thread-stale"),
+        );
+        let lock = home.join("thread-writer-locks/thread-stale.lock");
+        std::fs::write(&lock, []).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 1);
+        child.wait().unwrap();
+        assert!(!lease.exists());
+        assert!(!lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_terminates_verified_group_after_leader_exits() {
+        let (root, home) = cleanup_home();
+        let (mut child, grandchild) = process_group_with_term_ignoring_descendant(root.path());
+        let pid = child.id();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            999_999_999,
+            json!(process_identity(pid).unwrap()),
+            json!("thread-group"),
+        );
+        let lock = home.join("thread-writer-locks/thread-group.lock");
+        std::fs::write(&lock, []).unwrap();
+        let cleaned = cleanup_stale_app_servers_in_home(&home);
+        let _ = child.wait();
+        for _ in 0..100 {
+            if !process_alive(grandchild) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_alive = process_alive(grandchild);
+        let lease_exists = lease.exists();
+        let lock_exists = lock.exists();
+        if group_alive(pid) {
+            kill_process_group(pid);
+        }
+        assert_eq!(cleaned, 1);
+        assert!(!descendant_alive);
+        assert!(!lease_exists);
+        assert!(!lock_exists);
+    }
 }
 
 pub(super) struct CodexTurn {
@@ -691,7 +1395,6 @@ pub(super) struct CodexTurn {
     child_pid: u32,
     responses: PendingResponses,
     diagnostics: ProcessDiagnostics,
-    cleanup: AppServerCleanup,
 }
 
 #[derive(Clone)]
@@ -719,6 +1422,7 @@ impl StartingRpc {
         environment: &[(String, String)],
         app_server_args: &[String],
     ) -> Result<Self> {
+        preflight_app_servers(data, environment).await?;
         let file = binary();
         let mut args = vec!["app-server".to_owned()];
         args.extend(app_server_args.iter().cloned());
@@ -891,9 +1595,6 @@ pub(super) async fn spawn_turn(
         let (_home, environment) = super::usage::native_codex_environment(data)?;
         (environment, Vec::new())
     };
-    if let Some(thread_id) = native_id {
-        cleanup_thread_lock_for_environment(data, &environment, thread_id);
-    }
     let mut rpc = StartingRpc::start(data, workspace, &environment, &app_server_args).await?;
     let child_pid = rpc.cleanup.child_pid;
     let policy = execution_policy(workspace, options.policy);
@@ -980,7 +1681,6 @@ pub(super) async fn spawn_turn(
     let reader_responses = responses.clone();
     let diagnostics = rpc.diagnostics.clone();
     let cleanup = rpc.cleanup.clone();
-    let driver_cleanup = cleanup.clone();
     let reader_diagnostics = diagnostics.clone();
     let auto_approve = options.policy == ApprovalPolicy::Auto;
     tokio::spawn(async move {
@@ -998,8 +1698,8 @@ pub(super) async fn spawn_turn(
             },
         )
         .await;
-        cleanup.cleanup_thread_lock(&cleanup_thread_id);
         cleanup.terminate(&mut rpc.child).await;
+        cleanup.cleanup_thread_lock(&cleanup_thread_id);
     });
 
     let turn_start_id = 1_000_000_u64;
@@ -1057,7 +1757,6 @@ pub(super) async fn spawn_turn(
         child_pid,
         responses,
         diagnostics,
-        cleanup: driver_cleanup,
     })
 }
 
@@ -2824,7 +3523,6 @@ impl CodexTurn {
     }
 
     pub(super) fn kill(&self) {
-        self.cleanup.cleanup_thread_lock(&self.thread_id);
         kill_process_group(self.child_pid);
     }
 }

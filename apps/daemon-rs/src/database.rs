@@ -1,22 +1,23 @@
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 32;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
 pub struct Store {
     pub(crate) connection: Connection,
-    _lock: File,
+    _lock: Arc<File>,
 }
 
 pub(crate) fn label<T: Serialize>(value: T) -> Result<String> {
@@ -81,6 +82,16 @@ fn private_file(path: &Path) -> Result<File> {
 }
 
 impl Store {
+    pub(crate) fn read_snapshot<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.connection.is_autocommit() {
+            return operation();
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let value = operation()?;
+        transaction.commit()?;
+        Ok(value)
+    }
+
     pub fn open(directory: &Path) -> Result<Self> {
         if directory.join("orchestration.json").exists()
             || directory.join("sessions.sqlite").exists()
@@ -98,7 +109,7 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
-        let lock = private_file(&directory.join("owner.lock"))?;
+        let lock = Arc::new(private_file(&directory.join("owner.lock"))?);
         lock.try_lock_exclusive()
             .map_err(|_| Error::AlreadyRunning)?;
         let database = directory.join("prospero.sqlite");
@@ -148,6 +159,8 @@ impl Store {
             transaction.execute_batch(include_str!("agent/schema-v28.sql"))?;
             transaction.execute_batch(include_str!("agent/schema-v29.sql"))?;
             transaction.execute_batch(include_str!("agent/schema-v30.sql"))?;
+            transaction.execute_batch(include_str!("orchestration/schema-v31.sql"))?;
+            transaction.execute_batch(include_str!("orchestration/schema-v32.sql"))?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -230,6 +243,12 @@ impl Store {
             if version <= 29 {
                 transaction.execute_batch(include_str!("agent/schema-v30.sql"))?;
             }
+            if version <= 30 {
+                transaction.execute_batch(include_str!("orchestration/schema-v31.sql"))?;
+            }
+            if version <= 31 {
+                transaction.execute_batch(include_str!("orchestration/schema-v32.sql"))?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -252,6 +271,33 @@ impl Store {
         })
     }
 
+    pub(crate) fn owner_lock(&self) -> Arc<File> {
+        self._lock.clone()
+    }
+
+    pub(crate) fn open_reader(directory: &Path, lock: Arc<File>) -> Result<Self> {
+        let database = directory.join("prospero.sqlite");
+        let connection = Connection::open_with_flags(
+            database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(Duration::from_millis(1000))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA cache_size=-8192; PRAGMA mmap_size=0; PRAGMA query_only=ON;")?;
+        let application: i64 =
+            connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if application != APPLICATION_ID || version != SCHEMA_VERSION {
+            return Err(Error::Schema);
+        }
+        connection.prepare(
+            "SELECT id,created_at,lifecycle,revision,payload FROM session_heads LIMIT 0",
+        )?;
+        Ok(Self {
+            connection,
+            _lock: lock,
+        })
+    }
+
     pub fn create_session(&mut self, input: CreateSession) -> Result<SessionHead> {
         self.create_session_with(input, |_, _| Ok(()))
     }
@@ -261,11 +307,23 @@ impl Store {
         input: CreateSession,
         extra: impl FnOnce(&Transaction<'_>, &SessionHead) -> Result<()>,
     ) -> Result<SessionHead> {
+        self.create_session_with_id(input, None, extra)
+    }
+
+    pub(crate) fn create_session_with_id(
+        &mut self,
+        input: CreateSession,
+        id: Option<String>,
+        extra: impl FnOnce(&Transaction<'_>, &SessionHead) -> Result<()>,
+    ) -> Result<SessionHead> {
+        if let Some(id) = &id {
+            validate_id(id)?;
+        }
         validate_text(&input.title, 512, false)?;
         validate_text(&input.workspace, 4096, false)?;
         let timestamp = now();
         let session = SessionHead {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             agent: input.agent,
             kind: input.kind,
             title: input.title,
@@ -631,6 +689,15 @@ impl Store {
         cursor: Option<String>,
         limit: usize,
     ) -> Result<ContentPage> {
+        self.read_snapshot(|| self.contents_inner(session_id, cursor, limit))
+    }
+
+    fn contents_inner(
+        &self,
+        session_id: &str,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<ContentPage> {
         validate_id(session_id)?;
         if let Some(cursor) = &cursor {
             validate_id(cursor)?;
@@ -675,6 +742,10 @@ impl Store {
     }
 
     pub fn content(&self, session_id: &str, content_id: &str, offset: i64) -> Result<Vec<u8>> {
+        self.read_snapshot(|| self.content_inner(session_id, content_id, offset))
+    }
+
+    fn content_inner(&self, session_id: &str, content_id: &str, offset: i64) -> Result<Vec<u8>> {
         validate_id(session_id)?;
         validate_id(content_id)?;
         if !(0..=MAX_CONTENT_BYTES).contains(&offset) {
