@@ -1410,16 +1410,6 @@ async fn serve(
         return Err("the local API must bind to loopback".into());
     }
     let database = Database::open(directory.clone()).await?;
-    // Orphaned DAG dispatches from a crashed process are reconciled in one
-    // set-based pass before the API accepts traffic (Stage 7 batch recovery).
-    let recovery = database.call(|store| store.recover_dispatches()).await?;
-    if !recovery.settled.is_empty() || !recovery.resumed.is_empty() {
-        eprintln!(
-            "recovered orchestration dispatches: {} settled, {} resumed",
-            recovery.settled.len(),
-            recovery.resumed.len()
-        );
-    }
     let token = Token::load(&directory)?;
     // Keep inherited HTTP endpoints and direct-device reconnects usable when
     // an ephemeral listener can reclaim its previous port. Explicit ports are
@@ -1522,6 +1512,13 @@ async fn serve(
     if api.agents.reconcile_cross_model_children().await? > 0 {
         api.publish();
     }
+    let recovery = database
+        .call_control("dispatch.reconcile", |store| store.recover_dispatches())
+        .await?;
+    if !recovery.settled.is_empty() {
+        api.publish();
+    }
+    prosperod_rs::orchestration::recover_worker_starts(&database, &api.agents).await?;
     api.schedules.start().await;
     api.plugin_services.start_auto().await;
     let running_automations = database

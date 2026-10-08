@@ -13,7 +13,7 @@ use prosperod_rs::{
     orchestration::{
         CleanupWorktree, CreateRun, CreateTask, RegisterWorktree, StartWorker, StopWorker,
         WorktreeAssetKind, WorktreeAssetState, WorktreeCreate, cleanup_worktree, create_worktree,
-        inspect_worktree, start_worker, stop_worker, worktree_default_path,
+        get_worker_start, inspect_worktree, start_worker, stop_worker, worktree_default_path,
     },
     protocol::{AgentKind, CreateSession, SessionKind, UpdateSession},
     worker::Database,
@@ -464,6 +464,8 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
             skills: vec![],
             approval_policy: None,
             account_id: None,
+            plugin_id: None,
+            profile_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -502,6 +504,8 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
             skills: vec![],
             approval_policy: None,
             account_id: None,
+            plugin_id: None,
+            profile_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -571,6 +575,148 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
     .unwrap();
     assert_eq!(cleaned.asset.state, WorktreeAssetState::Cleaned);
     assert!(!tree_path.exists());
+}
+
+#[tokio::test]
+async fn concurrent_start_retries_survive_caller_cancellation_and_create_one_worker() {
+    let (directory, repo) = init_repo();
+    let _cli_env = CLI_ENV_LOCK.lock().await;
+    let cli = directory.path().join("fake-claude-concurrent.py");
+    std::fs::write(&cli, FAKE_CLI).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+    }
+    let database = Database::open(directory.path().join("data")).await.unwrap();
+    let agents = Agents::new(database.clone());
+    let (run_id, task_id) = database
+        .call(|store| {
+            let run = store.create_run(CreateRun {
+                objective: "concurrent worker start".into(),
+                coordinator_session_id: None,
+            })?;
+            let task = store.create_task(CreateTask {
+                run_id: run.id.clone(),
+                title: "one worker".into(),
+                spec: "run once".into(),
+                skills: Vec::new(),
+                deps: Vec::new(),
+                parent_id: None,
+            })?;
+            Ok((run.id, task.id))
+        })
+        .await
+        .unwrap();
+    let operation_id = "op-worker-concurrent";
+    let request = StartWorker {
+        agent: AgentKind::Claude,
+        kind: None,
+        skills: Vec::new(),
+        approval_policy: None,
+        account_id: None,
+        plugin_id: None,
+        profile_id: None,
+        task_id: task_id.clone(),
+        cwd: repo.to_string_lossy().into_owned(),
+        worktree: "new".into(),
+        operation_id: Some(operation_id.into()),
+    };
+    let first = tokio::spawn({
+        let database = database.clone();
+        let agents = agents.clone();
+        let request = request.clone();
+        async move { start_worker(&database, &agents, request).await }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if get_worker_start(&database, operation_id).await.is_ok() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    first.abort();
+    let mut retries = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let database = database.clone();
+        let agents = agents.clone();
+        let request = request.clone();
+        retries.spawn(async move { start_worker(&database, &agents, request).await });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(result) = retries.join_next().await {
+        outcomes.push(result.unwrap().unwrap());
+    }
+    assert_eq!(outcomes.len(), 20);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.dispatch.id == outcomes[0].dispatch.id)
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.session_id == outcomes[0].session_id)
+    );
+    assert_eq!(agents.count(), 1);
+    let (dispatches, assets) = database
+        .call({
+            let run_id = run_id.clone();
+            move |store| {
+                Ok((
+                    store.list_dispatches(Some(&run_id))?,
+                    store.list_worktree_assets(Some(&run_id))?,
+                ))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(dispatches.len(), 1);
+    assert_eq!(assets.len(), 1);
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        2
+    );
+    let dispatch_id = outcomes[0].dispatch.id.clone();
+    database
+        .call_control("worker.stop.settle", move |store| {
+            store.abandon_dispatch(
+                &dispatch_id,
+                "cancel before close",
+                prosperod_rs::orchestration::TaskStatus::Cancelled,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(agents.count(), 1);
+    let stopped = stop_worker(
+        &database,
+        &agents,
+        StopWorker {
+            task_id,
+            reason: Some("cancel concurrent worker".into()),
+            final_status: Some("cancelled".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stopped.task.status,
+        prosperod_rs::orchestration::TaskStatus::Cancelled
+    );
+    assert_eq!(agents.count(), 0);
+    let asset_id = assets[0].id.clone();
+    let asset = database
+        .call(move |store| store.worktree_asset(&asset_id))
+        .await
+        .unwrap();
+    assert_eq!(asset.state, WorktreeAssetState::Preserved);
 }
 
 /// Fake `claude` CLI with a per-test capture path baked into the script (the
@@ -647,6 +793,8 @@ async fn opencode_worker_requires_chat_completions_profile() {
             skills: vec![],
             approval_policy: None,
             account_id: None,
+            plugin_id: None,
+            profile_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "none".into(),
@@ -696,6 +844,8 @@ async fn worker_expands_bound_skill_into_the_delivered_brief() {
             skills: vec![],
             approval_policy: None,
             account_id: None,
+            plugin_id: None,
+            profile_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -795,6 +945,8 @@ async fn worker_rejects_undeclared_skill_mention_and_preserves_the_tree() {
             skills: vec![],
             approval_policy: None,
             account_id: None,
+            plugin_id: None,
+            profile_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -858,6 +1010,8 @@ async fn worker_rejects_missing_bound_skill_and_preserves_the_tree() {
             skills: vec![],
             approval_policy: None,
             account_id: None,
+            plugin_id: None,
+            profile_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),

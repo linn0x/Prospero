@@ -402,6 +402,15 @@ impl Store {
         body: String,
         previous: Option<TimelineRecord>,
     ) -> Result<TimelineRecord> {
+        let timestamp = crate::database::now();
+        let output = !input.text.is_empty()
+            && !matches!(
+                &input.body,
+                TimelineBody::Message {
+                    role: MessageRole::User,
+                    ..
+                }
+            );
         let position = if let Some(previous) = &previous {
             previous.position
         } else {
@@ -470,6 +479,18 @@ impl Store {
         };
         let revision = input.expected_revision + 1;
         transaction.execute("INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview,subagent_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(session_id,id) DO UPDATE SET revision=excluded.revision,generation=excluded.generation,body=excluded.body,preview=excluded.preview", params![session_id, input.id, input.turn_id, position, revision, generation, body, preview, input.subagent_id])?;
+        transaction.execute(
+            "INSERT INTO timeline_checkpoints(session_id,last_output_at,last_progress_at) VALUES(?1,?2,?3) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+             last_output_at=CASE \
+               WHEN excluded.last_output_at IS NULL THEN timeline_checkpoints.last_output_at \
+               WHEN timeline_checkpoints.last_output_at IS NULL THEN excluded.last_output_at \
+               ELSE max(timeline_checkpoints.last_output_at,excluded.last_output_at) END, \
+             last_progress_at=CASE \
+               WHEN timeline_checkpoints.last_progress_at IS NULL THEN excluded.last_progress_at \
+               ELSE max(timeline_checkpoints.last_progress_at,excluded.last_progress_at) END",
+            params![session_id, output.then_some(timestamp), timestamp],
+        )?;
         if let TimelineBody::Subagent {
             subagent_id,
             name,
@@ -574,6 +595,10 @@ impl Store {
     }
 
     pub fn timeline(&self, session_id: &str, query: TimelineQuery) -> Result<TimelinePage> {
+        self.read_snapshot(|| self.timeline_inner(session_id, query))
+    }
+
+    fn timeline_inner(&self, session_id: &str, query: TimelineQuery) -> Result<TimelinePage> {
         let (latest_position, revision) = self.timeline_head(session_id)?;
         let limit = query.limit.unwrap_or(40);
         if !(1..=100).contains(&limit)
@@ -628,6 +653,14 @@ impl Store {
         session_id: &str,
         ids: Vec<String>,
     ) -> Result<TimelineLookupResult> {
+        self.read_snapshot(|| self.timeline_lookup_inner(session_id, ids))
+    }
+
+    fn timeline_lookup_inner(
+        &self,
+        session_id: &str,
+        ids: Vec<String>,
+    ) -> Result<TimelineLookupResult> {
         let (latest_position, revision) = self.timeline_head(session_id)?;
         if ids.len() > 40 {
             return Err(Error::Invalid("timeline lookup limit is 40".into()));
@@ -654,6 +687,15 @@ impl Store {
     }
 
     pub fn timeline_text(
+        &self,
+        session_id: &str,
+        id: &str,
+        query: TimelineTextQuery,
+    ) -> Result<TimelineTextPage> {
+        self.read_snapshot(|| self.timeline_text_inner(session_id, id, query))
+    }
+
+    fn timeline_text_inner(
         &self,
         session_id: &str,
         id: &str,

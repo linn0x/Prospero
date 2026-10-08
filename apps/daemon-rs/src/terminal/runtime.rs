@@ -154,12 +154,19 @@ impl Terminals {
         if self.0.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
-        let permit = self
-            .0
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Busy)?;
+        let permit = self.0.slots.clone().try_acquire_owned().map_err(|_| {
+            self.0
+                .database
+                .record_rejection("terminal.create", "terminal_sessions");
+            Error::Backpressure(crate::error::ResourceBackpressure {
+                retry_after_ms: 1000,
+                operation: "terminal.create".into(),
+                resource: "terminal_sessions".into(),
+                queue_depth: self.count(),
+                queue_capacity: 16,
+                side_effect_committed: Some(false),
+            })
+        })?;
         let runtime = self.clone();
         let (reply, result) = oneshot::channel();
         tokio::spawn(async move {
@@ -212,19 +219,13 @@ impl Terminals {
         let persistence = runtime.persist_live(&head.id, &terminal).await;
         if terminal.lost() {
             activity_task.abort();
-            let id = head.id.clone();
-            if runtime
-                .0
-                .database
-                .call(move |store| store.fail_terminal(&id))
-                .await
-                .is_ok()
-            {
-                if let Ok(mut entries) = runtime.0.entries.lock() {
-                    entries.remove(&head.id);
+            match runtime.fail(&head.id).await {
+                Ok(()) => {
+                    if let Ok(mut entries) = runtime.0.entries.lock() {
+                        entries.remove(&head.id);
+                    }
                 }
-            } else {
-                runtime.0.failed.store(true, Ordering::Release);
+                Err(_) => runtime.0.failed.store(true, Ordering::Release),
             }
             drop(permit);
             runtime
@@ -355,23 +356,46 @@ impl Terminals {
     }
 
     async fn finish(&self, id: &str, archive: Archive) -> Result<()> {
-        for attempt in 0..20 {
+        let mut delay = Duration::from_millis(25);
+        loop {
             let id = id.to_owned();
             let archive = archive.clone();
             match self
                 .0
                 .database
-                .call(move |store| store.finish_terminal(&id, archive))
+                .call_control("terminal.finish", move |store| {
+                    store.finish_terminal(&id, archive)
+                })
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(Error::Busy) if attempt < 19 => {
-                    tokio::time::sleep(Duration::from_millis(25)).await
+                Err(error) if retryable_database_pressure(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err(Error::Busy)
+    }
+
+    async fn fail(&self, id: &str) -> Result<()> {
+        let mut delay = Duration::from_millis(25);
+        loop {
+            let id = id.to_owned();
+            match self
+                .0
+                .database
+                .call_control("terminal.fail", move |store| store.fail_terminal(&id))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if retryable_database_pressure(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn persist_activity(&self, id: &str, terminal: &Handle) -> Result<()> {
@@ -387,12 +411,18 @@ impl Terminals {
                 match self
                     .0
                     .database
-                    .call(move |store| store.set_session_busy_since(&id, busy_since))
+                    .call_background("terminal.activity", move |store| {
+                        store.set_session_busy_since(&id, busy_since)
+                    })
                     .await
                 {
                     Ok(true) => self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1)),
                     Ok(false) => {}
                     Err(Error::NotFound) if activity.exited => return Ok(()),
+                    Err(error) if retryable_database_pressure(&error) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 }
                 published = Some(activity.busy_since);
@@ -448,7 +478,9 @@ impl Terminals {
             match self
                 .0
                 .database
-                .call(move |store| store.checkpoint_terminal(&id, archive))
+                .call_background("terminal.checkpoint", move |store| {
+                    store.checkpoint_terminal(&id, archive)
+                })
                 .await
             {
                 Ok(()) => {
@@ -457,7 +489,7 @@ impl Terminals {
                         .changed
                         .send_modify(|value| *value = value.wrapping_add(1));
                 }
-                Err(Error::Busy) => {}
+                Err(error) if retryable_database_pressure(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -551,22 +583,18 @@ impl Terminals {
             Ok(terminal) => terminal,
             Err(error) => {
                 let id = head.id;
-                self.0
-                    .database
-                    .call(move |store| {
-                        store.finish_terminal(
-                            &id,
-                            Archive {
-                                snapshot: None,
-                                floor: 0,
-                                start: 0,
-                                seq: 0,
-                                events: Vec::new(),
-                                exit_code: None,
-                            },
-                        )
-                    })
-                    .await?;
+                self.finish(
+                    &id,
+                    Archive {
+                        snapshot: None,
+                        floor: 0,
+                        start: 0,
+                        seq: 0,
+                        events: Vec::new(),
+                        exit_code: None,
+                    },
+                )
+                .await?;
                 return Err(error);
             }
         };
@@ -592,10 +620,7 @@ impl Terminals {
             terminal.wait_exited().await;
             let archive = terminal.archive().await?;
             let id = head.id;
-            self.0
-                .database
-                .call(move |store| store.finish_terminal(&id, archive))
-                .await?;
+            self.finish(&id, archive).await?;
             return Err(error);
         }
         self.0
@@ -720,6 +745,14 @@ fn shell_command(command: &str) -> Result<ProgramSpec> {
         environment: Vec::new(),
         account_id: None,
     })
+}
+
+fn retryable_database_pressure(error: &Error) -> bool {
+    match error {
+        Error::Busy => true,
+        Error::Backpressure(pressure) => pressure.resource.starts_with("database."),
+        _ => false,
+    }
 }
 
 fn normalize_selection(

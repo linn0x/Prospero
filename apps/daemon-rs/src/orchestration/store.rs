@@ -17,7 +17,7 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use super::*;
-use crate::database::{Store, now, validate_id, validate_text};
+use crate::database::{Store, label, now, validate_id, validate_text};
 use crate::error::{Error, Result};
 
 const MAX_GRAPH_NODES: usize = 200;
@@ -41,6 +41,544 @@ pub(super) fn fingerprint(method: &str, payload: &impl Serialize) -> String {
     hasher.write(b"\0");
     hasher.write(serde_json::to_vec(payload).unwrap_or_default().as_slice());
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod worker_start_tests {
+    use super::*;
+    use crate::protocol::AgentKind;
+    use tempfile::TempDir;
+
+    fn input(task_id: String, operation_id: &str, account: &str, plugin: &str) -> StartWorker {
+        StartWorker {
+            task_id,
+            agent: AgentKind::Codex,
+            cwd: "/tmp".into(),
+            worktree: "none".into(),
+            kind: Some("structured".into()),
+            skills: Vec::new(),
+            approval_policy: Some("standard".into()),
+            account_id: Some(account.into()),
+            plugin_id: Some(plugin.into()),
+            profile_id: Some(account.into()),
+            operation_id: Some(operation_id.into()),
+        }
+    }
+
+    fn setup(count: usize) -> (TempDir, Store, String, Vec<String>) {
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let nodes = (0..count)
+            .map(|index| GraphNodeInput {
+                client_id: format!("n{index}"),
+                title: format!("task {index}"),
+                spec: format!("work {index}"),
+                skills: Vec::new(),
+                deps: Vec::new(),
+                parent_id: None,
+            })
+            .collect();
+        let graph = store
+            .create_run_graph(CreateRunGraph {
+                objective: "worker starts".into(),
+                nodes,
+                coordinator_session_id: None,
+                operation_id: "worker-start-test-graph".into(),
+            })
+            .unwrap();
+        let ids = (0..count)
+            .map(|index| graph.id_map[&format!("n{index}")].clone())
+            .collect();
+        (directory, store, graph.run.id, ids)
+    }
+
+    fn enqueue(store: &mut Store, run_id: &str, input: &StartWorker, fingerprint: &str) {
+        store
+            .enqueue_worker_start(
+                input.operation_id.as_deref().unwrap(),
+                fingerprint,
+                run_id,
+                input,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn worker_start_claim_is_durable_and_rejects_conflicting_reuse() {
+        let (_directory, mut store, run_id, ids) = setup(1);
+        let request = input(ids[0].clone(), "worker-op-one", "account-a", "plugin-a");
+        enqueue(&mut store, &run_id, &request, "fingerprint-a");
+        let replay = store
+            .enqueue_worker_start("worker-op-one", "fingerprint-a", &run_id, &request)
+            .unwrap();
+        assert!(matches!(
+            replay,
+            super::super::start::WorkerStartEnqueue::Existing(_)
+        ));
+        assert!(
+            store
+                .enqueue_worker_start("worker-op-one", "fingerprint-b", &run_id, &request)
+                .is_err()
+        );
+        let second = input(ids[0].clone(), "worker-op-two", "account-b", "plugin-b");
+        assert!(matches!(
+            store.enqueue_worker_start(
+                "worker-op-two",
+                "fingerprint-two",
+                &run_id,
+                &second
+            ),
+            Err(Error::Feature(code, _)) if code == "task_not_editable"
+        ));
+        let claim = store.claim_next_worker_start().unwrap().unwrap();
+        assert_eq!(claim.operation_id, "worker-op-one");
+        drop(store);
+        let mut reopened = Store::open(_directory.path()).unwrap();
+        assert_eq!(
+            reopened.worker_start("worker-op-one").unwrap().phase,
+            WorkerStartPhase::Preparing
+        );
+    }
+
+    #[test]
+    fn legacy_worker_start_receipt_is_imported_without_launching_again() {
+        let (_directory, mut store, run_id, ids) = setup(1);
+        let settled = store
+            .dispatch_task(&ids[0], "legacy-worker-session", None, None)
+            .unwrap();
+        let outcome = WorkerStartOutcome {
+            task: settled.task,
+            dispatch: settled.dispatch,
+            session_id: "legacy-worker-session".into(),
+            worktree: None,
+        };
+        let request = input(
+            ids[0].clone(),
+            "legacy-worker-operation",
+            "account-a",
+            "plugin-a",
+        );
+        let legacy_fingerprint = fingerprint(
+            "worker.start",
+            &serde_json::json!({
+                "taskId": request.task_id,
+                "cwd": request.cwd,
+                "worktree": request.worktree,
+            }),
+        );
+        store
+            .remember_operation("legacy-worker-operation", &legacy_fingerprint, &outcome)
+            .unwrap();
+        let imported = store
+            .enqueue_worker_start(
+                "legacy-worker-operation",
+                &super::super::start::worker_start_fingerprint(&request),
+                &run_id,
+                &request,
+            )
+            .unwrap();
+        assert!(matches!(
+            imported,
+            super::super::start::WorkerStartEnqueue::Existing(_)
+        ));
+        let operation = store.worker_start("legacy-worker-operation").unwrap();
+        assert_eq!(operation.phase, WorkerStartPhase::Running);
+        assert_eq!(operation.outcome.unwrap().dispatch.id, outcome.dispatch.id);
+        let mut conflict = request;
+        conflict.cwd = "/var/tmp".into();
+        assert!(
+            store
+                .enqueue_worker_start(
+                    "legacy-worker-operation",
+                    &super::super::start::worker_start_fingerprint(&conflict),
+                    &run_id,
+                    &conflict,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn existing_native_controllers_do_not_exhaust_worker_account_admission() {
+        let (_directory, mut store, run_id, ids) = setup(1);
+        for index in 0..20 {
+            store
+                .create_agent_session(
+                    crate::agent::CreateAgentSession {
+                        agent: AgentKind::Codex,
+                        title: format!("controller {index}"),
+                        workspace: "/tmp".into(),
+                        auto_approve: false,
+                        mode: None,
+                        model: None,
+                        effort: None,
+                        agent_preset: None,
+                        account_id: None,
+                        resume: None,
+                    },
+                    crate::agent::ApprovalPolicy::Manual,
+                )
+                .unwrap();
+        }
+        let mut request = input(
+            ids[0].clone(),
+            "worker-with-controllers",
+            "unused",
+            "crawler",
+        );
+        request.account_id = None;
+        request.profile_id = None;
+        enqueue(&mut store, &run_id, &request, "controller-admission");
+        assert_eq!(
+            store
+                .claim_next_worker_start()
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "worker-with-controllers"
+        );
+    }
+
+    #[test]
+    fn admission_skips_a_blocked_scope_without_head_of_line_blocking() {
+        let (_directory, mut store, run_id, ids) = setup(18);
+        for (index, task_id) in ids.iter().enumerate().take(17) {
+            let request = input(
+                task_id.clone(),
+                &format!("worker-op-{index}"),
+                "account-a",
+                &format!("plugin-{index}"),
+            );
+            enqueue(
+                &mut store,
+                &run_id,
+                &request,
+                &format!("fingerprint-{index}"),
+            );
+        }
+        let request = input(ids[17].clone(), "worker-op-17", "account-b", "plugin-b");
+        enqueue(&mut store, &run_id, &request, "fingerprint-17");
+        for index in 0..16 {
+            assert_eq!(
+                store
+                    .claim_next_worker_start()
+                    .unwrap()
+                    .unwrap()
+                    .operation_id,
+                format!("worker-op-{index}")
+            );
+        }
+        assert_eq!(
+            store
+                .claim_next_worker_start()
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "worker-op-17"
+        );
+        assert_eq!(
+            store
+                .cancel_queued_worker_start("worker-op-16")
+                .unwrap()
+                .phase,
+            WorkerStartPhase::Cancelled
+        );
+    }
+
+    #[test]
+    fn capped_1024_row_queue_uses_a_fixed_statement_budget() {
+        let (_directory, mut store, run_id, ids) = setup(1);
+        let tx = store.connection.transaction().unwrap();
+        let mut task_ids = vec![ids[0].clone()];
+        for index in 1..1024 {
+            let task_id = format!("task-bulk-{index}");
+            tx.execute(
+                "INSERT INTO orch_tasks(id,run_id,title,spec,skills,parent_id,status,result,created_at,updated_at) \
+                 VALUES(?1,?2,?3,'work','[]',NULL,'pending',NULL,?4,?4)",
+                params![task_id, run_id, format!("task {index}"), index as i64 + 1],
+            )
+            .unwrap();
+            task_ids.push(task_id);
+        }
+        for (index, task_id) in task_ids.iter().enumerate() {
+            let operation_id = format!("worker-bulk-{index}");
+            let request = input(
+                task_id.clone(),
+                &operation_id,
+                "account-cap",
+                &format!("plugin-{index}"),
+            );
+            tx.execute(
+                "INSERT INTO orch_worker_starts(operation_id,fingerprint,request,phase,task_id,run_id,agent,account_scope,plugin_scope,profile_scope,ticket,created_at,updated_at) \
+                 VALUES(?1,?2,?3,'queued',?4,?5,'codex','account-cap',?6,'account-cap',?7,?8,?8)",
+                params![
+                    operation_id,
+                    format!("fingerprint-{index}"),
+                    serde_json::to_string(&request).unwrap(),
+                    task_id,
+                    run_id,
+                    format!("plugin-{index}"),
+                    index as i64,
+                    index as i64 + 1,
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let limits = super::super::start::worker_start_limits();
+        let cap = limits
+            .global
+            .min(limits.agent)
+            .min(limits.account)
+            .min(limits.run)
+            .min(limits.profile)
+            .min(1023);
+        for _ in 0..cap {
+            assert!(store.claim_next_worker_start().unwrap().is_some());
+        }
+        let (claim, statements) = store.claim_next_worker_start_statement_count().unwrap();
+        assert!(claim.is_none());
+        assert!(statements <= 9, "statement count was {statements}");
+        let queued: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM orch_worker_starts WHERE phase='queued'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1024 - cap);
+    }
+
+    #[test]
+    fn admission_terminalizes_task_state_drift_before_side_effects() {
+        let (_directory, mut store, run_id, ids) = setup(2);
+        let changed = input(ids[0].clone(), "worker-op-changed", "account-a", "plugin-a");
+        let blocked = input(ids[1].clone(), "worker-op-blocked", "account-b", "plugin-b");
+        enqueue(&mut store, &run_id, &changed, "fingerprint-changed");
+        enqueue(&mut store, &run_id, &blocked, "fingerprint-blocked");
+        store
+            .connection
+            .execute(
+                "UPDATE orch_tasks SET status='cancelled' WHERE id=?1",
+                [&ids[0]],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO orch_task_deps(run_id,task_id,dep_id,position) VALUES(?1,?2,?3,0)",
+                params![run_id, ids[1], ids[0]],
+            )
+            .unwrap();
+        assert!(store.claim_next_worker_start().unwrap().is_none());
+        let changed = store.worker_start("worker-op-changed").unwrap();
+        assert_eq!(changed.phase, WorkerStartPhase::Failed);
+        assert_eq!(changed.error_code.as_deref(), Some("task_not_editable"));
+        let blocked = store.worker_start("worker-op-blocked").unwrap();
+        assert_eq!(blocked.phase, WorkerStartPhase::Failed);
+        assert_eq!(blocked.error_code.as_deref(), Some("task_not_ready"));
+        assert!(changed.asset_id.is_none());
+        assert!(changed.session_id.is_none());
+        assert!(blocked.asset_id.is_none());
+        assert!(blocked.session_id.is_none());
+    }
+
+    #[test]
+    fn recovery_requeues_only_operations_with_no_possible_side_effect() {
+        let (directory, mut store, run_id, ids) = setup(3);
+        let safe = input(ids[0].clone(), "worker-op-safe", "account-a", "plugin-a");
+        let uncertain = input(
+            ids[1].clone(),
+            "worker-op-uncertain",
+            "account-b",
+            "plugin-b",
+        );
+        enqueue(&mut store, &run_id, &safe, "fingerprint-safe");
+        enqueue(&mut store, &run_id, &uncertain, "fingerprint-uncertain");
+        let worktree = input(
+            ids[2].clone(),
+            "worker-op-worktree",
+            "account-c",
+            "plugin-c",
+        );
+        enqueue(&mut store, &run_id, &worktree, "fingerprint-worktree");
+        assert_eq!(
+            store
+                .claim_next_worker_start()
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "worker-op-safe"
+        );
+        assert_eq!(
+            store
+                .claim_next_worker_start()
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "worker-op-uncertain"
+        );
+        assert_eq!(
+            store
+                .claim_next_worker_start()
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            "worker-op-worktree"
+        );
+        store
+            .plan_worker_start_session("worker-op-uncertain", "worker-session-uncertain")
+            .unwrap();
+        let planned = directory.path().join("planned-worktree");
+        std::fs::create_dir(&planned).unwrap();
+        store
+            .plan_worker_start_worktree(
+                "worker-op-worktree",
+                directory.path().to_str().unwrap(),
+                planned.to_str().unwrap(),
+                "prospero/test/worktree",
+            )
+            .unwrap();
+        store.recover_worker_start_operations().unwrap();
+        assert_eq!(
+            store.worker_start("worker-op-safe").unwrap().phase,
+            WorkerStartPhase::Queued
+        );
+        assert_eq!(
+            store.worker_start("worker-op-uncertain").unwrap().phase,
+            WorkerStartPhase::Failed
+        );
+        let uncertain = store.worker_start("worker-op-uncertain").unwrap();
+        assert_eq!(
+            uncertain.side_effect_state,
+            WorkerStartSideEffectState::Unknown
+        );
+        assert_eq!(
+            uncertain.error_code.as_deref(),
+            Some("recovery_interrupted")
+        );
+        let worktree = store.worker_start("worker-op-worktree").unwrap();
+        assert_eq!(worktree.phase, WorkerStartPhase::Failed);
+        let asset = store
+            .worktree_asset(worktree.asset_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(asset.state, WorktreeAssetState::Preserved);
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_enqueue_has_one_durable_claim() {
+        let (directory, store, run_id, ids) = setup(1);
+        drop(store);
+        let database = crate::worker::Database::open(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let request = input(ids[0].clone(), "worker-op-race", "account-a", "plugin-a");
+        let first_database = database.clone();
+        let second_database = database.clone();
+        let first_request = request.clone();
+        let second_request = request.clone();
+        let first_run = run_id.clone();
+        let second_run = run_id.clone();
+        let (first, second) = tokio::join!(
+            first_database.call_control("test.worker.start.first", move |store| {
+                store.enqueue_worker_start(
+                    "worker-op-race",
+                    "fingerprint-race",
+                    &first_run,
+                    &first_request,
+                )
+            }),
+            second_database.call_control("test.worker.start.second", move |store| {
+                store.enqueue_worker_start(
+                    "worker-op-race",
+                    "fingerprint-race",
+                    &second_run,
+                    &second_request,
+                )
+            })
+        );
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|value| matches!(value, super::super::start::WorkerStartEnqueue::Fresh(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|value| matches!(
+                    value,
+                    super::super::start::WorkerStartEnqueue::Existing(_)
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_never_replays_a_delivery_that_may_have_started() {
+        let (_directory, mut store, run_id, ids) = setup(1);
+        let request = input(
+            ids[0].clone(),
+            "worker-op-delivery",
+            "account-a",
+            "plugin-a",
+        );
+        enqueue(&mut store, &run_id, &request, "fingerprint-delivery");
+        store.claim_next_worker_start().unwrap().unwrap();
+        let session_id = "worker-session-delivery";
+        store
+            .plan_worker_start_session("worker-op-delivery", session_id)
+            .unwrap();
+        store
+            .create_agent_session_with_id(
+                crate::agent::CreateAgentSession {
+                    agent: AgentKind::Codex,
+                    title: "worker delivery".into(),
+                    workspace: "/tmp".into(),
+                    auto_approve: false,
+                    mode: None,
+                    model: None,
+                    effort: None,
+                    agent_preset: None,
+                    account_id: None,
+                    resume: None,
+                },
+                crate::agent::ApprovalPolicy::Manual,
+                Some(session_id.into()),
+            )
+            .unwrap();
+        store
+            .record_worker_start_session("worker-op-delivery", session_id)
+            .unwrap();
+        store
+            .commit_worker_start_dispatch("worker-op-delivery", &ids[0], session_id, None)
+            .unwrap();
+        store
+            .mark_worker_start_delivering("worker-op-delivery")
+            .unwrap();
+        store.recover_worker_start_operations().unwrap();
+        let operation = store.worker_start("worker-op-delivery").unwrap();
+        assert_eq!(operation.phase, WorkerStartPhase::DeliveryUnknown);
+        assert_eq!(
+            operation.side_effect_state,
+            WorkerStartSideEffectState::Unknown
+        );
+        assert_eq!(operation.error_code.as_deref(), Some("delivery_unknown"));
+        let dispatch = store
+            .dispatch(operation.dispatch_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(dispatch.state, DispatchState::Abandoned);
+        assert_eq!(store.task(&ids[0]).unwrap().status, TaskStatus::Failed);
+        store.recover_worker_start_operations().unwrap();
+        assert_eq!(
+            store.worker_start("worker-op-delivery").unwrap().phase,
+            WorkerStartPhase::DeliveryUnknown
+        );
+    }
 }
 
 enum Idempotent<T> {
@@ -90,27 +628,26 @@ pub struct SettleOutcome {
 pub struct RecoveryReport {
     /// Dispatches whose worker session is gone; converged abandoned/failed.
     pub settled: Vec<Dispatch>,
-    /// `starting` dispatches whose worker survived; promoted to `running`.
     pub resumed: Vec<Dispatch>,
 }
 
 #[derive(Clone)]
-struct TaskRow {
-    id: String,
-    run_id: String,
-    title: String,
-    spec: String,
-    skills: Vec<String>,
-    deps: Vec<String>,
-    parent_id: Option<String>,
-    status: TaskStatus,
-    result: Option<String>,
-    created_at: i64,
-    updated_at: i64,
+pub(super) struct TaskRow {
+    pub(super) id: String,
+    pub(super) run_id: String,
+    pub(super) title: String,
+    pub(super) spec: String,
+    pub(super) skills: Vec<String>,
+    pub(super) deps: Vec<String>,
+    pub(super) parent_id: Option<String>,
+    pub(super) status: TaskStatus,
+    pub(super) result: Option<String>,
+    pub(super) created_at: i64,
+    pub(super) updated_at: i64,
 }
 
 impl TaskRow {
-    fn task(self) -> Task {
+    pub(super) fn task(self) -> Task {
         Task {
             id: self.id,
             run_id: self.run_id,
@@ -461,6 +998,91 @@ fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeAsset> {
     })
 }
 
+fn worker_start_phase(value: &str) -> WorkerStartPhase {
+    match value {
+        "queued" => WorkerStartPhase::Queued,
+        "preparing" => WorkerStartPhase::Preparing,
+        "worktree_created" => WorkerStartPhase::WorktreeCreated,
+        "session_created" => WorkerStartPhase::SessionCreated,
+        "dispatch_committed" => WorkerStartPhase::DispatchCommitted,
+        "delivering" => WorkerStartPhase::Delivering,
+        "delivery_unknown" => WorkerStartPhase::DeliveryUnknown,
+        "running" => WorkerStartPhase::Running,
+        "cancelled" => WorkerStartPhase::Cancelled,
+        _ => WorkerStartPhase::Failed,
+    }
+}
+
+fn map_worker_start(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerStartOperation> {
+    let request: String = row.get("request")?;
+    let input: StartWorker = serde_json::from_str(&request).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            request.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    let result: Option<String> = row.get("result")?;
+    let outcome = result
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                result.as_ref().map_or(0, String::len),
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let phase = worker_start_phase(&row.get::<_, String>("phase")?);
+    let worktree_path: Option<String> = row.get("worktree_path")?;
+    let asset_id: Option<String> = row.get("asset_id")?;
+    let session_id: Option<String> = row.get("session_id")?;
+    let dispatch_id: Option<String> = row.get("dispatch_id")?;
+    let side_effect_state = match phase {
+        WorkerStartPhase::Queued | WorkerStartPhase::Cancelled => WorkerStartSideEffectState::None,
+        WorkerStartPhase::Preparing if worktree_path.is_some() || session_id.is_some() => {
+            WorkerStartSideEffectState::Unknown
+        }
+        WorkerStartPhase::Preparing => WorkerStartSideEffectState::None,
+        WorkerStartPhase::DeliveryUnknown => WorkerStartSideEffectState::Unknown,
+        WorkerStartPhase::Failed
+            if worktree_path.is_none()
+                && asset_id.is_none()
+                && session_id.is_none()
+                && dispatch_id.is_none() =>
+        {
+            WorkerStartSideEffectState::None
+        }
+        WorkerStartPhase::Failed => WorkerStartSideEffectState::Unknown,
+        _ => WorkerStartSideEffectState::Committed,
+    };
+    Ok(WorkerStartOperation {
+        operation_id: row.get("operation_id")?,
+        phase,
+        task_id: row.get("task_id")?,
+        run_id: row.get("run_id")?,
+        agent: input.agent,
+        account_id: input.account_id,
+        worktree_path,
+        asset_id,
+        session_id,
+        dispatch_id,
+        outcome,
+        error: row.get("error")?,
+        error_code: row.get("error_code")?,
+        side_effect_state,
+        side_effect_committed: match side_effect_state {
+            WorkerStartSideEffectState::None => Some(false),
+            WorkerStartSideEffectState::Committed => Some(true),
+            WorkerStartSideEffectState::Unknown => None,
+        },
+        retry_after_ms: (!phase.terminal()).then_some(100),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
 fn map_gate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Gate> {
     let status: String = row.get("status")?;
     Ok(Gate {
@@ -478,6 +1100,15 @@ fn map_gate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Gate> {
         created_at: row.get("created_at")?,
         resolved_at: row.get("resolved_at")?,
     })
+}
+
+fn grouped_count(tx: &Transaction<'_>, sql: &str) -> Result<HashMap<String, i64>> {
+    let mut statement = tx.prepare(sql)?;
+    Ok(statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
 impl Store {
@@ -792,7 +1423,7 @@ impl Store {
     }
 
     /// All tasks of a run with their dependency edges, in creation order.
-    fn run_task_rows(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<TaskRow>> {
+    pub(super) fn run_task_rows(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<TaskRow>> {
         let mut tasks = Vec::new();
         {
             let mut statement = tx.prepare(
@@ -1727,6 +2358,845 @@ impl Store {
         Ok(())
     }
 
+    pub(super) fn worker_start(&mut self, operation_id: &str) -> Result<WorkerStartOperation> {
+        validate_id(operation_id)?;
+        let tx = self.connection.transaction()?;
+        let mut operation = tx
+            .query_row(
+                "SELECT * FROM orch_worker_starts WHERE operation_id=?1",
+                [operation_id],
+                map_worker_start,
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        if let Some(outcome) = operation.outcome.as_mut() {
+            if let Ok(task) = Self::task_row(&tx, &operation.task_id) {
+                outcome.task = task.task();
+            }
+            if let Some(dispatch_id) = operation.dispatch_id.as_deref()
+                && let Ok(dispatch) = Self::dispatch_row(&tx, dispatch_id)
+            {
+                outcome.dispatch = dispatch;
+            }
+            if let Some(asset_id) = operation.asset_id.as_deref()
+                && let Ok(asset) = Self::asset_row(&tx, asset_id)
+            {
+                outcome.worktree = Some(asset);
+            }
+        }
+        tx.commit()?;
+        Ok(operation)
+    }
+
+    pub(super) fn enqueue_worker_start(
+        &mut self,
+        operation_id: &str,
+        request_fingerprint: &str,
+        run_id: &str,
+        input: &StartWorker,
+    ) -> Result<super::start::WorkerStartEnqueue> {
+        validate_id(operation_id)?;
+        validate_id(&input.task_id)?;
+        validate_id(run_id)?;
+        validate_text(request_fingerprint, 4096, false)?;
+        let request = serde_json::to_string(input)?;
+        let agent = label(input.agent)?;
+        let account_scope = input
+            .account_id
+            .clone()
+            .unwrap_or_else(|| format!("native-{agent}"));
+        let plugin_scope = input.plugin_id.clone().unwrap_or_else(|| {
+            format!(
+                "unscoped-{}",
+                fingerprint("worker.start.plugin", &operation_id)
+            )
+        });
+        let profile_scope = input.profile_id.clone().unwrap_or_else(|| {
+            format!(
+                "unscoped-{}",
+                fingerprint("worker.start.profile", &operation_id)
+            )
+        });
+        validate_text(&account_scope, 128, false)?;
+        validate_text(&plugin_scope, 128, false)?;
+        validate_text(&profile_scope, 128, false)?;
+        let tx = self.connection.transaction()?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT fingerprint FROM orch_worker_starts WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != request_fingerprint {
+                return Err(invalid("operation id was already used for another request"));
+            }
+            let operation = tx.query_row(
+                "SELECT * FROM orch_worker_starts WHERE operation_id=?1",
+                [operation_id],
+                map_worker_start,
+            )?;
+            return Ok(super::start::WorkerStartEnqueue::Existing(operation));
+        }
+        let legacy: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT fingerprint,result,created_at FROM orch_operations WHERE id=?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((legacy_fingerprint, legacy_result, created_at)) = legacy {
+            let expected = fingerprint(
+                "worker.start",
+                &serde_json::json!({
+                    "taskId": input.task_id,
+                    "cwd": input.cwd,
+                    "worktree": input.worktree,
+                }),
+            );
+            if legacy_fingerprint != expected {
+                return Err(invalid("operation id was already used for another request"));
+            }
+            let outcome: WorkerStartOutcome = serde_json::from_str(&legacy_result)
+                .map_err(|_| invalid("operation id was already used for another request"))?;
+            if outcome.task.id != input.task_id || outcome.task.run_id != run_id {
+                return Err(invalid("operation id was already used for another request"));
+            }
+            let ticket: i64 = tx.query_row(
+                "SELECT COALESCE(max(ticket),-1)+1 FROM orch_worker_starts",
+                [],
+                |row| row.get(0),
+            )?;
+            let asset_id = outcome.worktree.as_ref().map(|asset| asset.id.as_str());
+            let worktree_path = outcome.worktree.as_ref().map(|asset| asset.path.as_str());
+            tx.execute(
+                "INSERT INTO orch_worker_starts(operation_id,fingerprint,request,phase,task_id,run_id,agent,account_scope,plugin_scope,profile_scope,ticket,worktree_repo,worktree_path,worktree_branch,asset_id,session_id,dispatch_id,result,error,error_code,created_at,updated_at) \
+                 VALUES(?1,?2,?3,'running',?4,?5,?6,?7,?8,?9,?10,NULL,?11,NULL,?12,?13,?14,?15,NULL,NULL,?16,?16)",
+                params![
+                    operation_id,
+                    request_fingerprint,
+                    request,
+                    input.task_id,
+                    run_id,
+                    agent,
+                    account_scope,
+                    plugin_scope,
+                    profile_scope,
+                    ticket,
+                    worktree_path,
+                    asset_id,
+                    outcome.session_id,
+                    outcome.dispatch.id,
+                    legacy_result,
+                    created_at
+                ],
+            )?;
+            let operation = tx.query_row(
+                "SELECT * FROM orch_worker_starts WHERE operation_id=?1",
+                [operation_id],
+                map_worker_start,
+            )?;
+            tx.commit()?;
+            return Ok(super::start::WorkerStartEnqueue::Existing(operation));
+        }
+        let reserved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orch_worker_starts WHERE task_id=?1 AND phase IN ('queued','preparing','worktree_created','session_created','dispatch_committed','delivering'))",
+            [&input.task_id],
+            |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(Error::Feature(
+                "task_not_editable".into(),
+                "the task already has a pending worker start".into(),
+            ));
+        }
+        let task = Self::task_row(&tx, &input.task_id)?;
+        if task.run_id != run_id {
+            return Err(invalid("worker start run does not own the task"));
+        }
+        Self::require_active_run(&tx, run_id)?;
+        if Self::active_dispatch(&tx, &input.task_id)?.is_some()
+            || !can_transition(task.status, TaskStatus::Dispatched)
+        {
+            return Err(Error::Feature(
+                "task_not_editable".into(),
+                "the task cannot accept another worker".into(),
+            ));
+        }
+        let unmet: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id WHERE d.task_id=?1 AND x.status<>'done'",
+            [&input.task_id],
+            |row| row.get(0),
+        )?;
+        if unmet > 0 {
+            return Err(Error::Feature(
+                "task_not_ready".into(),
+                "the task dependencies are not all done".into(),
+            ));
+        }
+        let queue_depth: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_worker_starts WHERE phase='queued'",
+            [],
+            |row| row.get(0),
+        )?;
+        let limits = super::start::worker_start_limits();
+        if queue_depth >= limits.queue {
+            return Err(Error::Backpressure(crate::error::ResourceBackpressure {
+                retry_after_ms: 250,
+                operation: "worker.start".into(),
+                resource: "worker_start_admission".into(),
+                queue_depth: queue_depth as usize,
+                queue_capacity: limits.queue as usize,
+                side_effect_committed: Some(false),
+            }));
+        }
+        let ticket: i64 = tx.query_row(
+            "SELECT COALESCE(max(ticket),-1)+1 FROM orch_worker_starts",
+            [],
+            |row| row.get(0),
+        )?;
+        let timestamp = now();
+        tx.execute(
+            "INSERT INTO orch_worker_starts(operation_id,fingerprint,request,phase,task_id,run_id,agent,account_scope,plugin_scope,profile_scope,ticket,worktree_repo,worktree_path,worktree_branch,asset_id,session_id,dispatch_id,result,error,error_code,created_at,updated_at) \
+             VALUES(?1,?2,?3,'queued',?4,?5,?6,?7,?8,?9,?10,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?11,?11)",
+            params![
+                operation_id,
+                request_fingerprint,
+                request,
+                input.task_id,
+                run_id,
+                agent,
+                account_scope,
+                plugin_scope,
+                profile_scope,
+                ticket,
+                timestamp
+            ],
+        )?;
+        let operation = tx.query_row(
+            "SELECT * FROM orch_worker_starts WHERE operation_id=?1",
+            [operation_id],
+            map_worker_start,
+        )?;
+        tx.commit()?;
+        Ok(super::start::WorkerStartEnqueue::Fresh(operation))
+    }
+
+    pub(super) fn claim_next_worker_start(
+        &mut self,
+    ) -> Result<Option<super::start::WorkerStartClaim>> {
+        let mut statement_count = 0;
+        self.claim_next_worker_start_inner(&mut statement_count)
+    }
+
+    fn claim_next_worker_start_inner(
+        &mut self,
+        statement_count: &mut usize,
+    ) -> Result<Option<super::start::WorkerStartClaim>> {
+        let tx = self.connection.transaction()?;
+        let limits = super::start::worker_start_limits();
+        let pending_filter = "('preparing','worktree_created')";
+        let scope_filter =
+            "('preparing','worktree_created','session_created','dispatch_committed','delivering')";
+        *statement_count += 1;
+        tx.execute(
+            "UPDATE orch_worker_starts AS s SET phase='failed',error='task changed while waiting for admission',error_code='task_not_editable',updated_at=?1 \
+             WHERE s.phase='queued' AND ( \
+               NOT EXISTS (SELECT 1 FROM orch_tasks t JOIN orch_runs r ON r.id=t.run_id WHERE t.id=s.task_id AND t.run_id=s.run_id AND t.status='pending' AND r.status='active') \
+               OR EXISTS (SELECT 1 FROM orch_dispatches d WHERE d.task_id=s.task_id AND d.state IN ('starting','running')) \
+             )",
+            [now()],
+        )?;
+        *statement_count += 1;
+        tx.execute(
+            "UPDATE orch_worker_starts AS s SET phase='failed',error='task dependencies changed while waiting for admission',error_code='task_not_ready',updated_at=?1 \
+             WHERE s.phase='queued' AND EXISTS ( \
+               SELECT 1 FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id \
+               WHERE d.task_id=s.task_id AND x.status<>'done' \
+             )",
+            [now()],
+        )?;
+        *statement_count += 1;
+        let active: i64 = tx.query_row(
+            &format!("SELECT (SELECT count(*) FROM agent_runs WHERE active=1) + (SELECT count(*) FROM orch_worker_starts WHERE phase IN {pending_filter})"),
+            [],
+            |row| row.get(0),
+        )?;
+        if active >= limits.global {
+            tx.commit()?;
+            return Ok(None);
+        }
+        *statement_count += 1;
+        let agent_usage = grouped_count(
+            &tx,
+            &format!(
+                "SELECT key,sum(amount) FROM ( \
+                   SELECT agent AS key,count(*) AS amount FROM agent_runs WHERE active=1 GROUP BY agent \
+                   UNION ALL \
+                   SELECT agent AS key,count(*) AS amount FROM orch_worker_starts WHERE phase IN {pending_filter} GROUP BY agent \
+                 ) GROUP BY key"
+            ),
+        )?;
+        *statement_count += 1;
+        let account_usage = grouped_count(
+            &tx,
+            &format!(
+                "SELECT key,sum(amount) FROM ( \
+                   SELECT coalesce(account_id,'native-' || agent) AS key,count(*) AS amount FROM agent_runs WHERE active=1 GROUP BY key \
+                   UNION ALL \
+                   SELECT account_scope AS key,count(*) AS amount FROM orch_worker_starts WHERE phase IN {pending_filter} GROUP BY account_scope \
+                 ) GROUP BY key"
+            ),
+        )?;
+        *statement_count += 1;
+        let run_usage = grouped_count(
+            &tx,
+            "SELECT key,sum(amount) FROM ( \
+               SELECT run_id AS key,count(*) AS amount FROM orch_dispatches WHERE state IN ('starting','running') GROUP BY run_id \
+               UNION ALL \
+               SELECT run_id AS key,count(*) AS amount FROM orch_worker_starts WHERE phase IN ('preparing','worktree_created','session_created') GROUP BY run_id \
+             ) GROUP BY key",
+        )?;
+        *statement_count += 1;
+        let plugin_usage = grouped_count(
+            &tx,
+            &format!(
+                "SELECT s.plugin_scope,count(*) FROM orch_worker_starts s \
+                 LEFT JOIN orch_dispatches d ON d.id=s.dispatch_id \
+                 WHERE s.phase IN {scope_filter} OR (s.phase='running' AND d.state IN ('starting','running')) \
+                 GROUP BY s.plugin_scope"
+            ),
+        )?;
+        *statement_count += 1;
+        let profile_usage = grouped_count(
+            &tx,
+            &format!(
+                "SELECT s.profile_scope,count(*) FROM orch_worker_starts s \
+                 LEFT JOIN orch_dispatches d ON d.id=s.dispatch_id \
+                 WHERE s.phase IN {scope_filter} OR (s.phase='running' AND d.state IN ('starting','running')) \
+                 GROUP BY s.profile_scope"
+            ),
+        )?;
+        *statement_count += 1;
+        let mut statement = tx.prepare(
+            "SELECT operation_id,agent,account_scope,plugin_scope,profile_scope,run_id,request \
+             FROM orch_worker_starts WHERE phase='queued' ORDER BY ticket,operation_id",
+        )?;
+        let queued = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (operation_id, agent, account, plugin, profile, run_id, request) in queued {
+            if agent_usage.get(&agent).copied().unwrap_or(0) >= limits.agent
+                || account_usage.get(&account).copied().unwrap_or(0) >= limits.account
+                || run_usage.get(&run_id).copied().unwrap_or(0) >= limits.run
+                || plugin_usage.get(&plugin).copied().unwrap_or(0) >= limits.plugin
+                || profile_usage.get(&profile).copied().unwrap_or(0) >= limits.profile
+            {
+                continue;
+            }
+            *statement_count += 1;
+            tx.execute(
+                "UPDATE orch_worker_starts SET phase='preparing',updated_at=?1 WHERE operation_id=?2 AND phase='queued'",
+                params![now(), operation_id],
+            )?;
+            let input = serde_json::from_str(&request)?;
+            tx.commit()?;
+            return Ok(Some(super::start::WorkerStartClaim {
+                operation_id,
+                input,
+            }));
+        }
+        tx.commit()?;
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn claim_next_worker_start_statement_count(
+        &mut self,
+    ) -> Result<(Option<super::start::WorkerStartClaim>, usize)> {
+        let mut statement_count = 0;
+        let claim = self.claim_next_worker_start_inner(&mut statement_count)?;
+        Ok((claim, statement_count))
+    }
+
+    pub fn plan_worker_start_worktree(
+        &mut self,
+        operation_id: &str,
+        repo: &str,
+        path: &str,
+        branch: &str,
+    ) -> Result<()> {
+        validate_id(operation_id)?;
+        validate_text(repo, 4096, false)?;
+        validate_text(path, 4096, false)?;
+        validate_text(branch, 256, false)?;
+        let changed = self.connection.execute(
+            "UPDATE orch_worker_starts SET worktree_repo=?1,worktree_path=?2,worktree_branch=?3,updated_at=?4 WHERE operation_id=?5 AND phase='preparing'",
+            params![repo, path, branch, now(), operation_id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
+        }
+    }
+
+    pub fn record_worker_start_worktree(
+        &mut self,
+        operation_id: &str,
+        input: RegisterWorktree,
+    ) -> Result<WorktreeAsset> {
+        validate_id(operation_id)?;
+        validate_id(&input.run_id)?;
+        validate_text(&input.repo, 4096, false)?;
+        validate_text(&input.path, 4096, false)?;
+        let tx = self.connection.transaction()?;
+        let phase: String = tx.query_row(
+            "SELECT phase FROM orch_worker_starts WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        if phase != "preparing" {
+            return Err(Error::Conflict);
+        }
+        let timestamp = now();
+        let asset_id = new_id("wt");
+        tx.execute(
+            "INSERT INTO orch_worktree_assets(id,kind,run_id,task_id,dispatch_id,repo,path,branch,state,created_at,updated_at,run_deleted_at,last_inspection,cleanup,last_error) \
+             VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,'active',?8,?8,NULL,NULL,NULL,NULL)",
+            params![asset_id, asset_kind_label(input.kind), input.run_id, input.task_id, input.repo, input.path, input.branch, timestamp],
+        )?;
+        tx.execute(
+            "UPDATE orch_worker_starts SET phase='worktree_created',asset_id=?1,updated_at=?2 WHERE operation_id=?3",
+            params![asset_id, timestamp, operation_id],
+        )?;
+        let asset = Self::asset_row(&tx, &asset_id)?;
+        Self::emit(
+            &tx,
+            "worktree_asset.updated",
+            &asset_id,
+            serde_json::to_value(&asset)?,
+        )?;
+        tx.commit()?;
+        Ok(asset)
+    }
+
+    pub fn plan_worker_start_session(
+        &mut self,
+        operation_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        validate_id(operation_id)?;
+        validate_id(session_id)?;
+        let changed = self.connection.execute(
+            "UPDATE orch_worker_starts SET session_id=?1,updated_at=?2 WHERE operation_id=?3 AND phase IN ('preparing','worktree_created')",
+            params![session_id, now(), operation_id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
+        }
+    }
+
+    pub fn record_worker_start_session(
+        &mut self,
+        operation_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        validate_id(operation_id)?;
+        validate_id(session_id)?;
+        let changed = self.connection.execute(
+            "UPDATE orch_worker_starts SET phase='session_created',updated_at=?1 WHERE operation_id=?2 AND session_id=?3 AND phase IN ('preparing','worktree_created')",
+            params![now(), operation_id, session_id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
+        }
+    }
+
+    pub fn commit_worker_start_dispatch(
+        &mut self,
+        operation_id: &str,
+        task_id: &str,
+        session_id: &str,
+        worktree_path: Option<&str>,
+    ) -> Result<SettleOutcome> {
+        validate_id(operation_id)?;
+        validate_id(task_id)?;
+        validate_id(session_id)?;
+        let tx = self.connection.transaction()?;
+        let (phase, asset_id): (String, Option<String>) = tx.query_row(
+            "SELECT phase,asset_id FROM orch_worker_starts WHERE operation_id=?1 AND task_id=?2 AND session_id=?3",
+            params![operation_id, task_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if phase != "session_created" {
+            return Err(Error::Conflict);
+        }
+        let task = Self::task_row(&tx, task_id)?;
+        Self::require_active_run(&tx, &task.run_id)?;
+        if Self::active_dispatch(&tx, task_id)?.is_some() {
+            return Err(Error::Feature(
+                "task_not_editable".into(),
+                "the task already has a live worker; settle it first".into(),
+            ));
+        }
+        let unmet: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id WHERE d.task_id=?1 AND x.status<>'done'",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if unmet > 0 {
+            return Err(Error::Feature(
+                "task_not_ready".into(),
+                "task is not ready for dispatch".into(),
+            ));
+        }
+        if !can_transition(task.status, TaskStatus::Dispatched) {
+            return Err(Error::Feature(
+                "task_not_editable".into(),
+                "task is not editable for dispatch".into(),
+            ));
+        }
+        let timestamp = now();
+        let dispatch_id = new_id("disp");
+        tx.execute(
+            "INSERT INTO orch_dispatches(id,run_id,task_id,session_id,state,outcome,started_at,settled_at,worktree_path) VALUES(?1,?2,?3,?4,'starting',NULL,?5,NULL,?6)",
+            params![dispatch_id, task.run_id, task_id, session_id, timestamp, worktree_path],
+        )?;
+        let task = Self::set_task_status(&tx, task_id, TaskStatus::Dispatched, None)?;
+        if let Some(asset_id) = asset_id {
+            tx.execute(
+                "UPDATE orch_worktree_assets SET dispatch_id=?1,updated_at=?2 WHERE id=?3 AND run_id=?4 AND task_id=?5",
+                params![dispatch_id, timestamp, asset_id, task.run_id, task_id],
+            )?;
+            let asset = Self::asset_row(&tx, &asset_id)?;
+            Self::emit(
+                &tx,
+                "worktree_asset.updated",
+                &asset_id,
+                serde_json::to_value(asset)?,
+            )?;
+        }
+        tx.execute(
+            "UPDATE orch_worker_starts SET phase='dispatch_committed',dispatch_id=?1,updated_at=?2 WHERE operation_id=?3",
+            params![dispatch_id, timestamp, operation_id],
+        )?;
+        let dispatch = Self::dispatch_row(&tx, &dispatch_id)?;
+        Self::emit(
+            &tx,
+            "dispatch.updated",
+            &dispatch_id,
+            serde_json::to_value(&dispatch)?,
+        )?;
+        tx.commit()?;
+        Ok(SettleOutcome { task, dispatch })
+    }
+
+    pub fn mark_worker_start_delivering(&mut self, operation_id: &str) -> Result<()> {
+        validate_id(operation_id)?;
+        let changed = self.connection.execute(
+            "UPDATE orch_worker_starts SET phase='delivering',updated_at=?1 WHERE operation_id=?2 AND phase='dispatch_committed'",
+            params![now(), operation_id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
+        }
+    }
+
+    pub fn fail_worker_start_delivery(&mut self, operation_id: &str, message: &str) -> Result<()> {
+        validate_id(operation_id)?;
+        validate_text(message, 8192, false)?;
+        let tx = self.connection.transaction()?;
+        let dispatch_id: Option<String> = tx.query_row(
+            "SELECT dispatch_id FROM orch_worker_starts WHERE operation_id=?1 AND phase='delivering'",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let dispatch_id = dispatch_id.ok_or(Error::Closed)?;
+        let timestamp = now();
+        tx.execute(
+            "UPDATE orch_dispatches SET state='abandoned',outcome=?1,settled_at=?2 WHERE id=?3 AND state='starting'",
+            params![message, timestamp, dispatch_id],
+        )?;
+        tx.execute(
+            "UPDATE orch_tasks SET status='failed',result=?1,updated_at=?2 WHERE id=(SELECT task_id FROM orch_dispatches WHERE id=?3) AND status='dispatched'",
+            params![message, timestamp, dispatch_id],
+        )?;
+        Self::preserve_dispatch_assets_tx(&tx, &dispatch_id, Some(message))?;
+        tx.execute(
+            "UPDATE orch_worker_starts SET phase='failed',error=?1,error_code='prompt_delivery_failed',updated_at=?2 WHERE operation_id=?3",
+            params![message, timestamp, operation_id],
+        )?;
+        let dispatch = Self::dispatch_row(&tx, &dispatch_id)?;
+        Self::emit(
+            &tx,
+            "dispatch.updated",
+            &dispatch_id,
+            serde_json::to_value(dispatch)?,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_worker_start(&mut self, operation_id: &str) -> Result<WorkerStartOutcome> {
+        validate_id(operation_id)?;
+        let tx = self.connection.transaction()?;
+        let (phase, task_id, session_id, dispatch_id, asset_id): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT phase,task_id,session_id,dispatch_id,asset_id FROM orch_worker_starts WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        if phase != "delivering" {
+            return Err(Error::Conflict);
+        }
+        let session_id = session_id.ok_or(Error::Closed)?;
+        let dispatch_id = dispatch_id.ok_or(Error::Closed)?;
+        tx.execute(
+            "UPDATE orch_dispatches SET state='running' WHERE id=?1 AND state='starting'",
+            [&dispatch_id],
+        )?;
+        let task = Self::task_row(&tx, &task_id)?.task();
+        let dispatch = Self::dispatch_row(&tx, &dispatch_id)?;
+        let worktree = asset_id
+            .as_deref()
+            .map(|id| Self::asset_row(&tx, id))
+            .transpose()?;
+        let outcome = WorkerStartOutcome {
+            task,
+            dispatch,
+            session_id,
+            worktree,
+        };
+        tx.execute(
+            "UPDATE orch_worker_starts SET phase='running',result=?1,error=NULL,error_code=NULL,updated_at=?2 WHERE operation_id=?3",
+            params![serde_json::to_string(&outcome)?, now(), operation_id],
+        )?;
+        Self::emit(
+            &tx,
+            "dispatch.updated",
+            &dispatch_id,
+            serde_json::to_value(&outcome.dispatch)?,
+        )?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn fail_worker_start(
+        &mut self,
+        operation_id: &str,
+        error_code: &str,
+        message: &str,
+    ) -> Result<WorkerStartOperation> {
+        validate_id(operation_id)?;
+        validate_id(error_code)?;
+        validate_text(message, 8192, false)?;
+        let tx = self.connection.transaction()?;
+        let (phase, dispatch_id, asset_id): (String, Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT phase,dispatch_id,asset_id FROM orch_worker_starts WHERE operation_id=?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if matches!(phase.as_str(), "running" | "cancelled" | "delivery_unknown") {
+            return tx
+                .query_row(
+                    "SELECT * FROM orch_worker_starts WHERE operation_id=?1",
+                    [operation_id],
+                    map_worker_start,
+                )
+                .map_err(Error::from);
+        }
+        let timestamp = now();
+        if let Some(dispatch_id) = dispatch_id {
+            tx.execute(
+                "UPDATE orch_dispatches SET state='abandoned',outcome=?1,settled_at=?2 WHERE id=?3 AND state IN ('starting','running')",
+                params![message, timestamp, dispatch_id],
+            )?;
+            tx.execute(
+                "UPDATE orch_tasks SET status='failed',result=?1,updated_at=?2 WHERE id=(SELECT task_id FROM orch_dispatches WHERE id=?3) AND status='dispatched'",
+                params![message, timestamp, dispatch_id],
+            )?;
+            Self::preserve_dispatch_assets_tx(&tx, &dispatch_id, Some(message))?;
+        } else if let Some(asset_id) = asset_id {
+            tx.execute(
+                "UPDATE orch_worktree_assets SET state='preserved',last_error=?1,updated_at=?2 WHERE id=?3",
+                params![message, timestamp, asset_id],
+            )?;
+        }
+        let (next_phase, next_code) = if phase == "delivering" {
+            ("delivery_unknown", "delivery_unknown")
+        } else {
+            ("failed", error_code)
+        };
+        tx.execute(
+            "UPDATE orch_worker_starts SET phase=?1,error=?2,error_code=?3,updated_at=?4 WHERE operation_id=?5",
+            params![next_phase, message, next_code, timestamp, operation_id],
+        )?;
+        let operation = tx.query_row(
+            "SELECT * FROM orch_worker_starts WHERE operation_id=?1",
+            [operation_id],
+            map_worker_start,
+        )?;
+        tx.commit()?;
+        Ok(operation)
+    }
+
+    pub fn cancel_queued_worker_start(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<WorkerStartOperation> {
+        validate_id(operation_id)?;
+        let changed = self.connection.execute(
+            "UPDATE orch_worker_starts SET phase='cancelled',error='cancelled before admission',error_code='cancelled',updated_at=?1 WHERE operation_id=?2 AND phase='queued'",
+            params![now(), operation_id],
+        )?;
+        if changed == 0 {
+            let current = self.worker_start(operation_id)?;
+            if !current.phase.terminal() {
+                return Err(Error::Conflict);
+            }
+            return Ok(current);
+        }
+        self.worker_start(operation_id)
+    }
+
+    pub fn recover_worker_start_operations(&mut self) -> Result<()> {
+        let planned_worktrees = {
+            let mut statement = self.connection.prepare(
+                "SELECT operation_id,run_id,task_id,worktree_repo,worktree_path,worktree_branch FROM orch_worker_starts WHERE phase='preparing' AND asset_id IS NULL AND worktree_path IS NOT NULL",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (operation_id, run_id, task_id, repo, path, branch) in planned_worktrees {
+            if Path::new(&path).exists()
+                && let (Some(repo), Some(branch)) = (repo, branch)
+            {
+                self.record_worker_start_worktree(
+                    &operation_id,
+                    RegisterWorktree {
+                        kind: WorktreeAssetKind::Worker,
+                        run_id,
+                        task_id: Some(task_id),
+                        repo,
+                        path,
+                        branch: Some(branch),
+                    },
+                )?;
+            }
+        }
+        let session_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT session_id FROM orch_worker_starts WHERE session_id IS NOT NULL AND phase IN ('preparing','worktree_created','session_created','dispatch_committed','delivering','delivery_unknown')",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for session_id in session_ids {
+            if self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1)",
+                [&session_id],
+                |row| row.get::<_, bool>(0),
+            )? {
+                self.archive_agent_session(&session_id, true)?;
+            }
+        }
+        let tx = self.connection.transaction()?;
+        let timestamp = now();
+        tx.execute(
+            "UPDATE orch_worker_starts SET phase='queued',updated_at=?1 WHERE phase='preparing' AND worktree_path IS NULL AND session_id IS NULL",
+            [timestamp],
+        )?;
+        let reason =
+            "worker start interrupted with an external side effect; delivery was not replayed";
+        let mut interrupted = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT operation_id,phase,dispatch_id,session_id,asset_id FROM orch_worker_starts WHERE phase IN ('preparing','worktree_created','session_created','dispatch_committed','delivering','delivery_unknown')",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                interrupted.push(row?);
+            }
+        }
+        for (operation_id, phase, dispatch_id, session_id, asset_id) in interrupted {
+            if let Some(dispatch_id) = dispatch_id {
+                tx.execute(
+                    "UPDATE orch_dispatches SET state='abandoned',outcome=?1,settled_at=?2 WHERE id=?3 AND state IN ('starting','running')",
+                    params![reason, timestamp, dispatch_id],
+                )?;
+                tx.execute(
+                    "UPDATE orch_tasks SET status='failed',result=?1,updated_at=?2 WHERE id=(SELECT task_id FROM orch_dispatches WHERE id=?3) AND status='dispatched'",
+                    params![reason, timestamp, dispatch_id],
+                )?;
+                Self::preserve_dispatch_assets_tx(&tx, &dispatch_id, Some(reason))?;
+            } else if let Some(asset_id) = asset_id {
+                tx.execute(
+                    "UPDATE orch_worktree_assets SET state='preserved',last_error=?1,updated_at=?2 WHERE id=?3",
+                    params![reason, timestamp, asset_id],
+                )?;
+            }
+            let _ = session_id;
+            let terminal = if matches!(
+                phase.as_str(),
+                "dispatch_committed" | "delivering" | "delivery_unknown"
+            ) {
+                "delivery_unknown"
+            } else {
+                "failed"
+            };
+            tx.execute(
+                "UPDATE orch_worker_starts SET phase=?1,error=?2,error_code=?3,updated_at=?4 WHERE operation_id=?5",
+                params![terminal, reason, if terminal == "delivery_unknown" { "delivery_unknown" } else { "recovery_interrupted" }, timestamp, operation_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Active session ids whose workspace is the path or inside it. The cleanup
     /// path refuses while a live worker may still be writing into the tree.
     pub fn active_sessions_under(&self, path: &str) -> Result<Vec<String>> {
@@ -1835,6 +3305,11 @@ impl Store {
             )
             .optional()?
             .ok_or(Error::NotFound)
+    }
+
+    pub fn latest_dispatch_for_task(&self, task_id: &str) -> Result<Option<Dispatch>> {
+        validate_id(task_id)?;
+        self.connection.query_row("SELECT * FROM orch_dispatches WHERE task_id=?1 ORDER BY started_at DESC,id DESC LIMIT 1", [task_id], map_dispatch).optional().map_err(Into::into)
     }
 
     pub fn list_dispatches(&self, run_id: Option<&str>) -> Result<Vec<Dispatch>> {
@@ -1980,76 +3455,97 @@ impl Store {
         Ok(SettleOutcome { task, dispatch })
     }
 
-    /// Batch reconciliation after a daemon restart, executed set-based in one
-    /// transaction: a live dispatch whose session vanished (or was archived) is
-    /// abandoned and its dispatched task failed; a surviving `starting`
-    /// dispatch resumes as `running`. Idempotent — a second run converges
-    /// nothing.
     pub fn recover_dispatches(&mut self) -> Result<RecoveryReport> {
+        self.recover_dispatches_for_session(None)
+    }
+
+    pub fn reconcile_dispatch_session(&mut self, session_id: &str) -> Result<RecoveryReport> {
+        validate_id(session_id)?;
+        self.recover_dispatches_for_session(Some(session_id))
+    }
+
+    fn recover_dispatches_for_session(
+        &mut self,
+        session_id: Option<&str>,
+    ) -> Result<RecoveryReport> {
         let tx = self.connection.transaction()?;
-        let now = now();
-        let reason = "worker session was gone when the daemon recovered";
-        let mut settled_ids = Vec::new();
+        let mut candidates = Vec::new();
         {
             let mut statement = tx.prepare(
-                "SELECT id FROM orch_dispatches WHERE state IN ('starting','running') AND ( \
-                   session_id NOT IN (SELECT id FROM session_heads) \
-                   OR session_id IN (SELECT id FROM session_heads WHERE lifecycle='archived') \
-                 )",
+                "SELECT d.id,CASE \
+                   WHEN h.id IS NULL THEN 'worker session is missing' \
+                   WHEN h.lifecycle='archived' THEN 'worker session is archived' \
+                   ELSE 'worker session is inactive' END \
+                 FROM orch_dispatches d \
+                 LEFT JOIN session_heads h ON h.id=d.session_id \
+                 LEFT JOIN agent_runs a ON a.session_id=d.session_id \
+                 WHERE d.state IN ('starting','running') \
+                   AND (?1 IS NULL OR d.session_id=?1) \
+                   AND (h.id IS NULL OR h.lifecycle='archived' OR ( \
+                     json_extract(h.payload,'$.kind')='structured' AND (a.session_id IS NULL OR a.active=0) \
+                   )) \
+                 ORDER BY d.started_at,d.id",
             )?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let rows = statement.query_map([session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             for row in rows {
-                settled_ids.push(row?);
+                candidates.push(row?);
             }
         }
         let mut settled = Vec::new();
-        for id in &settled_ids {
+        for (id, reason) in candidates {
+            let task = Self::task_row(&tx, &Self::dispatch_row(&tx, &id)?.task_id)?;
+            let (state, outcome) = match task.status {
+                TaskStatus::Done => (
+                    DispatchState::Succeeded,
+                    task.result
+                        .clone()
+                        .unwrap_or_else(|| "worker delivered".into()),
+                ),
+                TaskStatus::Failed => (
+                    DispatchState::Failed,
+                    task.result.clone().unwrap_or_else(|| reason.clone()),
+                ),
+                TaskStatus::Cancelled => (
+                    DispatchState::Abandoned,
+                    task.result.clone().unwrap_or_else(|| reason.clone()),
+                ),
+                _ => (DispatchState::Abandoned, reason.clone()),
+            };
+            let timestamp = now();
             tx.execute(
-                "UPDATE orch_dispatches SET state='abandoned',outcome=?1,settled_at=?2 WHERE id=?3",
-                params![reason, now, id],
+                "UPDATE orch_dispatches SET state=?1,outcome=?2,settled_at=?3 WHERE id=?4",
+                params![state.label(), outcome, timestamp, id],
             )?;
-            tx.execute(
-                "UPDATE orch_tasks SET status='failed',result=?1,updated_at=?2 \
-                 WHERE id=(SELECT task_id FROM orch_dispatches WHERE id=?3) AND status='dispatched'",
-                params![reason, now, id],
-            )?;
-            Self::preserve_dispatch_assets_tx(&tx, id, Some(reason))?;
-            let dispatch = Self::dispatch_row(&tx, id)?;
+            if task.status == TaskStatus::Dispatched {
+                tx.execute(
+                    "UPDATE orch_tasks SET status='failed',result=?1,updated_at=?2 WHERE id=?3",
+                    params![reason, timestamp, task.id],
+                )?;
+                let updated = Self::task_row(&tx, &task.id)?.task();
+                Self::emit(
+                    &tx,
+                    "task.updated",
+                    &task.id,
+                    serde_json::to_value(updated)?,
+                )?;
+            }
+            Self::preserve_dispatch_assets_tx(&tx, &id, Some(&reason))?;
+            let dispatch = Self::dispatch_row(&tx, &id)?;
             Self::emit(
                 &tx,
                 "dispatch.updated",
-                id,
+                &id,
                 serde_json::to_value(&dispatch)?,
             )?;
             settled.push(dispatch);
         }
-        let mut resumed = Vec::new();
-        {
-            let mut statement = tx.prepare(
-                "SELECT id FROM orch_dispatches WHERE state='starting' AND session_id IN ( \
-                   SELECT id FROM session_heads WHERE lifecycle='active' \
-                 )",
-            )?;
-            let ids = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for id in ids {
-                tx.execute(
-                    "UPDATE orch_dispatches SET state='running' WHERE id=?1",
-                    [&id],
-                )?;
-                let dispatch = Self::dispatch_row(&tx, &id)?;
-                Self::emit(
-                    &tx,
-                    "dispatch.updated",
-                    &id,
-                    serde_json::to_value(&dispatch)?,
-                )?;
-                resumed.push(dispatch);
-            }
-        }
         tx.commit()?;
-        Ok(RecoveryReport { settled, resumed })
+        Ok(RecoveryReport {
+            settled,
+            resumed: Vec::new(),
+        })
     }
 
     fn pause_running_automation_tx(

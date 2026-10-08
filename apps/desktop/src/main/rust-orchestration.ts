@@ -164,6 +164,8 @@ export async function orchestrationAction(
         skills: stringList(params["skills"]),
         approvalPolicy: workerApprovalPolicy(params),
         accountId: workerAccountId(params),
+        ...(text(params["pluginId"]) ? { pluginId: text(params["pluginId"]) } : {}),
+        ...(text(params["profileId"]) ? { profileId: text(params["profileId"]) } : {}),
         operationId: optionalText(params["operationId"]),
       };
       return client.startWorker(input, signal, timeoutMs) as Promise<JsonObject>;

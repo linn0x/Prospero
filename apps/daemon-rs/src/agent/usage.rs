@@ -138,6 +138,7 @@ impl CodexRpc {
         env: &[(String, String)],
         app_server_args: &[String],
     ) -> Result<Self> {
+        super::codex::preflight_app_servers(data, env).await?;
         let mut command = Command::new(codex_binary());
         command
             .arg("app-server")
