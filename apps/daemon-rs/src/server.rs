@@ -95,6 +95,21 @@ pub struct Api {
     remote_ws_handshake_timeout: Duration,
 }
 
+const DEFAULT_DISPATCH_TIMEOUT_MS: i64 = 6 * 60 * 60 * 1000;
+
+fn configured_dispatch_thresholds(value: impl Fn(&str) -> Option<String>) -> (i64, i64) {
+    let positive = |name| {
+        value(name)
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .filter(|millis| *millis > 0)
+            .unwrap_or(DEFAULT_DISPATCH_TIMEOUT_MS)
+    };
+    (
+        positive("PROSPERO_STALE_DISPATCH_MS"),
+        positive("PROSPERO_IDLE_WORKER_TIMEOUT_MS"),
+    )
+}
+
 #[derive(Default)]
 struct ProjectionState {
     initialized: bool,
@@ -195,11 +210,8 @@ impl Api {
         let mut stopped = self.stopping.subscribe();
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let stale_after = std::env::var("PROSPERO_STALE_DISPATCH_MS")
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(6 * 60 * 60 * 1000);
+        let (stale_after, idle_worker_timeout) =
+            configured_dispatch_thresholds(|name| std::env::var(name).ok());
         loop {
             tokio::select! {
                 _ = stopped.changed() => break,
@@ -216,18 +228,27 @@ impl Api {
                         let activity = store.dispatch_activity_health(
                             crate::database::now().saturating_sub(stale_after),
                         )?;
+                        let stale_idle_workers = store.stale_idle_worker_sessions(
+                            crate::database::now().saturating_sub(idle_worker_timeout),
+                            4,
+                        )?;
                         let queued: i64 = store.connection.query_row(
                             "SELECT count(*) FROM orch_worker_starts WHERE phase='queued'",
                             [],
                             |row| row.get(0),
                         )?;
-                        Ok((activity, queued, !report.settled.is_empty()))
+                        let recovered_run_ids = report
+                            .settled
+                            .iter()
+                            .map(|dispatch| dispatch.run_id.clone())
+                            .collect::<Vec<_>>();
+                        Ok((activity, queued, recovered_run_ids, stale_idle_workers))
                     }),
             )
             .await
             .unwrap_or(Err(Error::Timeout));
             match sample {
-                Ok((activity, queued, changed)) => {
+                Ok((activity, queued, recovered_run_ids, stale_idle_workers)) => {
                     if let Ok(mut health) = self.control_health.lock() {
                         health.stale_dispatch_count = activity.stale_dispatch_count;
                         health.terminal_misalignment_count = activity.terminal_misalignment_count;
@@ -235,8 +256,35 @@ impl Api {
                         health.sampled_at = Some(crate::database::now());
                         health.sampling_error = None;
                     }
-                    if changed {
+                    if !recovered_run_ids.is_empty() {
                         self.publish();
+                    }
+                    let mut runs_to_kick = recovered_run_ids.into_iter().collect::<HashSet<_>>();
+                    for session_id in stale_idle_workers {
+                        match self
+                            .agents
+                            .close_stale_idle_worker(
+                                &session_id,
+                                crate::database::now().saturating_sub(idle_worker_timeout),
+                            )
+                            .await
+                        {
+                            Ok(Some(run_ids)) => runs_to_kick.extend(run_ids),
+                            Ok(None) => {}
+                            Err(error) => self.database.record_recent_error(
+                                "worker.idle_timeout",
+                                "agent_sessions",
+                                &error.to_string(),
+                            ),
+                        }
+                    }
+                    for run_id in runs_to_kick {
+                        let api = self.clone();
+                        tokio::spawn(async move {
+                            orchestration::kick_automation(&api.database, &api.agents, &run_id)
+                                .await;
+                            api.publish();
+                        });
                     }
                 }
                 Err(error) => {
@@ -7468,6 +7516,22 @@ async fn mark_message_answered(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_worker_timeout_is_independent_of_stale_health_threshold() {
+        use super::*;
+        let (stale, idle) = configured_dispatch_thresholds(|name| match name {
+            "PROSPERO_STALE_DISPATCH_MS" => Some("1000".into()),
+            "PROSPERO_IDLE_WORKER_TIMEOUT_MS" => Some("7200000".into()),
+            _ => None,
+        });
+        assert_eq!(stale, 1_000);
+        assert_eq!(idle, 7_200_000);
+        assert_eq!(
+            configured_dispatch_thresholds(|_| None),
+            (DEFAULT_DISPATCH_TIMEOUT_MS, DEFAULT_DISPATCH_TIMEOUT_MS)
+        );
+    }
+
     #[tokio::test]
     async fn worker_start_timeout_does_not_restate_a_stale_side_effect_snapshot() {
         use super::*;

@@ -421,6 +421,35 @@ impl Agents {
             .await
     }
 
+    /// Retry unclaimed terminal child reports that did not reach their parent.
+    /// Claims without a queue row are released only during startup recovery;
+    /// releasing them while a live delivery is in flight could duplicate it.
+    pub async fn retry_durable_cross_model_fan_in_batch(
+        &self,
+        after_parent: Option<String>,
+        limit: i64,
+    ) -> Result<Option<String>> {
+        let parents = self
+            .0
+            .database
+            .call(move |store| {
+                store.pending_cross_model_fan_in_parents_limit(after_parent.as_deref(), limit)
+            })
+            .await?;
+        let last_parent = parents.last().cloned();
+        for parent_id in parents {
+            match self.deliver_pending_cross_model_fan_in(&parent_id).await {
+                Ok(_) => {}
+                Err(error) => self.0.database.record_recent_error(
+                    "cross_model.fan_in_retry",
+                    "agent_sessions",
+                    &error.to_string(),
+                ),
+            }
+        }
+        Ok(last_parent)
+    }
+
     pub async fn reconcile_cross_model_children(&self) -> Result<usize> {
         let children = self
             .0
@@ -710,10 +739,21 @@ impl Agents {
     pub async fn run_cross_model_check_worker(&self, mut stopping: watch::Receiver<bool>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut fan_in_ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        fan_in_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut fan_in_cursor = None;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     let _ = self.deliver_due_cross_model_checks().await;
+                }
+                _ = fan_in_ticker.tick() => {
+                    if let Ok(next) = self.retry_durable_cross_model_fan_in_batch(fan_in_cursor.clone(), 8).await {
+                        fan_in_cursor = next;
+                    }
                 }
                 changed = stopping.changed() => {
                     if changed.is_err() || *stopping.borrow() {
@@ -3996,6 +4036,32 @@ impl Agents {
                 store.archive_agent_session(&archived, true)
             })
             .await?;
+        self.finish_close(id, false).await
+    }
+
+    /// Expire only an idle worker with an overdue, still-live dispatch. The
+    /// database claim checks the state again so a concurrent follow-up or
+    /// explicit delivery cannot be cut off by the health monitor.
+    pub async fn close_stale_idle_worker(
+        &self,
+        id: &str,
+        stale_before: i64,
+    ) -> Result<Option<Vec<String>>> {
+        let session_id = id.to_owned();
+        let run_ids = self
+            .0
+            .database
+            .call_control("worker.idle_timeout", move |store| {
+                store.archive_stale_idle_worker_session(&session_id, stale_before)
+            })
+            .await?;
+        if run_ids.is_some() {
+            self.finish_close(id, true).await?;
+        }
+        Ok(run_ids)
+    }
+
+    async fn finish_close(&self, id: &str, idle_timeout: bool) -> Result<()> {
         if let Ok(entry) = self.session_entry(id).await {
             if let Some(handle) = entry.handle.lock().await.take() {
                 let pending = std::mem::take(&mut *handle.replies.lock().await);
@@ -4019,7 +4085,11 @@ impl Agents {
         self.0
             .database
             .call_control("dispatch.reconcile", move |store| {
-                store.reconcile_dispatch_session(&archived)
+                if idle_timeout {
+                    store.reconcile_stale_idle_worker_session(&archived)
+                } else {
+                    store.reconcile_dispatch_session(&archived)
+                }
             })
             .await?;
         self.publish();

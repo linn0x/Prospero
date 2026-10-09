@@ -311,7 +311,19 @@ impl Store {
         }
         self.connection.query_row(
             "SELECT \
-               coalesce(sum(coalesce(c.last_progress_at,d.started_at)<?1),0), \
+               coalesce(sum(coalesce(c.last_progress_at,d.started_at)<?1 AND NOT coalesce( \
+                 h.lifecycle='active' AND json_extract(h.payload,'$.status')='idle' AND ( \
+                   EXISTS (SELECT 1 FROM agent_message_queue q \
+                     WHERE q.session_id=d.session_id AND q.created_at>=?1) OR \
+                   EXISTS (SELECT 1 FROM cross_model_children child \
+                     LEFT JOIN timeline_checkpoints child_progress ON child_progress.session_id=child.child_session_id \
+                     WHERE child.parent_session_id=d.session_id AND child.summary_delivered=0 \
+                       AND (child.updated_at>=?1 OR child_progress.last_progress_at>=?1)) OR \
+                   EXISTS (SELECT 1 FROM cross_model_checks check_row \
+                     WHERE check_row.parent_session_id=d.session_id \
+                       AND check_row.state IN ('pending','claimed') \
+                       AND coalesce(check_row.claimed_at,check_row.due_at)>=?1) \
+                 ),0)),0), \
                coalesce(sum(h.id IS NULL OR h.lifecycle='archived' OR ( \
                  json_extract(h.payload,'$.kind')='structured' AND (a.session_id IS NULL OR a.active=0) \
                )),0) \

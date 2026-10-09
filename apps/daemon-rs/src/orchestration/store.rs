@@ -3456,17 +3456,102 @@ impl Store {
     }
 
     pub fn recover_dispatches(&mut self) -> Result<RecoveryReport> {
-        self.recover_dispatches_for_session(None)
+        self.recover_dispatches_for_session(None, None)
     }
 
     pub fn reconcile_dispatch_session(&mut self, session_id: &str) -> Result<RecoveryReport> {
         validate_id(session_id)?;
-        self.recover_dispatches_for_session(Some(session_id))
+        self.recover_dispatches_for_session(Some(session_id), None)
+    }
+
+    pub fn reconcile_stale_idle_worker_session(
+        &mut self,
+        session_id: &str,
+    ) -> Result<RecoveryReport> {
+        validate_id(session_id)?;
+        self.recover_dispatches_for_session(
+            Some(session_id),
+            Some("worker remained idle past the stale dispatch timeout"),
+        )
+    }
+
+    /// Idle workers may wait for a follow-up, but an unreported dispatch must
+    /// not keep its session lease forever. The caller rechecks each candidate
+    /// before archiving because a worker can resume or deliver in the meantime.
+    pub fn stale_idle_worker_sessions(&self, stale_before: i64, limit: i64) -> Result<Vec<String>> {
+        if stale_before < 0 || !(1..=64).contains(&limit) {
+            return Err(invalid("stale idle worker query is invalid"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT d.session_id FROM orch_dispatches d \
+             JOIN session_heads h ON h.id=d.session_id \
+             JOIN agent_runs a ON a.session_id=d.session_id \
+             LEFT JOIN timeline_checkpoints c ON c.session_id=d.session_id \
+             WHERE d.state IN ('starting','running') AND h.lifecycle='active' \
+               AND json_extract(h.payload,'$.kind')='structured' \
+               AND json_extract(h.payload,'$.status')='idle' AND a.active=1 \
+               AND coalesce(c.last_progress_at,d.started_at)<?1 \
+               AND EXISTS (SELECT 1 FROM orch_worker_starts w \
+                 WHERE w.dispatch_id=d.id AND w.session_id=d.session_id AND w.task_id=d.task_id) \
+               AND NOT EXISTS (SELECT 1 FROM orch_dispatches other \
+                 WHERE other.session_id=d.session_id AND other.id<>d.id AND other.state IN ('starting','running')) \
+               AND NOT EXISTS (SELECT 1 FROM agent_message_queue q WHERE q.session_id=d.session_id) \
+               AND NOT EXISTS (SELECT 1 FROM cross_model_children child \
+                 WHERE child.parent_session_id=d.session_id AND child.summary_delivered=0) \
+               AND NOT EXISTS (SELECT 1 FROM cross_model_checks check_row \
+                 WHERE check_row.parent_session_id=d.session_id AND check_row.state IN ('pending','claimed')) \
+             ORDER BY coalesce(c.last_progress_at,d.started_at),d.id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![stale_before, limit], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Claim and archive a stale idle worker on the database writer thread.
+    /// A newer turn, queued follow-up, or explicit task delivery cancels the
+    /// claim. Reconciliation and runtime permit release follow the archive.
+    pub fn archive_stale_idle_worker_session(
+        &mut self,
+        session_id: &str,
+        stale_before: i64,
+    ) -> Result<Option<Vec<String>>> {
+        validate_id(session_id)?;
+        if stale_before < 0 {
+            return Err(invalid("stale threshold is invalid"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT d.run_id FROM orch_dispatches d \
+             JOIN session_heads h ON h.id=d.session_id \
+             JOIN agent_runs a ON a.session_id=d.session_id \
+             LEFT JOIN timeline_checkpoints c ON c.session_id=d.session_id \
+             WHERE d.session_id=?1 AND d.state IN ('starting','running') \
+               AND h.lifecycle='active' AND json_extract(h.payload,'$.kind')='structured' \
+               AND json_extract(h.payload,'$.status')='idle' AND a.active=1 \
+               AND coalesce(c.last_progress_at,d.started_at)<?2 \
+               AND EXISTS (SELECT 1 FROM orch_worker_starts w \
+                 WHERE w.dispatch_id=d.id AND w.session_id=d.session_id AND w.task_id=d.task_id) \
+               AND NOT EXISTS (SELECT 1 FROM orch_dispatches other \
+                 WHERE other.session_id=d.session_id AND other.id<>d.id AND other.state IN ('starting','running')) \
+               AND NOT EXISTS (SELECT 1 FROM agent_message_queue q WHERE q.session_id=d.session_id) \
+               AND NOT EXISTS (SELECT 1 FROM cross_model_children child \
+                 WHERE child.parent_session_id=d.session_id AND child.summary_delivered=0) \
+               AND NOT EXISTS (SELECT 1 FROM cross_model_checks check_row \
+                 WHERE check_row.parent_session_id=d.session_id AND check_row.state IN ('pending','claimed'))",
+        )?;
+        let run_ids = statement
+            .query_map(params![session_id, stale_before], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        drop(statement);
+        if run_ids.is_empty() {
+            return Ok(None);
+        }
+        self.archive_agent_session(session_id, true)?;
+        Ok(Some(run_ids))
     }
 
     fn recover_dispatches_for_session(
         &mut self,
         session_id: Option<&str>,
+        reason_override: Option<&str>,
     ) -> Result<RecoveryReport> {
         let tx = self.connection.transaction()?;
         let mut candidates = Vec::new();
@@ -3495,6 +3580,7 @@ impl Store {
         }
         let mut settled = Vec::new();
         for (id, reason) in candidates {
+            let reason = reason_override.unwrap_or(&reason).to_owned();
             let task = Self::task_row(&tx, &Self::dispatch_row(&tx, &id)?.task_id)?;
             let (state, outcome) = match task.status {
                 TaskStatus::Done => (

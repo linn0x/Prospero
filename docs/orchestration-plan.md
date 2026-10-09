@@ -51,6 +51,17 @@ Gate      { id, runId, taskId, question, options[], status, decision, resolvedAt
 `SessionStatus` 回到 `idle` 只是**提示**协调者去看一眼,不等于任务完成。
 把“暂时空闲”当作“已经交付”会制造无法可靠恢复的误报。
 
+Rust daemon 对长期未交付的 idle worker 有失败兜底：若活跃 dispatch 超过
+`PROSPERO_IDLE_WORKER_TIMEOUT_MS`（默认 6 小时）没有进展，且会话仍 idle、
+独占该 dispatch、可由 `worker.start` 账本确认所有权，也没有排队消息、待回传
+子任务或待触发的定时检查，daemon 会再次核对状态，再归档 worker、将未交付
+任务标记为 failed，并释放会话名额。显式 `task done` 的结果仍优先保留。
+`PROSPERO_STALE_DISPATCH_MS` 只控制健康告警阈值：有近期进展的子任务、
+排队消息或未到期检查不会误报 stale；长期停滞的等待仍会告警。终态子任务的
+未交付摘要每分钟分批重试，单个失败不会阻塞后续父会话。仍在运行的子任务不会
+仅因父会话 idle 被终止；若停滞告警持续，可使用现有的 `prospero child cancel`
+显式结束子任务并触发失败结果回传。
+
 ## 分层
 
 ```
