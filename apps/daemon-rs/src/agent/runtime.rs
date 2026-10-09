@@ -443,7 +443,7 @@ impl Agents {
                 Err(error) => self.0.database.record_recent_error(
                     "cross_model.fan_in_retry",
                     "agent_sessions",
-                    &error.to_string(),
+                    &error.public().code,
                 ),
             }
         }
