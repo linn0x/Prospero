@@ -925,16 +925,30 @@ impl Store {
     /// reached the parent. Archived parents retain their truthful pending
     /// state but cannot accept an automatic turn.
     pub(crate) fn pending_cross_model_fan_in_parents(&self) -> Result<Vec<String>> {
+        self.pending_cross_model_fan_in_parents_limit(None, i64::MAX)
+    }
+
+    pub(crate) fn pending_cross_model_fan_in_parents_limit(
+        &self,
+        after_parent: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        if limit <= 0 {
+            return Err(Error::Invalid("fan-in retry limit is invalid".into()));
+        }
+        if let Some(parent) = after_parent {
+            crate::database::validate_id(parent)?;
+        }
         let mut statement = self.connection.prepare(
             "SELECT c.parent_session_id FROM cross_model_children c \
              JOIN session_heads h ON h.id=c.parent_session_id \
-             WHERE h.lifecycle='active' \
+             WHERE h.lifecycle='active' AND (?1 IS NULL OR c.parent_session_id>?1) \
              GROUP BY c.parent_session_id \
              HAVING sum(c.summary_delivered=0 AND c.summary_claim_id IS NULL AND c.status IN ('completed','failed','stopped'))>0 \
-             ORDER BY min(c.created_at),c.parent_session_id",
+             ORDER BY c.parent_session_id LIMIT ?2",
         )?;
         statement
-            .query_map([], |row| row.get(0))?
+            .query_map(params![after_parent, limit], |row| row.get(0))?
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(Error::from)
     }
@@ -1773,6 +1787,37 @@ mod tests {
     }
 
     #[test]
+    fn pending_fan_in_retry_pages_past_an_undelivered_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parents = [session(&mut store, "first"), session(&mut store, "second")];
+        for (index, parent) in parents.iter().enumerate() {
+            let child = active_child_session(&mut store, &format!("child-{index}"));
+            store
+                .register_cross_model_child(&child, parent, "task", "source", "route", "account")
+                .unwrap();
+            store
+                .complete_cross_model_child(&child, 1, "completed", Some("done"))
+                .unwrap();
+        }
+        let first = store
+            .pending_cross_model_fan_in_parents_limit(None, 1)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let second = store
+            .pending_cross_model_fan_in_parents_limit(Some(&first[0]), 1)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(first, second);
+        assert!(
+            store
+                .pending_cross_model_fan_in_parents_limit(Some(&second[0]), 1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn cross_model_child_delivery_can_be_acknowledged_and_redelivered() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(directory.path()).unwrap();
@@ -1790,7 +1835,19 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].summary_delivered);
+        assert_eq!(
+            store
+                .pending_cross_model_fan_in_parents_limit(None, 1)
+                .unwrap(),
+            vec![parent.clone()]
+        );
         let claim = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert!(
+            store
+                .pending_cross_model_fan_in_parents_limit(None, 1)
+                .unwrap()
+                .is_empty()
+        );
         let claimed = store.cross_model_child(&child).unwrap();
         assert!(!claimed.summary_delivered);
         assert!(claimed.summary_delivered_at.is_none());
@@ -2033,7 +2090,7 @@ mod tests {
             let store = Store::open(directory.path()).unwrap();
             store
                 .connection
-                .execute_batch("DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; DROP TABLE orch_worker_starts; DROP TABLE timeline_checkpoints; PRAGMA user_version=28;")
+                .execute_batch("DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; DROP INDEX orch_worker_starts_dispatch_owner; DROP INDEX orch_dispatch_active_session; DROP INDEX cross_model_checks_parent_state; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; DROP TABLE orch_worker_starts; DROP TABLE timeline_checkpoints; PRAGMA user_version=28;")
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
@@ -2057,7 +2114,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
         assert_eq!(columns, 5);
         assert_eq!(queue_columns, 1);
     }

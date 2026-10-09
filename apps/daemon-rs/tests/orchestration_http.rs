@@ -6,6 +6,9 @@ use axum::http::{Request, StatusCode};
 use prosperod_rs::agent::{ApprovalPolicy, CreateAgentSession};
 use prosperod_rs::auth::Token;
 use prosperod_rs::error::Error;
+use prosperod_rs::orchestration::{
+    AutomationState, AutomationWorkspace, DispatchState, RunAutomation,
+};
 use prosperod_rs::protocol::{
     AgentKind, CreateSession, MessageRole, SessionKind, TimelineBody, TimelineWrite,
 };
@@ -65,6 +68,114 @@ async fn fixture() -> (TempDir, Api) {
         directory,
         Api::new(database, Token::parse(SECRET.into()).unwrap()),
     )
+}
+
+#[tokio::test]
+async fn stale_idle_worker_monitor_releases_slot_and_pauses_automation() {
+    let (directory, api) = fixture().await;
+    let session = api
+        .agents
+        .create(CreateAgentSession {
+            agent: AgentKind::Codex,
+            title: "idle worker".into(),
+            workspace: directory.path().to_string_lossy().into_owned(),
+            auto_approve: true,
+            mode: None,
+            model: None,
+            effort: None,
+            account_id: None,
+            resume: None,
+            agent_preset: None,
+        })
+        .await
+        .unwrap();
+    let (status, graph) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
+    assert_eq!(status, StatusCode::OK);
+    let run_id = graph["run"]["id"].as_str().unwrap().to_owned();
+    let workspace = directory.path().to_string_lossy().into_owned();
+    let automation_run_id = run_id.clone();
+    api.database
+        .call_control("test.automation", move |store| {
+            store.set_run_automation(
+                &automation_run_id,
+                Some(RunAutomation {
+                    state: AutomationState::Running,
+                    agent: AgentKind::Codex,
+                    account_id: None,
+                    approval_policy: "standard".into(),
+                    workspace: AutomationWorkspace::Current,
+                    cwd: workspace.clone(),
+                    workspace_path: workspace,
+                    branch: None,
+                    started_at: 1,
+                    updated_at: 1,
+                    last_error: None,
+                }),
+            )
+        })
+        .await
+        .unwrap();
+    let task_id = graph["idMap"]["a"].as_str().unwrap().to_owned();
+    let session_id = session.id.clone();
+    let dispatch_id = api
+        .database
+        .call_control("test.idle_worker", move |store| {
+            let dispatch = store.dispatch_task(&task_id, &session_id, None, None)?;
+            store.set_dispatch_running(&dispatch.dispatch.id)?;
+            Ok(dispatch.dispatch.id)
+        })
+        .await
+        .unwrap();
+    let started_at: i64 = api
+        .database
+        .call_control("test.dispatch_started_at", {
+            let dispatch_id = dispatch_id.clone();
+            move |store| Ok(store.dispatch(&dispatch_id)?.started_at)
+        })
+        .await
+        .unwrap();
+    rusqlite::Connection::open(directory.path().join("prospero.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO timeline_checkpoints(session_id,last_progress_at) VALUES(?1,?2)",
+            rusqlite::params![session.id, started_at - 7 * 60 * 60 * 1000],
+        )
+        .unwrap();
+    rusqlite::Connection::open(directory.path().join("prospero.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO orch_worker_starts(operation_id,fingerprint,request,phase,task_id,run_id,agent,account_scope,plugin_scope,profile_scope,ticket,session_id,dispatch_id,created_at,updated_at) \
+             VALUES('owned-worker-op','test','{}','running',?1,?2,'codex','native','none','none',1,?3,?4,?5,?5)",
+            rusqlite::params![graph["idMap"]["a"].as_str().unwrap(), run_id, session.id, dispatch_id, started_at],
+        )
+        .unwrap();
+
+    assert_eq!(api.agents.count(), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        loop {
+            let run_id = run_id.clone();
+            let dispatch_id = dispatch_id.clone();
+            let (automation, dispatch) = api
+                .database
+                .call_control("test.observe_timeout", move |store| {
+                    Ok((
+                        store.orch_run(&run_id)?.automation.unwrap().state,
+                        store.dispatch(&dispatch_id)?.state,
+                    ))
+                })
+                .await
+                .unwrap();
+            if api.agents.count() == 0
+                && automation == AutomationState::Paused
+                && dispatch == DispatchState::Abandoned
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("monitor did not close the stale worker and pause automation");
 }
 
 async fn send(api: &Api, method: &str, uri: &str, payload: Option<Value>) -> (StatusCode, Value) {

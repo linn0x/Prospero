@@ -576,6 +576,277 @@ fn active_completed_turn_stays_dispatched_until_explicit_settlement() {
 }
 
 #[test]
+fn stale_idle_worker_is_archived_only_while_its_dispatch_is_still_unreported() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let session = store
+        .create_agent_session(
+            CreateAgentSession {
+                agent: AgentKind::Codex,
+                title: "worker".into(),
+                workspace: "/w".into(),
+                auto_approve: true,
+                mode: None,
+                model: None,
+                effort: None,
+                account_id: None,
+                resume: None,
+                agent_preset: None,
+            },
+            ApprovalPolicy::Auto,
+        )
+        .unwrap();
+    let (run_id, ids) = make_run(&mut store, "op-stale-idle", chain(1));
+    let dispatch = store
+        .dispatch_task(&ids["n0"], &session.id, None, None)
+        .unwrap();
+    store.set_dispatch_running(&dispatch.dispatch.id).unwrap();
+    let head = store
+        .update_session(
+            &session.id,
+            UpdateSession {
+                revision: session.revision,
+                title: None,
+                lifecycle: None,
+                status: Some(SessionStatus::Idle),
+            },
+        )
+        .unwrap();
+    let stale_before = dispatch.dispatch.started_at - 60_000;
+    raw(&directory)
+        .execute(
+            "INSERT INTO timeline_checkpoints(session_id,last_progress_at) VALUES(?1,?2)",
+            params![session.id, stale_before - 1],
+        )
+        .unwrap();
+
+    // A manual dispatch may point at any structured session. Only a dispatch
+    // linked to the durable worker.start ledger belongs to this watchdog.
+    assert!(
+        store
+            .stale_idle_worker_sessions(stale_before, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .archive_stale_idle_worker_session(&session.id, stale_before)
+            .unwrap()
+            .is_none()
+    );
+    raw(&directory)
+        .execute(
+            "INSERT INTO orch_worker_starts(operation_id,fingerprint,request,phase,task_id,run_id,agent,account_scope,plugin_scope,profile_scope,ticket,session_id,dispatch_id,created_at,updated_at) \
+             VALUES('owned-worker-op','test','{}','running',?1,?2,'codex','native','none','none',1,?3,?4,?5,?5)",
+            params![ids["n0"], run_id, session.id, dispatch.dispatch.id, dispatch.dispatch.started_at],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.stale_idle_worker_sessions(stale_before, 4).unwrap(),
+        vec![session.id.clone()]
+    );
+    let (_shared_run, shared) = make_run(&mut store, "op-shared-idle", chain(1));
+    let shared_dispatch = store
+        .dispatch_task(&shared["n0"], &session.id, None, None)
+        .unwrap();
+    store
+        .set_dispatch_running(&shared_dispatch.dispatch.id)
+        .unwrap();
+    assert!(
+        store
+            .stale_idle_worker_sessions(stale_before, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .archive_stale_idle_worker_session(&session.id, stale_before)
+            .unwrap()
+            .is_none()
+    );
+    store
+        .settle_dispatch(&shared_dispatch.dispatch.id, true, "other task delivered")
+        .unwrap();
+    let child = store
+        .create_session(CreateSession {
+            agent: AgentKind::Shell,
+            kind: SessionKind::Pty,
+            title: "pending child".into(),
+            workspace: "/w".into(),
+        })
+        .unwrap();
+    raw(&directory)
+        .execute(
+            "INSERT INTO cross_model_children(child_session_id,parent_session_id,task,source_id,route_id,account_id,status,created_at,updated_at) \
+             VALUES(?1,?2,'child task','source','route','account','running',?3,?3)",
+            params![child.id, session.id, stale_before],
+        )
+        .unwrap();
+    assert!(
+        store
+            .stale_idle_worker_sessions(stale_before, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .archive_stale_idle_worker_session(&session.id, stale_before)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .dispatch_activity_health(stale_before)
+            .unwrap()
+            .stale_dispatch_count,
+        0
+    );
+    raw(&directory)
+        .execute(
+            "UPDATE cross_model_children SET updated_at=?1 WHERE child_session_id=?2",
+            params![stale_before - 1, child.id],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .dispatch_activity_health(stale_before)
+            .unwrap()
+            .stale_dispatch_count,
+        1
+    );
+    raw(&directory)
+        .execute(
+            "INSERT INTO timeline_checkpoints(session_id,last_progress_at) VALUES(?1,?2)",
+            params![child.id, stale_before],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .dispatch_activity_health(stale_before)
+            .unwrap()
+            .stale_dispatch_count,
+        0
+    );
+    raw(&directory)
+        .execute(
+            "UPDATE cross_model_children SET status='completed',summary_delivered=1 WHERE child_session_id=?1",
+            [&child.id],
+        )
+        .unwrap();
+    raw(&directory)
+        .execute(
+            "INSERT INTO cross_model_checks(id,parent_session_id,due_at,state,created_at) \
+             VALUES('pending-check',?1,?2,'pending',?2)",
+            params![session.id, stale_before],
+        )
+        .unwrap();
+    assert!(
+        store
+            .stale_idle_worker_sessions(stale_before, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .archive_stale_idle_worker_session(&session.id, stale_before)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .dispatch_activity_health(stale_before)
+            .unwrap()
+            .stale_dispatch_count,
+        0
+    );
+    raw(&directory)
+        .execute(
+            "UPDATE cross_model_checks SET due_at=?1 WHERE id='pending-check'",
+            [stale_before - 1],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .dispatch_activity_health(stale_before)
+            .unwrap()
+            .stale_dispatch_count,
+        1
+    );
+    raw(&directory)
+        .execute(
+            "UPDATE cross_model_checks SET state='delivered',delivered_at=?1 WHERE id='pending-check'",
+            [stale_before],
+        )
+        .unwrap();
+    store
+        .update_session(
+            &session.id,
+            UpdateSession {
+                revision: head.revision,
+                title: None,
+                lifecycle: None,
+                status: Some(SessionStatus::Running),
+            },
+        )
+        .unwrap();
+    assert!(
+        store
+            .archive_stale_idle_worker_session(&session.id, stale_before)
+            .unwrap()
+            .is_none()
+    );
+    let head = store.session(&session.id).unwrap();
+    store
+        .update_session(
+            &session.id,
+            UpdateSession {
+                revision: head.revision,
+                title: None,
+                lifecycle: None,
+                status: Some(SessionStatus::Idle),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .archive_stale_idle_worker_session(&session.id, stale_before)
+            .unwrap()
+            .is_some()
+    );
+    let recovery = store
+        .reconcile_stale_idle_worker_session(&session.id)
+        .unwrap();
+    assert_eq!(recovery.settled.len(), 1);
+    assert_eq!(store.task(&ids["n0"]).unwrap().status, TaskStatus::Failed);
+    assert!(
+        store
+            .task(&ids["n0"])
+            .unwrap()
+            .result
+            .unwrap()
+            .contains("idle past")
+    );
+    assert_eq!(
+        store.dispatch(&dispatch.dispatch.id).unwrap().state,
+        DispatchState::Abandoned
+    );
+    assert_eq!(
+        store.session(&session.id).unwrap().lifecycle,
+        SessionLifecycle::Archived
+    );
+    let active: i64 = raw(&directory)
+        .query_row(
+            "SELECT active FROM agent_runs WHERE session_id=?1",
+            [&session.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+}
+
+#[test]
 fn archived_structured_session_fails_dispatch_and_preserves_explicit_delivery() {
     let directory = TempDir::new().unwrap();
     let mut store = Store::open(directory.path()).unwrap();
@@ -1040,7 +1311,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 32);
+    assert_eq!(version, 33);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -1278,9 +1549,42 @@ fn v8_database_is_migrated_forward_to_current_schema() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 32);
+    assert_eq!(version, 33);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
+}
+
+#[test]
+fn v32_database_adds_monitor_lookup_indexes() {
+    let directory = TempDir::new().unwrap();
+    drop(Store::open(directory.path()).unwrap());
+    let connection = raw(&directory);
+    connection
+        .execute_batch(
+            "DROP INDEX orch_worker_starts_dispatch_owner; \
+             DROP INDEX orch_dispatch_active_session; \
+             DROP INDEX cross_model_checks_parent_state; \
+             PRAGMA user_version=32;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let _store = Store::open(directory.path()).unwrap();
+    let connection = raw(&directory);
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 33);
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ( \
+               'orch_worker_starts_dispatch_owner','orch_dispatch_active_session', \
+               'cross_model_checks_parent_state')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 3);
 }
 
 #[test]
@@ -1308,7 +1612,7 @@ fn v9_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        32
+        33
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -1367,7 +1671,7 @@ fn v10_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        32
+        33
     );
     let mode: String = connection
         .query_row(
@@ -1427,7 +1731,7 @@ fn v11_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        32
+        33
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1524,7 +1828,7 @@ fn v12_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        32
+        33
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1622,7 +1926,7 @@ fn v13_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        32
+        33
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -1710,7 +2014,7 @@ fn v14_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        32
+        33
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -1818,7 +2122,7 @@ fn v15_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        32
+        33
     );
     let has_engine_validation_column: i64 = connection
         .query_row(
