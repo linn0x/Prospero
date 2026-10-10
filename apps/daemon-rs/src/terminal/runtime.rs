@@ -125,11 +125,19 @@ impl Terminals {
     }
 
     pub fn check(&self) -> Result<()> {
-        if self.0.failed.load(Ordering::Acquire) {
+        if self.closed() || self.failed() {
             Err(Error::Closed)
         } else {
             Ok(())
         }
+    }
+
+    pub fn closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
     }
 
     pub async fn create(&self, input: CreateTerminal) -> Result<SessionHead> {

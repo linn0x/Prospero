@@ -787,8 +787,21 @@ impl Agents {
         self.0.closed.load(Ordering::Acquire)
     }
 
+    pub fn closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_failed_for_test(&self) {
+        self.0.failed.store(true, Ordering::Release);
+    }
+
     pub fn check(&self) -> Result<()> {
-        if self.0.failed.load(Ordering::Acquire) {
+        if self.closed() || self.failed() {
             Err(Error::Closed)
         } else {
             Ok(())
