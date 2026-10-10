@@ -3578,8 +3578,21 @@ async fn runtime_health(api: &Api) -> Result<Health> {
     {
         reasons.push("control_health_sample_stale".into());
     }
-    let status = if !database.alive || api.terminals.check().is_err() || api.agents.check().is_err()
-    {
+    let terminal_runtime_closed = api.terminals.closed();
+    let terminal_runtime_failed = api.terminals.failed();
+    let agent_runtime_closed = api.agents.closed();
+    let agent_runtime_failed = api.agents.failed();
+    if terminal_runtime_closed {
+        reasons.push("terminal_runtime_closed".into());
+    } else if terminal_runtime_failed {
+        reasons.push("terminal_runtime_failed".into());
+    }
+    if agent_runtime_closed {
+        reasons.push("agent_runtime_closed".into());
+    } else if agent_runtime_failed {
+        reasons.push("agent_runtime_failed".into());
+    }
+    let status = if !database.alive || terminal_runtime_closed || agent_runtime_closed {
         RuntimeHealthStatus::Unhealthy
     } else if reasons.is_empty() {
         RuntimeHealthStatus::Healthy
@@ -7879,6 +7892,25 @@ mod tests {
         database.call(|_| Ok(())).await.unwrap();
         let sample = runtime_health(&api).await.unwrap();
         assert!(!sample.database.degraded);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_agent_runtime_failed_as_degraded_reason() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().to_path_buf()).await.unwrap();
+        let api = Api::new(database.clone(), Token::parse("a".repeat(64)).unwrap());
+
+        api.agents.mark_failed_for_test();
+        let health = runtime_health(&api).await.unwrap();
+
+        assert_eq!(health.status, RuntimeHealthStatus::Degraded);
+        assert!(
+            health
+                .degraded_reasons
+                .contains(&"agent_runtime_failed".into())
+        );
         database.shutdown().await.unwrap();
     }
 
