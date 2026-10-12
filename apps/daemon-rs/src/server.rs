@@ -2868,6 +2868,11 @@ async fn remote_session_create(
                         .get("effort")
                         .and_then(JsonValue::as_str)
                         .map(str::to_owned),
+                    approval_policy: message
+                        .get("approvalPolicy")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?,
                 })
                 .await?;
             Ok(head)

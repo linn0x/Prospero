@@ -8,17 +8,19 @@ export type TerminalReadingState = {
   viewport: number;
   followBottom: boolean;
   find: string;
+  findOpen: boolean;
 };
 
 const MAX_SESSIONS = 64;
 const states = new Map<string, TerminalReadingState>();
-const DEFAULT_STATE: TerminalReadingState = { viewport: 0, followBottom: true, find: "" };
+const DEFAULT_STATE: TerminalReadingState = { viewport: 0, followBottom: true, find: "", findOpen: false };
 
 function clean(value: Partial<TerminalReadingState> | undefined): TerminalReadingState {
   return {
     viewport: Number.isFinite(value?.viewport) ? Math.max(0, Math.floor(value!.viewport!)) : DEFAULT_STATE.viewport,
     followBottom: value?.followBottom !== false,
     find: typeof value?.find === "string" ? value.find.slice(0, 256) : DEFAULT_STATE.find,
+    findOpen: value?.findOpen === true,
   };
 }
 

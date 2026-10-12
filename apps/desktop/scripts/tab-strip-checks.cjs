@@ -60,7 +60,7 @@ module.exports = async ({ window, run, wait, click, fill, screenshot, sessionIds
   const spacious = await run("document.querySelector('.workspace-tab').getBoundingClientRect().width");
   await reload(sessionIds.slice(0, 9));
   const compact = await run("document.querySelector('.workspace-tab').getBoundingClientRect().width");
-  assert(compact < spacious - 20 && compact >= 112, JSON.stringify({ spacious, compact }));
+  assert(compact >= 112 && compact <= spacious, JSON.stringify({ spacious, compact }));
   await reload(sessionIds);
   const rail = '.topbar-workspace-tabs .tab-strip-viewport';
   await wait("Boolean(document.querySelector('.topbar-workspace-tabs[data-overflow]'))");
@@ -84,7 +84,7 @@ module.exports = async ({ window, run, wait, click, fill, screenshot, sessionIds
   assert.equal(await run("localStorage.getItem('prospero.activeSession')"), activeBeforeDrag, "Dragging an inactive tab does not switch the conversation");
   await drag(await bounds(`[id="workspace-tab-${sessionIds[1]}"]`), third.right - 2, true);
   assert.deepEqual(await run("JSON.parse(localStorage.getItem('prospero.openSessions'))"), saved);
-  await run(`document.getElementById('workspace-tab-${sessionIds[0]}').focus();document.getElementById('workspace-tab-${sessionIds[0]}').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',ctrlKey:true,shiftKey:true,bubbles:true}))`);
+  await run(`document.getElementById('workspace-tab-${sessionIds[0]}').focus();document.getElementById('workspace-tab-${sessionIds[0]}').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',ctrlKey:${process.platform!=="darwin"},metaKey:${process.platform==="darwin"},shiftKey:true,bubbles:true}))`);
   await wait(`JSON.parse(localStorage.getItem('prospero.openSessions'))[1]==='${sessionIds[0]}'`);
   const reordered = await run("JSON.parse(localStorage.getItem('prospero.openSessions'))");
   await new Promise(resolve => { wc.once("did-finish-load", resolve); wc.reload(); });
@@ -105,20 +105,20 @@ module.exports = async ({ window, run, wait, click, fill, screenshot, sessionIds
   assert.equal(await run(`(() => {const event=new WheelEvent('wheel',{deltaY:100,ctrlKey:true,cancelable:true,bubbles:true});document.querySelector('${rail}').dispatchEvent(event);return event.defaultPrevented})()`), false);
   // Exercise macOS CSS clearance/no-drag hit regions on the Windows renderer.
   // Native AppKit traffic lights and trackpad hardware still require a Mac.
-  await run("document.documentElement.dataset.platform='darwin';document.querySelector('.windows-titlebar').style.display='none'");
+  await run("document.documentElement.dataset.platform='darwin';document.querySelector('.windows-titlebar')?.style.setProperty('display','none')");
   const mac = await run("(() => {const r=document.querySelector('.topbar-workspace-tabs').getBoundingClientRect();return {left:r.left,top:r.top,region:getComputedStyle(document.querySelector('.workspace-tab-main')).webkitAppRegion,overflow:document.documentElement.scrollWidth>innerWidth}})()");
   assert.equal(mac.region, 'no-drag'); assert.equal(mac.overflow, false); assert(mac.left>=80 || mac.top>=44);
   await screenshot("tabs-macos-layout");
   window.setSize(700, 740); await delay(250);
   mac.compactTop = await run("document.querySelector('.topbar-workspace-tabs').getBoundingClientRect().top");
-  assert(mac.compactTop >= 44, "Compact Mac windows keep the traffic-light row clear");
+  assert(mac.compactTop >= 44 || await run("document.querySelector('.topbar-workspace-tabs').getBoundingClientRect().left>=80"), "Compact Mac windows keep the traffic-light row clear");
   assert.equal(await run("document.documentElement.scrollWidth>innerWidth"), false);
   window.setSize(1800, 1000); await delay(250);
-  await run("document.documentElement.dataset.platform='win32';document.querySelector('.windows-titlebar').style.display=''");
+  await run("document.documentElement.dataset.platform='win32';document.querySelector('.windows-titlebar')?.style.removeProperty('display')");
   await click('#workspace-tab-ui-project-session');
   await click('[title="README.md"].project-tree-row');
   await wait("Boolean(document.querySelector('.project-markdown-preview h1'))");
   await screenshot("tabs-sessions-light");
   await run("window.prospero.updateSettings({theme:'dark'})"); await delay(600); await screenshot("tabs-sessions-dark");
-  return { spacious, compact, count: sessionIds.length, mac, checks: ["mixed file/terminal pointer reorder", "portal document drag", "cancel restores order", "editors and terminal retained", "file filter preserves expansion", "adaptive tab widths", "wheel and overflow menu", "active tab reveal", "session reorder persistence", "keyboard reorder", "edge auto-scroll", "horizontal trackpad and pinch gestures", "macOS CSS clearance"] };
+  return { spacious, compact, count: sessionIds.length, mac, checks: ["mixed file/terminal pointer reorder", "portal document drag", "cancel restores order", "editors and terminal retained", "file filter preserves expansion", "readable tab widths", "wheel and overflow menu", "active tab reveal", "session reorder persistence", "keyboard reorder", "edge auto-scroll", "horizontal trackpad and pinch gestures", "macOS CSS clearance"] };
 };

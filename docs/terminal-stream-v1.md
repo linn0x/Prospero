@@ -1,7 +1,7 @@
 # Terminal stream v1 implementation contract
 
-Known recovery defect: real Codex sessions can return `history_gap` and a null
-snapshot after history pruning. See [evidence and follow-up](terminal-stream-known-issues.md).
+New hosts retain a private disk journal so a null snapshot can fall back to
+contiguous replay after memory pruning. See [recovery coverage and older-host limits](terminal-stream-known-issues.md).
 
 Scope: Rust daemon + Electron desktop. Keep the existing terminal engine and
 SQLite schema initially. Do not install or restart the daily application during
@@ -133,9 +133,9 @@ legacy Base64 representation inside persistence/compatibility adapters.
 - The terminal engine remains avt. Previously measured truecolor and Tab dump
   incompatibilities are normalized before xterm replay. Unsupported protected
   cells/selective erase now refuse a checkpoint instead of silently restoring
-  the wrong state. Combining characters/hyperlinks and truncated full history
-  still have the documented engine limitations; no unsafe cropped snapshot is
-  invented to hide a gap.
+  the wrong state. Combining characters and hyperlinks are preserved by the
+  compatible snapshot path; unsupported states replay the disk journal in
+  bounded pages. No cropped snapshot is invented to hide a gap.
 - SQLite schema/storage engine is retained. Measured transport improvements do
   not justify adding a message broker or replacing the database.
 

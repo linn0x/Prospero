@@ -73,6 +73,7 @@ fn input(directory: &TempDir) -> CreateTerminal {
         account_id: None,
         model: None,
         effort: None,
+        approval_policy: None,
     }
 }
 
@@ -466,7 +467,7 @@ sys.stdout.flush()
     let head = api.terminals.create(launch).await.unwrap();
     settled(&api.terminals).await;
     let dumped = wait_for_json(&capture).await;
-    assert_eq!(dumped["argv"], json!(["--dangerously-skip-permissions"]));
+    assert_eq!(dumped["argv"], json!(["--permission-mode", "acceptEdits"]));
     let env = &dumped["env"];
     assert_eq!(
         env["ANTHROPIC_API_KEY"],
@@ -499,6 +500,12 @@ async fn codex_pty_uses_native_isolation_and_model_arguments() {
     let runtime = Terminals::new(database.clone());
     let cli = directory.path().join("fake-codex-pty.py");
     let capture = directory.path().join("codex-pty.json");
+    let source_home = directory.path().join("native-source");
+    std::fs::create_dir_all(&source_home).unwrap();
+    let auth = r#"{"tokens":{"access_token":"synthetic"},"last_refresh":"2026-10-01T00:00:00Z"}"#;
+    let config = "model = 'gpt-test-native'\nmodel_reasoning_effort = 'medium'\n";
+    std::fs::write(source_home.join("auth.json"), auth).unwrap();
+    std::fs::write(source_home.join("config.toml"), config).unwrap();
     executable_script(
         &cli,
         r#"#!/usr/bin/env python3
@@ -516,6 +523,10 @@ sys.stdout.flush()
         "CODEX_API_KEY",
         "CODEX_ACCESS_TOKEN",
         "CODEX_REFRESH_TOKEN",
+        "CODEX_HOME",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "TERM_PROGRAM",
     ]);
     unsafe {
         std::env::set_var("PROSPERO_CODEX_BIN", &cli);
@@ -524,6 +535,10 @@ sys.stdout.flush()
         std::env::set_var("CODEX_API_KEY", "parent-codex");
         std::env::set_var("CODEX_ACCESS_TOKEN", "parent-access");
         std::env::set_var("CODEX_REFRESH_TOKEN", "parent-refresh");
+        std::env::set_var("CODEX_HOME", &source_home);
+        std::env::set_var("NO_COLOR", "1");
+        std::env::set_var("FORCE_COLOR", "0");
+        std::env::set_var("TERM_PROGRAM", "outer-host");
     }
     let mut launch = input(&workspace);
     launch.agent = Some(prosperod_rs::protocol::AgentKind::Codex);
@@ -531,12 +546,22 @@ sys.stdout.flush()
     launch.model = Some("gpt-6-test".into());
     launch.effort = Some("high".into());
     let head = runtime.create(launch).await.unwrap();
+    assert_eq!(head.account_id.as_deref(), Some("native-codex"));
+    assert_eq!(head.model.as_deref(), Some("gpt-6-test"));
+    assert_eq!(head.effort.as_deref(), Some("high"));
+    assert_eq!(
+        head.approval_policy,
+        Some(prosperod_rs::protocol::TerminalApprovalPolicy::Standard)
+    );
     settled(&runtime).await;
     let dumped = wait_for_json(&capture).await;
     assert_eq!(
         dumped["argv"],
         json!([
-            "--dangerously-bypass-approvals-and-sandbox",
+            "--ask-for-approval",
+            "on-request",
+            "--sandbox",
+            "workspace-write",
             "-c",
             format!(
                 "developer_instructions={}",
@@ -561,6 +586,29 @@ sys.stdout.flush()
     assert_eq!(env["CODEX_API_KEY"], "");
     assert_eq!(env["CODEX_ACCESS_TOKEN"], "");
     assert_eq!(env["CODEX_REFRESH_TOKEN"], "");
+    assert!(env.get("NO_COLOR").is_none());
+    assert!(env.get("FORCE_COLOR").is_none());
+    assert_eq!(env["TERM_PROGRAM"], "Prospero");
+    assert_eq!(env["CLICOLOR"], "1");
+    assert_eq!(
+        std::fs::read_to_string(native_root.join("auth.json")).unwrap(),
+        auth
+    );
+    assert_eq!(
+        std::fs::read_to_string(native_root.join("config.toml")).unwrap(),
+        config
+    );
+    let restored = database
+        .call({
+            let id = head.id.clone();
+            move |store| store.session(&id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(restored.account_id, head.account_id);
+    assert_eq!(restored.model, head.model);
+    assert_eq!(restored.effort, head.effort);
+    assert_eq!(restored.approval_policy, head.approval_policy);
     let stored: Option<String> =
         rusqlite::Connection::open(directory.path().join("prospero.sqlite"))
             .unwrap()
@@ -571,6 +619,20 @@ sys.stdout.flush()
             )
             .unwrap();
     assert_eq!(stored.as_deref(), Some("native-codex"));
+
+    let refreshed_auth = r#"{"tokens":{"access_token":"synthetic-refreshed"},"last_refresh":"2026-10-12T00:00:00Z"}"#;
+    std::fs::write(native_root.join("auth.json"), refreshed_auth).unwrap();
+    let mut inherited = input(&workspace);
+    inherited.agent = Some(prosperod_rs::protocol::AgentKind::Codex);
+    inherited.account_id = Some("native-codex".into());
+    let inherited_head = runtime.create(inherited).await.unwrap();
+    settled(&runtime).await;
+    assert_eq!(inherited_head.model.as_deref(), Some("gpt-test-native"));
+    assert_eq!(inherited_head.effort.as_deref(), Some("medium"));
+    assert_eq!(
+        std::fs::read_to_string(native_root.join("auth.json")).unwrap(),
+        refreshed_auth
+    );
 
     let mut rejected = input(&workspace);
     rejected.agent = Some(prosperod_rs::protocol::AgentKind::Codex);

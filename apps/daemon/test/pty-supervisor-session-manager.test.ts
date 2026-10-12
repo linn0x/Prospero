@@ -1,8 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../src/session-manager.js";
+import { sessionName, tmuxPath } from "../src/tmux.js";
 
 const homes: string[] = [];
 const live: Array<{ manager: SessionManager; sid: string }> = [];
@@ -35,6 +37,24 @@ afterEach(async () => {
 });
 
 describe("detached PTY session host", () => {
+  it.skipIf(process.platform === "win32")("restores and kills a legacy session from the default tmux server", async () => {
+    const tmux = tmuxPath();
+    if (!tmux) return;
+    const value = home();
+    const sid = `legacy-${String(Date.now())}`;
+    const name = sessionName(sid);
+    expect(spawnSync(tmux, ["new-session", "-d", "-s", name, "sleep", "30"]).status).toBe(0);
+    writeFileSync(path.join(value, "pty-sessions.json"), JSON.stringify([{
+      id: sid, agent: "custom", title: "legacy", cwd: value, cols: 80, rows: 24,
+    }]), { mode: 0o600 });
+    const manager = new SessionManager({ tmux: { home: value } });
+    live.push({ manager, sid });
+    const restored = await manager.restoreFromTmux();
+    expect(restored).toEqual([expect.objectContaining({ id: sid, kind: "pty" })]);
+    await manager.kill(sid);
+    expect(spawnSync(tmux, ["has-session", "-t", name]).status).not.toBe(0);
+  });
+
   it.skipIf(process.platform === "win32")("keeps the PTY, xterm snapshot and output cursor alive across daemon facade disposal", async () => {
     const value = home();
     const first = new SessionManager({ home: value, ptySupervisor: true });
@@ -101,13 +121,14 @@ describe("detached PTY session host", () => {
       version: 1, protocolVersion: 1, implementation: "pty-supervisor", sessionId: "stale-owner",
       agent: "custom", title: "stale", cwd: value, createdAt: 1, cols: 80, rows: 24,
       socket: path.join(root, "missing.sock"), tokenFile: "token", sessionDir: root,
-      supervisorPid: 999_999_999, lifecycleEpoch: "stale", ownerState: "active", status: "running",
+      supervisorPid: 999_999_999, lifecycleEpoch: "stale", ownerState: "active", status: "running", busySince: 123,
     }), { mode: 0o600 });
     chmodSync(path.join(root, "manifest.json"), 0o600);
 
     const manager = new SessionManager({ home: value, ptySupervisor: true });
     const restored = await manager.restorePtySupervisors();
     expect(restored).toEqual([expect.objectContaining({ id: "stale-owner", status: "died" })]);
+    expect(manager.requirePty("stale-owner").info().busySince).toBeUndefined();
     await expect(manager.requirePty("stale-owner").snapshot()).rejects.toThrow(/unavailable|disconnected/i);
     await manager.disposeAll();
   });

@@ -108,17 +108,17 @@ pub(crate) async fn serve(socket: WebSocket, terminal: Terminal) -> Result<()> {
         let _lease = Lease { terminal: terminal.clone(), client: client.clone() };
         let mut lease_changes = terminal.controller_changes();
         let mut cursor = attach.after_seq.unwrap_or(0);
-        let initial = terminal.read(TerminalQuery { after_seq: Some(cursor as i64), wait_ms: Some(0) }).await?;
         let snapshot = if attach.after_seq.is_none() {
             let term = terminal.clone();
             tokio::task::spawn_blocking(move || term.snapshot()).await.map_err(|_| Error::Closed)??
         } else { None };
+        let initial = terminal.read(TerminalQuery { after_seq: Some(snapshot.as_ref().map(|snapshot| snapshot.seq).unwrap_or(cursor as i64)), wait_ms: Some(0) }).await?;
         if (initial.resync_required && snapshot.is_none()) || cursor > initial.latest_seq as u64 {
             send_error(&mut sink, "history_gap", "The retained output cannot reconstruct this terminal").await?;
             return Ok(());
         }
         let size = snapshot.as_ref().map(|s| s.size).unwrap_or(initial.initial_size);
-        let barrier = snapshot.as_ref().map(|s| s.seq as u64).unwrap_or(initial.latest_seq as u64);
+        let barrier = initial.latest_seq as u64;
         let mut exited = initial.exited;
         if attach.want_control && !exited { let _ = terminal.acquire_controller(&client, false)?; }
         let owner = terminal.controller()?;
@@ -253,9 +253,10 @@ pub(crate) async fn serve(socket: WebSocket, terminal: Terminal) -> Result<()> {
             Error::Busy => "busy",
             Error::Timeout => "timeout",
             Error::Closed => "closed",
+            Error::Feature(code, _) if code == "terminal_replay_unavailable" => code.as_str(),
             _ => "protocol_error",
         };
-        let message = if let Error::Invalid(reason) = error {
+        let message = if let Error::Invalid(reason) | Error::Feature(_, reason) = error {
             reason.as_str()
         } else {
             "Terminal stream ended; unacknowledged input was not replayed"

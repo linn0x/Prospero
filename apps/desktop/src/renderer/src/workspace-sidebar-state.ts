@@ -118,7 +118,7 @@ export function matchesFocusShortcut(
   )
     return false;
   return platform === "darwin"
-    ? event.metaKey && event.shiftKey && !event.ctrlKey && !event.altKey
+    ? event.metaKey && event.altKey && !event.ctrlKey && !event.shiftKey
     : event.ctrlKey && event.altKey && !event.metaKey && !event.shiftKey;
 }
 

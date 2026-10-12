@@ -83,6 +83,14 @@ describe("session launch options", () => {
     expect(defaultSessionLaunchAccountId(accounts, "shell")).toBeUndefined();
   });
 
+  it("preserves an existing session directory without permitting unrelated paths", () => {
+    const value = snapshot([]);
+    value.daemon.sessions = [{ id: "nested", title: "Nested", agent: "codex", kind: "pty", cwd: "/repo/nested", status: "running" }];
+    expect(isSessionLaunchWorkspace(value, "/repo/nested")).toBe(true);
+    expect(isSessionLaunchWorkspace(value, "/repo/other")).toBe(false);
+    expect(isSessionLaunchWorkspace(value, "/unregistered")).toBe(false);
+  });
+
   it("forces Chat Completions profiles onto the structured pane", () => {
     const [chat, responses] = sessionLaunchAccounts([
       { id: "chat", agent: "codex", name: "Chat", status: "signed_in", apiProfile: { protocol: "openai_chat_completions" } },

@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -266,6 +267,39 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
     }
   });
 
+  it("rebuilds one damaged image safely across concurrent daemons", async () => {
+    const fixture = runtimeFixture("prospero-runtime-concurrent-rebuild");
+    const control = temp("prospero-runtime-concurrent-rebuild-control-");
+    const release = path.join(control, "release");
+    const markers = Array.from({ length: 4 }, (_, index) => path.join(control, "ready-" + String(index)));
+    writePrivate(fixture.runner, "console.log('rebuilt');\n");
+    const damaged = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    damaged.release();
+    writePrivate(path.join(damaged.directory, "injected"), "damage\n");
+    const runtimeModule = pathToFileURL(
+      path.join(import.meta.dirname, "..", "dist", "structured-supervisor-runtime.js"),
+    ).href;
+    const workers = markers.map((marker) => concurrentSnapshotWorker(
+      runtimeModule,
+      fixture.runtimeRoot,
+      fixture.runner,
+      marker,
+      release,
+    ));
+    try {
+      await waitForFiles(markers);
+      writePrivate(release, "rebuild\n");
+      const snapshots = await Promise.all(workers);
+      expect(new Set(snapshots.map((snapshot) => snapshot.directory)).size).toBe(1);
+      expect(snapshots[0]!.directory).toBe(damaged.directory);
+      expect(readdirSync(fixture.runtimeRoot).filter((name) => name.startsWith(".structured-supervisor-quarantine-")).length).toBe(1);
+      expect(readdirSync(fixture.runtimeRoot).filter((name) => name.startsWith(".structured-supervisor-staging-")).length).toBe(0);
+    } finally {
+      if (!existsSync(release)) writePrivate(release, "rebuild\n");
+      await Promise.allSettled(workers);
+    }
+  });
+
   it("trusts the physical node_modules tree for a package installed without a workspace manifest", () => {
     const fixture = installedLayoutFixture("prospero-runtime-installed");
     const sibling = path.join(fixture.project, "node_modules", "@fixture", "sibling");
@@ -452,6 +486,102 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
     }
   });
 
+  it("removes a stale private lease temporary file only after its owner exits", () => {
+    const fixture = runtimeFixture("prospero-runtime-lease-temp");
+    writePrivate(fixture.runner, "console.log('one');\n");
+    const original = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    const digest = path.basename(original.directory).replace("structured-supervisor-", "");
+    original.release();
+    const temporary = path.join(fixture.runtimeRoot, "leases", `${digest}-12345-0123456789abcdef01234567.json.987654321.0123456789ab.tmp`);
+    writePrivate(temporary, "partial\n");
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+    utimesSync(temporary, old, old);
+    writePrivate(fixture.runner, "console.log('two');\n");
+    const current = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    try {
+      expect(existsSync(temporary)).toBe(false);
+      const activeTemporary = path.join(fixture.runtimeRoot, "leases", `${digest}-12345-0123456789abcdef01234567.json.${process.pid}.0123456789ab.tmp`);
+      writePrivate(activeTemporary, "partial\n");
+      utimesSync(activeTemporary, old, old);
+      const reused = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+      try {
+        expect(existsSync(activeTemporary)).toBe(true);
+      } finally {
+        reused.release();
+      }
+    } finally {
+      current.release();
+    }
+  });
+
+  it("recovers a lock left by a killed owner process", async () => {
+    const fixture = runtimeFixture("prospero-runtime-lock-recovery");
+    writePrivate(fixture.runner, "console.log('recovered');\n");
+    mkdirSync(fixture.runtimeRoot, { recursive: true, mode: 0o700 });
+    chmodSync(fixture.runtimeRoot, 0o700);
+    const ready = path.join(fixture.runtimeRoot, "lock-ready");
+    const ownerToken = randomBytes(24).toString("hex");
+    const lockWorker = spawn(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      "const [root, ready, token] = process.argv.slice(1); const fs = await import('node:fs'); const path = await import('node:path'); const lock = path.join(root, '.structured-supervisor-recovery-lock'); fs.mkdirSync(lock, { mode: 0o700 }); fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({ version: 1, pid: process.pid, token }), { mode: 0o600 }); fs.chmodSync(path.join(lock, 'owner.json'), 0o600); fs.writeFileSync(ready, 'ready', { mode: 0o600 }); setInterval(() => {}, 1000);",
+      fixture.runtimeRoot,
+      ready,
+      ownerToken,
+    ], { stdio: "ignore" });
+    try {
+      await waitForFiles([ready]);
+      lockWorker.kill("SIGKILL");
+      await new Promise<void>((resolve) => lockWorker.once("close", () => resolve()));
+      const snapshot = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+      try {
+        expect(execFileSync(process.execPath, [snapshot.runnerPath], { encoding: "utf8" }).trim()).toBe("recovered");
+        expect(readdirSync(fixture.runtimeRoot).some((name) => name.startsWith(".structured-supervisor-recovery-lock.stale-"))).toBe(true);
+      } finally {
+        snapshot.release();
+      }
+    } finally {
+      lockWorker.kill("SIGKILL");
+    }
+  });
+
+  it("lets two daemons recover the same dead owner lock", async () => {
+    const fixture = runtimeFixture("prospero-runtime-lock-concurrent-recovery");
+    const control = temp("prospero-runtime-lock-concurrent-control-");
+    const release = path.join(control, "release");
+    const markers = [path.join(control, "ready-0"), path.join(control, "ready-1")];
+    writePrivate(fixture.runner, "console.log('recovered-twice');\n");
+    mkdirSync(fixture.runtimeRoot, { recursive: true, mode: 0o700 });
+    chmodSync(fixture.runtimeRoot, 0o700);
+    const lock = path.join(fixture.runtimeRoot, ".structured-supervisor-recovery-lock");
+    mkdirSync(lock, { mode: 0o700 });
+    writePrivate(path.join(lock, "owner.json"), JSON.stringify({
+      version: 1,
+      pid: 987654321,
+      token: randomBytes(24).toString("hex"),
+    }));
+    const runtimeModule = pathToFileURL(
+      path.join(import.meta.dirname, "..", "dist", "structured-supervisor-runtime.js"),
+    ).href;
+    const workers = markers.map((marker) => concurrentSnapshotWorker(
+      runtimeModule,
+      fixture.runtimeRoot,
+      fixture.runner,
+      marker,
+      release,
+    ));
+    try {
+      await waitForFiles(markers);
+      writePrivate(release, "recover\n");
+      const snapshots = await Promise.all(workers);
+      expect(new Set(snapshots.map((snapshot) => snapshot.directory)).size).toBe(1);
+      expect(execFileSync(process.execPath, [snapshots[0]!.directory + "/dist/runner.mjs"], { encoding: "utf8" }).trim()).toBe("recovered-twice");
+    } finally {
+      if (!existsSync(release)) writePrivate(release, "recover\n");
+      await Promise.allSettled(workers);
+    }
+  });
+
   it("rejects a runtime root whose ancestor is a symlink", () => {
     const fixture = runtimeFixture("prospero-runtime-symlink");
     writePrivate(fixture.runner, "console.log('unsafe');\n");
@@ -484,14 +614,59 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
     first.release();
     mutate(first.directory);
 
-    // Existing finals are never removed based on a failed inspection. The
-    // creator either publishes a separately valid replacement or fails closed
-    // when this content-addressed name is already occupied.
+    if (_description.includes("symlink")) {
+      expect(() => createStructuredSupervisorRuntimeSnapshot({
+        runtimeRoot: fixture.runtimeRoot,
+        runnerPath: fixture.runner,
+      })).toThrow();
+      expect(existsSync(first.directory)).toBe(true);
+      return;
+    }
+    const rebuilt = createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    });
+    try {
+      expect(rebuilt.directory).toBe(first.directory);
+      expect(execFileSync(process.execPath, [rebuilt.runnerPath], { encoding: "utf8" }).trim()).toBe("immutable");
+      expect(readdirSync(fixture.runtimeRoot).some((name) => name.startsWith(".structured-supervisor-quarantine-"))).toBe(true);
+    } finally {
+      rebuilt.release();
+    }
+  });
+
+  it("does not quarantine a damaged image with an unknown lease", () => {
+    const fixture = runtimeFixture("prospero-runtime-unknown-lease");
+    writePrivate(fixture.runner, "console.log('immutable');\n");
+    const first = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    first.release();
+    writePrivate(path.join(first.directory, "injected"), "unsafe\n");
+    writePrivate(path.join(fixture.runtimeRoot, "leases", "unknown.json"), "not-json\n");
     expect(() => createStructuredSupervisorRuntimeSnapshot({
       runtimeRoot: fixture.runtimeRoot,
       runnerPath: fixture.runner,
     })).toThrow();
     expect(existsSync(first.directory)).toBe(true);
+  });
+
+  it("does not quarantine a damaged image with an active lease", () => {
+    const fixture = runtimeFixture("prospero-runtime-active-lease");
+    writePrivate(fixture.runner, "console.log('immutable');\n");
+    const first = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    const digest = path.basename(first.directory).replace("structured-supervisor-", "");
+    writePrivate(path.join(first.directory, "injected"), "unsafe\n");
+    writePrivate(path.join(fixture.runtimeRoot, "leases", "active.json"), JSON.stringify({
+      version: 1,
+      digest,
+      pid: process.pid,
+      heartbeatAt: Date.now(),
+    }));
+    expect(() => createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    })).toThrow();
+    expect(existsSync(first.directory)).toBe(true);
+    first.release();
   });
 });
 

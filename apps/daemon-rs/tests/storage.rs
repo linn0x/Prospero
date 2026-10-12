@@ -56,6 +56,51 @@ fn session_and_event_commit_together_and_survive_reopen() {
 }
 
 #[test]
+fn schema_34_recovers_existing_terminal_account_bindings() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let head = store
+        .create_terminal(CreateTerminal {
+            title: "Existing terminal".into(),
+            workspace: "/synthetic".into(),
+            size: TerminalSize { cols: 80, rows: 24 },
+            agent: Some(AgentKind::Codex),
+            command: None,
+            account_id: None,
+            model: None,
+            effort: None,
+            approval_policy: None,
+        })
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE terminal_runs SET account_id='profile-original' WHERE session_id=?1",
+            [&head.id],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 33).unwrap();
+    drop(connection);
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(
+        store.session(&head.id).unwrap().account_id.as_deref(),
+        Some("profile-original")
+    );
+    assert_eq!(
+        store
+            .lookup_sessions(SessionLookup {
+                ids: vec![head.id.clone()]
+            })
+            .unwrap()
+            .items[0]
+            .account_id
+            .as_deref(),
+        Some("profile-original")
+    );
+}
+
+#[test]
 fn data_directory_has_one_writer() {
     let directory = TempDir::new().unwrap();
     let store = Store::open(directory.path()).unwrap();

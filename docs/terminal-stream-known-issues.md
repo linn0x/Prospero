@@ -1,9 +1,9 @@
 # Terminal stream known issues
 
-## Open: history gap with no recovery snapshot
+## Resolved in source: history gap with no recovery snapshot
 
 - Recorded: 2026-09-28.
-- Status: confirmed in the installed build from `aaca249`; not fixed.
+- Status: fixed for newly started hosts in the current source. The installed-build evidence below predates the fix.
 - Priority: high — terminal recovery and additional viewers can be blocked.
 
 ### Evidence
@@ -34,7 +34,9 @@ attribute it to a particular avt limitation without reproduction. Rejecting
 incomplete replay is intentional; the missing reliable recovery path is the
 defect. Increasing retention alone only delays the same failure.
 
-### Follow-up and acceptance criteria
+### Recovery and regression coverage
+
+Each new terminal records output and resize events in a private SQLite journal while keeping its memory ring bounded. Unsupported snapshots fall back to contiguous, paged journal replay. Checkpointing and exit archival drain bounded pages into the daemon database, and daemon restart resumes from its persisted sequence. Journal failures are reported explicitly without inventing missing history or automatically replaying input.
 
 1. Expose and reproduce why snapshot generation returns `None`, using real Codex
    TUI output, dimensions and resize history.
@@ -45,5 +47,5 @@ defect. Increasing retention alone only delays the same failure.
 4. Preserve controller ownership and PTY dimensions during observer recovery;
    never replay input whose outcome is unknown.
 
-Until fixed, keep an already working viewer open where practical. This is a
-temporary precaution, not a recovery solution.
+Existing hosts keep the implementation they were started with. Upgrading the
+daemon alone cannot recover events already discarded by an older host.

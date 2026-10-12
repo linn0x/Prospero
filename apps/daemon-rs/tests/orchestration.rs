@@ -1311,7 +1311,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 33);
+    assert_eq!(version, 34);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -1549,7 +1549,7 @@ fn v8_database_is_migrated_forward_to_current_schema() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 33);
+    assert_eq!(version, 34);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
@@ -1574,7 +1574,7 @@ fn v32_database_adds_monitor_lookup_indexes() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 33);
+    assert_eq!(version, 34);
     let count: i64 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ( \

@@ -34,6 +34,8 @@ export type SessionInfo = {
   createdAt?: number;
   accountId?: string;
   accountName?: string;
+  model?: string;
+  effort?: string;
   pendingPermissions?: number;
   pendingQuestions?: number;
   approvalPolicy?: string;
@@ -253,6 +255,7 @@ export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon" | "or
 
 export type SessionCreateInput = {
   cwd: string;
+  sourceSessionId?: string;
   agent: "codex" | "claude" | "deepseek" | "opencode" | "grok" | "trae" | "shell" | "custom";
   kind: "structured" | "pty";
   approvalPolicy: "strict" | "standard" | "yolo";
@@ -349,6 +352,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   /** 终端里的链接交给系统浏览器;主进程只放行 http(s)。 */
   openExternal(url: string): Promise<{ ok: boolean }>;
   readClipboard(): Promise<string>;
+  saveTerminalClipboardImage(sessionId: string): Promise<{ path: string }>;
   openTerminalContextMenu(options: { copy: boolean; paste: boolean }): Promise<void>;
   /** Opens an authenticated v1 attachment. Its port is delivered as a window message keyed by requestId. */
   openTerminalStream(sessionId: string, requestId: string): Promise<{ supported: boolean }>;

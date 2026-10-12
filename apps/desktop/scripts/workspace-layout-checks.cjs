@@ -56,7 +56,7 @@ module.exports = async ({ window, run, wait, click, screenshot, shellCreates }) 
   await wait("document.querySelector('.dock-terminal').textContent.includes('实时终端')");
   await run("window.__terminal=document.querySelector('.dock-terminal .xterm')");
   await delay(300);
-  const terminalGeometry = await run("['.dock-terminal','.terminal-host','.xterm-screen','.xterm-screen canvas'].map(s=>{const el=document.querySelector(s);const r=el?.getBoundingClientRect();return {s,width:r?.width,height:r?.height}})");
+  const terminalGeometry = await run("['.dock-terminal','.terminal-host','.xterm-screen','.xterm-screen canvas, .xterm-rows'].map(s=>{const el=document.querySelector(s);const r=el?.getBoundingClientRect();return {s,width:r?.width,height:r?.height}})");
   assert(terminalGeometry.every(item => item.width > 100 && item.height > 100), JSON.stringify(terminalGeometry));
   await screenshot("workspace-terminal-light");
   await click('[data-slot="project-file-tab"][title="src/workspace.ts"]');

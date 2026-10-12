@@ -223,6 +223,10 @@ impl Host {
             let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
             return Err(match error["code"].as_str() {
                 Some("terminal_input_failed") => Error::TerminalInput,
+                Some("terminal_replay_unavailable") => Error::Feature(
+                    "terminal_replay_unavailable".into(),
+                    "Terminal replay journal is unavailable".into(),
+                ),
                 Some("busy") => Error::Busy,
                 Some("timeout") => Error::Timeout,
                 _ => match status.as_u16() {

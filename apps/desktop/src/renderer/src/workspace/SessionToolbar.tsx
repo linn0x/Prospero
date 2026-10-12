@@ -37,7 +37,7 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
     <header className="pane-toolbar session-toolbar">
       <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}><StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} /><strong>{label === project ? shortPath(session.cwd) : label}</strong>{label !== project && <small>{shortPath(session.cwd)}</small>}</div>
       <div className="pane-toolbar-actions">
-        {session.kind === "pty" && <TerminalMouseToggle localSelection={localSelection} onChange={onLocalSelectionChange} />}
+        {session.kind === "pty" && <TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={onLocalSelectionChange} />}
         <Button variant="ghost" size="icon-sm" aria-label={t("浏览项目文件", "Browse project files")} title={t("浏览项目文件", "Browse project files")} onClick={() => openProjectTools(session.cwd)}><Files /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("搜索项目内容", "Search project contents")} title={t("搜索项目内容", "Search project contents")} onClick={() => openProjectTools(session.cwd, "search")}><Search /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("查看 Git 变更", "Review Git changes")} title={t("查看 Git 变更", "Review Git changes")} onClick={() => openProjectTools(session.cwd, "git")}><GitBranch /></Button>
@@ -46,7 +46,7 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
         <Button variant="ghost" size="icon-sm" disabled={busy || !["running", "starting", "waiting_input", "waiting_approval"].includes(session.status)} aria-label={t("停止当前轮次", "Stop current turn")} title={t("停止当前轮次", "Stop current turn")} onClick={() => void action(() => window.prospero.interruptSession(session.id))}><DesktopIcon name="stop" /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("切换工具栏", "Toggle tools")} title={t("文件、搜索、Git 与会话工具", "Files, search, Git and session tools")} aria-pressed={contextVisible} onClick={onToggleContext}><DesktopIcon name="sidebar" /></Button>
         <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label={t("会话操作", "Session actions")} />}><DesktopIcon name="more" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>
-          <DropdownMenuItem onClick={onToggleFocus}><DesktopIcon name="expand" />{t("进入专注模式", "Enter focus mode")}</DropdownMenuItem>
+          <DropdownMenuItem onClick={onToggleFocus}><DesktopIcon name="expand" />{t("进入专注模式", "Enter focus mode")}<span className="ml-auto text-xs text-muted-foreground">{isMac ? "⌘⌥F" : "Ctrl+Alt+F"}</span></DropdownMenuItem>
           <DropdownMenuItem disabled={busy} onClick={() => void action(() => window.prospero.revealPath(session.cwd))}><DesktopIcon name="folderOpen" />{isMac ? t("在访达中显示", "Reveal in Finder") : t("在资源管理器中打开", "Open in Explorer")}</DropdownMenuItem>
           <DropdownMenuItem variant="destructive" disabled={busy || ["done", "completed", "exited", "cancelled"].includes(session.status)} onClick={() => void action(() => window.prospero.killSession(session.id))}><DesktopIcon name="close" />{t("结束会话", "End session")}</DropdownMenuItem>
         </DropdownMenuGroup></DropdownMenuContent></DropdownMenu>

@@ -118,13 +118,13 @@ async fn input_is_not_duplicated_and_resize_is_ordered() {
 }
 
 #[tokio::test]
-async fn excess_output_requires_resync_and_queries_stay_bounded() {
+async fn excess_output_replays_from_disk_and_queries_stay_bounded() {
     let terminal = start("dd if=/dev/zero bs=65536 count=48 2>/dev/null");
     wait(&terminal).await;
     let page = terminal.read(TerminalQuery::default()).await.unwrap();
-    assert!(page.resync_required);
-    assert!(page.events.is_empty());
-    assert!(page.latest_seq - page.floor_seq <= 512);
+    assert!(!page.resync_required);
+    assert!(!page.events.is_empty());
+    assert_eq!(page.floor_seq, 0);
     let mut after = page.floor_seq;
     let mut bytes = 0;
     while after < page.latest_seq {
@@ -147,7 +147,7 @@ async fn excess_output_requires_resync_and_queries_stay_bounded() {
         assert!(next.next_seq > after);
         after = next.next_seq;
     }
-    assert!(bytes <= 1024 * 1024);
+    assert_eq!(bytes, 65536 * 48);
     assert!(
         terminal
             .read(TerminalQuery {
@@ -325,4 +325,60 @@ async fn dropping_the_last_handle_terminates_the_owned_process() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("owned terminal process survived handle disposal");
+}
+
+#[tokio::test]
+async fn live_pty_recovers_unicode_and_links_after_history_is_trimmed() {
+    let terminal = start(
+        r#"stty -echo; printf 'é 👩‍💻 ❤️ \033]8;;https://example.com\007link\033]8;;\007'; dd if=/dev/zero bs=65536 count=24 2>/dev/null; printf '\r\nREADY'; read value; printf '\r\ncontinued:%s' "$value""#,
+    );
+    let snapshot = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(snapshot) = terminal.snapshot().unwrap() {
+                let bytes = STANDARD.decode(&snapshot.data_b64).unwrap();
+                if bytes.windows(5).any(|part| part == b"READY") {
+                    break snapshot;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let page = terminal.read(TerminalQuery::default()).await.unwrap();
+    assert!(!page.resync_required);
+    assert_eq!(page.floor_seq, 0);
+    assert!(!page.exited);
+    let mut restored = prosperod_rs::terminal::screen::Screen::new(snapshot.size);
+    restored.process(&STANDARD.decode(&snapshot.data_b64).unwrap());
+    assert!(restored.visible_tail_text(24).contains("é 👩‍💻 ❤️ link"));
+    terminal
+        .input(TerminalInput {
+            data_b64: STANDARD.encode("恢复\n"),
+        })
+        .await
+        .unwrap();
+    wait(&terminal).await;
+    let tail = terminal
+        .read(TerminalQuery {
+            after_seq: Some(snapshot.seq),
+            wait_ms: None,
+        })
+        .await
+        .unwrap();
+    assert!(!tail.resync_required);
+    for event in tail.events {
+        if let TerminalEvent::Output { data_b64 } = event {
+            restored.process(&STANDARD.decode(data_b64).unwrap());
+        }
+    }
+    assert!(restored.visible_tail_text(24).contains("continued:恢复"));
+    let latest = terminal.snapshot().unwrap().unwrap();
+    let mut expected = prosperod_rs::terminal::screen::Screen::new(latest.size);
+    expected.process(&STANDARD.decode(latest.data_b64).unwrap());
+    assert_eq!(
+        restored.visible_tail_text(24),
+        expected.visible_tail_text(24)
+    );
+    assert_eq!(restored.cursor_position(), expected.cursor_position());
 }

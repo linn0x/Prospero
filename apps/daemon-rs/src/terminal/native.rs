@@ -51,7 +51,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
     // At most 1 MiB of reader chunks can await terminal parsing.
     let (output_sender, output_receiver) = std::sync::mpsc::sync_channel::<ReaderEvent>(64);
     let wake = Wake(output_sender.clone());
-    let output = Arc::new(Mutex::new(Output::new(size)));
+    let output = Arc::new(Mutex::new(Output::new(size)?));
     let stop = Arc::new(AtomicBool::new(false));
     let (changed, updates) = watch::channel(0);
     let terminal = Terminal(Arc::new(Inner {
@@ -473,7 +473,9 @@ mod tests {
         Terminal(Arc::new(Inner {
             epoch: "test-epoch".into(),
             sender,
-            output: Arc::new(Mutex::new(Output::new(TerminalSize { cols: 80, rows: 24 }))),
+            output: Arc::new(Mutex::new(
+                Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap(),
+            )),
             notifier,
             changed,
             stop: Arc::new(AtomicBool::new(false)),

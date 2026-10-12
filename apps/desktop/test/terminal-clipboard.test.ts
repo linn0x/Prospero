@@ -55,6 +55,24 @@ describe("terminal paste ownership", () => {
     dispose();
   });
 
+  it("routes screenshot files to image paste exactly once and respects input ownership", () => {
+    const target = new EventTarget(); const terminal = { paste: vi.fn() }; const image = vi.fn(); const blocked = vi.fn();
+    let allowed = true;
+    const dispose = bindTerminalPaste(target, terminal, () => allowed, blocked, undefined, undefined, image);
+    const pasteImage = () => {
+      const event = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", { value: { types: ["Files"], items: [{ type: "image/png" }], getData: () => "image fallback text" } });
+      target.dispatchEvent(event);
+    };
+    pasteImage();
+    expect(image).toHaveBeenCalledOnce();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    allowed = false; pasteImage();
+    expect(image).toHaveBeenCalledOnce();
+    expect(blocked).toHaveBeenCalledOnce();
+    dispose();
+  });
+
   it("uses the real xterm paste path for line endings and bracketed paste, without adding Enter", async () => {
     const terminal = new Terminal();
     (terminal as unknown as { _core: { textarea: { value: string } } })._core.textarea = { value: "" };

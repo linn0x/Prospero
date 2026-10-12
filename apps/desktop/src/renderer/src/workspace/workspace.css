@@ -17,6 +17,17 @@
 .topbar-workspace-tabs .workspace-tab-main span { color: inherit; }
 .topbar-workspace-tabs button { -webkit-app-region: no-drag; }
 .workspace-session-layout { height: 100%; }
+.workspace-multipane { display: flex; flex-direction: column; }
+.workspace-split-controls { display: flex; flex: none; align-items: center; gap: 6px; min-height: 32px; padding: 3px 10px; border-bottom: 1px solid var(--border); }
+.workspace-split-controls [data-slot="native-select-wrapper"] { width: min(280px, 60%); }
+.workspace-session-stack { display: grid; position: relative; flex: 1; min-width: 0; min-height: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); overflow: hidden; }
+.workspace-session-slot { min-width: 0; min-height: 0; grid-row: 1; grid-column: 1; overflow: hidden; }
+.workspace-session-stack.is-split > [data-position="secondary"] { grid-column: 3; }
+.workspace-session-stack.is-split.is-stacked > [data-position="secondary"] { grid-column: 1; grid-row: 3; }
+.workspace-session-stack.is-split > [data-focused] { outline: 1px solid var(--ring); outline-offset: -1px; }
+.workspace-split-resizer { grid-column: 2; grid-row: 1; cursor: col-resize; touch-action: none; background: var(--border); outline-offset: -2px; }
+.is-stacked > .workspace-split-resizer { grid-column: 1; grid-row: 2; cursor: row-resize; }
+.workspace-split-resizer:hover, .workspace-split-resizer:focus-visible { background: var(--ring); }
 .session-toolbar { min-height: 38px; gap: 8px; padding: 3px 8px; }
 .session-toolbar-identity { display: flex; min-width: 0; align-items: center; gap: 6px; font-size: var(--ui-text-caption); }
 .session-toolbar-identity strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--ui-text-small); font-weight: 400; }
@@ -24,6 +35,8 @@
 .session-toolbar-identity small { color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-toolbar .pane-toolbar-actions { gap: 2px; }
 .session-toolbar .pane-toolbar-actions > [data-slot="button"] { width: 28px; height: 28px; }
+.session-toolbar .pane-toolbar-actions > .terminal-mouse-toggle { width: auto; flex: none; }
+@container workspace-primary (max-width: 700px) { .session-toolbar { flex-wrap: wrap; } .session-toolbar-identity { flex: 1 1 100%; } .session-toolbar .pane-toolbar-actions { flex-wrap: wrap; } }
 .session-toolbar .session-model-chip { width: auto !important; max-width: 190px; height: 28px; min-height: 28px; padding-inline: 8px; gap: 4px; font-size: var(--ui-text-caption); }
 .session-model-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-model-chip svg { flex: none; width: 12px; }

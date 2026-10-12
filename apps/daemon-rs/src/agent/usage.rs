@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use fs2::FileExt;
 use serde_json::{Value, json};
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -77,46 +79,94 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn native_codex_environment(data: &Path) -> Result<(PathBuf, Vec<(String, String)>)> {
-    let usage_root = data
-        .join("agent-accounts")
-        .join("codex-usage")
-        .join(NATIVE_CODEX_ID);
-    let usage_home = usage_root.join("home");
-    let usage_sqlite = usage_root.join("sqlite");
-    for dir in [&usage_root, &usage_home, &usage_sqlite] {
+fn replace_file_atomically(source: &Path, target: &Path) -> std::io::Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("target has no parent"))?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut std::fs::File::open(source)?, &mut temporary)?;
+    set_private_file_permissions(temporary.path())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(target)
+        .map(|_| ())
+        .map_err(std::io::Error::from)
+}
+
+fn prepare_native_codex_environment(home: &Path, sqlite: &Path) -> Result<Vec<(String, String)>> {
+    for dir in [home, sqlite] {
         std::fs::create_dir_all(dir)?;
         let _ = set_private_dir_permissions(dir);
     }
-    crate::cross_model_tool::install_codex_skill(&usage_home)?;
+    crate::cross_model_tool::install_codex_skill(home)?;
+    let lock_path = home.join(".sync.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
 
-    let target_auth = usage_home.join("auth.json");
+    let target_auth = home.join("auth.json");
     let shared_auth = shared_codex_home().join("auth.json");
     if shared_auth != target_auth && shared_auth.exists() {
+        let shared_refresh = codex_auth_refresh(&shared_auth);
+        let target_refresh = codex_auth_refresh(&target_auth);
         let should_copy = !target_auth.exists()
-            || codex_auth_refresh(&shared_auth) > codex_auth_refresh(&target_auth);
-        if should_copy && std::fs::copy(&shared_auth, &target_auth).is_ok() {
-            let _ = set_private_file_permissions(&target_auth);
+            || shared_refresh > target_refresh
+            || (shared_refresh == target_refresh
+                && std::fs::metadata(&shared_auth)?.modified()?
+                    > std::fs::metadata(&target_auth)?.modified()?);
+        if should_copy {
+            replace_file_atomically(&shared_auth, &target_auth)?;
         }
     }
+    let target_config = home.join("config.toml");
+    let shared_config = shared_codex_home().join("config.toml");
+    if shared_config != target_config && shared_config.is_file() {
+        let shared_time = std::fs::metadata(&shared_config)?.modified()?;
+        let target_time = std::fs::metadata(&target_config)
+            .and_then(|value| value.modified())
+            .ok();
+        if target_time.is_none_or(|time| shared_time > time) {
+            replace_file_atomically(&shared_config, &target_config)?;
+        }
+    }
+    FileExt::unlock(&lock)?;
 
+    Ok(vec![
+        ("OPENAI_API_KEY".into(), String::new()),
+        ("CODEX_API_KEY".into(), String::new()),
+        ("CODEX_ACCESS_TOKEN".into(), String::new()),
+        ("CODEX_REFRESH_TOKEN".into(), String::new()),
+        ("CODEX_HOME".into(), home.to_string_lossy().into_owned()),
+        (
+            "CODEX_SQLITE_HOME".into(),
+            sqlite.to_string_lossy().into_owned(),
+        ),
+    ])
+}
+
+pub(crate) fn native_codex_environment(data: &Path) -> Result<(PathBuf, Vec<(String, String)>)> {
+    let root = data
+        .join("agent-accounts")
+        .join("codex-usage")
+        .join(NATIVE_CODEX_ID);
+    std::fs::create_dir_all(&root)?;
+    set_private_dir_permissions(&root)?;
     Ok((
         user_home().unwrap_or_else(|| PathBuf::from("/")),
-        vec![
-            ("OPENAI_API_KEY".into(), String::new()),
-            ("CODEX_API_KEY".into(), String::new()),
-            ("CODEX_ACCESS_TOKEN".into(), String::new()),
-            ("CODEX_REFRESH_TOKEN".into(), String::new()),
-            (
-                "CODEX_HOME".into(),
-                usage_home.to_string_lossy().into_owned(),
-            ),
-            (
-                "CODEX_SQLITE_HOME".into(),
-                usage_sqlite.to_string_lossy().into_owned(),
-            ),
-        ],
+        prepare_native_codex_environment(&root.join("home"), &root.join("sqlite"))?,
     ))
+}
+
+pub(crate) fn native_codex_terminal_environment(data: &Path) -> Result<Vec<(String, String)>> {
+    let root = data
+        .join("agent-accounts")
+        .join("codex")
+        .join(NATIVE_CODEX_ID);
+    prepare_native_codex_environment(&root, &root)
 }
 
 struct CodexRpc {
@@ -754,5 +804,40 @@ mod tests {
         .unwrap();
         assert_eq!(history.lifetime_tokens, Some(1234));
         assert_eq!(history.daily_usage.unwrap()[0].tokens, 12);
+    }
+
+    #[test]
+    fn atomic_codex_file_replacement_keeps_readers_on_complete_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("target");
+        let first = "{\"tokens\":{\"access_token\":\"first\"}}";
+        let second = "{\"tokens\":{\"access_token\":\"second\"}}";
+        std::fs::write(&source, first).unwrap();
+        std::fs::write(&target, first).unwrap();
+        let reader_target = target.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..500 {
+                let value = std::fs::read_to_string(&reader_target).unwrap();
+                assert!(value == first || value == second);
+            }
+        });
+        for _ in 0..100 {
+            std::fs::write(&source, second).unwrap();
+            replace_file_atomically(&source, &target).unwrap();
+            std::fs::write(&source, first).unwrap();
+            replace_file_atomically(&source, &target).unwrap();
+        }
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn atomic_codex_file_replacement_failure_preserves_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, "existing").unwrap();
+        let result = replace_file_atomically(&directory.path().join("missing"), &target);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "existing");
     }
 }

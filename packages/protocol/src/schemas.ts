@@ -312,6 +312,8 @@ export const SessionInfoSchema = z.object({
   pendingQuestions: z.number().int().nonnegative().optional(),
   /** 当前审批策略;放宽时 UI 必须显著提示 */
   approvalPolicy: ApprovalPolicySchema.optional(),
+  model: z.string().max(300).optional(),
+  effort: z.string().max(80).optional(),
   /** 最后一条助手消息的摘要,用于会话列表预览 */
   preview: z.string().optional(),
   /** 本轮开始时间戳,客户端据此显示"运行 12s" */

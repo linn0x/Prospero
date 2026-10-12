@@ -18,18 +18,29 @@ function decodedWindowsArgv(spec: { file: string; args: string[] }): string[] {
 }
 
 describe("PTY agent startup commands", () => {
-  it("starts Codex with approvals and sandboxing bypassed", () => {
+  it("starts Codex with approvals and workspace sandboxing", () => {
     expect(commandFor("codex", undefined, "linux")).toEqual({
       file: "codex",
-      args: ["--dangerously-bypass-approvals-and-sandbox"],
+      args: ["--ask-for-approval", "on-request", "--sandbox", "workspace-write"],
     });
   });
 
-  it("starts Claude with permission checks skipped", () => {
+  it("starts Claude with editing approvals configured", () => {
     expect(commandFor("claude", undefined, "linux")).toEqual({
       file: "claude",
-      args: ["--dangerously-skip-permissions"],
+      args: ["--permission-mode", "acceptEdits"],
     });
+  });
+
+  it.each(["linux", "win32"] as const)("honors explicit strict and yolo policies on %s", (platform) => {
+    const argv = (agent: "codex" | "claude", policy: "strict" | "yolo"): string[] => {
+      const spec = commandFor(agent, undefined, platform, {}, [], policy);
+      return platform === "win32" ? decodedWindowsArgv(spec).slice(1) : spec.args;
+    };
+    expect(argv("codex", "strict")).toEqual(["--ask-for-approval", "untrusted", "--sandbox", "read-only"]);
+    expect(argv("claude", "strict")).toEqual(["--permission-mode", "default"]);
+    expect(argv("codex", "yolo")).toEqual(["--dangerously-bypass-approvals-and-sandbox"]);
+    expect(argv("claude", "yolo")).toEqual(["--dangerously-skip-permissions"]);
   });
 
   it("routes DeepSeek Harness through its structured web API", () => {
@@ -68,7 +79,7 @@ describe("PTY agent startup commands", () => {
     const session = commandFor("codex", undefined, "win32", env);
     expect(decodedWindowsArgv(session)).toEqual([
       "codex",
-      "--dangerously-bypass-approvals-and-sandbox",
+      "--ask-for-approval", "on-request", "--sandbox", "workspace-write",
     ]);
     expect(() => commandFor("deepseek", undefined, "win32", env)).toThrow("structured");
   });
@@ -83,7 +94,7 @@ describe("PTY agent startup commands", () => {
     );
     expect(decodedWindowsArgv(spec)).toEqual([
       "codex",
-      "--dangerously-bypass-approvals-and-sandbox",
+      "--ask-for-approval", "on-request", "--sandbox", "workspace-write",
       "-c",
       'model_provider="prospero"',
       "-c",

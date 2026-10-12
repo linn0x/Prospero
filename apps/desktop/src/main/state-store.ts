@@ -363,6 +363,8 @@ export class StateStore extends EventEmitter {
           pendingPermissions: numberValue(value["pendingPermissions"]),
           pendingQuestions: numberValue(value["pendingQuestions"]),
           approvalPolicy: stringValue(value["approvalPolicy"]),
+          ...(typeof value["model"] === "string" ? { model: value["model"] } : {}),
+          ...(typeof value["effort"] === "string" ? { effort: value["effort"] } : {}),
           ...(typeof value["busySince"] === "number" ? { busySince: nonNegativeInteger(value["busySince"]) } : {}),
           ...(messageQueue.length > 0 ? { messageQueue } : {}),
           subagents: Array.isArray(value["subagents"])

@@ -222,6 +222,7 @@ import "./styles.css";
 import "./workspace/workspace.css";
 import { WorkspacePane } from "./workspace/WorkspacePane";
 import { WorkspaceTabs } from "./app-shell/WorkspaceTabs";
+import { rememberedLaunchAgent, rememberedLaunchKind, rememberLaunch } from "./workspace/session-launch-preferences";
 import { WorkspacePicker } from "./remote-workspaces/AddWorkspaceDialog";
 import { RemoteWorkspaceList } from "./remote-workspaces/RemoteWorkspaceList";
 import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
@@ -2870,15 +2871,16 @@ function NewSessionDialog({
   const independentAccounts = useMemo(() => snapshot.accounts.filter(account => !account.modelSource), [snapshot.accounts]);
   const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
   const rememberedSource = useMemo(() => rememberedSourceSelection(), []);
+  const initialAgent = initialSource?.agent ?? rememberedSource?.agent ?? rememberedLaunchAgent();
   const [useSource, setUseSource] = useState(() => sourceSupported && Boolean(initialSource || rememberedSource));
   const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialSource ?? (rememberedSource ? { ...rememberedSource, revision: 0 } : undefined));
   const sourceState = useModelSources(sourceSupported && useSource);
   const [input, setInput] = useState<SessionCreateInput>({
     cwd: project || snapshot.projects[0] || "",
-    agent: initialSource?.agent ?? rememberedSource?.agent ?? "codex",
-    kind: "structured",
+    agent: initialAgent,
+    kind: initialSource ? "structured" : rememberedLaunchKind(initialAgent),
     approvalPolicy: "standard",
-    accountId: defaultSessionLaunchAccountId(independentAccounts, initialSource?.agent ?? rememberedSource?.agent ?? "codex"),
+    accountId: initialAgent === "opencode" && rememberedLaunchKind(initialAgent) === "pty" ? undefined : defaultSessionLaunchAccountId(independentAccounts, initialAgent),
   });
   const sourceRuntimeAgent: SourceRuntimeAgent = input.agent === "claude" || input.agent === "opencode" ? input.agent : "codex";
   const sourceChoice = selectedSourceRoute(sourceState.sources, sourceSelection, sourceRuntimeAgent);
@@ -2889,7 +2891,7 @@ function NewSessionDialog({
       accountId: defaultSessionLaunchAccountId(independentAccounts, agent),
       model: undefined,
       effort: undefined,
-      kind: "structured",
+      kind: rememberedLaunchKind(agent),
     }));
   };
   const [busy, setBusy] = useState(false);
@@ -2916,7 +2918,8 @@ function NewSessionDialog({
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
   const selectedKind: SessionCreateInput["kind"] = useSource ? sourceChoice?.route.protocol === "openai_chat_completions" ? "structured" : input.kind : requiresStructured ? "structured" : input.kind;
-  const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? input.agent !== "opencode");
+  const supportsApprovalPolicy = selectedKind === "structured" || input.agent === "codex" || input.agent === "claude";
+  const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? (input.agent !== "opencode" || selectedKind === "pty"));
   const selectedWorkspace = launchWorkspaces.find(
     (workspace) => workspace.path === input.cwd,
   );
@@ -2943,7 +2946,7 @@ function NewSessionDialog({
           ? current.cwd
           : launchWorkspaces[0]?.path ?? "";
       const accounts = useSource ? [] : sessionLaunchAccounts(independentAccounts, current.agent);
-      const accountId = useSource
+      const accountId = useSource || (current.agent === "opencode" && current.accountId === undefined)
         ? undefined
         : accounts.some((account) => account.id === current.accountId)
           ? current.accountId
@@ -2961,7 +2964,6 @@ function NewSessionDialog({
   const supportsLaunchModels =
     !useSource &&
     !remoteId &&
-    selectedKind === "structured" &&
     (selectedAccount?.capabilities?.modelSelection ?? true) &&
     (input.agent === "codex" ||
       input.agent === "claude" ||
@@ -2988,6 +2990,7 @@ function NewSessionDialog({
     let cancelled = false;
     const agent = input.agent as "codex" | "claude" | "deepseek" | "opencode";
     const accountId = input.accountId;
+    const kind = input.kind;
     setLaunchModels([]);
     setLaunchModelsLoading(true);
     setLaunchModelsError(undefined);
@@ -3004,7 +3007,7 @@ function NewSessionDialog({
         setInput((current) => {
           if (
             current.agent !== agent ||
-            current.kind !== "structured" ||
+            current.kind !== kind ||
             current.accountId !== accountId
           ) return current;
           return {
@@ -3053,6 +3056,7 @@ function NewSessionDialog({
         onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
         rememberSourceSelection(undefined);
       }
+      rememberLaunch(input.agent, selectedKind);
       onOpenChange(false);
     } catch (reason) {
       setError(reportError(reason));
@@ -3163,11 +3167,8 @@ function NewSessionDialog({
                     ),
                     model: undefined,
                     effort: undefined,
-                    ...(!["codex", "claude", "deepseek", "opencode"].includes(
-                      agent,
-                    )
-                      ? { kind: "pty" as const }
-                      : {}),
+                    kind: rememberedLaunchKind(agent),
+                    ...(agent === "opencode" && rememberedLaunchKind(agent) === "pty" ? { accountId: undefined } : {}),
                   });
                 }}
               >
@@ -3204,12 +3205,12 @@ function NewSessionDialog({
               >
                 <NativeSelectOption
                   value="structured"
-                  disabled={!supportsStructured || selectedAccount?.capabilities?.sessionKinds.includes("structured") === false}
+                  disabled={!supportsStructured || (input.agent === "opencode" && !selectedAccount) || selectedAccount?.capabilities?.sessionKinds.includes("structured") === false}
                 >
                   {t("对话", "Conversation")}
                 </NativeSelectOption>
-                <NativeSelectOption value="pty" disabled={selectedAccount?.capabilities?.sessionKinds.includes("pty") === false || requiresStructured}>
-                  {t("终端", "Terminal")}
+                <NativeSelectOption value="pty" disabled={input.agent === "deepseek" || selectedAccount?.capabilities?.sessionKinds.includes("pty") === false || requiresStructured}>
+                  {t("Agent TUI · 终端", "Agent TUI · Terminal")}
                 </NativeSelectOption>
               </NativeSelect>
               {requiresStructured && <FieldDescription>{t("当前账号仅支持对话会话。", "This account supports conversation sessions only.")}</FieldDescription>}
@@ -3227,12 +3228,14 @@ function NewSessionDialog({
                   setInput({
                     ...input,
                     accountId: event.target.value || undefined,
+                    ...(input.agent === "opencode" ? { kind: event.target.value ? "structured" as const : "pty" as const } : {}),
                     model: undefined,
                     effort: undefined,
                   })
                 }
               >
-                {launchAccounts.length === 0 && (
+                {input.agent === "opencode" && <NativeSelectOption value="">{t("本机 OpenCode CLI", "Local OpenCode CLI")}</NativeSelectOption>}
+                {input.agent !== "opencode" && launchAccounts.length === 0 && (
                   <NativeSelectOption value="" disabled>
                     {t("没有可用账号", "No accounts available")}
                   </NativeSelectOption>
@@ -3247,7 +3250,7 @@ function NewSessionDialog({
               <FieldDescription>
                 {selectedAccount
                   ? selectedAccount.apiProfileError ?? (selectedAccount.apiProfile ? `${t("模型", "Model")} · ${text(selectedAccount.apiProfile["model"])}` : status(selectedAccount.status))
-                  : t("在 Agents 与账号页面添加或登录账号。", "Add or sign in to an account from Agents & accounts.")}
+                  : input.agent === "opencode" ? t("使用本机 OpenCode 的登录和模型配置。", "Use the local OpenCode login and model configuration.") : t("在 Agents 与账号页面添加或登录账号。", "Add or sign in to an account from Agents & accounts.")}
               </FieldDescription>
             </Field>
           )}
@@ -3336,6 +3339,7 @@ function NewSessionDialog({
             <NativeSelect
               id="session-approval"
               value={input.approvalPolicy}
+              disabled={!supportsApprovalPolicy}
               onChange={(event) =>
                 setInput({
                   ...input,
@@ -3349,7 +3353,7 @@ function NewSessionDialog({
               <NativeSelectOption value="yolo">{t("自动批准（高风险）", "Auto-approve (high risk)")}</NativeSelectOption>
             </NativeSelect>
             <FieldDescription>
-              {input.approvalPolicy === "strict"
+              {!supportsApprovalPolicy ? t("此终端的操作确认由 CLI 自身配置管理。", "This terminal uses the CLI's own approval configuration.") : input.approvalPolicy === "strict"
                 ? t("严格确认所有可能修改系统或文件的操作。", "Ask before operations that may modify files or the system.")
                 : input.approvalPolicy === "yolo"
                   ? t("高风险：自动批准操作，仅用于可信工作区。", "High risk: approve operations automatically; use only in trusted workspaces.")
@@ -3679,6 +3683,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       else localStorage.removeItem("prospero.activeRemoteWorkspace");
     } catch {}
   }, [activeRemoteId]);
+  const [focusedSessionId, setFocusedSessionId] = useState<string>();
   const [hydratedSessions, setHydratedSessions] = useState<SessionInfo[]>([]);
   const [openIds, setOpenIds] = useState<string[]>(() => {
     try {
@@ -3750,7 +3755,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     }).catch(() => {});
     return () => { cancelled = true; };
   }, [openMetadataKey, snapshot.daemon.metadataRevision, snapshot.daemon.running]);
-  useSessionUnread(sessionSnapshot.daemon.sessions, snapshot.unreadSessionIds, view === "workspaces" && !activeRemote ? activeId : undefined);
+  useSessionUnread(sessionSnapshot.daemon.sessions, snapshot.unreadSessionIds, view === "workspaces" && !activeRemote ? focusedSessionId ?? activeId : undefined);
   const accountUsageKey = snapshot.accounts
     .map((account) => `${text(account["id"])}:${text(account["status"])}`)
     .join("|");
@@ -3913,7 +3918,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         upsertHydratedSession(current, session, HYDRATED_SESSION_CACHE_LIMIT),
       );
     }
-    if (options.openTab === true) {
+    if (options.openTab !== false) {
       setOpenIds((current) =>
         current.includes(id) ? current : [...current, id],
       );
@@ -4010,9 +4015,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       )
         ? (session.agent as SessionCreateInput["agent"])
         : "shell";
-      const project =
-        projectForSession(snapshotRef.current.projects, session) ??
-        snapshotRef.current.projects[0];
+      const project = session.cwd;
       if (!project) return;
       const approvalPolicy =
         session.approvalPolicy === "strict" || session.approvalPolicy === "yolo"
@@ -4038,10 +4041,14 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       }
       const created = await window.prospero.createSession({
         cwd: project,
+        sourceSessionId: session.id,
         agent,
         kind,
         approvalPolicy,
         ...(session.accountId ? { accountId: session.accountId } : {}),
+        ...(session.model ?? session.agentControls?.currentModel ? { model: session.model ?? session.agentControls?.currentModel } : {}),
+        ...(session.effort ?? session.agentControls?.currentEffort ? { effort: session.effort ?? session.agentControls?.currentEffort } : {}),
+        ...(session.agentControls?.currentMode === "plan" ? { mode: "plan" as const } : {}),
       });
       openSession(created.id, created, { openTab: true });
       try {
@@ -4181,6 +4188,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onToggleFocus={() => setFocus((current) => !current)}
                 onAddWorkspace={openAddWorkspace}
                 onMissingSession={forgetMissingSession}
+                onFocusedSessionChange={setFocusedSessionId}
               /></div></Suspense>}
         </div>
       </SidebarInset>

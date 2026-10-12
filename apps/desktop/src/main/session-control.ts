@@ -83,6 +83,8 @@ export function sessionInfoFromControl(value: unknown): SessionInfo {
     ...(typeof item["pendingPermissions"] === "number" ? { pendingPermissions: boundedNonNegativeInteger(item["pendingPermissions"]) } : {}),
     ...(typeof item["pendingQuestions"] === "number" ? { pendingQuestions: boundedNonNegativeInteger(item["pendingQuestions"]) } : {}),
     ...(typeof item["approvalPolicy"] === "string" ? { approvalPolicy: item["approvalPolicy"].slice(0, 80) } : {}),
+    ...(typeof item["model"] === "string" ? { model: item["model"].slice(0, 300) } : {}),
+    ...(typeof item["effort"] === "string" ? { effort: item["effort"].slice(0, 80) } : {}),
     ...(typeof item["busySince"] === "number" ? { busySince: boundedNonNegativeInteger(item["busySince"]) } : {}),
     ...(messageQueue.length > 0 ? { messageQueue } : {}),
     ...(subagents.length > 0 ? { subagents } : {}),

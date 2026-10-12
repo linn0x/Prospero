@@ -4,13 +4,31 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { once } from "node:events";
 import WebSocket from "ws";
+import { Terminal } from "@xterm/xterm";
 import { expect, it } from "vitest";
 import { decodeTerminalFrame, encodeTerminalFrame, TerminalStreamKind as K, type TerminalStreamFrame } from "../src/shared/terminal-stream";
 import { cleanupTerminalHosts } from "./terminal-host-cleanup";
+import { configureRustTerminalUnicode } from "../src/renderer/src/terminal-unicode";
 
 const json = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 const body = (frame: TerminalStreamFrame) => JSON.parse(new TextDecoder().decode(frame.payload));
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+function terminalState(terminal: Terminal) {
+  const buffer = terminal.buffer.active;
+  return { type: buffer.type, x: buffer.cursorX, y: buffer.cursorY, modes: terminal.modes,
+    rows: Array.from({ length: terminal.rows }, (_, row) => Array.from({ length: terminal.cols }, (_, col) => {
+      const cell = buffer.getLine(buffer.baseY + row)?.getCell(col);
+      return [cell?.getChars(), cell?.getWidth(), cell?.getFgColor(), cell?.getBgColor(), cell?.isBold(), cell?.isItalic(), cell?.isUnderline()];
+    })) };
+}
+async function renderStreamFrames(terminal: Terminal, frames: TerminalStreamFrame[]): Promise<void> {
+  for (const frame of frames) {
+    if (frame.kind === K.Hello || frame.kind === K.Ready || frame.kind === K.State || frame.kind === K.Error) continue;
+    if (frame.kind === K.Snapshot) { terminal.reset(); await new Promise<void>(done => terminal.write(frame.payload, done)); continue; }
+    if (frame.kind === K.Output) { await new Promise<void>(done => terminal.write(frame.payload, done)); continue; }
+    if (frame.kind === K.Resize) { const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength); terminal.resize(view.getUint16(0, false), view.getUint16(2, false)); }
+  }
+}
 
 class Peer {
   readonly frames: TerminalStreamFrame[] = [];
@@ -205,18 +223,45 @@ it("bounds an unacknowledged observer without stalling a consuming client", asyn
   expect(retained).toBeLessThan(700000);
 }), 45000);
 
-it("reports a pruned resume cursor explicitly and permits an authoritative fresh snapshot", async () => fixture(async ({ request, connect }) => {
-  const created = await request("/v1/terminals", { title: "stream history", agent: "custom", size: { cols: 80, rows: 24 }, command: "stty -echo; printf READY; read line; python3 -u -c 'import sys,time; [(sys.stdout.write(\"x\"*4096),sys.stdout.flush(),time.sleep(.002)) for _ in range(300)]; sys.stdout.write(\"HISTORY_END\"); sys.stdout.flush()'; sleep 10" });
+it("replays complete journal history across restart with exact xterm state and lease continuity", async () => fixture(async ({ request, connect, connectOwner, restart }) => {
+  const created = await request("/v1/terminals", { title: "stream history", agent: "custom", size: { cols: 80, rows: 24 }, command: "stty raw -echo; printf '\x1b]9;notification\x07READY'; python3 -u -c 'import sys,time; [(sys.stdout.write(\"x\"*4096),sys.stdout.flush(),time.sleep(.002)) for _ in range(700)]; sys.stdout.write(\"HISTORY_END\"); sys.stdout.flush()'; cat" });
   expect(created.ok).toBe(true); const session = await created.json();
-  const live = await connect(session.id); const hello = body(await live.wait(f=>f.kind===K.Hello)); await live.wait(f=>f.kind===K.Ready);
-  expect((await live.operation(K.Input,new TextEncoder().encode("go\n"))).ok).toBe(true);
-  for(let n=0;n<500&&!live.output.includes("HISTORY_END");n++)await sleep(20);
-  expect(live.output).toContain("HISTORY_END");
-  const stale = await connect(session.id,{wantControl:false,epoch:hello.epoch,afterSeq:0});
-  expect(body(await stale.wait(f=>f.kind===K.Error)).code).toBe("history_gap");
-  expect(stale.frames.some(f=>f.kind===K.Snapshot||f.kind===K.Output)).toBe(false);
-  const fresh = await connect(session.id,{wantControl:false}); await fresh.wait(f=>f.kind===K.Ready);
-  expect(body(await fresh.wait(f=>f.kind===K.Hello)).epoch).toBe(hello.epoch);
-  expect(fresh.frames.some(f=>f.kind===K.Snapshot)).toBe(true);
-  expect(fresh.output).toContain("HISTORY_END");
-}),45000);
+  const owner = await connectOwner(session.id); const hello = body(await owner.wait(f=>f.kind===K.Hello)); await owner.wait(f=>f.kind===K.Ready);
+  const resize = new Uint8Array([0, 100, 0, 30]);
+  expect((await owner.operation(K.ResizeRequest, resize)).ok).toBe(true);
+  await owner.wait(f=>f.kind===K.Resize && f.payload[1]===100 && f.payload[3]===30);
+  expect((await owner.operation(K.Input,new TextEncoder().encode("go\n"))).ok).toBe(true);
+  for(let n=0;n<700&&!owner.output.includes("HISTORY_END");n++)await sleep(20);
+  expect(owner.output).toContain("HISTORY_END");
+  expect(owner.frames.filter(f=>f.kind===K.Output).length).toBeGreaterThan(512);
+  const snapshot = await request(`/v1/terminals/${session.id}/snapshot`);
+  expect(snapshot.ok).toBe(true); expect(await snapshot.json()).toBeNull();
+  const cursor = Math.max(...owner.frames.filter(f=>[K.Snapshot,K.Output,K.Resize].includes(f.kind as typeof K.Output)).map(f=>f.sequence));
+  const original = new Terminal({ cols: 80, rows: 24, allowProposedApi: true }); configureRustTerminalUnicode(original);
+  await renderStreamFrames(original, owner.frames);
+
+  await restart();
+  expect((await request(`/v1/terminals/${session.id}/input`, { dataB64: Buffer.from("http-bypass").toString("base64") })).status).toBe(409);
+  const resumed = await connect(session.id,{wantControl:false,epoch:hello.epoch,afterSeq:cursor});
+  const resumedHello = body(await resumed.wait(f=>f.kind===K.Hello)); await resumed.wait(f=>f.kind===K.Ready);
+  expect(resumedHello.epoch).toBe(hello.epoch); expect(resumedHello.controllerId).toBe(hello.clientId);
+  const stale = await connect(session.id,{wantControl:false,epoch:hello.epoch,afterSeq:0}); await stale.wait(f=>f.kind===K.Ready);
+  const fresh = await connect(session.id,{wantControl:false}); const freshHello = body(await fresh.wait(f=>f.kind===K.Hello)); await fresh.wait(f=>f.kind===K.Ready);
+  expect(freshHello.epoch).toBe(hello.epoch); expect(resumed.frames.some(f=>f.kind===K.Snapshot)).toBe(false); expect(stale.frames.some(f=>f.kind===K.Snapshot)).toBe(false); expect(fresh.frames.some(f=>f.kind===K.Snapshot)).toBe(false);
+  for(let n=0;n<700&&(!stale.output.includes("HISTORY_END")||!fresh.output.includes("HISTORY_END"));n++)await sleep(20);
+  expect(stale.output).toContain("HISTORY_END"); expect(fresh.output).toContain("HISTORY_END");
+  const restored = new Terminal({ cols: 80, rows: 24, allowProposedApi: true }); const freshTerminal = new Terminal({ cols: 80, rows: 24, allowProposedApi: true }); const resumedTerminal = new Terminal({ cols: 80, rows: 24, allowProposedApi: true });
+  configureRustTerminalUnicode(restored); configureRustTerminalUnicode(freshTerminal); configureRustTerminalUnicode(resumedTerminal);
+  await renderStreamFrames(restored, stale.frames); await renderStreamFrames(freshTerminal, fresh.frames); await renderStreamFrames(resumedTerminal, owner.frames);
+  const ownerBefore = owner.frames.length; const staleBefore = stale.frames.length; const freshBefore = fresh.frames.length; const resumedBefore = resumed.frames.length;
+  const marker = "AFTER_RESTART_UNIQUE";
+  expect((await owner.operation(K.Input,new TextEncoder().encode(marker))).ok).toBe(true);
+  for(let n=0;n<300&&(!owner.output.includes(marker)||!stale.output.includes(marker)||!fresh.output.includes(marker)||!resumed.output.includes(marker));n++)await sleep(20);
+  expect(owner.output.split(marker).length-1).toBe(1); expect(stale.output.split(marker).length-1).toBe(1); expect(fresh.output.split(marker).length-1).toBe(1); expect(resumed.output.split(marker).length-1).toBe(1);
+  await renderStreamFrames(restored, stale.frames.slice(staleBefore)); await renderStreamFrames(freshTerminal, fresh.frames.slice(freshBefore)); await renderStreamFrames(resumedTerminal, resumed.frames.slice(resumedBefore));
+  await renderStreamFrames(original, owner.frames.slice(ownerBefore));
+  expect(terminalState(restored)).toEqual(terminalState(freshTerminal));
+  expect(terminalState(restored)).toEqual(terminalState(original));
+  expect(terminalState(restored)).toEqual(terminalState(resumedTerminal));
+  original.dispose(); restored.dispose(); freshTerminal.dispose(); resumedTerminal.dispose();
+}),60000);

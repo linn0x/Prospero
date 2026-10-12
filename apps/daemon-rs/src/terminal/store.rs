@@ -17,12 +17,19 @@ impl Store {
         account_id: Option<String>,
     ) -> Result<SessionHead> {
         let size = validate_size(input.size)?;
-        self.create_session_with(
+        self.create_session_with_launch(
             CreateSession {
                 agent: input.agent.unwrap_or(AgentKind::Shell),
                 kind: SessionKind::Pty,
                 title: input.title,
                 workspace: input.workspace,
+            },
+            None,
+            SessionLaunchOptions {
+                account_id: input.account_id.or_else(|| account_id.clone()),
+                model: input.model,
+                effort: input.effort,
+                approval_policy: input.approval_policy,
             },
             |tx, head| {
                 tx.execute(
@@ -60,6 +67,17 @@ impl Store {
         persist(&tx, id, archive, true)?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn terminal_checkpoint_seq(&self, id: &str) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT latest_seq FROM terminal_runs WHERE session_id=? AND active=1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::Conflict)
     }
 
     pub fn active_terminal_ids(&mut self) -> Result<Vec<String>> {
@@ -131,7 +149,7 @@ impl Store {
             let mut bytes = 0;
             while let Some(record) = records.next()? {
                 let payload: String = record.get(0)?;
-                if bytes + payload.len() > PAGE_BYTES {
+                if !events.is_empty() && bytes + payload.len() > PAGE_BYTES {
                     break;
                 }
                 bytes += payload.len();
@@ -169,23 +187,37 @@ impl Store {
 }
 
 fn persist(tx: &Transaction<'_>, id: &str, archive: Archive, active: bool) -> Result<()> {
-    let previous: i64 = tx
+    let (previous, previous_floor, previous_snapshot): (i64, i64, Option<String>) = tx
         .query_row(
-            "SELECT latest_seq FROM terminal_runs WHERE session_id=? AND active=1",
+            "SELECT latest_seq,floor_seq,snapshot FROM terminal_runs WHERE session_id=? AND active=1",
             [id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .ok_or(Error::Conflict)?;
     if archive.seq < previous
+        || archive.latest_seq != 0 && archive.latest_seq < archive.seq
+        || !active && archive.latest_seq > archive.seq
         || archive.floor < 0
+        || archive.floor < previous_floor && archive.start > archive.floor
         || archive.start < archive.floor
         || archive.start > previous.max(archive.floor)
         || archive.start + archive.events.len() as i64 != archive.seq
     {
         return Err(Error::Conflict);
     }
-    tx.execute("UPDATE terminal_runs SET active=?1,floor_seq=?2,latest_seq=?3,exit_code=?4,snapshot=?5 WHERE session_id=?6", params![active, archive.floor, archive.seq, archive.exit_code, archive.snapshot.map(|snapshot| serde_json::to_string(&snapshot)).transpose()?, id])?;
+    if archive
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.seq < archive.floor || snapshot.seq > archive.seq)
+    {
+        return Err(Error::Conflict);
+    }
+    let snapshot = archive.snapshot.or(previous_snapshot
+        .map(|value| serde_json::from_str::<TerminalSnapshot>(&value))
+        .transpose()?
+        .filter(|snapshot| snapshot.seq >= archive.floor && snapshot.seq <= archive.seq));
+    tx.execute("UPDATE terminal_runs SET active=?1,floor_seq=?2,latest_seq=?3,exit_code=?4,snapshot=?5 WHERE session_id=?6", params![active, archive.floor, archive.seq, archive.exit_code, snapshot.map(|snapshot| serde_json::to_string(&snapshot)).transpose()?, id])?;
     tx.execute(
         "DELETE FROM terminal_output WHERE session_id=?1 AND seq<=?2",
         params![id, archive.floor],
@@ -210,6 +242,7 @@ mod tests {
             floor,
             start: floor,
             seq,
+            latest_seq: seq,
             events: (floor..seq)
                 .map(|_| TerminalEvent::Output {
                     data_b64: STANDARD.encode("x"),
@@ -218,6 +251,102 @@ mod tests {
             snapshot: None,
             exit_code: None,
         }
+    }
+
+    #[test]
+    fn paged_checkpoints_keep_the_recovery_base_and_archive_every_event() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let head = store
+            .create_terminal(CreateTerminal {
+                title: "Paged recovery".into(),
+                workspace: "/synthetic".into(),
+                size: TerminalSize { cols: 80, rows: 24 },
+                agent: None,
+                command: None,
+                account_id: None,
+                model: None,
+                effort: None,
+                approval_policy: None,
+            })
+            .unwrap();
+        let mut first = archive(0, 400);
+        first.snapshot = Some(TerminalSnapshot {
+            seq: 400,
+            size: TerminalSize { cols: 80, rows: 24 },
+            data_b64: STANDARD.encode("base"),
+        });
+        store.checkpoint_terminal(&head.id, first).unwrap();
+        let mut seq = 400;
+        while seq < 900 {
+            let next = (seq + 64).min(900);
+            let mut page = archive(seq, next);
+            page.floor = 0;
+            page.latest_seq = 900;
+            if next < 900 {
+                assert!(store.finish_terminal(&head.id, page.clone()).is_err());
+                store.checkpoint_terminal(&head.id, page).unwrap();
+            } else {
+                page.exit_code = Some(0);
+                store.finish_terminal(&head.id, page).unwrap();
+            }
+            seq = next;
+        }
+        assert_eq!(store.terminal_snapshot(&head.id).unwrap().unwrap().seq, 400);
+        let mut cursor = 0;
+        while cursor < 900 {
+            let page = store
+                .terminal_output(
+                    &head.id,
+                    TerminalQuery {
+                        after_seq: Some(cursor),
+                        wait_ms: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(page.floor_seq, 0);
+            assert!(!page.resync_required);
+            assert!(page.exited);
+            assert_eq!(page.exit_code, Some(0));
+            assert!(page.next_seq > cursor);
+            assert!(page.events.len() <= 64);
+            cursor = page.next_seq;
+        }
+        assert_eq!(cursor, 900);
+    }
+
+    #[test]
+    fn checkpoint_rejects_missing_events_and_future_snapshots() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let head = store
+            .create_terminal(CreateTerminal {
+                title: "Recovery validation".into(),
+                workspace: "/synthetic".into(),
+                size: TerminalSize { cols: 80, rows: 24 },
+                agent: None,
+                command: None,
+                account_id: None,
+                model: None,
+                effort: None,
+                approval_policy: None,
+            })
+            .unwrap();
+        store
+            .checkpoint_terminal(&head.id, archive(0, 400))
+            .unwrap();
+        let mut gap = archive(401, 402);
+        gap.floor = 0;
+        assert!(store.checkpoint_terminal(&head.id, gap).is_err());
+        let mut future = archive(400, 401);
+        future.floor = 0;
+        future.snapshot = Some(TerminalSnapshot {
+            seq: 402,
+            size: TerminalSize { cols: 80, rows: 24 },
+            data_b64: STANDARD.encode("future"),
+        });
+        assert!(store.checkpoint_terminal(&head.id, future).is_err());
+        assert_eq!(store.terminal_checkpoint_seq(&head.id).unwrap(), 400);
     }
 
     #[test]
@@ -234,6 +363,7 @@ mod tests {
                 account_id: None,
                 model: None,
                 effort: None,
+                approval_policy: None,
             })
             .unwrap();
         store.connection.execute_batch("CREATE TABLE inserted(seq INTEGER); CREATE TRIGGER record_insert AFTER INSERT ON terminal_output BEGIN INSERT INTO inserted VALUES(NEW.seq); END;").unwrap();
@@ -307,6 +437,7 @@ mod tests {
                 account_id: None,
                 model: None,
                 effort: None,
+                approval_policy: None,
             })
             .unwrap();
         store.checkpoint_terminal(&head.id, archive(0, 2)).unwrap();

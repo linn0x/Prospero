@@ -33,9 +33,9 @@ export function ProjectToolsProvider({ children }: { children: ReactNode }) {
   </Suspense>, container)}</HostContext.Provider>;
 }
 
-export function ProjectToolsSlot({ root, mode, active, tabsHost, onActivate, onDocumentTabs }: Omit<Location, "host">) {
+export function ProjectToolsSlot({ root, mode, active, enabled = active, tabsHost, onActivate, onDocumentTabs }: Omit<Location, "host"> & { enabled?: boolean }) {
   const mount = useContext(HostContext);
   const [host, setHost] = useState<HTMLDivElement | null>(null);
-  useLayoutEffect(() => { if (host && mount) return mount({ host, root, mode, active, tabsHost, onActivate, onDocumentTabs }); }, [host, mount, root, mode, active, tabsHost, onActivate, onDocumentTabs]);
+  useLayoutEffect(() => { if (host && mount && enabled) return mount({ host, root, mode, active, tabsHost, onActivate, onDocumentTabs }); }, [host, mount, root, mode, active, enabled, tabsHost, onActivate, onDocumentTabs]);
   return <div className="project-tools-slot" ref={setHost} />;
 }

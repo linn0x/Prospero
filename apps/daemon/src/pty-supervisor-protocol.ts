@@ -67,6 +67,7 @@ export interface PtySupervisorManifest {
   lifecycleEpoch: string;
   ownerState: "active" | "killed" | "failed";
   status?: SessionStatus;
+  busySince?: number;
   updatedAt?: number;
   accountId?: string;
   accountName?: string;
