@@ -2,7 +2,7 @@
  * 各 agent 的 PTY 启动配置。M1 全部走 PTY 通用轨;
  * M2 起 claude/opencode/codex 迁移到结构化适配(Agent SDK / HTTP / app-server)。
  */
-import type { AgentKind } from "@prospero/protocol";
+import type { AgentKind, ApprovalPolicy } from "@prospero/protocol";
 
 export interface SpawnSpec {
   file: string;
@@ -100,6 +100,7 @@ export function commandFor(
   platform: NodeJS.Platform = process.platform,
   env: EnvLike = process.env,
   extraArgs: string[] = [],
+  approvalPolicy: ApprovalPolicy = "standard",
 ): SpawnSpec {
   switch (agent) {
     case "shell":
@@ -107,14 +108,14 @@ export function commandFor(
     case "claude":
       return programCommandFor(
         "claude",
-        ["--dangerously-skip-permissions", ...extraArgs],
+        [...(approvalPolicy === "yolo" ? ["--dangerously-skip-permissions"] : ["--permission-mode", approvalPolicy === "strict" ? "default" : "acceptEdits"]), ...extraArgs],
         platform,
         env,
       );
     case "codex":
       return programCommandFor(
         "codex",
-        ["--dangerously-bypass-approvals-and-sandbox", ...extraArgs],
+        [...(approvalPolicy === "yolo" ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--ask-for-approval", approvalPolicy === "strict" ? "untrusted" : "on-request", "--sandbox", approvalPolicy === "strict" ? "read-only" : "workspace-write"]), ...extraArgs],
         platform,
         env,
       );

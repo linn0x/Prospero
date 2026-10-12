@@ -8,12 +8,13 @@ module.exports = async ({ window, run, wait, click, screenshot, sessions, update
   await run("document.querySelectorAll('.workspace-session-more').forEach(button=>button.click())");
   const row = session => `[...document.querySelectorAll('.workspace-session-link')].find(el=>el.querySelector('.workspace-session-copy')?.textContent===${JSON.stringify(session.title)})`;
   const mark = session => `${row(session)}?.querySelector('.status-mark')`;
-  updateSession(running.id, { status: "running" });
+  updateSession(completed.id, { status: "done" });
+  updateSession(running.id, { status: "running", busySince: Date.now() });
   updateSession(stopped.id, { status: "died", pendingPermissions: 1 });
   updateSession(approval.id, { status: "running", pendingPermissions: 1 });
-  updateSession(unread.id, { status: "running" });
+  updateSession(unread.id, { status: "running", busySince: Date.now() });
   await wait(`${mark(running)}?.dataset.motion==='breathe' && ${mark(approval)}?.dataset.motion==='blink' && ${mark(unread)}?.dataset.motion==='breathe'`);
-  updateSession(unread.id, { status: "idle" });
+  updateSession(unread.id, { status: "done", busySince: undefined });
   await wait(`${mark(unread)}?.dataset.motion==='bounce'`);
   assert.equal(await run(`${mark(stopped)}.dataset.state`), "terminated");
   const inspect = session => run(`(() => {const row=${row(session)},dot=row.querySelector('.status-mark'),s=getComputedStyle(dot),r=row.getBoundingClientRect(),d=dot.getBoundingClientRect(),title=row.querySelector('strong').getBoundingClientRect();return {state:dot.dataset.state,animation:s.animationName,color:s.backgroundColor,height:r.height,right:r.right-d.right,titleRight:title.right,dotLeft:d.left,small:row.querySelectorAll('small').length,label:dot.getAttribute('aria-label')}})()`);
@@ -41,7 +42,7 @@ module.exports = async ({ window, run, wait, click, screenshot, sessions, update
   await click(`#workspace-tab-${completed.id}`);
   updateSession(completed.id, { status: "waiting_approval" });
   await wait("document.querySelector('.session-toolbar-identity .status-mark')?.dataset.motion==='blink'");
-  updateSession(completed.id, { status: "idle" });
+  updateSession(completed.id, { status: "done" });
   await wait("document.querySelector('.session-toolbar-identity .status-mark')?.dataset.state==='completed'");
   await run("window.prospero.updateSettings({theme:'dark'})"); await delay(600); await screenshot("session-status-dark");
 
@@ -59,7 +60,7 @@ module.exports = async ({ window, run, wait, click, screenshot, sessions, update
     { name: 'prefers-reduced-motion', value: 'no-preference' },
   ];
   await wc.debugger.sendCommand('Emulation.setEmulatedMedia', { features: media });
-  const simulateMac = () => run("document.documentElement.dataset.platform='darwin';document.documentElement.dataset.nativeGlass='true';document.documentElement.dataset.reducedTransparency='false';document.documentElement.dataset.highContrast='false';document.querySelector('.windows-titlebar').style.display='none'");
+  const simulateMac = () => run("document.documentElement.dataset.platform='darwin';document.documentElement.dataset.nativeGlass='true';document.documentElement.dataset.reducedTransparency='false';document.documentElement.dataset.highContrast='false';document.querySelector('.windows-titlebar')?.style.setProperty('display','none')");
   await simulateMac(); await delay(250);
   glass.main = await style(surface);
   assert.match(glass.main.filter, /blur\(/, JSON.stringify(await run(`({dataset:{...document.documentElement.dataset},token:getComputedStyle(document.documentElement).getPropertyValue('--glass-filter'),media:['prefers-reduced-transparency: no-preference','prefers-contrast: no-preference','forced-colors: none'].map(query=>[query,matchMedia('('+query+')').matches])})`)));
@@ -86,6 +87,6 @@ module.exports = async ({ window, run, wait, click, screenshot, sessions, update
   await wc.debugger.sendCommand('Emulation.setEmulatedMedia', { features: media.map(feature => feature.name === 'prefers-reduced-motion' ? { ...feature, value: 'reduce' } : feature) });
   assert.equal(await run("[...document.querySelectorAll('.status-mark')].every(dot=>getComputedStyle(dot).animationName==='none')"), true);
   wc.debugger.detach();
-  await run("document.documentElement.dataset.platform='win32';document.documentElement.dataset.nativeGlass='false';document.querySelector('.windows-titlebar').style.display=''");
+  await run("document.documentElement.dataset.platform='win32';document.documentElement.dataset.nativeGlass='false';document.querySelector('.windows-titlebar')?.style.removeProperty('display')");
   return { states, glass, checks: ['single-line rows and pins', 'right status dot', 'running/completed/stopped/approval/unread animations', 'background completion unread', 'opening clears unread', 'toolbar status without text', 'macOS tab material', 'conversation sidebar excluded', 'Base UI tabs', 'no hover layout shift', 'reduced transparency/high contrast/reduced motion'] };
 };

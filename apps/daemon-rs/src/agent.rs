@@ -19,7 +19,10 @@ pub use codex::{
 };
 pub use runtime::Agents;
 pub use store::{ApprovalPolicy, PermissionMode};
-pub(crate) use usage::{NATIVE_CODEX_ID, native_codex_environment, read_native_codex_models};
+pub(crate) use usage::{
+    NATIVE_CODEX_ID, native_codex_environment, native_codex_terminal_environment,
+    read_native_codex_models,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

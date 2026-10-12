@@ -5787,6 +5787,7 @@ async fn create_session(state: CreateSessionState) -> Result<SessionHead, String
                 account_id: None,
                 model: None,
                 effort: None,
+                approval_policy: None,
             })
             .await
             .map_err(|error| error.to_string())

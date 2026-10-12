@@ -51,6 +51,8 @@ const server = createServer((request, response) => {
   else response.end(JSON.stringify({ ok: true, available: false, items: [], modes: [], models: [] }));
 });
 process.env.PROSPERO_HOME = home;
+process.env.PROSPERO_BACKEND = "legacy";
+process.env.PROSPERO_RUNTIME_SWITCH_FILE = path.join(fixture, "runtime-switch.json");
 process.argv.push("--background");
 app.setPath("userData", path.join(fixture, "userData"));
 app.disableHardwareAcceleration();
@@ -64,6 +66,7 @@ app.on("browser-window-created", (_event, window) => {
   window.webContents.once("did-finish-load", async () => {
     log("Renderer loaded");
     const wc = window.webContents;
+    wc.setBackgroundThrottling(false);
     const run = source => wc.executeJavaScript(source, true);
     const errors = [];
     wc.on("console-message", details => { if (details.level === "error" && !details.message.includes("ERR_CONNECTION_REFUSED")) errors.push(details.message); });
@@ -124,9 +127,9 @@ app.on("browser-window-created", (_event, window) => {
       assert.equal(await run("window.__editor===document.querySelector('.project-tools-instance:not([hidden]) .project-code-editor') && window.__editor.value.includes('Prospero edited')"), true, "Switching projects preserves unsaved files");
       await run("window.__originalCenter=document.querySelector('.workspace-primary')");
       await click('[aria-label="关闭 workspace.ts"]');
-      await wait("Boolean(document.querySelector('[role=dialog]'))");
-      assert.match(await run("document.querySelector('[role=dialog]').textContent"), /尚未保存/);
-      await click('[role="dialog"] [data-slot="button"]'); // Cancel.
+      await wait("Boolean(document.querySelector('[role=dialog][data-slot=dialog-content]'))");
+      assert.match(await run("document.querySelector('[role=dialog][data-slot=dialog-content]').textContent"), /尚未保存/);
+      await click('[role="dialog"][data-slot="dialog-content"] [data-slot="button"]'); // Cancel.
       await run("window.dispatchEvent(new KeyboardEvent('keydown',{key:'s',ctrlKey:true,metaKey:true,bubbles:true}))");
       await wait(`window.prospero.readProjectFile(${JSON.stringify(project)},'src/workspace.ts').then(file=>file.content.includes('Prospero edited'))`);
       await navigate("search");
@@ -155,7 +158,7 @@ app.on("browser-window-created", (_event, window) => {
       assert.equal(await run("document.querySelector('[title=\"src\"].project-tree-row').getAttribute('aria-expanded')"), "true", "Explorer expansion survives tool navigation");
       await click('[aria-label="新建文件"]');
       await fill('[data-slot="project-file-name"]', "notes.txt");
-      await click('[role="dialog"] button[type="submit"]');
+      await click('[role="dialog"][data-slot="dialog-content"] button[type="submit"]');
       await wait("Boolean(document.querySelector('[title=\"notes.txt\"].project-tree-row'))");
       assert(fs.existsSync(path.join(project, "notes.txt")));
       await back();

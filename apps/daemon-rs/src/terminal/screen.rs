@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use unicode_width::UnicodeWidthChar;
 
@@ -12,6 +13,29 @@ const MAX_CELLS: usize = 2_048_000;
 const MAX_SCROLLBACK_LINES: usize = 3_400;
 const MAX_PENDING: usize = 8192;
 const MAX_SNAPSHOT: usize = 1024 * 1024;
+const MAX_GLYPHS: usize = 32_768;
+const MAX_GLYPH_BYTES: usize = 4 * 1024 * 1024;
+const NARROW_PROXY: u32 = 0xf0000;
+const WIDE_PROXY: u32 = 0x20000;
+const PROXY_COUNT: u32 = 0xfffe;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Glyph {
+    text: Arc<str>,
+    link: Option<Arc<str>>,
+}
+
+impl Glyph {
+    fn bytes(&self) -> usize {
+        self.text.len() + self.link.as_ref().map_or(0, |link| link.len())
+    }
+}
+
+fn is_proxy(ch: char) -> bool {
+    let value = u32::from(ch);
+    (NARROW_PROXY..NARROW_PROXY + PROXY_COUNT).contains(&value)
+        || (WIDE_PROXY..WIDE_PROXY + PROXY_COUNT).contains(&value)
+}
 
 pub fn width_tables() -> String {
     [0, 2].map(|width| {
@@ -47,6 +71,12 @@ pub struct Screen {
     keypad: bool,
     osc: bool,
     cursor_style: String,
+    glyphs: HashMap<char, Glyph>,
+    proxies: HashMap<Glyph, char>,
+    glyph_bytes: usize,
+    next_proxy: [u32; 2],
+    link: Option<Arc<str>>,
+    join_width: usize,
 }
 
 impl Screen {
@@ -72,6 +102,12 @@ impl Screen {
             keypad: false,
             osc: false,
             cursor_style: String::new(),
+            glyphs: HashMap::new(),
+            proxies: HashMap::new(),
+            glyph_bytes: 0,
+            next_proxy: [0, 0],
+            link: None,
+            join_width: 0,
         }
     }
 
@@ -106,7 +142,15 @@ impl Screen {
         terminal
             .view()
             .skip(usize::from(self.size.rows).saturating_sub(limit))
-            .map(|line| line.text())
+            .map(|line| {
+                line.chars()
+                    .map(|ch| {
+                        self.glyphs
+                            .get(&ch)
+                            .map_or_else(|| ch.to_string(), |glyph| glyph.text.to_string())
+                    })
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -151,12 +195,17 @@ impl Screen {
                 self.pending.push(ch);
                 self.escape = Escape::Start;
             } else {
-                if (!ch.is_control() && ch.width() == Some(0))
-                    || ('\u{80}'..='\u{9f}').contains(&ch)
-                {
-                    self.compatible = false;
+                if ch.is_control() {
+                    if ('\u{80}'..='\u{9f}').contains(&ch) {
+                        self.compatible = false;
+                    }
+                    if ch != '\x7f' {
+                        self.join_width = 0;
+                    }
+                    self.feed(ch);
+                } else {
+                    self.print(ch);
                 }
-                self.feed(ch);
             }
             return;
         }
@@ -192,6 +241,7 @@ impl Screen {
                 *self = Self::new(self.size);
                 return;
             }
+            self.join_width = 0;
             self.input_modes(&sequence);
             for ch in sequence.chars() {
                 self.feed(ch);
@@ -211,7 +261,145 @@ impl Screen {
         }
     }
 
+    fn print(&mut self, ch: char) {
+        let width = ch.width().unwrap_or(1);
+        if width == 0 {
+            let Some(terminal) = &self.terminal else {
+                return;
+            };
+            if self.join_width > 0 && !terminal.last_print_succeeded() {
+                self.compatible = false;
+                return;
+            }
+            let cursor = terminal.cursor();
+            if self.join_width == 0 || cursor.col < self.join_width {
+                self.compatible = false;
+                self.feed(ch);
+                return;
+            }
+            let col = cursor.col - self.join_width;
+            let cell = &terminal.line(cursor.row)[col];
+            let mut glyph = self
+                .glyphs
+                .get(&cell.char())
+                .cloned()
+                .unwrap_or_else(|| Glyph {
+                    text: Arc::from(cell.char().to_string()),
+                    link: None,
+                });
+            glyph.text = Arc::from(format!("{}{ch}", glyph.text));
+            if let Some(proxy) = self.proxy(glyph, self.join_width)
+                && let Some(terminal) = &mut self.terminal
+            {
+                terminal.replace_character(col, cursor.row, proxy);
+            }
+            return;
+        }
+        if self.join_width == 0
+            && let Some(terminal) = &mut self.terminal
+        {
+            terminal.begin_print();
+        }
+        self.join_width = width;
+        if self.link.is_some() || is_proxy(ch) {
+            let ch = self
+                .terminal
+                .as_ref()
+                .map_or(ch, |terminal| terminal.translate_character(ch));
+            let glyph = Glyph {
+                text: Arc::from(ch.to_string()),
+                link: self.link.clone(),
+            };
+            if let Some(proxy) = self.proxy(glyph, width) {
+                self.feed(proxy);
+            } else {
+                self.feed(ch);
+            }
+        } else {
+            self.feed(ch);
+        }
+    }
+
+    fn proxy(&mut self, glyph: Glyph, width: usize) -> Option<char> {
+        if let Some(proxy) = self.proxies.get(&glyph) {
+            return Some(*proxy);
+        }
+        let bytes = glyph.bytes();
+        if bytes > MAX_PENDING || !self.compatible {
+            self.compatible = false;
+            return None;
+        }
+        if self.glyphs.len() >= MAX_GLYPHS || self.glyph_bytes + bytes > MAX_GLYPH_BYTES {
+            let used: HashSet<_> = self
+                .terminal
+                .as_ref()
+                .into_iter()
+                .flat_map(|terminal| terminal.all_cells())
+                .map(|cell| cell.char())
+                .collect();
+            self.glyphs.retain(|proxy, _| used.contains(proxy));
+            self.proxies.retain(|_, proxy| used.contains(proxy));
+            self.glyph_bytes = self.glyphs.values().map(Glyph::bytes).sum();
+        }
+        if self.glyphs.len() >= MAX_GLYPHS || self.glyph_bytes + bytes > MAX_GLYPH_BYTES {
+            self.compatible = false;
+            return None;
+        }
+        let slot = usize::from(width == 2);
+        let base = if slot == 1 { WIDE_PROXY } else { NARROW_PROXY };
+        loop {
+            let proxy = char::from_u32(base + self.next_proxy[slot]).expect("proxy scalar");
+            self.next_proxy[slot] = (self.next_proxy[slot] + 1) % PROXY_COUNT;
+            if !self.glyphs.contains_key(&proxy) {
+                self.glyph_bytes += bytes;
+                self.proxies.insert(glyph.clone(), proxy);
+                self.glyphs.insert(proxy, glyph);
+                return Some(proxy);
+            }
+        }
+    }
+
+    fn expand_dump(&self, source: &str, mut link: Option<Arc<str>>) -> Result<String> {
+        let mut parser = avt::parser::Parser::new();
+        let mut output = String::with_capacity(source.len().min(MAX_SNAPSHOT));
+        for ch in source.chars() {
+            if matches!(parser.feed(ch), Some(avt::parser::Function::Print(_))) {
+                let glyph = self.glyphs.get(&ch);
+                let next_link = glyph.and_then(|glyph| glyph.link.clone());
+                if link != next_link {
+                    output.push_str(next_link.as_deref().unwrap_or("\x1b]8;;\x1b\\"));
+                    link = next_link;
+                }
+                if let Some(glyph) = glyph {
+                    output.push_str(&glyph.text);
+                } else {
+                    output.push(ch);
+                }
+            } else {
+                output.push(ch);
+            }
+            if output.len() > MAX_SNAPSHOT {
+                return Err(Error::Invalid("terminal checkpoint exceeds limit".into()));
+            }
+        }
+        if link != self.link {
+            output.push_str(self.link.as_deref().unwrap_or("\x1b]8;;\x1b\\"));
+        }
+        Ok(output)
+    }
+
     fn input_modes(&mut self, sequence: &str) {
+        if sequence == "\x1b[!p" {
+            self.link = None;
+        }
+        if let Some(value) = sequence.strip_prefix("\x1b]8;").and_then(|value| {
+            value
+                .strip_suffix('\x07')
+                .or_else(|| value.strip_suffix("\x1b\\"))
+        }) && let Some((_, uri)) = value.split_once(';')
+        {
+            self.link = (!uri.is_empty()).then(|| Arc::from(format!("\x1b]8;{value}\x1b\\")));
+        }
         // avt retains protected cells, but its dump does not restore DECSCA or
         // selective erase semantics in xterm. Refuse a misleading checkpoint.
         if sequence.starts_with("\x1b[")
@@ -224,7 +412,7 @@ impl Screen {
         if let Some(value) = sequence.strip_prefix("\x1b]") {
             let code = value.split(';').next().unwrap_or("");
             let color_query = value.starts_with("10;?") || value.starts_with("11;?");
-            if !color_query && !["0", "1", "2", "7", "52", "133", "633"].contains(&code) {
+            if !color_query && !["0", "1", "2", "7", "8", "52", "133", "633"].contains(&code) {
                 self.compatible = false;
             }
         }
@@ -277,7 +465,16 @@ impl Screen {
             .as_ref()
             .filter(|_| self.compatible)
             .ok_or_else(|| Error::Invalid("terminal state cannot be checkpointed yet".into()))?;
-        let mut ansi = normalize_xterm_dump(&terminal.dump());
+        let cursor = terminal.cursor();
+        if self.join_width > 0 && !terminal.last_print_succeeded() && cursor.col > 0 {
+            let previous = &terminal.line(cursor.row)[cursor.col - 1];
+            if previous.char() == ' ' && previous.width() == 1 {
+                return Err(Error::Invalid(
+                    "terminal state cannot be checkpointed yet".into(),
+                ));
+            }
+        }
+        let mut ansi = self.expand_dump(&normalize_xterm_dump(&terminal.dump()), None)?;
         for mode in &self.modes {
             ansi.push_str(&format!("\x1b[?{mode}h"));
         }
@@ -285,6 +482,9 @@ impl Screen {
             ansi.push_str("\x1b=");
         }
         ansi.push_str(&self.cursor_style);
+        ansi.push_str(
+            &self.expand_dump(&terminal.reprint_last(self.join_width), self.link.clone())?,
+        );
         ansi.push_str(&self.pending);
         if ansi.len() + self.utf8.len() > MAX_SNAPSHOT {
             return Err(Error::Invalid("terminal checkpoint exceeds limit".into()));
@@ -374,7 +574,61 @@ fn normalize_xterm_dump(source: &str) -> String {
 
 #[cfg(test)]
 mod dump_tests {
-    use super::normalize_xterm_dump;
+    use super::*;
+
+    #[test]
+    fn glyph_storage_is_reclaimed_across_buffers_and_long_link_streams() {
+        let mut screen = Screen::new(TerminalSize { cols: 24, rows: 8 });
+        screen.process("e\u{0301} 👩‍💻 \u{f0000}\u{20000}\x1b[?1049h".as_bytes());
+        for index in 0..70_000 {
+            screen.process(
+                format!("\r\x1b]8;id={index};https://example.com/{index}\x07x\x1b]8;;\x07")
+                    .as_bytes(),
+            );
+            assert!(screen.glyphs.len() <= MAX_GLYPHS);
+            assert!(screen.glyph_bytes <= MAX_GLYPH_BYTES);
+        }
+        screen.process(b"\x1b[?1049l");
+        assert!(screen.snapshot(1).is_ok());
+        assert!(
+            screen
+                .visible_tail_text(8)
+                .contains("e\u{0301} 👩‍💻 \u{f0000}\u{20000}")
+        );
+    }
+
+    #[test]
+    fn failed_combining_proxy_does_not_advance_cursor() {
+        let mut screen = Screen::new(TerminalSize { cols: 24, rows: 8 });
+        screen.compatible = false;
+        screen.process("e\u{0301}".as_bytes());
+        assert_eq!(screen.terminal.as_ref().unwrap().cursor().col, 1);
+    }
+
+    #[test]
+    fn combining_after_an_ignored_wide_glyph_never_invents_a_checkpoint() {
+        let mut screen = Screen::new(TerminalSize { cols: 24, rows: 8 });
+        screen.process(format!("\x1b[?7l{}\x1b[1;24H界", "a".repeat(24)).as_bytes());
+        assert!(screen.snapshot(1).is_ok());
+        screen.process("\u{0301}".as_bytes());
+        assert_eq!(screen.cursor_position(), (0, 23));
+        assert!(screen.snapshot(2).is_err());
+    }
+
+    #[test]
+    fn ignored_wide_glyph_after_an_ambiguous_blank_keeps_raw_replay() {
+        for before in [
+            format!("\x1b[?7l{}中X\x1b[1;24H界", "a".repeat(22)),
+            format!("\x1b[?7l{} 界", "a".repeat(22)),
+        ] {
+            let mut screen = Screen::new(TerminalSize { cols: 24, rows: 8 });
+            screen.process(before.as_bytes());
+            assert_eq!(screen.cursor_position(), (0, 23));
+            assert!(screen.snapshot(1).is_err());
+            screen.process(b"Z");
+            assert!(screen.snapshot(2).is_ok());
+        }
+    }
 
     #[test]
     fn only_complete_dump_controls_are_rewritten() {

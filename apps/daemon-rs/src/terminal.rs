@@ -27,6 +27,7 @@ pub fn validate_size(size: TerminalSize) -> Result<TerminalSize> {
     Ok(size)
 }
 
+mod replay;
 pub mod screen;
 
 pub struct Output {
@@ -35,6 +36,8 @@ pub struct Output {
     events: VecDeque<(TerminalEvent, usize)>,
     bytes: usize,
     seq: i64,
+    replay: replay::Replay,
+    replay_failed: bool,
     query_carry: Vec<u8>,
     exited: bool,
     exit_code: Option<u32>,
@@ -49,15 +52,19 @@ pub(crate) struct Archive {
     floor: i64,
     start: i64,
     seq: i64,
+    #[serde(default)]
+    latest_seq: i64,
     events: Vec<TerminalEvent>,
     exit_code: Option<u32>,
 }
 
 impl Output {
-    fn new(size: TerminalSize) -> Self {
-        Self {
+    fn new(size: TerminalSize) -> Result<Self> {
+        Ok(Self {
             screen: screen::Screen::new(size),
             initial_size: size,
+            replay: replay::Replay::new()?,
+            replay_failed: false,
             events: VecDeque::new(),
             bytes: 0,
             seq: 0,
@@ -67,7 +74,7 @@ impl Output {
             busy_since: None,
             last_activity_at: None,
             activity_version: 0,
-        }
+        })
     }
 
     fn push(&mut self, event: TerminalEvent, bytes: usize) {
@@ -77,6 +84,14 @@ impl Output {
         self.events.push_back((event, bytes));
         self.bytes += bytes;
         self.seq += 1;
+        if !self.replay_failed
+            && self
+                .replay
+                .append(self.seq, &self.events.back().expect("event inserted").0)
+                .is_err()
+        {
+            self.replay_failed = true;
+        }
         while self.bytes > RETAINED_BYTES || self.events.len() > RETAINED_EVENTS {
             self.bytes -= self.events.pop_front().expect("retained event").1;
         }
@@ -241,24 +256,44 @@ impl Output {
         if after < 0 {
             return Err(Error::Invalid("terminal cursor is ahead of output".into()));
         }
-        let floor = self.seq - self.events.len() as i64;
-        let mut events = Vec::new();
-        let mut bytes = 0;
-        if after >= floor && after <= self.seq {
-            for (event, size) in self.events.iter().skip((after - floor) as usize).take(64) {
-                if bytes + size > PAGE_BYTES {
+        let ring_floor = self.seq - self.events.len() as i64;
+        let (floor, events) = if after < ring_floor {
+            if self.replay_failed {
+                return Err(Error::Feature(
+                    "terminal_replay_unavailable".into(),
+                    "Terminal replay journal is unavailable".into(),
+                ));
+            }
+            self.replay.page(after, self.seq)?
+        } else {
+            let mut events = Vec::new();
+            let mut bytes = 0;
+            for (event, size) in self
+                .events
+                .iter()
+                .skip((after - ring_floor) as usize)
+                .take(64)
+            {
+                if !events.is_empty() && bytes + size > PAGE_BYTES {
                     break;
                 }
                 bytes += size;
                 events.push(event.clone());
             }
+            (ring_floor, events)
+        };
+        if after >= floor && after < self.seq && events.is_empty() {
+            return Err(Error::Feature(
+                "terminal_replay_unavailable".into(),
+                "Terminal replay journal is unavailable".into(),
+            ));
         }
         Ok(TerminalPage {
             initial_size: self.initial_size,
             base_seq: after,
             next_seq: after + events.len() as i64,
             latest_seq: self.seq,
-            floor_seq: floor,
+            floor_seq: if self.replay_failed { floor } else { 0 },
             resync_required: after < floor || after > self.seq,
             events,
             exited: self.exited,
@@ -395,6 +430,21 @@ impl Terminal {
         if after == Some(output.seq) {
             return Ok(None);
         }
+        if let Some(after) = after {
+            let page = output.page(after)?;
+            let snapshot = (page.next_seq == page.latest_seq)
+                .then(|| output.screen.snapshot(page.latest_seq).ok())
+                .flatten();
+            return Ok(Some(Archive {
+                snapshot,
+                floor: page.floor_seq,
+                start: page.base_seq,
+                seq: page.next_seq,
+                latest_seq: page.latest_seq,
+                events: page.events,
+                exit_code: output.exit_code,
+            }));
+        }
         let floor = output.seq - output.events.len() as i64;
         let start = after.unwrap_or(floor).max(floor).min(output.seq);
         Ok(Some(Archive {
@@ -402,6 +452,7 @@ impl Terminal {
             floor,
             start,
             seq: output.seq,
+            latest_seq: output.seq,
             events: output
                 .events
                 .iter()
@@ -587,8 +638,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unicode_and_links_survive_event_and_byte_retention() {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let mut output = Output::new(size).unwrap();
+        output
+            .write("e\u{0301} 👩‍💻 ❤️ \x1b]8;;https://example.com\x07linked\x1b]8;;\x07".as_bytes());
+        for _ in 0..RETAINED_EVENTS + 1 {
+            output.write(b"\0");
+        }
+        assert!(!output.page(0).unwrap().resync_required);
+        for _ in 0..32 {
+            output.write(&vec![0; 65536]);
+        }
+        assert!(output.bytes <= RETAINED_BYTES);
+        let snapshot = output.screen.snapshot(output.seq).unwrap();
+        let mut restored = screen::Screen::new(size);
+        restored.process(&STANDARD.decode(snapshot.data_b64).unwrap());
+        let suffix = "\r\ncontinued e\u{0301}\x1b[6n".as_bytes();
+        output.write(suffix);
+        restored.process(suffix);
+        assert_eq!(restored.cursor_position(), output.screen.cursor_position());
+        assert_eq!(
+            restored.visible_tail_text(24),
+            output.screen.visible_tail_text(24)
+        );
+        assert!(restored.snapshot(output.seq).is_ok());
+    }
+
+    #[test]
     fn output_activity_clears_when_prompt_returns() {
-        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
         output.write(b"running");
         assert!(output.activity(crate::database::now()).busy_since.is_some());
         output.write("\r\n\u{276f}\r\n".as_bytes());
@@ -597,21 +676,92 @@ mod tests {
 
     #[test]
     fn dsr_response_uses_cursor_at_query_position() {
-        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
         let responses = output.write(b"abc\x1b[6nxyz");
         assert_eq!(responses, vec![b"\x1b[1;4R".to_vec()]);
     }
 
     #[test]
+    fn unsupported_checkpoint_state_preserves_output_and_cursor_replies() {
+        let mut output = Output::new(TerminalSize { cols: 24, rows: 8 }).unwrap();
+        let replies = output.write(
+            b"\x1b]9;notification\x07\x1b]8;;https://example.com\x07ABC\x1b]8;;\x07Z\x1b[6n",
+        );
+        assert_eq!(replies, vec![b"\x1b[1;5R".to_vec()]);
+        assert!(output.screen.visible_tail_text(8).contains("ABCZ"));
+        assert!(output.screen.snapshot(output.seq).is_err());
+    }
+
+    #[test]
+    fn journal_replays_beyond_memory_retention_after_snapshot_failure() {
+        let mut output = Output::new(TerminalSize { cols: 24, rows: 8 }).unwrap();
+        output.write(b"\x1b]9;notification\x07base");
+        for _ in 0..(RETAINED_EVENTS + 64) {
+            output.write(b"x");
+        }
+        for _ in 0..1_100 {
+            output.write(&vec![0; 1_024]);
+        }
+        output.push(
+            TerminalEvent::Resize {
+                size: TerminalSize { cols: 16, rows: 4 },
+            },
+            0,
+        );
+        let latest = output.seq;
+        let mut cursor = 0;
+        let mut count = 0;
+        let mut restored = screen::Screen::new(output.initial_size);
+        while cursor < latest {
+            let page = output.page(cursor).unwrap();
+            assert!(!page.resync_required);
+            assert!(page.events.len() <= 64);
+            assert!(page.next_seq > cursor);
+            count += page.events.len();
+            for event in page.events.iter().cloned() {
+                match event {
+                    TerminalEvent::Output { data_b64 } => {
+                        restored.process(&STANDARD.decode(data_b64).unwrap());
+                    }
+                    TerminalEvent::Resize { size } => restored.resize(size),
+                }
+            }
+            cursor = page.next_seq;
+        }
+        assert_eq!(cursor, latest);
+        assert_eq!(count, latest as usize);
+        assert_eq!(output.initial_size, TerminalSize { cols: 24, rows: 8 });
+        assert_eq!(restored.cursor_position(), output.screen.cursor_position());
+        assert_eq!(
+            restored.visible_tail_text(8),
+            output.screen.visible_tail_text(8)
+        );
+    }
+
+    #[test]
+    fn failed_journal_keeps_ring_reads_but_rejects_old_cursors() {
+        let mut output = Output::new(TerminalSize { cols: 24, rows: 8 }).unwrap();
+        output.replay_failed = true;
+        for _ in 0..RETAINED_EVENTS + 1 {
+            output.write(b"x");
+        }
+        assert!(!output.page(output.seq - 1).unwrap().resync_required);
+        assert!(matches!(
+            output.page(0),
+            Err(Error::Feature(code, _)) if code == "terminal_replay_unavailable"
+        ));
+    }
+
+    #[test]
     fn split_terminal_query_is_answered_once() {
-        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
         assert!(output.write(b"abc\x1b[").is_empty());
         assert_eq!(output.write(b"6n"), vec![b"\x1b[1;4R".to_vec()]);
     }
 
     #[test]
     fn numeric_query_parameters_match_renderer_normalization_across_chunks() {
-        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
         let mut responses = Vec::new();
         for byte in b"abc\x1b[00000000000000000006nxyz\x1b[0000000000000000c\x1b]000000000010;?\x07"
         {
@@ -629,7 +779,7 @@ mod tests {
 
     #[test]
     fn normalized_numeric_terminal_queries_are_answered() {
-        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 });
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
         assert_eq!(output.write(b"x\x1b[06n"), vec![b"\x1b[1;2R".to_vec()]);
         assert_eq!(output.write(b"\x1b[00c"), vec![b"\x1b[?6c".to_vec()]);
     }

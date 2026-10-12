@@ -66,9 +66,6 @@ impl Handle {
             }
         }
     }
-    pub async fn archive(&self) -> Result<Archive> {
-        self.checkpoint(None).await?.ok_or(Error::Conflict)
-    }
     pub async fn activity(&self) -> Result<TerminalActivity> {
         match self {
             Self::Local(t) => t.activity(),

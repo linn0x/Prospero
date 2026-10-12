@@ -11,6 +11,7 @@ import { useLocale } from "../locale";
 import { reportError } from "../state";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "../terminal-clipboard";
 import { configureRustTerminalUnicode } from "../terminal-unicode";
+import { terminalBinaryBase64 } from "../terminal-bytes";
 import { RemoteTerminalBuffer, remoteInputBase64, remoteTerminalTheme } from "./remote-terminal-state";
 import "./remote-workspaces.css";
 
@@ -118,15 +119,20 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
         } else if (message.type === "term.output") buffer.output(Number(message.seq), String(message.dataB64 ?? ""));
       } catch (reason) { attached = false; updateInput(); snapshotRequested = false; clearTimeout(snapshotTimer); setAttaching(false); fail(reason); }
     });
-    const sendInput = (data: string) => {
+    const sendInput = (data: string, binary = false) => {
       if (!canInput()) return;
       inputQueue = inputQueue.then(async () => {
-        if (canInput()) await window.prospero.sendRemoteShellInput(hostId, sid, remoteInputBase64(data), ownerId);
+        if (canInput()) await window.prospero.sendRemoteShellInput(hostId, sid, binary ? terminalBinaryBase64(data) : remoteInputBase64(data), ownerId);
       }).catch(reason => { attached = false; updateInput(); fail(reason); });
     };
     sendInputRef.current = sendInput;
-    const input = term.onData(sendInput);
-    const disposePaste = bindTerminalPaste(container.current, term, canInput);
+    const input = term.onData(data => sendInput(data));
+    const binaryInput = term.onBinary(data => sendInput(data, true));
+    const disposePaste = bindTerminalPaste(container.current, term, canInput,
+      () => setError(translate.current("远程终端尚未就绪，请连接后再粘贴", "The remote terminal is not ready; connect before pasting")),
+      () => setError(""),
+      () => setError(translate.current("远程终端只支持文本；请先上传图片到远程主机，再粘贴远程文件路径", "This remote terminal accepts text; upload the image to the remote host and paste its remote path")),
+      () => setError(translate.current("请先上传图片到远程主机，再粘贴远程文件路径", "Upload the image to the remote host, then paste its remote path")));
     term.attachCustomKeyEventHandler(event => {
       if (event.type !== "keydown") return true;
       const action = terminalClipboardShortcut(event, window.prospero.platform === "darwin");
@@ -151,7 +157,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     requestSnapshot();
     term.focus();
     return () => {
-      disposed = true; attached = false; buffer.dispose(); unsubscribe(); input.dispose(); resizeObserver.disconnect(); themeObserver.disconnect();
+      disposed = true; attached = false; buffer.dispose(); unsubscribe(); input.dispose(); binaryInput.dispose(); resizeObserver.disconnect(); themeObserver.disconnect();
       disposePaste();
       motion.removeEventListener("change", updateTheme);
       clearTimeout(resizeTimer); clearTimeout(snapshotTimer);

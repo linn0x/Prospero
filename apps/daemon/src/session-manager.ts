@@ -212,6 +212,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly structuredSessions = new Map<string, StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession>();
   private readonly startingAccountLeases = new Map<string, number>();
   private readonly tmuxConfigFile: string | null;
+  private readonly tmuxSocketFile: string | null;
+  private readonly tmuxSessionSockets = new Map<string, string | undefined>();
   private readonly tmuxBin: string | null;
 
   private readonly metaFile: string | null;
@@ -260,11 +262,12 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     // 没装 tmux 就静默退回直接 spawn —— 托管是增强,不该变成硬依赖
     this.tmuxBin = opts.tmux ? tmux.tmuxPath() : null;
     this.tmuxConfigFile = this.tmuxBin && opts.tmux ? tmux.writeConfig(opts.tmux.home) : null;
+    this.tmuxSocketFile = this.tmuxBin && opts.tmux ? tmux.socketPath(opts.tmux.home) : null;
     if (this.tmuxBin && this.tmuxConfigFile) {
       // `tmux -f` is ignored after a server already exists. Reload only the
       // safe server capabilities; per-session input/UI options are targeted
       // after each attach below.
-      tmux.reloadConfig(this.tmuxBin);
+      tmux.reloadConfig(this.tmuxBin, this.tmuxSocketFile ?? undefined);
     }
     this.metaFile = opts.tmux ? path.join(opts.tmux.home, "pty-sessions.json") : null;
     const home = opts.home ?? opts.tmux?.home;
@@ -318,14 +321,17 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    */
   async restoreFromTmux(): Promise<SessionInfo[]> {
     if (!this.tmuxEnabled || !this.metaFile) return [];
-    const alive = new Set(tmux.listSessions());
-    if (alive.size === 0) {
+    const privateAlive = new Set(tmux.listSessions(this.tmuxSocketFile ?? undefined));
+    const legacyAlive = new Set(tmux.listSessions());
+    if (privateAlive.size === 0 && legacyAlive.size === 0) {
       this.persistMeta();
       return [];
     }
     const restored: SessionInfo[] = [];
     for (const meta of this.loadMeta()) {
-      if (this.deletedSessionIds.has(meta.id) || !alive.has(meta.id) || this.ptySessions.has(meta.id)) continue;
+      if (this.deletedSessionIds.has(meta.id) || this.ptySessions.has(meta.id)) continue;
+      const socket = privateAlive.has(meta.id) ? this.tmuxSocketFile : legacyAlive.has(meta.id) ? null : undefined;
+      if (!socket && socket !== null) continue;
       try {
         // `new-session -A` 存在即 attach,所以恢复和新建走同一条命令
         const account = meta.accountId
@@ -341,8 +347,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
             meta.rows,
             undefined,
             account,
+            socket,
           ),
         );
+        this.tmuxSessionSockets.set(meta.id, socket ?? undefined);
       } catch {
         // 单个恢复失败不该拖垮启动
       }
@@ -856,6 +864,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           ...(account?.defaultModel && !account.apiProfile ? ["-c", `model=${JSON.stringify(account.defaultModel)}`] : []),
           ...(account?.defaultEffort ? ["-c", `model_reasoning_effort=${JSON.stringify(account.defaultEffort)}`] : []),
         ] : [],
+        input.approvalPolicy,
       );
     } catch (e) {
       throw new SessionError(
@@ -891,7 +900,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     rows: number,
     spec: { file: string; args: string[] } | undefined,
     account?: AccountBinding,
+    socketOverride?: string | null,
   ): Promise<SessionInfo> {
+    const tmuxSocket = socketOverride === null ? undefined : socketOverride ?? this.tmuxSocketFile;
     const base = spec ?? noopCommand();
     const sessionEnv = { ...(account?.environment ?? {}), ...this.sessionEnv(id) };
     const ptyEnv = spawnEnv(sessionEnv);
@@ -907,6 +918,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
             rows,
             configFile: this.tmuxConfigFile,
             tmux: this.tmuxBin,
+            ...(tmuxSocket ? { socket: tmuxSocket } : {}),
             // tmux servers are long-lived and do not reliably refresh these
             // variables from attaching clients. Set the session copy as well
             // as sanitizing the initial pane command in wrapSpawn().
@@ -969,7 +981,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       // a bounded moment to create/attach its server-side session before
       // targeting options. Restore normally succeeds on the first attempt.
       for (let attempt = 0; attempt < 8 && !configured; attempt++) {
-        configured = tmux.configureSession(id, this.tmuxBin);
+        configured = tmux.configureSession(id, this.tmuxBin, tmuxSocket ?? undefined);
         if (!configured) await new Promise((resolve) => setTimeout(resolve, 10));
       }
       if (!configured) {
@@ -977,6 +989,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       }
     }
     this.ptySessions.set(id, session);
+    this.tmuxSessionSockets.set(id, tmuxSocket ?? undefined);
     this.wirePtySession(session);
     this.emit("state", this.sessionInfoWithCapabilities(session.info()));
     return session.info();
@@ -1591,9 +1604,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
     else await pty.dispose();
     // tmux 下 dispose 只是断开 client,进程还在 server 里活着 —— kill 得说到做到
-    if (this.tmuxEnabled) tmux.killSession(sid);
+    if (this.tmuxEnabled) {
+      const socket = this.tmuxSessionSockets.has(sid) ? this.tmuxSessionSockets.get(sid) : this.tmuxSocketFile ?? undefined;
+      tmux.killSession(sid, socket);
+    }
     this.markSessionDeleted(sid);
     this.ptySessions.delete(sid);
+    this.tmuxSessionSockets.delete(sid);
     this.persistMeta();
     await this.removeSessionDirectory(cleanup);
     if (this.canForgetDeletedSession(sid)) this.forgetDeletedSession(sid);
@@ -1637,6 +1654,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
       const deadline = Date.now() + 750;
       while (expected.size > 0 && Date.now() < deadline) {
+        for (const id of tmux.listSessions(this.tmuxSocketFile ?? undefined)) expected.delete(id);
         for (const id of tmux.listSessions()) expected.delete(id);
         if (expected.size > 0) {
           await new Promise((resolve) => setTimeout(resolve, 25));

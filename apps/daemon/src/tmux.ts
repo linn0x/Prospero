@@ -65,6 +65,14 @@ export function sessionName(id: string): string {
   return `${PREFIX}${id}`;
 }
 
+export function socketPath(home: string): string {
+  return path.join(home, "tmux", "prospero.sock");
+}
+
+function commandArgs(socket: string | undefined, args: string[]): string[] {
+  return socket ? ["-S", socket, ...args] : args;
+}
+
 /** Prefer tmux's accurate terminfo, with the portable screen entry as fallback. */
 export function defaultTerminal(): "tmux-256color" | "screen-256color" {
   for (const infocmp of ["/usr/bin/infocmp", "/opt/homebrew/bin/infocmp", "/usr/local/bin/infocmp"]) {
@@ -101,6 +109,7 @@ export function writeConfig(home: string): string {
       // A tiny window keeps Option/Alt escape sequences intact without the
       // perceptible 500 ms default delay after a literal Escape key.
       "set -s escape-time 10",
+      "set-window-option -g history-limit 10000",
       "",
     ].join("\n"),
   );
@@ -108,20 +117,21 @@ export function writeConfig(home: string): string {
 }
 
 /** Reload safe server capabilities when the tmux server predates this daemon. */
-export function reloadConfig(tmux: string): void {
+export function reloadConfig(tmux: string, socket?: string): void {
   // A missing server is expected on first launch. `new-session -f` will load
   // the file when it creates one, so these commands are deliberately best-effort.
-  const current = spawnSync(tmux, ["show-options", "-sv", "terminal-features"], {
+  const current = spawnSync(tmux, commandArgs(socket, ["show-options", "-sv", "terminal-features"]), {
     encoding: "utf8",
   });
   if (current.status !== 0) return;
-  spawnSync(tmux, ["set-option", "-s", "default-terminal", defaultTerminal()], { stdio: "ignore" });
-  spawnSync(tmux, ["set-option", "-s", "focus-events", "on"], { stdio: "ignore" });
-  spawnSync(tmux, ["set-option", "-s", "escape-time", "10"], { stdio: "ignore" });
+  spawnSync(tmux, commandArgs(socket, ["set-option", "-s", "default-terminal", defaultTerminal()]), { stdio: "ignore" });
+  spawnSync(tmux, commandArgs(socket, ["set-option", "-s", "focus-events", "on"]), { stdio: "ignore" });
+  spawnSync(tmux, commandArgs(socket, ["set-option", "-s", "escape-time", "10"]), { stdio: "ignore" });
+  if (socket) spawnSync(tmux, commandArgs(socket, ["set-window-option", "-g", "history-limit", "10000"]), { stdio: "ignore" });
   if (!current.stdout.includes("xterm-256color:RGB")) {
     // Append once. Re-sourcing an `-a` config on every daemon restart would
     // otherwise grow terminal-features without bound.
-    spawnSync(tmux, ["set-option", "-sa", "terminal-features", ",xterm-256color:RGB"], {
+    spawnSync(tmux, commandArgs(socket, ["set-option", "-sa", "terminal-features", ",xterm-256color:RGB"]), {
       stdio: "ignore",
     });
   }
@@ -132,7 +142,7 @@ export function reloadConfig(tmux: string): void {
  * status and mouse must not change the user's unrelated sessions in the same
  * default tmux server.
  */
-export function configureSession(id: string, tmux: string): boolean {
+export function configureSession(id: string, tmux: string, socket?: string): boolean {
   const target = sessionName(id);
   const commands = [
     ["set-option", "-t", target, "status", "off"],
@@ -151,7 +161,7 @@ export function configureSession(id: string, tmux: string): boolean {
     ["set-window-option", "-t", target, "history-limit", "10000"],
     ["set-window-option", "-t", target, "window-size", "latest"],
   ];
-  return commands.every((args) => spawnSync(tmux, args, { stdio: "ignore" }).status === 0);
+  return commands.every((args) => spawnSync(tmux, commandArgs(socket, args), { stdio: "ignore" }).status === 0);
 }
 
 /**
@@ -167,6 +177,7 @@ export function wrapSpawn(
     rows: number;
     configFile: string;
     tmux: string;
+    socket?: string;
     /** tmux server 不会可靠继承 client 环境，必须用 new-session -e 显式带入。 */
     environment?: Record<string, string>;
   },
@@ -178,7 +189,7 @@ export function wrapSpawn(
   return {
     file: opts.tmux,
     args: [
-      "-f", opts.configFile,
+      ...(opts.socket ? ["-S", opts.socket] : []), "-f", opts.configFile,
       "new-session",
       "-A", // attach-or-create
       ...environmentArgs,
@@ -200,10 +211,10 @@ export function wrapSpawn(
 }
 
 /** 当前存在的 Prospero tmux 会话 id(去掉前缀)。 */
-export function listSessions(): string[] {
+export function listSessions(socket?: string): string[] {
   const tmux = tmuxPath();
   if (!tmux) return [];
-  const result = spawnSync(tmux, ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8" });
+  const result = spawnSync(tmux, commandArgs(socket, ["list-sessions", "-F", "#{session_name}"]), { encoding: "utf8" });
   // 没有 server 在跑时 tmux 以非 0 退出,这不是错误
   if (result.status !== 0 || !result.stdout) return [];
   return result.stdout
@@ -214,8 +225,8 @@ export function listSessions(): string[] {
 }
 
 /** 真正结束一个会话 —— 关 PTY 只是断开 client,进程还在 tmux 里活着。 */
-export function killSession(id: string): void {
+export function killSession(id: string, socket?: string): void {
   const tmux = tmuxPath();
   if (!tmux) return;
-  spawnSync(tmux, ["kill-session", "-t", sessionName(id)], { stdio: "ignore" });
+  spawnSync(tmux, commandArgs(socket, ["kill-session", "-t", sessionName(id)]), { stdio: "ignore" });
 }

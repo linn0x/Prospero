@@ -140,7 +140,8 @@ describe("workspace sidebar state", () => {
       target: terminal,
     };
 
-    expect(matchesFocusShortcut(event, "darwin")).toBe(true);
+    expect(matchesFocusShortcut(event, "darwin")).toBe(false);
+    expect(matchesFocusShortcut({ ...event, altKey: true, shiftKey: false }, "darwin")).toBe(true);
     expect(matchesFocusShortcut({ ...event, target: input }, "darwin")).toBe(false);
     expect(matchesFocusShortcut({ ...event, altKey: true, ctrlKey: true, metaKey: false, shiftKey: false }, "win32")).toBe(true);
   });

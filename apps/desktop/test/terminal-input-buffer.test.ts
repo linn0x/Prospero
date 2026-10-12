@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { TerminalInputBuffer, TerminalInputQueue } from "../src/renderer/src/terminal-input-buffer";
+import { terminalBinaryBase64, terminalBytes } from "../src/renderer/src/terminal-bytes";
 
 afterEach(() => vi.useRealTimers());
 it("delivers already accepted characters to their original session after switching", async () => {
@@ -35,4 +36,23 @@ it("bounds queued paste bytes, preserves ordering and frees capacity after failu
   release(); await first; await rejected;
   expect(order).toEqual([1,2]);
   await expect(queue.enqueue(async () => true, 8)).resolves.toBe(true);
+});
+
+it("preserves raw mouse bytes and their position between Unicode text batches", async () => {
+  const queue = new TerminalInputQueue();
+  const output: Uint8Array[] = [];
+  const buffer = new TerminalInputBuffer((value, binary) => queue.enqueue(async () => {
+    output.push(binary ? terminalBytes(terminalBinaryBase64(value)) : new TextEncoder().encode(value));
+    return true;
+  }));
+  buffer.append("中文");
+  const mouse = buffer.appendBinary("\x1b[M \xff\x80");
+  buffer.append("after 🦀");
+  await mouse;
+  await buffer.flush();
+  expect(output).toEqual([
+    new TextEncoder().encode("中文"),
+    Uint8Array.from([27, 91, 77, 32, 255, 128]),
+    new TextEncoder().encode("after 🦀"),
+  ]);
 });

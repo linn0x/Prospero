@@ -284,7 +284,7 @@ export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[
     ...(controls.currentEffort !== null ? { currentEffort: controls.currentEffort } : {}),
     ...(controls.currentMode !== null ? { currentMode: controls.currentMode } : {}),
   } : undefined;
-  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
+  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.accountId ? { accountId: head.accountId } : {}), ...(head.model ? { model: head.model } : {}), ...(head.effort ? { effort: head.effort } : {}), ...(head.approvalPolicy ? { approvalPolicy: head.approvalPolicy } : {}), ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
 }
 
 type TerminalReader = Pick<RustConnection["client"], "terminalOutput" | "terminalSnapshot">;
@@ -1063,6 +1063,8 @@ export class RustRuntime {
       if (input["kind"] === "pty") {
         const agent = input["agent"];
         if (typeof agent !== "string" || !["codex", "claude", "opencode", "grok", "trae", "shell", "custom"].includes(agent)) throw new Error("Agent 无效");
+        const policy = input["approvalPolicy"] ?? "standard";
+        if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
         const command = input["command"];
         if (command !== undefined && (typeof command !== "string" || !command.trim() || command.length > 2_000 || command.includes("\0"))) throw new Error("终端命令无效");
         const model = normalizeLaunchSelection(input["model"], 160, "模型无效");
@@ -1076,7 +1078,7 @@ export class RustRuntime {
           } else throw new Error("此 Agent 的账号选择尚未接入 Rust daemon");
         }
         if ((model || effort) && agent !== "claude" && agent !== "codex") throw new Error("此 Agent 的模型参数尚未接入 Rust daemon");
-        const head = await this.current().client.createTerminal({ title: agent === "shell" && !command ? "Terminal" : `${agent} · ${basename(String(input["cwd"]))}`, workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) }, agent: agent as never, ...(command ? { command } : {}), ...(accountId ? { accountId } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) }, signal, init.timeoutMs ?? 180_000);
+        const head = await this.current().client.createTerminal({ title: agent === "shell" && !command ? "Terminal" : `${agent} · ${basename(String(input["cwd"]))}`, workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) }, agent: agent as never, approvalPolicy: policy, ...(command ? { command } : {}), ...(accountId ? { accountId } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) }, signal, init.timeoutMs ?? 180_000);
         await this.refresh(true);
         return rustSessionInfo(head);
       }

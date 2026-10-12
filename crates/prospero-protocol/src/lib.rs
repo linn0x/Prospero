@@ -65,6 +65,14 @@ pub struct SessionHead {
     pub lifecycle: SessionLifecycle,
     pub status: SessionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<TerminalApprovalPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null")]
     pub busy_since: Option<i64>,
     #[ts(type = "number")]
@@ -694,6 +702,25 @@ pub struct CreateTerminal {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<TerminalApprovalPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalApprovalPolicy {
+    Strict,
+    #[default]
+    Standard,
+    Yolo,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionLaunchOptions {
+    pub account_id: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub approval_policy: Option<TerminalApprovalPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

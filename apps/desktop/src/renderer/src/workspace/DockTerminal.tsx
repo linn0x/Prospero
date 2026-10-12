@@ -11,19 +11,8 @@ const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ de
 
 export function DockTerminal({ session, root = session.cwd, snapshot, active = true }: { session: SessionInfo; root?: string; snapshot: DesktopSnapshot; active?: boolean }) {
   const { t } = useLocale();
-  const [localSelection, setLocalSelection] = useState(readTerminalMousePreference);
-  useEffect(() => {
-    const sync = (event: Event): void => {
-      if (event.type === "storage" && (event as StorageEvent).key !== "prospero.terminal.mouse-mode") return;
-      const custom = (event as CustomEvent<unknown>).detail;
-      if (typeof custom === "boolean") setLocalSelection(custom);
-      else if (event.type === "storage") setLocalSelection(readTerminalMousePreference());
-    };
-    window.addEventListener(TERMINAL_MOUSE_MODE_EVENT, sync);
-    window.addEventListener("storage", sync);
-    return () => { window.removeEventListener(TERMINAL_MOUSE_MODE_EVENT, sync); window.removeEventListener("storage", sync); };
-  }, []);
   const [shell, setShell] = useState<SessionInfo>();
+  const [localSelection, setLocalSelection] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const [attempt, setAttempt] = useState(0);
@@ -38,12 +27,31 @@ export function DockTerminal({ session, root = session.cwd, snapshot, active = t
     return () => { active = false; };
   }, [root, attempt]);
   const current = snapshot.daemon.sessions.find((item) => item.id === shell?.id) ?? shell;
+  const shellSessionId = current?.id;
+  useEffect(() => {
+    setLocalSelection(readTerminalMousePreference(undefined, shellSessionId));
+  }, [shellSessionId]);
+  useEffect(() => {
+    const sync = (event: Event): void => {
+      if (event.type === "storage") {
+        const key = (event as StorageEvent).key;
+        if (key !== "prospero.terminal.mouse-mode" && key !== `prospero.terminal.mouse-mode:${shellSessionId}`) return;
+        setLocalSelection(readTerminalMousePreference(undefined, shellSessionId));
+        return;
+      }
+      const custom = (event as CustomEvent<{ sessionId?: string; localSelection?: boolean }>).detail;
+      if (custom?.sessionId === shellSessionId && typeof custom.localSelection === "boolean") setLocalSelection(custom.localSelection);
+    };
+    window.addEventListener(TERMINAL_MOUSE_MODE_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => { window.removeEventListener(TERMINAL_MOUSE_MODE_EVENT, sync); window.removeEventListener("storage", sync); };
+  }, [shellSessionId]);
   const forgetShell = useCallback((): void => {
     setShell(undefined);
     setError(t("终端会话已不存在", "Terminal session no longer exists"));
   }, [t]);
   return <div className="dock-terminal">
-    <div className="dock-terminal-toolbar"><span title={root}>{root}</span><TerminalMouseToggle localSelection={localSelection} onChange={setLocalSelection} />{(error || current && !shellIsLive(current)) && <Button variant="ghost" size="icon-xs" disabled={loading} aria-label={t("重建终端", "Recreate terminal")} onClick={() => setAttempt((value) => value + 1)}><RefreshCw /></Button>}</div>
+    <div className="dock-terminal-toolbar"><span title={root}>{root}</span>{current && <TerminalMouseToggle sessionId={current.id} localSelection={localSelection} onChange={setLocalSelection} />}{(error || current && !shellIsLive(current)) && <Button variant="ghost" size="icon-xs" disabled={loading} aria-label={t("重建终端", "Recreate terminal")} onClick={() => setAttempt((value) => value + 1)}><RefreshCw /></Button>}</div>
     {error && <div className="workspace-action-error" role="alert">{error}</div>}
     {loading ? <div className="dock-empty" role="status">{t("正在连接工作区终端…", "Connecting workspace terminal…")}</div> : current ? <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载终端…", "Loading terminal…")}</div>}><TerminalPane localSelection={localSelection} key={current.id} session={current} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={forgetShell} /></Suspense> : null}
   </div>;

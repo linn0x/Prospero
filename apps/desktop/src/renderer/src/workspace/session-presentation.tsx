@@ -11,9 +11,14 @@ export function sessionLabel(session: SessionInfo): string {
 export function StatusMark({ status, unread = false, pendingPermissions, pendingQuestions, busySince }: { status: string; unread?: boolean; pendingPermissions?: number | undefined; pendingQuestions?: number | undefined; busySince?: number | undefined }) {
   const { t } = useLocale();
   const indicator = sessionIndicator({ status, ...(pendingPermissions !== undefined ? { pendingPermissions } : {}), ...(pendingQuestions !== undefined ? { pendingQuestions } : {}), ...(busySince !== undefined ? { busySince } : {}) }, unread);
-  const labels = { completed: t("已完成", "Completed"), idle: t("空闲", "Idle"), terminated: t("已终止", "Stopped"), running: t("运行中", "Running"), approval: t("需要授权", "Needs approval"), input: t("需要输入", "Needs input"), waiting: t("等待中", "Waiting"), unknown: t("状态未知", "Unknown status") };
-  const label = labels[indicator.state] + (unread ? t("，未读", ", unread") : "");
+  const label = sessionStatusLabel({ status, pendingPermissions, pendingQuestions, busySince }, unread, t);
   return <span className="status-mark" data-state={indicator.state} data-motion={indicator.motion} data-unread={unread || undefined} role="img" aria-label={label} title={label} />;
+}
+
+export function sessionStatusLabel(session: { status: string; pendingPermissions?: number | undefined; pendingQuestions?: number | undefined; busySince?: number | undefined }, unread: boolean, t: (zh: string, en: string) => string): string {
+  const indicator = sessionIndicator({ status: session.status, ...(session.pendingPermissions !== undefined ? { pendingPermissions: session.pendingPermissions } : {}), ...(session.pendingQuestions !== undefined ? { pendingQuestions: session.pendingQuestions } : {}), ...(session.busySince !== undefined ? { busySince: session.busySince } : {}) }, unread);
+  const labels = { completed: t("已完成", "Completed"), idle: t("空闲", "Idle"), terminated: t("已终止", "Stopped"), running: t("运行中", "Running"), approval: t("需要授权", "Needs approval"), input: t("需要输入", "Needs input"), waiting: t("等待中", "Waiting"), unknown: t("状态未知", "Unknown status") };
+  return labels[indicator.state] + (unread ? t("，未读", ", unread") : "");
 }
 
 export function SessionAgentIcon({ agent, unread = false }: { agent: string; unread?: boolean }) {

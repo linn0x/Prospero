@@ -87,7 +87,7 @@ export function isSessionLaunchWorkspace(
   const key = sessionLaunchPathKey(path);
   return sessionLaunchWorkspaces(snapshot).some(
     (workspace) => sessionLaunchPathKey(workspace.path) === key,
-  );
+  ) || snapshot.daemon.sessions.some(session => sessionLaunchPathKey(session.cwd) === key);
 }
 
 export function sessionLaunchAccounts(

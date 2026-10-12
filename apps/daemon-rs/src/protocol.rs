@@ -5,8 +5,9 @@ pub use prospero_protocol_rs::{
     DATABASE_QUEUE_CAPACITY, DatabaseHealth, EVENT_RETENTION, EventPage, EventQuery, Health,
     HealthPersistence, MAX_EVENT_BYTES, MAX_PAGE_BYTES, MAX_PAGE_ITEMS, RelayConnectionState,
     RelayRuntimeDeviceStatus, RelayRuntimeStatus, RenameSession, ResyncRequired, SessionHead,
-    SessionKind, SessionLifecycle, SessionLookup, SessionLookupResult, SessionPage, SessionQuery,
-    SessionStatus, SessionSummary, UpdateSession, WorkspaceHead, WorkspacePage, WorkspaceQuery,
+    SessionKind, SessionLaunchOptions, SessionLifecycle, SessionLookup, SessionLookupResult,
+    SessionPage, SessionQuery, SessionStatus, SessionSummary, TerminalApprovalPolicy,
+    UpdateSession, WorkspaceHead, WorkspacePage, WorkspaceQuery,
 };
 
 pub use prospero_protocol_rs::{
@@ -77,6 +78,7 @@ pub fn typescript() -> String {
         TimelineTextQuery::decl(&config),
         TimelineTextPage::decl(&config),
         CreateTerminal::decl(&config),
+        TerminalApprovalPolicy::decl(&config),
         TerminalSize::decl(&config),
         TerminalEvent::decl(&config),
         TerminalQuery::decl(&config),

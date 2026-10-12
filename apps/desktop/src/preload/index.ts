@@ -48,6 +48,7 @@ const api: DesktopApi = {
   openWindowMenu: (request) => ipcRenderer.invoke("window:menu", request),
   openExternal: (url: string) => ipcRenderer.invoke("external:open", url),
   readClipboard: () => ipcRenderer.invoke("clipboard:read"),
+  saveTerminalClipboardImage: sessionId => ipcRenderer.invoke("terminal:clipboard-image", sessionId),
   openTerminalContextMenu: options => ipcRenderer.invoke("terminal:context-menu", options),
   openTerminalStream: (sessionId, requestId) => ipcRenderer.invoke("terminal:stream:open", sessionId, requestId),
   writeClipboard: (value: string) => ipcRenderer.invoke("clipboard:write", value),

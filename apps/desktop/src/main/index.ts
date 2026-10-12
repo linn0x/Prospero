@@ -1,6 +1,6 @@
 import { windowMenuRequest } from "../shared/window-menu";
 import { popupWindowMenu } from "./window-menu";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { networkInterfaces } from "node:os";
@@ -1034,6 +1034,21 @@ function installIpc(): void {
     return { ok: true };
   });
   ipcMain.handle("clipboard:read", () => clipboard.readText());
+  ipcMain.handle("terminal:clipboard-image", (event, rawId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    const id = requireId(rawId, "终端会话");
+    const session = store.snapshot().daemon.sessions.find(item => item.id === id);
+    if (!session || session.kind !== "pty" || !["codex", "claude"].includes(session.agent)) throw new Error("此会话不支持图片粘贴 / Image paste is unavailable for this session");
+    const image = clipboard.readImage();
+    if (image.isEmpty()) throw new Error("剪贴板中没有图片 / No image in clipboard");
+    const bytes = image.toPNG();
+    if (bytes.length > 20 * 1024 * 1024) throw new Error("图片不能超过 20 MB / Image exceeds 20 MB");
+    const directory = resolve(app.getPath("userData"), "terminal-attachments", id);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const path = resolve(directory, `${randomUUID()}.png`);
+    writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
+    return { path };
+  });
   ipcMain.handle("terminal:context-menu", (event, raw: unknown) => {
     const options = requireObject(raw);
     if (typeof options["copy"] !== "boolean" || typeof options["paste"] !== "boolean") throw new Error("终端菜单参数无效");
@@ -1155,7 +1170,16 @@ function installIpc(): void {
   ipcMain.handle("session:create", async (_event, raw: unknown) => {
     const input = requireObject(raw) as SessionCreateInput;
     const normalized = resolve(String(input.cwd ?? ""));
-    if (!isSessionLaunchWorkspace(store.snapshot(), normalized)) throw new Error("只能在已添加的项目或可用 worktree 中创建会话");
+    if (!isSessionLaunchWorkspace(store.snapshot(), normalized)) {
+      if (!input.sourceSessionId) throw new Error("只能在已添加的项目或可用 worktree 中创建会话");
+      const sourceId = requireId(input.sourceSessionId, "原会话");
+      const page = runtime instanceof RustRuntime
+        ? await runtime.listSessions({ ids: [sourceId], limit: 1 })
+        : await runtime.request(`/_prospero/control/sessions?id=${encodeURIComponent(sourceId)}&limit=1`);
+      const source = Array.isArray(page?.items) ? page.items.map(sessionInfoFromControl).find(session => session.id === sourceId) : undefined;
+      if (!source || resolve(source.cwd) !== normalized) throw new Error("原会话的工作目录不可用，请重新选择工作区 / Original session workspace is unavailable");
+    }
+    if (!existsSync(normalized) || !statSync(normalized).isDirectory()) throw new Error("原工作目录已不可用，请选择有效的工作区 / Workspace directory is unavailable");
     if (!["codex", "claude", "deepseek", "opencode", "grok", "trae", "shell", "custom"].includes(input.agent)) throw new Error("Agent 无效");
     if (input.kind !== "structured" && input.kind !== "pty") throw new Error("会话类型无效");
     if (!["strict", "standard", "yolo"].includes(input.approvalPolicy)) throw new Error("审批策略无效");

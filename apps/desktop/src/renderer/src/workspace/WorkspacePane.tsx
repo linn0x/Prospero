@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Files, FolderKanban, FolderPlus, GitBranch, Plus, Search } from "lucide-react";
+import { Columns2, Files, FolderKanban, FolderPlus, GitBranch, Plus, Search, X } from "lucide-react";
 import type { DesktopSnapshot, SessionInfo } from "../../../shared/types";
 import { Button } from "../components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../components/ui/empty";
@@ -23,7 +23,7 @@ import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_E
 const ChatPane = lazy(() => import("../ChatPane").then((module) => ({ default: module.ChatPane })));
 const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
 
-function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, onMissingSession, empty, active = true }: { active?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void; onMissingSession: (id: string) => void }) {
+function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, onMissingSession, empty, active = true, focused = true, primary = true }: { active?: boolean; focused?: boolean; primary?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void; onMissingSession: (id: string) => void }) {
   const { t } = useLocale();
   const host = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(0);
@@ -36,13 +36,18 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   const root = session ? text(dispatch?.["worktreePath"], session.cwd) : selectedRoot || snapshot.projects[0] || "";
   const { width: effectiveWidth, maxWidth, overlay } = workspaceDockLayout(available, autoWidth ? available * .48 : width);
   const [dock, setDock] = useState<DockState>(() => sessionDockState(readDockPreferences().sessions.find((item) => item.id === dockId)?.state, trajectory));
-  const [localSelection, setLocalSelection] = useState(readTerminalMousePreference);
+  const [localSelection, setLocalSelection] = useState(() => readTerminalMousePreference(undefined, session?.id));
   useEffect(() => {
-    const sync = (event: Event): void => { if (event.type === "storage" && (event as StorageEvent).key !== "prospero.terminal.mouse-mode") return; const value = (event as CustomEvent<unknown>).detail; if (typeof value === "boolean") setLocalSelection(value); else if (event.type === "storage") setLocalSelection(readTerminalMousePreference()); };
+    setLocalSelection(readTerminalMousePreference(undefined, session?.id));
+    const sync = (event: Event): void => {
+      if (event.type === "storage") { setLocalSelection(readTerminalMousePreference(undefined, session?.id)); return; }
+      const value = (event as CustomEvent<{ sessionId?: string; localSelection?: boolean }>).detail;
+      if (value?.sessionId === session?.id && typeof value.localSelection === "boolean") setLocalSelection(value.localSelection);
+    };
     window.addEventListener(TERMINAL_MOUSE_MODE_EVENT, sync);
     window.addEventListener("storage", sync);
     return () => { window.removeEventListener(TERMINAL_MOUSE_MODE_EVENT, sync); window.removeEventListener("storage", sync); };
-  }, []);
+  }, [session?.id]);
   const [trajectoryHost, setTrajectoryHost] = useState<HTMLDivElement | null>(null);
   const [dockContainer] = useState(() => {
     if (typeof document === "undefined") return null;
@@ -56,7 +61,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   const widthRef = useRef(width);
   widthRef.current = width;
   const chromeVisible = workspaceChromeVisible(focus);
-  const visible = active && chromeVisible && dock.visible && available > 0;
+  const visible = active && focused && chromeVisible && dock.visible && available > 0;
   useEffect(() => { if (visible) setDockVisited(true); }, [visible]);
   useEffect(() => {
     const element = host.current;
@@ -80,22 +85,22 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   };
   useEffect(() => {
     const open = (event: Event): void => {
-      if (!active) return;
+      if (!active || !focused) return;
       const detail = (event as CustomEvent<{ root: string; mode: ProjectTool }>).detail;
       if (!detail || typeof detail.root !== "string" || !["files", "search", "git"].includes(detail.mode)) return;
       if (!session) setSelectedRoot(detail.root);
       openTool(detail.mode);
     };
     const search = (event: KeyboardEvent): void => {
-      if (!active) return;
-      if ((window.prospero.platform === "darwin" ? event.metaKey : event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "f") {
+      if (!active || !focused || event.defaultPrevented || event.isComposing || event.altKey) return;
+      if ((window.prospero.platform === "darwin" ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) && event.shiftKey && event.key.toLowerCase() === "f") {
         event.preventDefault(); openTool("search");
       }
     };
     window.addEventListener("prospero:project-tools", open);
     window.addEventListener("keydown", search);
     return () => { window.removeEventListener("prospero:project-tools", open); window.removeEventListener("keydown", search); };
-  }, [active, dockId, focus, onToggleFocus]);
+  }, [active, focused, dockId, focus, onToggleFocus]);
   const saveWidth = (next: number): void => {
     const value = clampDockWidth(next);
     widthRef.current = value;
@@ -128,11 +133,11 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   </>;
   return <div ref={host} className={cn("pane-workspace workspace-session-layout", focus && "is-focus")} data-dock-resizing={resizing || undefined}>
     <div className={cn("workspace-grid", visible && !overlay && "has-dock")} style={{ "--context-dock-width": `${effectiveWidth}px` } as CSSProperties}>
-      <main id={active ? "workspace-session-panel" : undefined} role="tabpanel" aria-labelledby={chromeVisible && session ? `workspace-tab-${session.id}` : undefined} aria-label={focus && session ? sessionLabel(session) : undefined} className="workspace-primary">
+      <main id={active ? primary ? "workspace-session-panel" : "workspace-secondary-panel" : undefined} role="tabpanel" aria-labelledby={chromeVisible && session ? `workspace-tab-${session.id}` : undefined} aria-label={focus && session ? sessionLabel(session) : undefined} className="workspace-primary">
         {toolbar}
-        {focus && session?.kind === "pty" && <div className="workspace-focus-controls"><TerminalMouseToggle localSelection={localSelection} onChange={setLocalSelection} /></div>}
+        {focus && session?.kind === "pty" && <div className="workspace-focus-controls"><TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={setLocalSelection} /></div>}
         <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载会话…", "Loading session…")}</div>}>
-          {!session ? empty : session.kind === "pty" ? <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
+          {!session ? empty : session.kind === "pty" ? <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
         </Suspense>
       </main>
       {visible && !overlay && <>
@@ -171,17 +176,87 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   </div>;
 }
 
-export function WorkspacePane({ active = true, snapshot, activeId, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, focus }: { active?: boolean; snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onActivate: (id: string) => void; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; onMissingSession: (id: string) => void; focus: boolean }) {
+export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, onFocusedSessionChange, focus }: { active?: boolean; snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onFocusedSessionChange?: (id: string | undefined) => void; onActivate: (id: string) => void; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; onMissingSession: (id: string) => void; focus: boolean }) {
   const { t } = useLocale();
-  const session = snapshot.daemon.sessions.find((item) => item.id === activeId);
+  const session = snapshot.daemon.sessions.find(item => item.id === activeId);
+  const [splitId, setSplitId] = useState<string>();
+  const [focusedId, setFocusedId] = useState(activeId);
+  const [ratio, setRatio] = useState(50);
+  const [stacked, setStacked] = useState(false);
+  const stack = useRef<HTMLDivElement>(null);
+  const previousActive = useRef(activeId);
+  const drag = useRef<{ pointer: number; ratio: number } | undefined>(undefined);
+  const candidates = openIds.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty" && id !== activeId)).filter((item): item is SessionInfo => Boolean(item));
+  const peerId = splitId === activeId ? previousActive.current : splitId;
+  const splitSession = session?.kind === "pty" ? candidates.find(item => item.id === peerId) : undefined;
   const [recentTerminals, setRecentTerminals] = useState<string[]>([]);
-  const retained = retainTerminalIds(recentTerminals, session?.kind === "pty" ? session.id : undefined);
-  if (retained !== recentTerminals) setRecentTerminals(retained);
+  const retained = retainTerminalIds(retainTerminalIds(recentTerminals, splitSession?.id), session?.kind === "pty" ? session.id : undefined);
+  if (retained.length !== recentTerminals.length || retained.some((id, index) => id !== recentTerminals[index])) setRecentTerminals(retained);
   const terminalSessions = retained.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty")).filter((item): item is SessionInfo => Boolean(item));
-  return <div className="workspace-view workspace-view-single" style={{ position: "relative" }}>
-    {terminalSessions.map(item => <div key={item.id} inert={!active || item.id !== activeId} aria-hidden={!active || item.id !== activeId} style={{ position: "absolute", inset: 0, visibility: active && item.id === activeId ? "visible" : "hidden", minHeight: 0 }}>
-      <WorkspaceSession session={item} active={active && item.id === activeId} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} />
-    </div>)}
-    {session?.kind !== "pty" && <WorkspaceSession key={session?.id ?? "empty"} active={active} session={session} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} />}
+  useEffect(() => {
+    const previous = previousActive.current;
+    previousActive.current = activeId;
+    setSplitId(current => current === activeId ? previous : current);
+    setFocusedId(activeId);
+  }, [activeId]);
+  useEffect(() => {
+    if (focusedId === activeId || focusedId === splitSession?.id) return;
+    setFocusedId(splitSession?.id ?? activeId);
+  }, [activeId, focusedId, splitSession?.id]);
+  useEffect(() => {
+    const element = stack.current;
+    if (!element) return;
+    const measure = (): void => setStacked(element.clientWidth < 900);
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    onFocusedSessionChange?.(active ? focusedId === splitSession?.id ? focusedId : activeId : undefined);
+  }, [active, activeId, focusedId, splitSession?.id, onFocusedSessionChange]);
+  const focusSession = (id: string): void => {
+    setFocusedId(id);
+    onFocusedSessionChange?.(id);
+    if (snapshot.unreadSessionIds.includes(id)) void window.prospero.setSessionUnread(id, false);
+  };
+  const closeSplit = (): void => { setSplitId(undefined); setFocusedId(activeId); };
+  const endDrag = (event: PointerEvent<HTMLDivElement>, cancel: boolean): void => {
+    const current = drag.current;
+    if (!current || current.pointer !== event.pointerId) return;
+    if (cancel) setRatio(current.ratio);
+    drag.current = undefined;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+  return <div className="workspace-view workspace-view-single workspace-multipane">
+    {session?.kind === "pty" && (candidates.length > 0 || splitId) && <div className="workspace-split-controls">
+      <Button size="xs" variant={splitSession ? "secondary" : "ghost"} aria-pressed={Boolean(splitSession)} disabled={!splitSession && candidates.length === 0} onClick={() => splitSession ? closeSplit() : setSplitId(candidates[0]?.id)}><Columns2 />{t("分屏", "Split view")}</Button>
+      {splitSession && <><NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => setSplitId(event.target.value)}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect><Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button></>}
+    </div>}
+    <div ref={stack} className={cn("workspace-session-stack", splitSession && "is-split", stacked && "is-stacked")} style={splitSession ? { [stacked ? "gridTemplateRows" : "gridTemplateColumns"]: `${ratio}fr 6px ${100 - ratio}fr` } : undefined}>
+      {terminalSessions.map(item => {
+        const primary = item.id === activeId;
+        const visible = active && (primary || item.id === splitSession?.id);
+        return <div key={item.id} className="workspace-session-slot" data-position={primary ? "primary" : "secondary"} data-focused={focusedId === item.id || undefined} inert={!visible} aria-hidden={!visible} style={visible ? undefined : { position: "absolute", inset: 0, visibility: "hidden", pointerEvents: "none" }} onPointerDownCapture={() => visible && focusSession(item.id)} onFocusCapture={() => visible && focusSession(item.id)}>
+          <WorkspaceSession session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} />
+        </div>;
+      })}
+      {splitSession && <div className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => setRatio(50)} onPointerDown={event => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        drag.current = { pointer: event.pointerId, ratio };
+        event.currentTarget.setPointerCapture(event.pointerId);
+        event.currentTarget.focus();
+      }} onPointerMove={event => {
+        if (drag.current?.pointer !== event.pointerId || !stack.current) return;
+        const rect = stack.current.getBoundingClientRect();
+        setRatio(Math.max(25, Math.min(75, 100 * (stacked ? (event.clientY - rect.top) / rect.height : (event.clientX - rect.left) / rect.width))));
+      }} onPointerUp={event => endDrag(event, false)} onPointerCancel={event => endDrag(event, true)} onLostPointerCapture={event => endDrag(event, true)} onKeyDown={event => {
+        if (event.key === "Escape" && drag.current) { setRatio(drag.current.ratio); drag.current = undefined; event.preventDefault(); return; }
+        const next = event.key === "Home" ? 25 : event.key === "End" ? 75 : ["ArrowLeft", "ArrowUp"].includes(event.key) ? ratio - 5 : ["ArrowRight", "ArrowDown"].includes(event.key) ? ratio + 5 : undefined;
+        if (next !== undefined) { event.preventDefault(); setRatio(Math.max(25, Math.min(75, next))); }
+      }} />}
+      {session?.kind !== "pty" && <WorkspaceSession key={session?.id ?? "empty"} active={active} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} />}
+    </div>
   </div>;
 }

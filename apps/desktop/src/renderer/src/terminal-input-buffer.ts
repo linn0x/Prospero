@@ -3,7 +3,7 @@
 export class TerminalInputBuffer {
   private text = "";
   private timer: ReturnType<typeof setTimeout> | undefined;
-  constructor(private readonly deliver: (value: string) => Promise<boolean>) {}
+  constructor(private readonly deliver: (value: string, binary?: boolean) => Promise<boolean>) {}
   append(value: string): void {
     if (!value) return;
     this.text += value;
@@ -15,6 +15,11 @@ export class TerminalInputBuffer {
     if (!this.text) return undefined;
     const text = this.text; this.text = "";
     return this.deliver(text);
+  }
+  appendBinary(value: string): Promise<boolean> | undefined {
+    if (!value) return undefined;
+    void this.flush();
+    return this.deliver(value, true);
   }
 }
 

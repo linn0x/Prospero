@@ -8,6 +8,7 @@ import {
   defaultTerminal,
   resetTmuxPathCache,
   sessionName,
+  socketPath,
   tmuxPath,
   wrapSpawn,
   writeConfig,
@@ -122,11 +123,12 @@ describe("tmux 托管", () => {
     if (!tmux) return; // 没装 tmux 就跳过,不让环境差异变成红灯
     const home = tempHome();
     const conf = writeConfig(home);
+    const socket = socketPath(home);
     const name = `prospero-conftest-${String(Date.now())}`;
-    const r = spawnSync(tmux, ["-f", conf, "new-session", "-d", "-s", name, "true"], {
+    const r = spawnSync(tmux, ["-S", socket, "-f", conf, "new-session", "-d", "-s", name, "true"], {
       encoding: "utf8",
     });
-    spawnSync(tmux, ["kill-session", "-t", name], { stdio: "ignore" });
+    spawnSync(tmux, ["-S", socket, "kill-session", "-t", name], { stdio: "ignore" });
     const noise = `${r.stderr ?? ""}${r.stdout ?? ""}`;
     expect(noise).not.toMatch(/bad key|unknown option|invalid|error/i);
   });
@@ -145,15 +147,21 @@ describe("tmux 托管", () => {
   it("只给目标 Prospero session 配置 UI 与可滚动历史", () => {
     const tmux = tmuxPath();
     if (!tmux) return;
+    const home = tempHome();
+    const conf = writeConfig(home);
+    const socket = socketPath(home);
     const id = `optiontest-${String(Date.now())}`;
     const name = sessionName(id);
-    const created = spawnSync(tmux, ["new-session", "-d", "-s", name, "sleep", "10"]);
+    const legacyName = `prospero-legacy-${String(Date.now())}`;
+    expect(spawnSync(tmux, ["new-session", "-d", "-s", legacyName, "sleep", "10"]).status).toBe(0);
+    const globalBefore = spawnSync(tmux, ["show-window-options", "-gv", "history-limit"], { encoding: "utf8" }).stdout.trim();
+    const created = spawnSync(tmux, ["-S", socket, "-f", conf, "new-session", "-d", "-s", name, "/bin/sh", "-c", "sleep 0.2; seq 1 2500; sleep 1"]);
     expect(created.status).toBe(0);
     try {
-      expect(configureSession(id, tmux)).toBe(true);
+      expect(configureSession(id, tmux, socket)).toBe(true);
       const option = (scope: "session" | "window", name: string): string => {
         const command = scope === "window" ? "show-window-options" : "show-options";
-        return spawnSync(tmux, [command, "-v", "-t", sessionName(id), name], {
+        return spawnSync(tmux, ["-S", socket, command, "-v", "-t", sessionName(id), name], {
           encoding: "utf8",
         }).stdout.trim();
       };
@@ -164,8 +172,19 @@ describe("tmux 托管", () => {
       expect(option("session", "xterm-keys")).toBe("on");
       expect(option("window", "history-limit")).toBe("10000");
       expect(option("window", "window-size")).toBe("latest");
+      let history = "";
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        history = spawnSync(tmux, ["-S", socket, "capture-pane", "-p", "-t", name, "-S", "-2500"], { encoding: "utf8" }).stdout;
+        if (history.includes("2500")) break;
+        spawnSync("/bin/sleep", ["0.05"], { stdio: "ignore" });
+      }
+      expect(history).toMatch(/(?:^|\n)\s*1\s*\n/);
+      expect(history).toContain("2500");
+      expect(spawnSync(tmux, ["show-window-options", "-gv", "history-limit"], { encoding: "utf8" }).stdout.trim()).toBe(globalBefore);
     } finally {
-      spawnSync(tmux, ["kill-session", "-t", name], { stdio: "ignore" });
+      spawnSync(tmux, ["-S", socket, "kill-session", "-t", name], { stdio: "ignore" });
+      spawnSync(tmux, ["kill-session", "-t", legacyName], { stdio: "ignore" });
     }
   });
 });

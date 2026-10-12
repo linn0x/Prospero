@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -162,6 +162,7 @@ impl Store {
             transaction.execute_batch(include_str!("orchestration/schema-v31.sql"))?;
             transaction.execute_batch(include_str!("orchestration/schema-v32.sql"))?;
             transaction.execute_batch(include_str!("orchestration/schema-v33.sql"))?;
+            transaction.execute_batch(include_str!("agent/schema-v34.sql"))?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -253,6 +254,9 @@ impl Store {
             if version <= 32 {
                 transaction.execute_batch(include_str!("orchestration/schema-v33.sql"))?;
             }
+            if version <= 33 {
+                transaction.execute_batch(include_str!("agent/schema-v34.sql"))?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -320,6 +324,16 @@ impl Store {
         id: Option<String>,
         extra: impl FnOnce(&Transaction<'_>, &SessionHead) -> Result<()>,
     ) -> Result<SessionHead> {
+        self.create_session_with_launch(input, id, SessionLaunchOptions::default(), extra)
+    }
+
+    pub(crate) fn create_session_with_launch(
+        &mut self,
+        input: CreateSession,
+        id: Option<String>,
+        launch: SessionLaunchOptions,
+        extra: impl FnOnce(&Transaction<'_>, &SessionHead) -> Result<()>,
+    ) -> Result<SessionHead> {
         if let Some(id) = &id {
             validate_id(id)?;
         }
@@ -334,6 +348,10 @@ impl Store {
             workspace: input.workspace,
             lifecycle: SessionLifecycle::Active,
             status: SessionStatus::Idle,
+            account_id: launch.account_id,
+            model: launch.model,
+            effort: launch.effort,
+            approval_policy: launch.approval_policy,
             created_at: timestamp,
             updated_at: timestamp,
             revision: 1,
@@ -506,6 +524,49 @@ impl Store {
                     params![scope, workspace],
                 )?;
             }
+        }
+        Self::append_event(
+            &transaction,
+            "sessions",
+            "session.updated",
+            id,
+            serde_json::to_value(&session)?,
+        )?;
+        transaction.commit()?;
+        Ok(session)
+    }
+
+    pub(crate) fn update_session_metadata_with(
+        &mut self,
+        id: &str,
+        update: impl FnOnce(&mut SessionHead),
+        extra: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> Result<SessionHead> {
+        validate_id(id)?;
+        let mut session = self.session(id)?;
+        let previous = session.clone();
+        update(&mut session);
+        session.revision += 1;
+        session.updated_at = now();
+        let transaction = self.connection.transaction()?;
+        extra(&transaction)?;
+        let changed = transaction.execute(
+            "UPDATE session_heads SET revision=?1,payload=?2 WHERE id=?3 AND revision=?4",
+            params![
+                session.revision,
+                serde_json::to_string(&session)?,
+                id,
+                previous.revision
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        for (scope, workspace) in [(0, ""), (1, session.workspace.as_str())] {
+            transaction.execute(
+                "UPDATE session_counts SET revision=revision+1 WHERE scope=?1 AND workspace=?2",
+                params![scope, workspace],
+            )?;
         }
         Self::append_event(
             &transaction,
@@ -816,6 +877,10 @@ impl Store {
                     workspace: "/synthetic".into(),
                     lifecycle: SessionLifecycle::Archived,
                     status: SessionStatus::Completed,
+                    account_id: None,
+                    model: None,
+                    effort: None,
+                    approval_policy: None,
                     created_at: index as i64 + 1,
                     updated_at: index as i64 + 1,
                     revision: 1,

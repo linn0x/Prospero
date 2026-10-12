@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TerminalRecovery } from "../src/main/terminal-recovery";
 import { RustProcess } from "../src/main/rust-process";
-import { RustRuntime, rustTerminalView } from "../src/main/rust-runtime";
+import { RustRuntime, rustSessionInfo, rustTerminalView } from "../src/main/rust-runtime";
 import type { StateStore } from "../src/main/state-store";
 import type { TerminalPage } from "@prospero/protocol/rust-daemon";
 
@@ -14,6 +14,22 @@ const mocks = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("node:child_process", async (original) => ({ ...await original<typeof import("node:child_process")>(), spawn: mocks.spawn }));
 
 afterEach(() => { vi.restoreAllMocks(); });
+
+it("preserves terminal account and launch choices in the desktop projection", () => {
+  const session = rustSessionInfo({
+    id: "pty", agent: "codex", kind: "pty", title: "Codex", workspace: "/project", lifecycle: "active", status: "running", createdAt: 1, updatedAt: 1, revision: 1,
+    accountId: "profile-codex", model: "chosen-model", effort: "high", approvalPolicy: "strict",
+  });
+  expect(session).toMatchObject({ accountId: "profile-codex", model: "chosen-model", effort: "high", approvalPolicy: "strict", terminalMode: "events" });
+});
+
+it.each(["strict", "standard", "yolo"] as const)("forwards the %s policy when creating a Rust PTY", async approvalPolicy => {
+  const createTerminal = vi.fn(async (input: Record<string, unknown>) => ({ id: "pty", agent: "codex", kind: "pty", title: "Codex", workspace: "/project", lifecycle: "active", status: "running", createdAt: 1, updatedAt: 1, revision: 1, ...input }));
+  const runtime = new RustRuntime({ backend: "api" } as StateStore, "/synthetic/prosperod", "/synthetic/daemon");
+  Object.assign(runtime, { connection: { client: { createTerminal } }, refresh: async () => undefined });
+  await runtime.request("/_prospero/control/session/create", { method: "POST", body: { kind: "pty", agent: "codex", cwd: "/project", accountId: "native-codex", approvalPolicy } });
+  expect(createTerminal).toHaveBeenCalledWith(expect.objectContaining({ approvalPolicy, accountId: "native-codex" }), expect.any(AbortSignal), 180_000);
+});
 
 function health(buildId: string, activeRuntimeSessions = 0): Record<string, unknown> {
   return {

@@ -1,0 +1,16 @@
+[package]
+name = "avt"
+version = "0.18.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/asciinema/avt"
+
+[dependencies]
+rgb = "0.8.33"
+unicode-width = "0.1.13"
+
+[dev-dependencies]
+rand = "0.7"
+proptest = "=1.9.0"
+tempfile = "=3.24.0"
+pretty_assertions = "1.0"

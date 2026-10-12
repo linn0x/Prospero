@@ -20,13 +20,16 @@ export function allowNativeTerminalPaste(event: Pick<KeyboardEvent, "preventDefa
   return allowed;
 }
 
-export function bindTerminalPaste(target: EventTarget, terminal: { paste(text: string): void }, canPaste: () => boolean, blocked: () => void = () => {}, pasted: () => void = () => {}, nonText: () => void = () => {}): () => void {
+export function bindTerminalPaste(target: EventTarget, terminal: { paste(text: string): void }, canPaste: () => boolean, blocked: () => void = () => {}, pasted: () => void = () => {}, nonText: () => void = () => {}, image?: () => void): () => void {
   const handle = (raw: Event): void => {
     const event = raw as ClipboardEvent;
     const cancelled = event.defaultPrevented;
     event.preventDefault(); event.stopImmediatePropagation();
     if (cancelled) return;
     if (!canPaste()) { blocked(); return; }
+    const clipboard = event.clipboardData;
+    const hasImage = Array.from(clipboard?.items ?? []).some(item => item.type.startsWith("image/")) || Array.from(clipboard?.types ?? []).some(type => type.startsWith("image/"));
+    if (hasImage && image) { image(); return; }
     const text = event.clipboardData?.getData("text/plain");
     if (!text) { if (event.clipboardData?.types?.length) nonText(); return; }
     pasted();

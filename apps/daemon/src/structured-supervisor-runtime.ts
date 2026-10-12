@@ -21,6 +21,7 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -30,6 +31,10 @@ import { resolveStructuredSupervisorRunnerPath } from "./structured-supervisor-c
 
 const SNAPSHOT_PREFIX = "structured-supervisor-";
 const STAGING_PREFIX = ".structured-supervisor-staging-";
+const QUARANTINE_PREFIX = ".structured-supervisor-quarantine-";
+const LOCK_DIRECTORY = ".structured-supervisor-recovery-lock";
+const LOCK_OWNER_FILE = "owner.json";
+const LOCK_VERSION = 1;
 const LEASE_DIR = "leases";
 const SNAPSHOT_VERSION = 2;
 const LEASE_VERSION = 1;
@@ -544,6 +549,21 @@ function readActiveLeases(runtimeRoot: string, now: number): Set<string> | null 
       let metadata;
       try { metadata = lstatSync(file); } catch { return null; }
       if (isIgnoredMetadataFile(entry.name, metadata)) continue;
+      if (entry.name.includes(".json.") && entry.name.endsWith(".tmp")) {
+        if (!metadata.isFile() || metadata.isSymbolicLink() || !isPrivateFile(file)) return null;
+        const match = /^([a-f0-9]{64})-(\d+)-([a-f0-9]{24})\.json\.(\d+)\.([a-f0-9]{12})\.tmp$/.exec(entry.name);
+        if (!match) return null;
+        const digest = match[1];
+        const pid = Number(match[4]);
+        if (!digest) return null;
+        const expired = now - metadata.mtimeMs > LEASE_STALE_MS;
+        if (!Number.isSafeInteger(pid) || pid <= 1 || !expired || processAlive(pid)) {
+          active.add(digest);
+          continue;
+        }
+        try { rmSync(file, { force: true }); } catch { return null; }
+        continue;
+      }
       if (!metadata.isFile() || metadata.isSymbolicLink() || !entry.name.endsWith(".json")) return null;
       if (!isPrivateFile(file)) return null;
       let parsed: unknown;
@@ -604,9 +624,91 @@ function cleanupRuntimeCache(runtimeRoot: string): void {
       }
       continue;
     }
+    if (entry.name.startsWith(QUARANTINE_PREFIX)) {
+      if (now - metadata.mtimeMs >= STAGING_GC_AGE_MS) {
+        try { removePrivateSnapshot(directory); } catch { return; }
+      }
+      continue;
+    }
     const digest = snapshotDigestFromName(entry.name);
     if (!digest || active === null || active.has(digest) || now - metadata.mtimeMs < FINAL_GC_AGE_MS) continue;
     try { removePrivateSnapshot(directory); } catch { /* retain uncertain final image */ }
+  }
+}
+
+function acquireRuntimeLock(runtimeRoot: string): () => void {
+  const lock = path.join(runtimeRoot, LOCK_DIRECTORY);
+  const owner = path.join(lock, LOCK_OWNER_FILE);
+  const deadline = Date.now() + 30_000;
+  while (true) {
+    try {
+      mkdirSync(lock, { mode: 0o700 });
+      const token = randomBytes(24).toString("hex");
+      try {
+        atomicPrivateJson(owner, { version: LOCK_VERSION, pid: process.pid, token });
+      } catch (error) {
+        try { rmdirSync(lock); } catch { throw error; }
+        throw error;
+      }
+      return () => {
+        try { rmSync(owner, { force: true }); } catch { return; }
+        try { rmdirSync(lock); } catch { return; }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let metadata;
+      try { metadata = lstatSync(lock); } catch (metadataError) {
+        if ((metadataError as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw metadataError;
+      }
+      if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700) {
+        throw new Error("structured supervisor runtime lock is unsafe");
+      }
+      if (!isPrivateFile(owner)) {
+        if (Date.now() >= deadline) throw new Error("structured supervisor runtime lock owner is unknown");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        continue;
+      }
+      let parsed: unknown;
+      try { parsed = JSON.parse(readFileSync(owner, "utf8")); } catch (ownerError) {
+        if ((ownerError as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw new Error("structured supervisor runtime lock owner is invalid");
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("structured supervisor runtime lock owner is invalid");
+      const value = parsed as { version?: unknown; pid?: unknown; token?: unknown };
+      if (value.version !== LOCK_VERSION || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 1 || typeof value.token !== "string" || !/^[a-f0-9]{48}$/.test(value.token)) {
+        throw new Error("structured supervisor runtime lock owner is invalid");
+      }
+      if (processAlive(value.pid)) {
+        if (Date.now() >= deadline) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        continue;
+      }
+      const stale = path.join(runtimeRoot, `${LOCK_DIRECTORY}.stale-${value.token}`);
+      try {
+        renameSync(lock, stale);
+      } catch (staleError) {
+        const code = (staleError as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "EEXIST" && code !== "ENOTEMPTY") throw staleError;
+      }
+    }
+  }
+}
+
+function quarantineInvalidSnapshot(runtimeRoot: string, directory: string, digest: string): boolean {
+  const root = path.resolve(runtimeRoot);
+  const target = path.resolve(directory);
+  if (path.dirname(target) !== root || path.basename(target) !== `${SNAPSHOT_PREFIX}${digest}`) return false;
+  if (!privateTree(target)) return false;
+  const active = readActiveLeases(root, Date.now());
+  if (active === null || active.has(digest)) return false;
+  const quarantine = path.join(root, `${QUARANTINE_PREFIX}${digest}-${randomBytes(8).toString("hex")}`);
+  try {
+    renameSync(target, quarantine);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    return false;
   }
 }
 
@@ -795,28 +897,63 @@ export function createStructuredSupervisorRuntimeSnapshot(
   }
   ensurePrivateDirectory(options.runtimeRoot);
   ensurePrivateDirectory(path.join(options.runtimeRoot, LEASE_DIR));
-  cleanupRuntimeCache(options.runtimeRoot);
+  const cleanupRelease = acquireRuntimeLock(options.runtimeRoot);
+  try {
+    cleanupRuntimeCache(options.runtimeRoot);
+  } finally {
+    cleanupRelease();
+  }
 
   for (let attempt = 1; attempt <= MAX_CAPTURE_ATTEMPTS; attempt++) {
-    const image = collectRuntimeImage(runner);
-    const contentDigest = digestFiles(image.files);
-    const record = expectedSnapshotRecord(contentDigest, image);
-    const digest = imageDigest(contentDigest, record);
-    const directory = path.join(options.runtimeRoot, `${SNAPSHOT_PREFIX}${digest}`);
-    if (validExistingSnapshot(directory, digest, contentDigest, image)) {
-      // Re-read the source graph before adopting a shared final image.
-      const current = collectRuntimeImage(runner);
-      if (digestFiles(current.files) !== contentDigest) continue;
-      const lease = createLease(options.runtimeRoot, digest);
-      return {
-        runnerPath: path.join(directory, image.runnerTarget),
-        directory,
-        heartbeat: lease.heartbeat,
-        release: lease.release,
-      };
+    let captured: {
+      image: RuntimeImage;
+      contentDigest: string;
+      record: SnapshotRecord;
+      digest: string;
+    } | undefined;
+    const decisionRelease = acquireRuntimeLock(options.runtimeRoot);
+    try {
+      const image = collectRuntimeImage(runner);
+      const contentDigest = digestFiles(image.files);
+      const record = expectedSnapshotRecord(contentDigest, image);
+      const digest = imageDigest(contentDigest, record);
+      const directory = path.join(options.runtimeRoot, `${SNAPSHOT_PREFIX}${digest}`);
+      if (validExistingSnapshot(directory, digest, contentDigest, image)) {
+        const current = collectRuntimeImage(runner);
+        if (digestFiles(current.files) !== contentDigest) continue;
+        const lease = createLease(options.runtimeRoot, digest);
+        return {
+          runnerPath: path.join(directory, image.runnerTarget),
+          directory,
+          heartbeat: lease.heartbeat,
+          release: lease.release,
+        };
+      }
+      if (isPrivateDirectory(directory)) {
+        if (validExistingSnapshot(directory, digest, contentDigest, image)) {
+          const lease = createLease(options.runtimeRoot, digest);
+          return {
+            runnerPath: path.join(directory, image.runnerTarget),
+            directory,
+            heartbeat: lease.heartbeat,
+            release: lease.release,
+          };
+        }
+        quarantineInvalidSnapshot(options.runtimeRoot, directory, digest);
+      }
+      captured = { image, contentDigest, record, digest };
+    } finally {
+      decisionRelease();
     }
+    if (!captured) continue;
+    const { image, contentDigest, record, digest } = captured;
 
-    const staging = mkdtempSync(path.join(options.runtimeRoot, STAGING_PREFIX));
+    let staging: string;
+    try {
+      staging = mkdtempSync(path.join(options.runtimeRoot, STAGING_PREFIX));
+    } catch (error) {
+      throw error;
+    }
     chmodSync(staging, 0o700);
     try {
       copyImage(staging, image);
@@ -831,16 +968,22 @@ export function createStructuredSupervisorRuntimeSnapshot(
 
       privateWrite(path.join(staging, "snapshot.json"), `${JSON.stringify(record)}\n`);
       const published = path.join(options.runtimeRoot, `${SNAPSHOT_PREFIX}${digest}`);
-      publishSnapshot(staging, published, digest, contentDigest, image);
-      if (!validExistingSnapshot(published, digest, contentDigest, image)) {
-        throw new Error("structured supervisor runtime snapshot is incomplete");
+      const publishRelease = acquireRuntimeLock(options.runtimeRoot);
+      let lease: ReturnType<typeof createLease> | undefined;
+      try {
+        publishSnapshot(staging, published, digest, contentDigest, image);
+        if (!validExistingSnapshot(published, digest, contentDigest, image)) {
+          throw new Error("structured supervisor runtime snapshot is incomplete");
+        }
+        lease = createLease(options.runtimeRoot, digest);
+      } finally {
+        publishRelease();
       }
-      const lease = createLease(options.runtimeRoot, digest);
       return {
         runnerPath: path.join(published, image.runnerTarget),
         directory: published,
-        heartbeat: lease.heartbeat,
-        release: lease.release,
+        heartbeat: lease!.heartbeat,
+        release: lease!.release,
       };
     } finally {
       // rename moved staging on success; exact private-path cleanup is safe on

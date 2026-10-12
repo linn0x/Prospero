@@ -1055,7 +1055,7 @@ impl Store {
             }
         };
         let agent = input.agent;
-        self.create_session_with_id(
+        self.create_session_with_launch(
             CreateSession {
                 agent,
                 kind: SessionKind::Structured,
@@ -1063,6 +1063,19 @@ impl Store {
                 workspace: input.workspace,
             },
             id,
+            SessionLaunchOptions {
+                account_id: account_id.clone().or_else(|| match agent {
+                    AgentKind::Codex => Some(crate::agent::NATIVE_CODEX_ID.into()),
+                    AgentKind::Claude => Some(crate::accounts::NATIVE_CLAUDE_ID.into()),
+                    _ => None,
+                }),
+                model: model.clone(),
+                effort: effort.clone(),
+                approval_policy: Some(match policy {
+                    ApprovalPolicy::Manual => TerminalApprovalPolicy::Standard,
+                    ApprovalPolicy::Auto => TerminalApprovalPolicy::Yolo,
+                }),
+            },
             |tx, head| {
                 tx.execute(
                     "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id,agent_preset) \
@@ -1151,9 +1164,21 @@ impl Store {
         if !run.active {
             return Err(Error::Conflict);
         }
-        self.connection.execute(
-            "UPDATE agent_runs SET approval_policy=?1 WHERE session_id=?2",
-            params![policy.label(), id],
+        let head_policy = if policy == ApprovalPolicy::Auto {
+            TerminalApprovalPolicy::Yolo
+        } else {
+            TerminalApprovalPolicy::Standard
+        };
+        self.update_session_metadata_with(
+            id,
+            |head| head.approval_policy = Some(head_policy),
+            |transaction| {
+                transaction.execute(
+                    "UPDATE agent_runs SET approval_policy=?1 WHERE session_id=?2",
+                    params![policy.label(), id],
+                )?;
+                Ok(())
+            },
         )?;
         Ok(())
     }
@@ -1188,9 +1213,19 @@ impl Store {
         if !run.active {
             return Err(Error::Conflict);
         }
-        self.connection.execute(
-            "UPDATE agent_runs SET model=?1, effort=?2 WHERE session_id=?3",
-            params![model, effort, id],
+        self.update_session_metadata_with(
+            id,
+            |head| {
+                head.model = Some(model.clone());
+                head.effort = effort.clone();
+            },
+            |transaction| {
+                transaction.execute(
+                    "UPDATE agent_runs SET model=?1, effort=?2 WHERE session_id=?3",
+                    params![model, effort, id],
+                )?;
+                Ok(())
+            },
         )?;
         Ok((model, effort))
     }
@@ -1672,6 +1707,78 @@ mod tests {
     }
 
     #[test]
+    fn agent_metadata_updates_publish_revision_and_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let head = store
+            .create_agent_session(
+                CreateAgentSession {
+                    agent: AgentKind::Codex,
+                    title: "metadata".into(),
+                    workspace: "/synthetic".into(),
+                    auto_approve: false,
+                    mode: None,
+                    model: Some("gpt-test".into()),
+                    effort: Some("medium".into()),
+                    agent_preset: None,
+                    account_id: None,
+                    resume: None,
+                },
+                ApprovalPolicy::Manual,
+            )
+            .unwrap();
+        let updated = store.session(&head.id).unwrap();
+        store
+            .set_approval_policy(&head.id, ApprovalPolicy::Auto)
+            .unwrap();
+        let approval = store.session(&head.id).unwrap();
+        assert_eq!(approval.revision, updated.revision + 1);
+        assert_eq!(store.events("sessions", 0, 10).unwrap().latest_seq, 2);
+        store
+            .set_agent_selection(&head.id, "gpt-next", Some("high"))
+            .unwrap();
+        let selection = store.session(&head.id).unwrap();
+        assert_eq!(selection.revision, approval.revision + 1);
+        assert_eq!(store.events("sessions", 0, 10).unwrap().latest_seq, 3);
+        let counts_revision: i64 = store
+            .connection
+            .query_row(
+                "SELECT revision FROM session_counts WHERE scope=0 AND workspace=''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(counts_revision, 3);
+    }
+
+    #[test]
+    fn agent_metadata_update_rolls_back_with_agent_run_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let id = active_child_session(&mut store, "rollback");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_agent_model BEFORE UPDATE OF model ON agent_runs
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        assert!(store.set_agent_selection(&id, "gpt-next", None).is_err());
+        let session = store.session(&id).unwrap();
+        assert_eq!(session.revision, 1);
+        assert_eq!(store.events("sessions", 0, 10).unwrap().latest_seq, 1);
+        let model: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT model FROM agent_runs WHERE session_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, None);
+    }
+
+    #[test]
     fn completed_cross_model_child_can_be_reopened_for_a_new_fan_in() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(directory.path()).unwrap();
@@ -2114,7 +2221,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
         assert_eq!(columns, 5);
         assert_eq!(queue_columns, 1);
     }

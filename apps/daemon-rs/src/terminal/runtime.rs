@@ -92,6 +92,7 @@ impl Terminals {
             account_id: None,
             model: None,
             effort: None,
+            approval_policy: None,
         };
         let spec = ProgramSpec {
             program,
@@ -140,8 +141,8 @@ impl Terminals {
         self.0.failed.load(Ordering::Acquire)
     }
 
-    pub async fn create(&self, input: CreateTerminal) -> Result<SessionHead> {
-        let spec = self.pty_program_for(&input).await?;
+    pub async fn create(&self, mut input: CreateTerminal) -> Result<SessionHead> {
+        let spec = self.pty_program_for(&mut input).await?;
         self.create_with(input, spec).await
     }
 
@@ -264,10 +265,7 @@ impl Terminals {
                 .send_modify(|seq| *seq = seq.wrapping_add(1));
             return;
         }
-        let finalized = match terminal.archive().await {
-            Ok(archive) => runtime.finish(&head.id, archive).await,
-            Err(error) => Err(error),
-        };
+        let finalized = runtime.finish_handle(&head.id, &terminal).await;
         if finalized.is_ok() {
             let _ = terminal.release().await;
         }
@@ -386,6 +384,85 @@ impl Terminals {
         }
     }
 
+    async fn checkpoint_cursor(&self, id: &str) -> Result<i64> {
+        let mut delay = Duration::from_millis(25);
+        loop {
+            let id = id.to_owned();
+            match self
+                .0
+                .database
+                .call_control("terminal.checkpoint.cursor", move |store| {
+                    store.terminal_checkpoint_seq(&id)
+                })
+                .await
+            {
+                Ok(seq) => return Ok(seq),
+                Err(error) if retryable_database_pressure(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn finish_handle(&self, id: &str, terminal: &Handle) -> Result<()> {
+        let mut seq = self.checkpoint_cursor(id).await?;
+        loop {
+            let archive = match terminal.checkpoint(Some(seq)).await? {
+                Some(archive) => archive,
+                None => {
+                    let page = terminal
+                        .read(TerminalQuery {
+                            after_seq: Some(seq),
+                            wait_ms: Some(0),
+                        })
+                        .await?;
+                    if !page.exited || page.latest_seq != seq || page.resync_required {
+                        return Err(Error::Conflict);
+                    }
+                    Archive {
+                        snapshot: terminal.snapshot().await?,
+                        floor: page.floor_seq,
+                        start: seq,
+                        seq,
+                        latest_seq: seq,
+                        events: Vec::new(),
+                        exit_code: page.exit_code,
+                    }
+                }
+            };
+            if archive.latest_seq <= archive.seq {
+                return self.finish(id, archive).await;
+            }
+            if archive.seq <= seq {
+                return Err(Error::Conflict);
+            }
+            let next = archive.seq;
+            let mut delay = Duration::from_millis(25);
+            loop {
+                let id = id.to_owned();
+                let archive = archive.clone();
+                match self
+                    .0
+                    .database
+                    .call_control("terminal.checkpoint", move |store| {
+                        store.checkpoint_terminal(&id, archive)
+                    })
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) if retryable_database_pressure(&error) => {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_millis(500));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            seq = next;
+        }
+    }
+
     async fn fail(&self, id: &str) -> Result<()> {
         let mut delay = Duration::from_millis(25);
         loop {
@@ -454,19 +531,21 @@ impl Terminals {
     }
 
     async fn persist_live(&self, id: &str, terminal: &Handle) -> Result<()> {
-        let mut seq = 0;
+        let mut seq = self.checkpoint_cursor(id).await?;
+        let mut catching_up = false;
+        let mut replay_warning = false;
         loop {
-            tokio::select! {
-                _ = self.stopping(), if terminal.hosted() => return Ok(()),
-                _ = terminal.wait_exited() => return Ok(()),
-                _ = terminal.wait_output(seq) => {},
-            }
-            // A fixed window from the first change batches a burst without
-            // postponing persistence indefinitely under continuous output.
-            tokio::select! {
-                _ = self.stopping(), if terminal.hosted() => return Ok(()),
-                _ = terminal.wait_exited() => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+            if !catching_up {
+                tokio::select! {
+                    _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                    _ = terminal.wait_exited() => return Ok(()),
+                    _ = terminal.wait_output(seq) => {},
+                }
+                tokio::select! {
+                    _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                    _ = terminal.wait_exited() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                }
             }
             let permit = tokio::select! {
                 _ = self.stopping(), if terminal.hosted() => return Ok(()),
@@ -475,13 +554,37 @@ impl Terminals {
             };
             let archive = tokio::select! {
                 _ = self.stopping(), if terminal.hosted() => return Ok(()),
-                archive = terminal.checkpoint(Some(seq)) => archive?,
+                archive = terminal.checkpoint(Some(seq)) => archive,
             };
             drop(permit);
+            let archive = match archive {
+                Ok(archive) => archive,
+                Err(Error::Feature(code, _)) if code == "terminal_replay_unavailable" => {
+                    if !replay_warning {
+                        eprintln!(
+                            "terminal replay journal is unavailable; preserving the live terminal"
+                        );
+                        replay_warning = true;
+                    }
+                    catching_up = true;
+                    tokio::select! {
+                        _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                        _ = terminal.wait_exited() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let Some(archive) = archive else {
+                catching_up = false;
                 continue;
             };
             let next = archive.seq;
+            if next <= seq {
+                return Err(Error::Conflict);
+            }
+            let more = archive.latest_seq > next;
             let id = id.to_owned();
             match self
                 .0
@@ -493,11 +596,15 @@ impl Terminals {
             {
                 Ok(()) => {
                     seq = next;
+                    catching_up = more;
                     self.0
                         .changed
                         .send_modify(|value| *value = value.wrapping_add(1));
                 }
-                Err(error) if retryable_database_pressure(&error) => {}
+                Err(error) if retryable_database_pressure(&error) => {
+                    catching_up = true;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -560,6 +667,18 @@ impl Terminals {
             command.cwd(directory);
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
+            command.env("CLICOLOR", "1");
+            command.env("TERM_PROGRAM", "Prospero");
+            command.env_remove("NO_COLOR");
+            if command
+                .get_env("FORCE_COLOR")
+                .is_some_and(|value| value == "0")
+            {
+                command.env_remove("FORCE_COLOR");
+            }
+            if command.get_env("LANG").is_none() {
+                command.env("LANG", "en_US.UTF-8");
+            }
             if let Some(control) = control_environment {
                 for (key, value) in control.vars(Some(&session_id)) {
                     command.env(key, value);
@@ -598,6 +717,7 @@ impl Terminals {
                         floor: 0,
                         start: 0,
                         seq: 0,
+                        latest_seq: 0,
                         events: Vec::new(),
                         exit_code: None,
                     },
@@ -626,9 +746,8 @@ impl Terminals {
         if let Err(error) = running {
             let _ = terminal.stop().await;
             terminal.wait_exited().await;
-            let archive = terminal.archive().await?;
             let id = head.id;
-            self.finish(&id, archive).await?;
+            self.finish_handle(&id, &terminal).await?;
             return Err(error);
         }
         self.0
@@ -722,7 +841,11 @@ impl Terminals {
         })
         .await
         .map_err(|_| Error::Timeout)?;
-        self.check()
+        if self.failed() {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -786,38 +909,6 @@ fn push_env(env: &mut Vec<(String, String)>, key: &str, value: impl Into<String>
     env.push((key.into(), value.into()));
 }
 
-#[cfg(unix)]
-fn private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
-}
-
-fn native_codex_environment(data: &Path) -> Result<Vec<(String, String)>> {
-    let root = data
-        .join("agent-accounts")
-        .join("codex")
-        .join(NATIVE_CODEX_ID);
-    private_dir(&root)?;
-    crate::cross_model_tool::install_codex_skill(&root)?;
-    Ok(vec![
-        ("OPENAI_API_KEY".into(), String::new()),
-        ("CODEX_API_KEY".into(), String::new()),
-        ("CODEX_ACCESS_TOKEN".into(), String::new()),
-        ("CODEX_REFRESH_TOKEN".into(), String::new()),
-        ("CODEX_HOME".into(), root.to_string_lossy().into_owned()),
-        (
-            "CODEX_SQLITE_HOME".into(),
-            root.to_string_lossy().into_owned(),
-        ),
-    ])
-}
-
 fn claude_binary() -> String {
     std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
 }
@@ -827,7 +918,9 @@ fn codex_binary() -> String {
 }
 
 impl Terminals {
-    async fn pty_program_for(&self, input: &CreateTerminal) -> Result<Option<ProgramSpec>> {
+    async fn pty_program_for(&self, input: &mut CreateTerminal) -> Result<Option<ProgramSpec>> {
+        let policy = input.approval_policy.unwrap_or_default();
+        input.approval_policy = Some(policy);
         let Some(agent) = input.agent else {
             if input.account_id.is_some() || input.model.is_some() || input.effort.is_some() {
                 return Err(Error::Invalid(
@@ -838,7 +931,7 @@ impl Terminals {
         };
         let model = normalize_selection(input.model.as_ref(), 160, "模型无效")?;
         let effort = normalize_selection(input.effort.as_ref(), 80, "思考强度无效")?;
-        if effort.is_some() && model.is_none() {
+        if effort.is_some() && model.is_none() && agent != crate::protocol::AgentKind::Codex {
             return Err(Error::Invalid("推理强度必须和启动模型一起指定".into()));
         }
         match (agent, input.command.as_deref()) {
@@ -882,6 +975,8 @@ impl Terminals {
                 } else {
                     default_effort
                 };
+                input.model = effective_model.clone();
+                input.effort = effective_effort.clone();
                 if let Some(model) = effective_model {
                     push_env(&mut environment, "ANTHROPIC_MODEL", model);
                 }
@@ -890,7 +985,17 @@ impl Terminals {
                 }
                 Ok(Some(ProgramSpec {
                     program: claude_binary(),
-                    args: vec!["--dangerously-skip-permissions".into()],
+                    args: match policy {
+                        crate::protocol::TerminalApprovalPolicy::Strict => {
+                            vec!["--permission-mode".into(), "default".into()]
+                        }
+                        crate::protocol::TerminalApprovalPolicy::Standard => {
+                            vec!["--permission-mode".into(), "acceptEdits".into()]
+                        }
+                        crate::protocol::TerminalApprovalPolicy::Yolo => {
+                            vec!["--dangerously-skip-permissions".into()]
+                        }
+                    },
                     environment,
                     account_id,
                 }))
@@ -899,7 +1004,52 @@ impl Terminals {
                 let (environment, account_id, profile) = self
                     .resolve_codex_terminal_account(input.account_id.clone())
                     .await?;
-                let mut args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
+                let mut effective_model = model.clone();
+                let mut effective_effort = effort.clone();
+                if let Some((_, home)) = environment.iter().find(|(key, _)| key == "CODEX_HOME") {
+                    let config_path = PathBuf::from(home).join("config.toml");
+                    let defaults = tokio::task::spawn_blocking(move || {
+                        let source = std::fs::read_to_string(config_path).ok()?;
+                        let config = toml::from_str::<toml::Value>(&source).ok()?;
+                        let selected = config
+                            .get("profile")
+                            .and_then(toml::Value::as_str)
+                            .and_then(|name| config.get("profiles")?.get(name));
+                        let value = |key: &str| {
+                            selected
+                                .and_then(|table| table.get(key))
+                                .or_else(|| config.get(key))
+                                .and_then(toml::Value::as_str)
+                                .map(str::to_owned)
+                        };
+                        Some((value("model"), value("model_reasoning_effort")))
+                    })
+                    .await
+                    .map_err(|_| Error::Closed)?;
+                    if let Some((default_model, default_effort)) = defaults {
+                        effective_model = effective_model.or(default_model);
+                        effective_effort = effective_effort.or(default_effort);
+                    }
+                }
+                input.model = effective_model.clone();
+                input.effort = effective_effort.clone();
+                let mut args = match policy {
+                    crate::protocol::TerminalApprovalPolicy::Strict => vec![
+                        "--ask-for-approval".into(),
+                        "untrusted".into(),
+                        "--sandbox".into(),
+                        "read-only".into(),
+                    ],
+                    crate::protocol::TerminalApprovalPolicy::Standard => vec![
+                        "--ask-for-approval".into(),
+                        "on-request".into(),
+                        "--sandbox".into(),
+                        "workspace-write".into(),
+                    ],
+                    crate::protocol::TerminalApprovalPolicy::Yolo => {
+                        vec!["--dangerously-bypass-approvals-and-sandbox".into()]
+                    }
+                };
                 args.extend([
                     "-c".into(),
                     format!(
@@ -916,14 +1066,17 @@ impl Terminals {
                         ));
                     }
                     args.extend(crate::accounts::profile::codex_app_server_args(profile));
+                    input.model = Some(profile.model.clone());
                 }
-                if let Some(model) = model {
+                if let Some(model) = effective_model {
+                    input.model = Some(model.clone());
                     args.extend([
                         "-c".into(),
                         format!("model={}", serde_json::to_string(&model)?),
                     ]);
                 }
-                if let Some(effort) = effort {
+                if let Some(effort) = effective_effort {
+                    input.effort = Some(effort.clone());
                     args.extend([
                         "-c".into(),
                         format!("model_reasoning_effort={}", serde_json::to_string(&effort)?),
@@ -1024,7 +1177,9 @@ impl Terminals {
                             .and_then(|profile| profile.model_capabilities.clone()),
                         active_sessions: 0,
                     };
-                    let defaults = crate::accounts::config::read_defaults(&data, &target)?;
+                    let (default_model, default_effort) =
+                        crate::accounts::config::read_defaults(&data, &target)?;
+                    let defaults = (target.model.or(default_model), default_effort);
                     Ok((record, defaults))
                 }
             })
@@ -1056,9 +1211,11 @@ impl Terminals {
             None => Ok((Vec::new(), None, None)),
             Some(NATIVE_CODEX_ID) => {
                 let data = self.0.database.directory().to_owned();
-                let env = tokio::task::spawn_blocking(move || native_codex_environment(&data))
-                    .await
-                    .map_err(|_| Error::Closed)??;
+                let env = tokio::task::spawn_blocking(move || {
+                    crate::agent::native_codex_terminal_environment(&data)
+                })
+                .await
+                .map_err(|_| Error::Closed)??;
                 Ok((env, Some(NATIVE_CODEX_ID.into()), None))
             }
             Some(account_id) => {
@@ -1186,6 +1343,114 @@ fn is_windows_powershell(shell: &str) -> bool {
 mod tests {
     use super::{default_shell, login_shell};
     use std::ffi::OsString;
+
+    #[tokio::test]
+    async fn approval_policies_control_agent_launch_arguments() {
+        use crate::protocol::{AgentKind, TerminalApprovalPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let database = crate::worker::Database::open(directory.path().into())
+            .await
+            .unwrap();
+        let runtime = super::Terminals::new(database.clone());
+        for (agent, policy, expected) in [
+            (
+                AgentKind::Claude,
+                TerminalApprovalPolicy::Strict,
+                vec!["--permission-mode", "default"],
+            ),
+            (
+                AgentKind::Claude,
+                TerminalApprovalPolicy::Standard,
+                vec!["--permission-mode", "acceptEdits"],
+            ),
+            (
+                AgentKind::Claude,
+                TerminalApprovalPolicy::Yolo,
+                vec!["--dangerously-skip-permissions"],
+            ),
+            (
+                AgentKind::Codex,
+                TerminalApprovalPolicy::Strict,
+                vec!["--ask-for-approval", "untrusted", "--sandbox", "read-only"],
+            ),
+            (
+                AgentKind::Codex,
+                TerminalApprovalPolicy::Standard,
+                vec![
+                    "--ask-for-approval",
+                    "on-request",
+                    "--sandbox",
+                    "workspace-write",
+                ],
+            ),
+            (
+                AgentKind::Codex,
+                TerminalApprovalPolicy::Yolo,
+                vec!["--dangerously-bypass-approvals-and-sandbox"],
+            ),
+        ] {
+            let mut input = super::CreateTerminal {
+                title: "policy".into(),
+                workspace: directory.path().to_string_lossy().into_owned(),
+                size: super::TerminalSize { cols: 80, rows: 24 },
+                agent: Some(agent),
+                command: None,
+                account_id: None,
+                model: None,
+                effort: None,
+                approval_policy: Some(policy),
+            };
+            let spec = runtime.pty_program_for(&mut input).await.unwrap().unwrap();
+            assert_eq!(&spec.args[..expected.len()], expected.as_slice());
+            assert_eq!(input.approval_policy, Some(policy));
+        }
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_codex_effort_uses_cli_default_model() {
+        use crate::protocol::{AgentKind, TerminalApprovalPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let source_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_home.path().join("config.toml"),
+            "model_reasoning_effort = 'high'\n",
+        )
+        .unwrap();
+        let previous = std::env::var_os("CODEX_HOME");
+        unsafe { std::env::set_var("CODEX_HOME", source_home.path()) };
+        let database = crate::worker::Database::open(directory.path().into())
+            .await
+            .unwrap();
+        let runtime = super::Terminals::new(database.clone());
+        let mut input = super::CreateTerminal {
+            title: "native default".into(),
+            workspace: directory.path().to_string_lossy().into_owned(),
+            size: super::TerminalSize { cols: 80, rows: 24 },
+            agent: Some(AgentKind::Codex),
+            command: None,
+            account_id: Some("native-codex".into()),
+            model: None,
+            effort: Some("high".into()),
+            approval_policy: Some(TerminalApprovalPolicy::Standard),
+        };
+        let spec = runtime.pty_program_for(&mut input).await.unwrap().unwrap();
+        assert!(!spec.args.iter().any(|arg| arg == "model=\""));
+        assert!(
+            spec.args
+                .iter()
+                .any(|arg| arg == "model_reasoning_effort=\"high\"")
+        );
+        assert_eq!(input.model, None);
+        assert_eq!(input.effort.as_deref(), Some("high"));
+        database.shutdown().await.unwrap();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
 
     #[test]
     fn login_shell_rejects_non_shell() {
