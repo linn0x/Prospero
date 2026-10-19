@@ -1,0 +1,264 @@
+diff --git a/build.zig b/build.zig
+index f9d861b..7ddfb28 100644
+--- a/build.zig
++++ b/build.zig
+@@ -138,7 +138,11 @@ pub fn build(b: *std.Build) !void {
+ 
+         // We shouldn't have this guard but we don't currently
+         // build on macOS this way ironically so we need to fix that.
+-        if (!config.target.result.os.tag.isDarwin()) {
++        if (config.target.result.os.tag.isDarwin()) {
++            libghostty_static.installHeader();
++            libghostty_static.install("libghostty.a");
++            resources.install();
++        } else {
+             libghostty_shared.installHeader(); // Only need one header
+             libghostty_shared.install("libghostty.so");
+             libghostty_static.install("libghostty.a");
+@@ -147,7 +151,7 @@ pub fn build(b: *std.Build) !void {
+ 
+     // macOS only artifacts. These will error if they're initialized for
+     // other targets.
+-    if (config.target.result.os.tag.isDarwin()) {
++    if (config.target.result.os.tag.isDarwin() and config.emit_xcframework) {
+         // Ghostty xcframework
+         const xcframework = try buildpkg.GhosttyXCFramework.init(
+             b,
+@@ -202,7 +206,7 @@ pub fn build(b: *std.Build) !void {
+ 
+         // On macOS we can run the macOS app. For "run" we always force
+         // a native-only build so that we can run as quickly as possible.
+-        if (config.target.result.os.tag.isDarwin()) {
++        if (config.target.result.os.tag.isDarwin() and config.emit_macos_app) {
+             const xcframework_native = try buildpkg.GhosttyXCFramework.init(
+                 b,
+                 &deps,
+diff --git a/pkg/macos/video/display_link.zig b/pkg/macos/video/display_link.zig
+index 7d6b437..a335eaa 100644
+--- a/pkg/macos/video/display_link.zig
++++ b/pkg/macos/video/display_link.zig
+@@ -1,21 +1,27 @@
+ const std = @import("std");
+ const assert = std.debug.assert;
+-const Allocator = std.mem.Allocator;
+ const c = @import("c.zig").c;
+ 
+ pub const DisplayLink = opaque {
+     pub const Error = error{
+         InvalidOperation,
++        CreateFailed,
+     };
+ 
+-    pub fn createWithActiveCGDisplays() Allocator.Error!*DisplayLink {
++    pub fn createWithActiveCGDisplays() Error!*DisplayLink {
+         var result: ?*DisplayLink = null;
+-        if (c.CVDisplayLinkCreateWithActiveCGDisplays(
++        const status = c.CVDisplayLinkCreateWithActiveCGDisplays(
+             @ptrCast(&result),
+-        ) != c.kCVReturnSuccess)
+-            return error.OutOfMemory;
++        );
++        if (status != c.kCVReturnSuccess) {
++            std.log.warn("CVDisplayLinkCreateWithActiveCGDisplays failed status={}; falling back to change-driven rendering", .{status});
++            return error.CreateFailed;
++        }
+ 
+-        return result orelse error.OutOfMemory;
++        return result orelse {
++            std.log.warn("CVDisplayLinkCreateWithActiveCGDisplays returned null; falling back to change-driven rendering", .{});
++            return error.CreateFailed;
++        };
+     }
+ 
+     pub fn release(self: *DisplayLink) void {
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 4d66622..d56ff31 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -3415,28 +3415,10 @@ pub fn scrollCallback(
+             break :yoff_adjusted yoff_max * cell_size * self.config.mouse_scroll_multiplier.discrete;
+         };
+ 
+-        // Add our previously saved pending amount to the offset to get the
+-        // new offset value. The signs of the pending and yoff should match
+-        // so that we move further away from zero, but we don't assert
+-        // this because in theory a user could scroll in the opposite
+-        // direction and undo a pending scroll.
+-        const poff: f64 = self.mouse.pending_scroll_y + yoff_adjusted;
+-
+-        // If the new offset is less than a single unit of scroll, we save
+-        // the new pending value and do not scroll yet.
+-        if (@abs(poff) < cell_size) {
+-            self.mouse.pending_scroll_y = poff;
+-            break :y .{};
+-        }
+-
+-        // We scroll by the number of rows in the offset and save the remainder
+-        const amount = poff / cell_size;
+-        assert(@abs(amount) >= 1);
+-        self.mouse.pending_scroll_y = poff - (amount * cell_size);
+-
+-        // Round towards zero.
+-        const delta: isize = @intFromFloat(@trunc(amount));
+-        assert(@abs(delta) >= 1);
++        // Add our same-direction pending amount to the offset. The accumulator
++        // discards a sub-cell remainder from the previous direction so reversal
++        // responds immediately instead of first canceling that stale fraction.
++        const delta = accumulatePixelScroll(&self.mouse.pending_scroll_y, yoff_adjusted, cell_size);
+ 
+         break :y .{ .delta = delta };
+     };
+@@ -3448,18 +3430,8 @@ pub fn scrollCallback(
+             break :x .{ .delta = x_delta_isize };
+         }
+ 
+-        const poff: f64 = self.mouse.pending_scroll_x + xoff;
+         const cell_size: f64 = @floatFromInt(self.size.cell.width);
+-        if (@abs(poff) < cell_size) {
+-            self.mouse.pending_scroll_x = poff;
+-            break :x .{};
+-        }
+-
+-        const amount = poff / cell_size;
+-        assert(@abs(amount) >= 1);
+-        self.mouse.pending_scroll_x = poff - (amount * cell_size);
+-        const delta: isize = @intFromFloat(@trunc(amount));
+-        assert(@abs(delta) >= 1);
++        const delta = accumulatePixelScroll(&self.mouse.pending_scroll_x, xoff, cell_size);
+         break :x .{ .delta = delta };
+     };
+ 
+@@ -3548,6 +3520,88 @@ pub fn scrollCallback(
+     try self.queueRender();
+ }
+ 
++/// Accumulate pixel scroll offsets until they cover whole terminal cells.
++/// Truncating toward zero preserves the sub-cell remainder in either direction.
++fn accumulatePixelScroll(pending: *f64, offset: f64, cell_size: f64) isize {
++    assert(cell_size > 0);
++    // On a direction change, discard the old direction's sub-cell fraction so
++    // it cannot cancel the first movement in the new direction.
++    if (offset != 0 and pending.* != 0 and ((pending.* > 0) != (offset > 0))) {
++        pending.* = 0;
++    }
++
++    const total = pending.* + offset;
++    if (@abs(total) < cell_size) {
++        pending.* = total;
++        return 0;
++    }
++
++    const amount = total / cell_size;
++    const delta: isize = @intFromFloat(@trunc(amount));
++    assert(@abs(delta) >= 1);
++    pending.* = total - (@as(f64, @floatFromInt(delta)) * cell_size);
++    return delta;
++}
++
++test "Surface: precise scroll accumulation preserves cell remainder" {
++    var pending_y: f64 = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending_y, 20, 30));
++    try std.testing.expectEqual(@as(f64, 20), pending_y);
++    try std.testing.expectEqual(@as(isize, 1), accumulatePixelScroll(&pending_y, 20, 30));
++    try std.testing.expectEqual(@as(f64, 10), pending_y);
++    try std.testing.expectEqual(@as(isize, 1), accumulatePixelScroll(&pending_y, 20, 30));
++    try std.testing.expectEqual(@as(f64, 0), pending_y);
++
++    var pending_y_negative: f64 = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending_y_negative, -20, 30));
++    try std.testing.expectEqual(@as(f64, -20), pending_y_negative);
++    try std.testing.expectEqual(@as(isize, -1), accumulatePixelScroll(&pending_y_negative, -20, 30));
++    try std.testing.expectEqual(@as(f64, -10), pending_y_negative);
++    try std.testing.expectEqual(@as(isize, -1), accumulatePixelScroll(&pending_y_negative, -20, 30));
++    try std.testing.expectEqual(@as(f64, 0), pending_y_negative);
++
++    var pending_x_positive: f64 = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending_x_positive, 20, 30));
++    try std.testing.expectEqual(@as(f64, 20), pending_x_positive);
++    try std.testing.expectEqual(@as(isize, 1), accumulatePixelScroll(&pending_x_positive, 20, 30));
++    try std.testing.expectEqual(@as(f64, 10), pending_x_positive);
++    try std.testing.expectEqual(@as(isize, 1), accumulatePixelScroll(&pending_x_positive, 20, 30));
++    try std.testing.expectEqual(@as(f64, 0), pending_x_positive);
++
++    var pending_x: f64 = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending_x, -20, 30));
++    try std.testing.expectEqual(@as(f64, -20), pending_x);
++    try std.testing.expectEqual(@as(isize, -1), accumulatePixelScroll(&pending_x, -20, 30));
++    try std.testing.expectEqual(@as(f64, -10), pending_x);
++    try std.testing.expectEqual(@as(isize, -1), accumulatePixelScroll(&pending_x, -20, 30));
++    try std.testing.expectEqual(@as(f64, 0), pending_x);
++}
++
++test "Surface: precise scroll reversal discards opposing sub-cell remainder" {
++    var pending: f64 = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, 29, 30));
++    try std.testing.expectEqual(@as(isize, -1), accumulatePixelScroll(&pending, -30, 30));
++    try std.testing.expectEqual(@as(f64, 0), pending);
++
++    pending = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, -29, 30));
++    try std.testing.expectEqual(@as(isize, 1), accumulatePixelScroll(&pending, 30, 30));
++    try std.testing.expectEqual(@as(f64, 0), pending);
++
++    pending = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, 20, 30));
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, 5, 30));
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, 0, 30));
++    try std.testing.expectEqual(@as(f64, 25), pending);
++
++    pending = 0;
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, 20, 30));
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, -5, 30));
++    try std.testing.expectEqual(@as(f64, -5), pending);
++    try std.testing.expectEqual(@as(isize, 0), accumulatePixelScroll(&pending, 0, 30));
++    try std.testing.expectEqual(@as(f64, -5), pending);
++}
++
+ /// This is called when the content scale of the surface changes. The surface
+ /// can then update any DPI-sensitive state.
+ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !void {
+diff --git a/src/build/MetallibStep.zig b/src/build/MetallibStep.zig
+index fcf3055..cefdfaf 100644
+--- a/src/build/MetallibStep.zig
++++ b/src/build/MetallibStep.zig
+@@ -55,6 +55,11 @@ pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
+         b,
+         b.fmt("metal {s}", .{opts.name}),
+     );
++    const metal_developer_dir = std.process.getEnvVarOwned(
++        b.allocator,
++        "PROSPERO_GHOSTTY_METAL_DEVELOPER_DIR",
++    ) catch "/Applications/Xcode.app/Contents/Developer";
++    run_ir.setEnvironmentVariable("DEVELOPER_DIR", metal_developer_dir);
+     run_ir.addArgs(&.{ "/usr/bin/xcrun", "-sdk", sdk, "metal", "-o" });
+     const output_ir = run_ir.addOutputFileArg(b.fmt("{s}.ir", .{opts.name}));
+     run_ir.addArgs(&.{"-c"});
+@@ -70,6 +75,7 @@ pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
+         b,
+         b.fmt("metallib {s}", .{opts.name}),
+     );
++    run_lib.setEnvironmentVariable("DEVELOPER_DIR", metal_developer_dir);
+     run_lib.addArgs(&.{ "/usr/bin/xcrun", "-sdk", sdk, "metallib", "-o" });
+     const output_lib = run_lib.addOutputFileArg(b.fmt("{s}.metallib", .{opts.name}));
+     run_lib.addFileArg(output_ir);
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index ff632f6..d9d9b0f 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -690,10 +690,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             };
+ 
+             const display_link: ?DisplayLink = switch (builtin.os.tag) {
+-                .macos => if (options.config.vsync)
+-                    try macos.video.DisplayLink.createWithActiveCGDisplays()
+-                else
+-                    null,
++                .macos => if (options.config.vsync) display_link: {
++                    break :display_link macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
++                        log.warn("unable to create display link; using change-driven rendering err={}", .{err});
++                        break :display_link null;
++                    };
++                } else null,
+                 else => null,
+             };
+             errdefer if (display_link) |v| v.release();

@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DesktopApi, DesktopSettings, DesktopSnapshotPatch, JsonObject, SessionCreateInput, SessionPageRequest } from "../shared/types";
+import type { DesktopApi, DesktopSettings, DesktopSnapshotPatch, JsonObject, NativeTerminalShortcut, NativeTerminalState, SessionCreateInput, SessionPageRequest } from "../shared/types";
 import type { WindowAppearance } from "../shared/window-appearance";
 
 // Apply appearance to the shared DOM without granting the renderer another
@@ -28,6 +28,36 @@ ipcRenderer.on("terminal:port", (event, value: unknown) => {
 });
 
 const api: DesktopApi = {
+  nativeTerminal: {
+    available: () => ipcRenderer.invoke("native-terminal:available"),
+    open: (sessionId, fontSize, fontFamily) => ipcRenderer.invoke("native-terminal:open", sessionId, fontSize, fontFamily),
+    update: (id, bounds) => ipcRenderer.invoke("native-terminal:update", id, bounds),
+    close: id => ipcRenderer.invoke("native-terminal:close", id),
+    action: (id, action) => ipcRenderer.invoke("native-terminal:action", id, action),
+    search: (id, value) => ipcRenderer.invoke("native-terminal:search", id, value),
+    searchStep: (id, direction) => ipcRenderer.invoke("native-terminal:search-step", id, direction),
+    inputText: (id, value) => ipcRenderer.invoke("native-terminal:input-text", id, value),
+    subscribeState: listener => {
+      const wrapped = (_event: Electron.IpcRendererEvent, value: { id: number; state: NativeTerminalState }): void => listener(value);
+      ipcRenderer.on("native-terminal:state", wrapped);
+      return () => ipcRenderer.removeListener("native-terminal:state", wrapped);
+    },
+    subscribeError: listener => {
+      const wrapped = (_event: Electron.IpcRendererEvent, value: { id: number; message: string }): void => listener(value);
+      ipcRenderer.on("native-terminal:error", wrapped);
+      return () => ipcRenderer.removeListener("native-terminal:error", wrapped);
+    },
+    subscribeShortcut: listener => {
+      const wrapped = (_event: Electron.IpcRendererEvent, value: NativeTerminalShortcut): void => listener(value);
+      ipcRenderer.on("native-terminal:shortcut", wrapped);
+      return () => ipcRenderer.removeListener("native-terminal:shortcut", wrapped);
+    },
+    subscribeFocus: listener => {
+      const wrapped = (_event: Electron.IpcRendererEvent, value: { id: number; focused: boolean }): void => listener(value);
+      ipcRenderer.on("native-terminal:focus", wrapped);
+      return () => ipcRenderer.removeListener("native-terminal:focus", wrapped);
+    },
+  },
   listProjectFiles: (root, path) => ipcRenderer.invoke("project-tools:list", root, path),
   readProjectFile: (root, path) => ipcRenderer.invoke("project-tools:read", root, path),
   mutateProjectFile: (root, mutation) => ipcRenderer.invoke("project-tools:file", root, mutation),

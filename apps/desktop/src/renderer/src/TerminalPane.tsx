@@ -446,7 +446,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
       customGlyphs: true,
       drawBoldTextInBrightColors: true,
       rescaleOverlappingGlyphs: true,
-      smoothScrollDuration: 80,
+      smoothScrollDuration: 0,
       fastScrollSensitivity: 4,
       macOptionIsMeta: isMac,
       macOptionClickForcesSelection: isMac,

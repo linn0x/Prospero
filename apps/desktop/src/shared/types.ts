@@ -12,6 +12,18 @@ export type AccountConfigInput = Omit<C2SAgentAccountConfigSet, "type" | "reques
 
 export type JsonObject = Record<string, unknown>;
 
+export type NativeTerminalState = {
+  connected: boolean;
+  syncing: boolean;
+  controller: boolean;
+  exited: boolean;
+  readOnly: boolean;
+  error?: string;
+};
+
+export type NativeTerminalBounds = { x: number; y: number; width: number; height: number; visible: boolean; focus?: boolean };
+export type NativeTerminalShortcut = { id: number; action: "toggle-focus" | "project-search" | "terminal-search" | "paste-image" };
+
 export type QueuedChatMessage = {
   id: string;
   text: string;
@@ -326,6 +338,20 @@ export type AgentModelCatalog = { models: AgentModel[]; currentModel?: string; c
 export type SkillSuggestion = { value: string; label?: string; detail?: string };
 
 export type DesktopApi = import("./project-tools").ProjectToolsApi & {
+  nativeTerminal: {
+    available(): Promise<{ available: boolean; reason?: string }>;
+    open(sessionId: string, fontSize: number, fontFamily: string): Promise<{ id: number }>;
+    update(id: number, bounds: NativeTerminalBounds): Promise<void>;
+    close(id: number): Promise<void>;
+    action(id: number, action: "acquire" | "takeover" | "release"): Promise<void>;
+    search(id: number, text: string): Promise<void>;
+    searchStep(id: number, direction: "next" | "previous" | "end"): Promise<void>;
+    inputText(id: number, text: string): Promise<void>;
+    subscribeState(listener: (event: { id: number; state: NativeTerminalState }) => void): () => void;
+    subscribeError(listener: (event: { id: number; message: string }) => void): () => void;
+    subscribeShortcut(listener: (event: NativeTerminalShortcut) => void): () => void;
+    subscribeFocus(listener: (event: { id: number; focused: boolean }) => void): () => void;
+  };
   modelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult>;
   subscribeModelSources(listener: (sources: ModelSource[]) => void): () => void;
   getSnapshot(): Promise<DesktopSnapshot>;

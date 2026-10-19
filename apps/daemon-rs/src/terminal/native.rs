@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::time::Instant;
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use super::*;
 
@@ -28,6 +30,62 @@ struct PendingWrite {
 }
 const PENDING_WRITE_BYTES: usize = 1024 * 1024;
 const RESPONSE_RESERVE_BYTES: usize = 128 * 1024;
+#[cfg(unix)]
+const PTY_READ_POLL_TIMEOUT_MS: i32 = 100;
+
+#[cfg(unix)]
+fn duplicate_poll_fd(master: &dyn MasterPty) -> Result<OwnedFd> {
+    let fd = master.as_raw_fd().ok_or(Error::Closed)?;
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // Own a descriptor for poll so it cannot be closed and reused while the
+    // reader thread waits. It is dropped only after that thread exits.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+#[cfg(unix)]
+fn wait_for_pty_readable(fd: RawFd, stop: &AtomicBool) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        descriptor.revents = 0;
+        let result = unsafe { libc::poll(&mut descriptor, 1, PTY_READ_POLL_TIMEOUT_MS) };
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PTY poll descriptor is no longer valid",
+                ));
+            }
+            // Drain buffered bytes before treating a simultaneous hangup as
+            // EOF. A bare HUP/ERR ends the reader so a persistent poll flag
+            // cannot turn into a busy loop.
+            if descriptor.revents & libc::POLLIN != 0 {
+                return Ok(true);
+            }
+            if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(false);
+            }
+            return Err(std::io::Error::other("PTY poll returned no readable event"));
+        }
+        if result == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
 
 fn pty_size(size: TerminalSize) -> PtySize {
     PtySize {
@@ -45,6 +103,8 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
         .map_err(|_| Error::Invalid("cannot allocate terminal".into()))?;
     #[cfg(unix)]
     set_nonblocking(pair.master.as_ref())?;
+    #[cfg(unix)]
+    let reader_poll_fd = duplicate_poll_fd(pair.master.as_ref())?;
     let mut reader = pair.master.try_clone_reader().map_err(|_| Error::Closed)?;
     let mut writer = pair.master.take_writer().map_err(|_| Error::Closed)?;
     let (sender, mut receiver) = mpsc::channel::<Control>(32);
@@ -64,7 +124,9 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
         wake,
         controller: Mutex::new(None),
         controller_changed: watch::channel(0).0,
-        stream_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+        stream_slots: Arc::new(tokio::sync::Semaphore::new(
+            super::STREAM_VIEWER_SLOTS as usize,
+        )),
     }));
     let (ready, started) = std::sync::mpsc::sync_channel(1);
     let reader_stop = stop.clone();
@@ -83,12 +145,14 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                             return;
                         }
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                        ) =>
-                    {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        #[cfg(unix)]
+                        match wait_for_pty_readable(reader_poll_fd.as_raw_fd(), &reader_stop) {
+                            Ok(true) => {}
+                            Ok(false) | Err(_) => break,
+                        }
+                        #[cfg(not(unix))]
                         std::thread::sleep(Duration::from_millis(2));
                     }
                     Err(_) => break,
@@ -194,16 +258,16 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                 {
                     break;
                 }
-                while let Ok(control) = receiver.try_recv() {
-                    handle_control(
-                        control,
-                        pair.master.as_ref(),
-                        &mut current_size,
-                        &output,
-                        &changed,
-                        &mut pending_input,
-                    );
-                }
+                process_controls_and_drain_input(
+                    &mut receiver,
+                    pair.master.as_ref(),
+                    &mut current_size,
+                    &output,
+                    &changed,
+                    &mut pending_input,
+                    writer.as_mut(),
+                    &stop,
+                );
                 if !read_any
                     && pending_bytes(&pending_input) <= PENDING_WRITE_BYTES - RESPONSE_RESERVE_BYTES
                 {
@@ -324,6 +388,33 @@ fn handle_control(
             }
         }
     }
+}
+
+/// Apply controls and immediately try their PTY writes before any timed wait.
+/// Controls may be admitted after the earlier pending-write pass, so leaving
+/// them for the next loop could add the full idle timeout to input latency.
+#[allow(clippy::too_many_arguments)]
+fn process_controls_and_drain_input(
+    receiver: &mut mpsc::Receiver<Control>,
+    master: &dyn MasterPty,
+    current_size: &mut TerminalSize,
+    output: &Arc<Mutex<Output>>,
+    changed: &watch::Sender<u64>,
+    pending_input: &mut VecDeque<PendingWrite>,
+    writer: &mut dyn Write,
+    stop: &AtomicBool,
+) {
+    while let Ok(control) = receiver.try_recv() {
+        handle_control(
+            control,
+            master,
+            current_size,
+            output,
+            changed,
+            pending_input,
+        );
+    }
+    drain_pending_input(writer, stop, pending_input);
 }
 
 fn drain_pending_input(
@@ -482,7 +573,9 @@ mod tests {
             wake: Wake(wake_sender),
             controller: Mutex::new(None),
             controller_changed: watch::channel(0).0,
-            stream_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+            stream_slots: Arc::new(tokio::sync::Semaphore::new(
+                super::STREAM_VIEWER_SLOTS as usize,
+            )),
         }))
     }
 
@@ -531,6 +624,112 @@ mod tests {
         wake.signal();
         assert!(matches!(receiver.try_recv(), Ok(ReaderEvent::Wake)));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_reader_wait_wakes_when_data_arrives_and_on_hangup() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        let stop = AtomicBool::new(false);
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            writer.write_all(b"ready").unwrap();
+        });
+        let started = Instant::now();
+        assert!(wait_for_pty_readable(fd, &stop).unwrap());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        signal.join().unwrap();
+        let mut ready = [0; 5];
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        // A buffered read wins over a simultaneous hangup so the last bytes
+        // are not discarded when a child exits.
+        writer.write_all(b"last").unwrap();
+        drop(writer);
+        assert!(wait_for_pty_readable(fd, &stop).unwrap());
+        let mut last = [0; 4];
+        reader.read_exact(&mut last).unwrap();
+        assert_eq!(&last, b"last");
+        // Some Unix poll implementations report EOF as readable plus HUP;
+        // either poll result must lead to a clean zero-byte read or stop.
+        if wait_for_pty_readable(fd, &stop).unwrap() {
+            assert_eq!(reader.read(&mut ready).unwrap(), 0);
+        }
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        drop(writer);
+        if wait_for_pty_readable(fd, &stop).unwrap() {
+            let mut reader = reader;
+            assert_eq!(reader.read(&mut ready).unwrap(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_reader_wait_observes_stop_with_bounded_latency() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let reader_stop = stop.clone();
+        let waiter = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            wait_for_pty_readable(fd, &reader_stop).unwrap()
+        });
+        started_receiver.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let stopped_at = Instant::now();
+        stop.store(true, Ordering::Release);
+        assert!(!waiter.join().unwrap());
+        assert!(stopped_at.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn controls_are_written_before_the_worker_enters_its_idle_wait() {
+        let terminal = fixture();
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let pair = native_pty_system().openpty(pty_size(size)).unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (reply, mut response) = oneshot::channel();
+        sender
+            .try_send(Control::Input(b"wheel-report".to_vec(), reply))
+            .unwrap();
+        // Simulate the independent Wake having already been consumed by the
+        // reader-event loop before this Input is admitted.
+        let (wake_sender, wake_receiver) = std::sync::mpsc::sync_channel(1);
+        Wake(wake_sender).signal();
+        assert!(matches!(wake_receiver.try_recv(), Ok(ReaderEvent::Wake)));
+
+        let mut current_size = size;
+        let mut pending = VecDeque::new();
+        let stop = AtomicBool::new(false);
+        let mut writer = std::io::Cursor::new(Vec::new());
+        process_controls_and_drain_input(
+            &mut receiver,
+            pair.master.as_ref(),
+            &mut current_size,
+            &terminal.0.output,
+            &terminal.0.notifier,
+            &mut pending,
+            &mut writer,
+            &stop,
+        );
+
+        assert_eq!(writer.into_inner(), b"wheel-report");
+        assert!(response.try_recv().unwrap().is_ok());
+        assert!(pending.is_empty());
     }
 
     #[test]

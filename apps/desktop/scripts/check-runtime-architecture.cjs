@@ -46,6 +46,12 @@ function checkRuntimeArchitecture(context) {
     const cliArch = machoArchitecture(cli);
     if (cliArch !== expected) throw new Error(`macOS ${expected} package requires matching prospero. Build target/release/prospero for ${expected} first.`);
     if (!existsSync(join(root, 'install-rust-daemon-launchagent.sh'))) throw new Error('macOS runtime is missing the Rust daemon LaunchAgent installer.');
+    const nativeRoot = join(context.packager.projectDir, '.native', 'ghostty');
+    for (const name of ['ghostty.node', 'prospero-terminal-relay']) {
+      const file = join(nativeRoot, name);
+      if (!existsSync(file)) throw new Error('Native Ghostty is missing. Run npm run build:native:mac before packaging macOS.');
+      if (machoArchitecture(file) !== expected) throw new Error(`macOS ${expected} requires a matching native Ghostty addon and relay; rebuild them for the target architecture.`);
+    }
     return;
   }
   if (context.electronPlatformName !== 'win32') return;

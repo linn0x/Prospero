@@ -18,6 +18,7 @@
     "check:chat": "npm run build && electron scripts/check-chat.cjs",
     "check:terminal": "npm run build && electron scripts/check-terminal.cjs",
     "check:terminal:performance": "electron scripts/check-terminal-performance.cjs",
+    "check:daemon-output-throughput": "npm run build && electron scripts/check-daemon-output-throughput.cjs",
     "check:terminal:stream": "npm run build && electron scripts/check-terminal-stream.cjs",
     "check:project-tools": "npm run build && electron scripts/check-project-tools.cjs",
     "check:packaged-rust": "node scripts/smoke-packaged-runtime.cjs",
@@ -27,8 +28,11 @@
     "prepare:runtime:mac": "node scripts/prepare-runtime.mjs",
     "install:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh install",
     "uninstall:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh uninstall",
-    "dist:mac": "npm run prepare:runtime:mac && npm run build && electron-builder --mac",
-    "preview:ux": "npm run build && electron scripts/preview-ux.cjs"
+    "dist:mac": "npm run build:native:mac && npm run prepare:runtime:mac && npm run build && electron-builder --mac",
+    "preview:ux": "npm run build && electron scripts/preview-ux.cjs",
+    "build:native:mac": "node scripts/build-native-ghostty.mjs",
+    "check:native:mac": "electron scripts/check-native-ghostty.cjs",
+    "check:native-terminal": "npm run build && electron scripts/check-native-terminal.cjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
@@ -180,12 +184,18 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
-        "NSLocalNetworkUsageDescription": "Prospero 在本地网络上广播与接受来自你手机的直连,用于远程控制 code agent 会话。",
+        "NSLocalNetworkUsageDescription": "Prospero \u5728\u672c\u5730\u7f51\u7edc\u4e0a\u5e7f\u64ad\u4e0e\u63a5\u53d7\u6765\u81ea\u4f60\u624b\u673a\u7684\u76f4\u8fde,\u7528\u4e8e\u8fdc\u7a0b\u63a7\u5236 code agent \u4f1a\u8bdd\u3002",
         "NSBonjourServices": [
           "_prospero._tcp"
         ],
         "LSMinimumSystemVersion": "14.0"
-      }
+      },
+      "extraResources": [
+        {
+          "from": ".native/ghostty",
+          "to": "native-ghostty"
+        }
+      ]
     }
   }
 }

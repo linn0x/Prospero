@@ -79,6 +79,7 @@ xcuserdata/
 apps/daemon/windows-native/
 
 # OS metadata
+apps/desktop/.native/
 .DS_Store
 Thumbs.db
 Desktop.ini

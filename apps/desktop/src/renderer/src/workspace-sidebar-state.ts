@@ -92,13 +92,13 @@ export function matchesDesktopShortcut(
 }
 
 export function matchesFocusShortcut(
-  event: DesktopShortcutEvent,
+  event: DesktopShortcutEvent & Partial<Pick<KeyboardEvent, "code">>,
   platform: string,
 ): boolean {
   if (
     event.defaultPrevented ||
     event.repeat ||
-    event.key.toLocaleLowerCase() !== "f"
+    (event.code ? event.code !== "KeyF" : event.key.toLocaleLowerCase() !== "f")
   )
     return false;
   const target = event.target as

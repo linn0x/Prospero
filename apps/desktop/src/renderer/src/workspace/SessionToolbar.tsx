@@ -4,7 +4,7 @@ import { useRef, useState } from "react";
 import { Files, GitBranch, Search } from "lucide-react";
 import { openProjectTools } from "../project-tools/tool-state";
 import { DesktopIcon } from "../design-system/icons";
-import type { JsonObject, SessionInfo } from "../../../shared/types";
+import type { JsonObject, NativeTerminalState, SessionInfo } from "../../../shared/types";
 import { Button } from "../components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "../components/ui/dropdown-menu";
 import { useLocale } from "../locale";
@@ -12,7 +12,7 @@ import { reportError, shortPath } from "../state";
 
 import { sessionLabel, StatusMark } from "./session-presentation";
 
-export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus, localSelection, onLocalSelectionChange }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void; localSelection: boolean; onLocalSelectionChange: (value: boolean) => void }) {
+export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus, localSelection, onLocalSelectionChange, nativeTerminal = false, nativeTerminalState, onNativeTerminalAction }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void; localSelection: boolean; onLocalSelectionChange: (value: boolean) => void; nativeTerminal?: boolean; nativeTerminalState?: NativeTerminalState; onNativeTerminalAction?: (action: "acquire" | "takeover" | "release" | "reconnect") => void }) {
   const { t } = useLocale();
   const label = sessionTabName(session);
   const project = session.cwd.split(/[\\/]/).filter(Boolean).at(-1);
@@ -33,11 +33,15 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
       setNotice(success);
     } catch (reason) { setError(reportError(reason)); } finally { pending.current = false; setBusy(false); }
   };
+  const nativeConnected = Boolean(nativeTerminalState?.connected && !nativeTerminalState.syncing && !nativeTerminalState.exited);
+  const nativeCanRelease = nativeConnected && Boolean(nativeTerminalState?.controller) && !nativeTerminalState?.readOnly;
+  const nativeCanAcquire = nativeConnected && !nativeTerminalState?.controller;
+  const nativeDisconnected = Boolean(nativeTerminal && nativeTerminalState && !nativeTerminalState.connected && !nativeTerminalState.syncing && !nativeTerminalState.exited);
   return <>
     <header className="pane-toolbar session-toolbar">
       <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}><StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} /><strong>{label === project ? shortPath(session.cwd) : label}</strong>{label !== project && <small>{shortPath(session.cwd)}</small>}</div>
       <div className="pane-toolbar-actions">
-        {session.kind === "pty" && <TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={onLocalSelectionChange} />}
+        {session.kind === "pty" && !nativeTerminal && <TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={onLocalSelectionChange} />}
         <Button variant="ghost" size="icon-sm" aria-label={t("浏览项目文件", "Browse project files")} title={t("浏览项目文件", "Browse project files")} onClick={() => openProjectTools(session.cwd)}><Files /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("搜索项目内容", "Search project contents")} title={t("搜索项目内容", "Search project contents")} onClick={() => openProjectTools(session.cwd, "search")}><Search /></Button>
         <Button variant="ghost" size="icon-sm" aria-label={t("查看 Git 变更", "Review Git changes")} title={t("查看 Git 变更", "Review Git changes")} onClick={() => openProjectTools(session.cwd, "git")}><GitBranch /></Button>
@@ -47,6 +51,12 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
         <Button variant="ghost" size="icon-sm" aria-label={t("切换工具栏", "Toggle tools")} title={t("文件、搜索、Git 与会话工具", "Files, search, Git and session tools")} aria-pressed={contextVisible} onClick={onToggleContext}><DesktopIcon name="sidebar" /></Button>
         <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label={t("会话操作", "Session actions")} />}><DesktopIcon name="more" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>
           <DropdownMenuItem onClick={onToggleFocus}><DesktopIcon name="expand" />{t("进入专注模式", "Enter focus mode")}<span className="ml-auto text-xs text-muted-foreground">{isMac ? "⌘⌥F" : "Ctrl+Alt+F"}</span></DropdownMenuItem>
+          {nativeCanRelease && <DropdownMenuItem onClick={() => onNativeTerminalAction?.("release")}><DesktopIcon name="terminal" />{t("释放终端控制", "Release terminal control")}</DropdownMenuItem>}
+          {nativeCanAcquire && <>
+            <DropdownMenuItem onClick={() => onNativeTerminalAction?.("acquire")}><DesktopIcon name="terminal" />{t("请求终端控制", "Request terminal control")}</DropdownMenuItem>
+            <DropdownMenuItem onClick={() => onNativeTerminalAction?.("takeover")}><DesktopIcon name="terminal" />{t("接管终端控制", "Take over terminal control")}</DropdownMenuItem>
+          </>}
+          {nativeDisconnected && <DropdownMenuItem onClick={() => onNativeTerminalAction?.("reconnect")}><DesktopIcon name="terminal" />{t("重新连接终端", "Reconnect terminal")}</DropdownMenuItem>}
           <DropdownMenuItem disabled={busy} onClick={() => void action(() => window.prospero.revealPath(session.cwd))}><DesktopIcon name="folderOpen" />{isMac ? t("在访达中显示", "Reveal in Finder") : t("在资源管理器中打开", "Open in Explorer")}</DropdownMenuItem>
           <DropdownMenuItem variant="destructive" disabled={busy || ["done", "completed", "exited", "cancelled"].includes(session.status)} onClick={() => void action(() => window.prospero.killSession(session.id))}><DesktopIcon name="close" />{t("结束会话", "End session")}</DropdownMenuItem>
         </DropdownMenuGroup></DropdownMenuContent></DropdownMenu>

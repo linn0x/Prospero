@@ -56,6 +56,38 @@ describe("TerminalStreamController", () => {
     expect(port.sent.slice(1).map(item => decodeTerminalStreamFrame(item, "client").sequence)).toEqual([6, 7]);
   });
 
+  it("does not publish an unchanged state for output frames and still acknowledges each committed frame", async () => {
+    const port = new Port();
+    const states: Array<{ connected: boolean; syncing: boolean; readOnly: boolean; exited: boolean; controller: boolean; epoch?: string }> = [];
+    const controller = new TerminalStreamController({
+      sessionId: "term", cursor: () => 4, epoch: () => undefined, wantControl: false,
+      consume: async () => undefined,
+      onState: state => states.push({ ...state }), onError: message => { throw new Error(message); }, onHistoryGap: () => undefined,
+    });
+    controller.attach(port as unknown as MessagePort);
+    port.receive(frame(TerminalStreamKind.Hello, 0, json({ epoch: "same", clientId: "me", controllerId: "me", cols: 80, rows: 24, windowBytes: 1 })));
+    await tick();
+    port.receive(frame(TerminalStreamKind.Ready, 4));
+    await tick();
+    const stateCountAfterReady = states.length;
+    const outputSequences = Array.from({ length: 100 }, (_, index) => index + 5);
+    for (const sequence of outputSequences) {
+      port.receive(frame(TerminalStreamKind.Output, sequence, new Uint8Array([sequence & 0xff])));
+      await tick();
+    }
+
+    expect(states).toHaveLength(stateCountAfterReady);
+    expect(port.sent.map(value => decodeTerminalStreamFrame(value, "client"))
+      .filter(item => item.kind === TerminalStreamKind.Applied).map(item => item.sequence)).toEqual(outputSequences);
+    port.receive(frame(TerminalStreamKind.State, 0, json({ controllerId: "other", readOnly: true, exited: false })));
+    await tick();
+    expect(states).toHaveLength(stateCountAfterReady + 1);
+    expect(states.at(-1)).toMatchObject({ connected: true, syncing: false, readOnly: true, controller: false });
+    controller.close();
+    expect(states).toHaveLength(stateCountAfterReady + 2);
+    expect(states.at(-1)).toMatchObject({ connected: false, syncing: false, controller: false });
+  });
+
   it("blocks input and resize before Ready and for observers", async () => {
     const current = setup();
     await expect(current.controller.input(new Uint8Array([65]))).rejects.toThrow("not ready");
