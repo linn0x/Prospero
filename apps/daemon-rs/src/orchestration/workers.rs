@@ -75,7 +75,7 @@ fn canonical(path: &Path) -> PathBuf {
 pub(super) async fn launch_worker_start(
     database: &Database,
     agents: &Agents,
-    input: StartWorker,
+    mut input: StartWorker,
     operation_id: &str,
 ) -> Result<WorkerStartOutcome> {
     validate_text(&input.cwd, 4096, false)?;
@@ -109,24 +109,18 @@ pub(super) async fn launch_worker_start(
         _ => return Err(Error::Invalid("approvalPolicy is invalid".into())),
     };
     let hosted = super::reliability_operations::hosted_workers_enabled()?;
-    if hosted
-        && (input
-            .account_id
-            .as_deref()
-            .is_some_and(|id| !id.is_empty() && id != crate::accounts::NATIVE_CLAUDE_ID)
-            || input.agent == crate::protocol::AgentKind::Opencode)
-    {
-        return Err(Error::Invalid(
-            "execution Host currently requires a native Claude/Codex/DeepSeek account".into(),
-        ));
-    }
     let account_id = match input.account_id.as_deref() {
-        None | Some("") if input.agent == crate::protocol::AgentKind::Opencode => {
+        None | Some("") | Some(crate::accounts::NATIVE_CLAUDE_ID)
+            if input.agent == crate::protocol::AgentKind::Opencode =>
+        {
             return Err(Error::Invalid(
                 "OpenCode worker 需要 OpenAI Chat Completions API Profile".into(),
             ));
         }
         None | Some("") | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+        Some(crate::agent::NATIVE_CODEX_ID) if input.agent == crate::protocol::AgentKind::Codex => {
+            None
+        }
         Some(_) if input.agent == crate::protocol::AgentKind::Deepseek => {
             return Err(Error::Invalid(
                 "DeepSeek worker 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
@@ -298,6 +292,7 @@ pub(super) async fn launch_worker_start(
     };
 
     if hosted {
+        input.account_id = account_id;
         let session_id = super::start::worker_session_id(operation_id);
         let prompt = worker_prompt(
             &task,

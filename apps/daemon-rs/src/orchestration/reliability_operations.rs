@@ -53,13 +53,29 @@ pub(super) async fn launch_hosted_worker(
 ) -> Result<super::WorkerStartOutcome> {
     let binary = host_binary()?;
     let runtime = runtime_digest(&binary)?;
+    let account_snapshot = match input.account_id.as_deref() {
+        Some(account_id) => Some(
+            crate::execution_host::accounts::capture(
+                database,
+                operation_id,
+                input.agent,
+                account_id,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let engine = account_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.engine)
+        .unwrap_or(input.agent);
     let session_id = super::start::worker_session_id(operation_id);
     let title = format!("worker {}", task.title)
         .chars()
         .take(200)
         .collect::<String>();
     let session = crate::agent::CreateAgentSession {
-        agent: input.agent,
+        agent: engine,
         title: title.clone(),
         workspace: workspace.clone(),
         auto_approve,
@@ -67,10 +83,13 @@ pub(super) async fn launch_hosted_worker(
         model: None,
         effort: None,
         agent_preset: None,
-        account_id: None,
+        account_id: input.account_id.clone(),
         resume: None,
     };
-    let payload = serde_json::json!({"session":session,"prompt":prompt,"admission":{"runId":task.run_id,"pluginId":input.plugin_id,"profileId":input.profile_id}});
+    let mut payload = serde_json::json!({"session":session,"prompt":prompt,"admission":{"runId":task.run_id,"pluginId":input.plugin_id,"profileId":input.profile_id}});
+    if let Some(snapshot) = account_snapshot {
+        payload["accountSnapshot"] = serde_json::to_value(snapshot)?;
+    }
     let config = super::reliability::request_fingerprint(
         OperationKind::Start,
         1,
@@ -90,7 +109,7 @@ pub(super) async fn launch_hosted_worker(
             let mut settled = None;
             store.create_session_with_id(
                 crate::protocol::CreateSession {
-                    agent: input.agent,
+                    agent: engine,
                     kind: crate::protocol::SessionKind::Structured,
                     title,
                     workspace,
@@ -680,6 +699,27 @@ async fn deliver_command(
             Err(error) => return Err(Error::Invalid(error.to_string())),
         }
     }
+    if target.command.kind == HostCommandKind::Start {
+        let payload: serde_json::Value = serde_json::from_str(&target.command.payload)?;
+        if let Some(snapshot) = payload.get("accountSnapshot") {
+            if !matches!(client.health().await?, crate::execution_host::HostResponse::Health { capabilities, .. } if capabilities.iter().any(|capability| capability == "managed_account_snapshots"))
+            {
+                return Err(Error::Feature(
+                    "execution_capability_unsupported".into(),
+                    "execution Host runtime does not support managed account snapshots".into(),
+                ));
+            }
+            let reference: crate::execution_host::accounts::AccountSnapshotRef =
+                serde_json::from_value(snapshot.clone())?;
+            let directory = data_dir.to_owned();
+            let host_directory = handle.directory()?.to_owned();
+            tokio::task::spawn_blocking(move || {
+                crate::execution_host::accounts::stage(&directory, &host_directory, &reference)
+            })
+            .await
+            .map_err(|_| Error::Closed)??;
+        }
+    }
     let command = target.command.clone();
     database.call_control("reliability.command.sent", move |store| {
         let valid:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM orch_host_commands c JOIN orch_operations_v2 o ON o.operation_id=c.operation_id JOIN orch_executions e ON e.attempt_id=c.attempt_id WHERE c.command_id=?1 AND o.state NOT IN ('succeeded','failed','cancelled') AND (c.command_kind!='start' OR e.state NOT IN ('finalized','quiesced','exit_confirmed','stop_requested','stopping','stop_unknown')))",[&command.command_id],|row|row.get(0))?;
@@ -745,10 +785,15 @@ fn reserve_start_tx(tx: &rusqlite::Transaction<'_>, command: &HostCommand) -> Re
         },
         ResourceClaim {
             kind: "account".into(),
-            scope: format!(
-                "native-{}",
-                payload["session"]["agent"].as_str().unwrap_or("unknown")
-            ),
+            scope: payload["session"]["accountId"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "native-{}",
+                        payload["session"]["agent"].as_str().unwrap_or("unknown")
+                    )
+                }),
             limit: limits.account as u32,
         },
         ResourceClaim {
@@ -918,6 +963,7 @@ async fn persist_host_result(
             let capacity_wait=matches!(&receipt,Err(Error::Feature(code,_)) if code=="execution_capacity");
             let preparation_wait=matches!(&receipt,Err(Error::Feature(code,_)) if code=="host_preparation_wait");
             let known_wait=capacity_wait||preparation_wait;
+            let account_rejected = command.kind == HostCommandKind::Start && receipt.as_ref().is_ok_and(|receipt| receipt.state == HostCommandState::Rejected && receipt.effect_state == ControlEffectState::Failed && receipt.receipt.as_deref().and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()).is_some_and(|body| body["code"] == "ACCOUNT_SNAPSHOT_INVALID"));
             let error_detail=receipt.as_ref().err().map(|error|{let public=error.public();serde_json::json!({"code":public.code,"message":public.message.chars().take(2048).collect::<String>()})});
             match &receipt {
                 Err(Error::Feature(code,_)) if matches!(code.as_str(),"execution_capacity"|"host_preparation_wait") => {state=OperationState::Waiting;effect=ControlEffectState::None;}
@@ -954,7 +1000,12 @@ async fn persist_host_result(
             } else {
                 tx.execute("UPDATE orch_recovery_jobs SET state='complete',revision=revision+1,updated_at=?2 WHERE kind='operation' AND object_id=?1",params![command.operation_id,now()])?;
             }
-            if state == OperationState::OutcomeUnknown || (state == OperationState::Failed && matches!(command.kind,HostCommandKind::Start|HostCommandKind::Stop)) {
+            if account_rejected {
+                let proven: bool = tx.query_row("SELECT state IN ('finalized','quiesced','exit_confirmed') FROM orch_executions WHERE attempt_id=?1", [&command.identity.attempt_id], |row| row.get(0))?;
+                if !proven { enqueue_cleanup_stop(tx, &command.identity, &command.operation_id, "account snapshot rejected before execution")?; }
+                tx.execute("UPDATE orch_worker_starts SET phase='failed',error='account snapshot rejected before execution',error_code='account_snapshot_invalid',updated_at=?2 WHERE operation_id=?1 AND phase='delivering'", params![command.operation_id, now()])?;
+            }
+            if !account_rejected && (state == OperationState::OutcomeUnknown || (state == OperationState::Failed && matches!(command.kind,HostCommandKind::Start|HostCommandKind::Stop))) {
                 schedule_recovery(tx,&NewRecoveryJob { job_id:stable_id("execution-recovery",&command.identity.attempt_id),kind:"execution".into(),object_id:command.identity.attempt_id.clone(),owner:"reliability-dispatcher".into(),next_check_at:next,detail:None,created_at:now() })?;
                 execution_state=match command.kind { HostCommandKind::Start=>Some(ExecutionState::StartUnknown),HostCommandKind::Stop=>Some(ExecutionState::StopUnknown),_=>None };
                 if state==OperationState::Failed {tx.execute("UPDATE orch_recovery_jobs SET state='manual_required',detail='Host rejected command; process state requires explicit reconciliation',updated_at=?2 WHERE kind='execution' AND object_id=?1",params![command.identity.attempt_id,now()])?;}
@@ -1245,7 +1296,7 @@ fn settle_result_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
         let identity: ExecutionIdentity = serde_json::from_value(request["identity"].clone())?;
         let closed:bool=tx.query_row("SELECT state IN ('quiesced','exit_confirmed','finalized') FROM orch_executions WHERE attempt_id=?1",[&attempt],|row|row.get(0))?;
         if !closed {
-            enqueue_cleanup_stop(tx, &identity, id)?;
+            enqueue_cleanup_stop(tx, &identity, id, "result accepted; execution cleanup")?;
         }
     }
     Store::append_event(
@@ -1327,10 +1378,11 @@ fn enqueue_cleanup_stop(
     tx: &rusqlite::Transaction<'_>,
     identity: &ExecutionIdentity,
     result_id: &str,
+    reason: &str,
 ) -> Result<()> {
     let id = stable_id("result-stop", result_id);
     let generation:i64=tx.query_row("UPDATE orch_executions SET stop_generation=stop_generation+1,updated_at=?2 WHERE attempt_id=?1 RETURNING stop_generation",params![identity.attempt_id,now()],|row|row.get(0))?;
-    let payload = serde_json::json!({"reason":"result accepted; execution cleanup","stopGeneration":generation});
+    let payload = serde_json::json!({"reason":reason,"stopGeneration":generation});
     let request = serde_json::json!({"identity":identity,"payload":payload});
     let operation = NewOperation {
         operation: OperationView {
@@ -1450,6 +1502,159 @@ mod tests {
             store.connection.query_row("SELECT command_id,command_kind,fingerprint,payload FROM orch_host_commands WHERE operation_id=?1",[id.clone()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))
                 .map_err(Error::from).and_then(|(command_id,kind,fingerprint,payload)|Ok(HostCommand{command_id,operation_id:id,identity,kind:parse_host_command_kind(&kind)?,fingerprint,payload}))
         }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn hosted_admission_reserves_the_bound_account_and_resolved_engine() {
+        let (_directory, database, identity) = fixture().await;
+        database.call_control("test.account.admission", move |store| {
+            let task = store.task(&identity.task_id)?;
+            let command = HostCommand {
+                command_id: "managed-start".into(),
+                operation_id: "managed-start".into(),
+                identity,
+                kind: HostCommandKind::Start,
+                fingerprint: String::new(),
+                payload: json!({"session":{"agent":"opencode","accountId":"managed-chat"},"admission":{"runId":task.run_id}}).to_string(),
+            };
+            store.reliability_transaction(|tx| reserve_start_tx(tx, &command))?;
+            store.reliability_transaction(|tx| reserve_start_tx(tx, &command))?;
+            let account: String = store.connection.query_row("SELECT resource_scope FROM orch_resource_reservations WHERE attempt_id=?1 AND resource_kind='account'", [&command.identity.attempt_id], |row| row.get(0))?;
+            assert_eq!(account, "managed-chat");
+            let engine: String = store.connection.query_row("SELECT resource_scope FROM orch_resource_reservations WHERE attempt_id=?1 AND resource_kind='backend'", [&command.identity.attempt_id], |row| row.get(0))?;
+            assert_eq!(engine, "opencode");
+            Ok(())
+        }).await.unwrap();
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_account_snapshot_requires_cleanup_proof_before_releasing_capacity() {
+        for late in [false, true] {
+            let (_directory, database, identity) = fixture().await;
+            let payload =
+                json!({"session":{"agent":"claude","accountId":"managed"},"prompt":"test"});
+            let request = json!({"identity":identity,"payload":payload});
+            let mut command = HostCommand {
+                command_id: "account-start-command".into(),
+                operation_id: "account-start".into(),
+                identity: identity.clone(),
+                kind: HostCommandKind::Start,
+                fingerprint: String::new(),
+                payload: payload.to_string(),
+            };
+            command.fingerprint =
+                super::super::reliability::host_command_fingerprint(&command).unwrap();
+            let operation = NewOperation {
+                operation: OperationView {
+                    operation_id: command.operation_id.clone(),
+                    kind: OperationKind::Start,
+                    state: OperationState::Accepted,
+                    task_id: Some(identity.task_id.clone()),
+                    attempt_id: Some(identity.attempt_id.clone()),
+                    execution_epoch: Some(identity.execution_epoch),
+                    effect_state: ControlEffectState::None,
+                    wait_reason: None,
+                    retry_after_ms: None,
+                    next_reconcile_at: None,
+                    revision: 1,
+                },
+                request_version: 1,
+                fingerprint: super::super::reliability::request_fingerprint(
+                    OperationKind::Start,
+                    1,
+                    &request,
+                ),
+                request: request.to_string(),
+                created_at: now(),
+            };
+            submit_operation(&database, operation, command.clone())
+                .await
+                .unwrap();
+            if late {
+                database.call_control("test.account.start_sent", |store| {
+                    store.connection.execute("UPDATE orch_host_commands SET state='sent' WHERE command_id='account-start-command'", [])?;
+                    Ok(())
+                }).await.unwrap();
+                submit_execution_operation(
+                    &database,
+                    &identity.attempt_id,
+                    "prior-stop",
+                    OperationKind::Stop,
+                    json!({"reason":"user stop before start receipt"}),
+                )
+                .await
+                .unwrap();
+                confirm_execution_exit(
+                    &database,
+                    identity.clone(),
+                    VerifiedExitProof {
+                        proof_id: "prior-exit".into(),
+                        attempt_id: identity.attempt_id.clone(),
+                        execution_epoch: identity.execution_epoch,
+                        host: identity.host.clone(),
+                        config_digest: identity.config_digest.clone(),
+                        kind: ExitProofKind::DriverQuiescence,
+                        verifier: ExitProofVerifier::Driver,
+                        evidence_digest: "f".repeat(64),
+                        verified_at: now(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let receipt = CommandReceipt {
+                command_id: command.command_id.clone(),
+                identity: identity.clone(),
+                state: HostCommandState::Rejected,
+                effect_state: ControlEffectState::Failed,
+                receipt: Some(json!({"code":"ACCOUNT_SNAPSHOT_INVALID"}).to_string()),
+            };
+            persist_host_result(&database, command.clone(), Ok(receipt.clone()))
+                .await
+                .unwrap();
+            persist_host_result(&database, command, Ok(receipt))
+                .await
+                .unwrap();
+            assert_eq!(
+                get_operation(&database, "account-start")
+                    .await
+                    .unwrap()
+                    .state,
+                OperationState::Failed
+            );
+            database
+                .call_control("test.account.rejected", move |store| {
+                    let state: String = store.connection.query_row(
+                        "SELECT state FROM orch_executions WHERE attempt_id='attempt-contract'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(state, if late { "finalized" } else { "stop_requested" });
+                    let pending: i64 = store.connection.query_row(
+                        "SELECT count(*) FROM orch_host_commands WHERE command_kind='stop'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(pending, 1);
+                    let held: i64 = store.connection.query_row(
+                        "SELECT count(*) FROM orch_resource_reservations WHERE state='held'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(held, if late { 0 } else { 1 });
+                    let proofs: i64 = store.connection.query_row(
+                        "SELECT count(*) FROM orch_exit_proofs",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(proofs, i64::from(late));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            database.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

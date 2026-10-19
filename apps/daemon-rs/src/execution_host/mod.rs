@@ -1,3 +1,4 @@
+pub(crate) mod accounts;
 #[cfg(unix)]
 pub mod launcher;
 #[cfg(not(unix))]

@@ -15,7 +15,7 @@
 | 工作包 | 实现 | 适用边界 |
 | --- | --- | --- |
 | W01 | schema 35；attempt/epoch、操作、命令、结果回执、退出证明、资源保留及恢复责任；未知状态唯一约束、参数指纹、旧启动映射 | 旧库迁移；未知新 schema 拒绝；不伪造历史 Host |
-| W02 | 独立 Rust Execution Host；私有 IPC、完整身份、持久命令与事件、审批原 ID、离线交付、共享摘要固定的 Rust 运行时 | Unix native Claude/Codex/DeepSeek；managed account、OpenCode hosted、Windows hosted 明确不支持 |
+| W02 | 独立 Rust Execution Host；私有 IPC、完整身份、持久命令与事件、审批原 ID、离线交付、共享摘要固定的 Rust 运行时 | Unix native Claude/Codex/DeepSeek；托管 Claude API Key/OAuth、Anthropic/Responses/Chat Completions API profile（含 OpenCode）；Windows hosted 不支持 |
 | W03 | Driver 启动回滚、退出/输出排空证明、未知容量隔离、结构化错误及 Retry-After、未知用量与重复结算保护 | 外部脱离进程组的进程和远端副作用不在 Unix 退出证明内 |
 | W04 | 持久异步 stop/message/result/reconcile；有界对账；原业务验收；结果与进程分别收尾；旧调用兼容 | hosted 显式启用；无通用外部副作用 exactly-once 保证 |
 | W05 | 当前用户同机唯一预算服务；原子准入、未知隔离计量、证明释放、重启保留占用 | 预算服务不可用时停止新准入；停止路径独立可用 |
@@ -43,7 +43,7 @@ hosted 模式使用 `PROSPERO_EXECUTION_MODE=hosted`。首次切换应先 drain 
 
 原始成功和失败日志都保留在本次工作树的 `output/runtime-reliability-2026-10-19/`。必须以最后一次完整验证和最终源码快照为准；中间失败记录不会改写为通过。
 
-最终冻结源码验证：
+首轮核心改造冻结源码验证：
 
 | 检查 | 结果 | 原始日志 |
 | --- | --- | --- |
@@ -97,9 +97,21 @@ node tools/perf/runtime-reliability/workload.mjs --profile diagnostic --duration
 | F07/F09/F12/F14–F18/F20/F22/F24/F26–F28 | 已有部分约束、兼容或组件证据 | 完整故障组合、负载及恢复场景仍未全覆盖 |
 | F01/F03/F08/F11/F19/F23/F25 | 保留矩阵中的发布阻塞状态 | 必须补齐真实注入/升级/旧快照证据 |
 
+## 托管账号与 API profile 支持补齐
+
+hosted 启动保留既有 `accountId`。每个启动操作生成不可变的私有账号快照，固定凭据、协议、模型、地址、请求头和现有账户默认配置；公开操作与 Host 日志只记录账号 ID、快照 ID、摘要与执行器类型。Host 将快照导入自己的私有账号目录和数据库，复用既有 Driver 的账号解析链路，不读写主控账号目录。原账号后续变化不改变同一次执行的配置。
+
+协议继续决定执行器：Anthropic 使用 Claude，Responses 使用 Codex，Chat Completions 使用 OpenCode。GPT、DeepSeek、Flash 等模型保留其 profile 配置，不新增按模型名猜测后端的逻辑。原生 DeepSeek `dsh` 路径保持原有独立账号语义。OpenCode 的推理参数等能力仍以既有 Driver 为准，本次不扩展模型参数支持范围。
+
+账号占用统计覆盖 hosted 未收口执行和 legacy 未知执行；容量按实际账号及执行器保留。缺失、损坏或不匹配的快照拒绝执行，不回退本机账号。安装失败时仍通过独立停止操作取得未启动证明后释放预算。启动前检查 Host 的 `managed_account_snapshots` 能力，避免向旧运行时盲发新账号命令。
+
+新增合成测试覆盖五个并行账号的配置与凭据隔离、主 daemon 被终止后同一 Host 持续运行、重连后确认退出与预算归零，以及公开响应、操作记录、事件和 Host 日志不含合成密钥。所有 provider 请求均由隔离 fake executor 处理；未验证实际账号的余额、网络可达性或真实模型响应。最终全工作区验证为 551 项通过、0 失败、6 项忽略；命令为 `cargo test --workspace --locked --no-fail-fast -- --test-threads=4`。严格 Clippy、格式检查、`npm run typecheck` 和 macOS arm64 打包启动 smoke 均通过，包内四个运行时摘要一致。
+
+本轮源码与日志保留在独立工作树的 `output/hosted-accounts-2026-10-19/`。中间出现过测试 URL 预期错误、晚到回执测试未注入“已发送”状态，以及并行构建/测试期间的启动和握手超时；失败日志保留。最终固定 4 个测试线程后完整通过，未放宽超时时限。发布包验证包含最终生产实现，之后仅修正了回归测试中的状态注入。以上验证使用隔离合成账号，不构成线上数据库迁移、真实账号探测或启用 hosted 的执行记录。
+
 ## 保留的发布阻塞项
 
-- Windows hosted 的受控树、peer identity 与真实平台验证；其他 hosted 后端/托管账号能力。
+- Windows hosted 的受控树、peer identity 与真实平台验证；未覆盖协议与后端的扩展能力。
 - 完整合作取消→宽限→强制停止策略；当前已验证的是强制停止与严格证明路径。
 - Host 被 SIGKILL、日志/磁盘失败、实际 PID 复用、旧控制快照对账，以及所有外部 native CLI/工具依赖的运行中版本固定。
 - 40 个长期活跃执行的稳态基线、连续 24 小时功能长跑和 72 小时 soak。

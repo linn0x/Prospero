@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{OptionalExtension, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::database::{now, validate_id};
@@ -54,7 +54,7 @@ struct LegacyAccount {
     api_profile: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CredentialKind {
     OauthToken,
@@ -124,6 +124,27 @@ fn profile_account_root_for_agent(data: &Path, id: &str, agent: AgentKind) -> Re
         _ => "claude",
     };
     account_root_for_agent(data, agent, id)
+}
+
+pub(crate) fn execution_account_root(
+    data: &Path,
+    id: &str,
+    agent: AgentKind,
+    profile: bool,
+) -> Result<PathBuf> {
+    if profile {
+        profile_account_root_for_agent(data, id, agent)
+    } else if agent == AgentKind::Claude {
+        account_root(data, id)
+    } else {
+        Err(Error::Invalid(
+            "managed account is incompatible with execution engine".into(),
+        ))
+    }
+}
+
+pub(crate) fn execution_credential_path(root: &Path) -> PathBuf {
+    credential_path(root)
 }
 
 fn credential_path(root: &Path) -> PathBuf {
@@ -1125,7 +1146,7 @@ impl crate::database::Store {
     pub(crate) fn active_session_count(&self, id: &str) -> Result<i64> {
         validate_account_id(id)?;
         let agents: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM agent_runs WHERE active=1 AND account_id=?",
+            "SELECT COUNT(*) FROM (SELECT session_id AS owner FROM agent_runs WHERE (active=1 OR execution_unknown=1) AND account_id=?1 UNION SELECT e.attempt_id AS owner FROM orch_executions e WHERE e.state!='finalized' AND EXISTS(SELECT 1 FROM orch_host_commands c WHERE c.attempt_id=e.attempt_id AND c.command_kind='start' AND json_extract(c.payload,'$.session.accountId')=?1))",
             [id],
             |row| row.get(0),
         )?;
@@ -1135,6 +1156,28 @@ impl crate::database::Store {
             |row| row.get(0),
         )?;
         Ok(agents + terminals)
+    }
+
+    pub(crate) fn install_execution_account_row(
+        &mut self,
+        id: &str,
+        agent: AgentKind,
+        profile: Option<&ApiProfile>,
+    ) -> Result<()> {
+        validate_account_id(id)?;
+        match self.managed_account(id) {
+            Ok(existing) => {
+                if existing.agent == agent && existing.api_profile.as_ref() == profile {
+                    return Ok(());
+                }
+                return Err(Error::Conflict);
+            }
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let timestamp = now();
+        self.connection.execute("INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at,api_profile) VALUES(?1,?2,'Hosted execution account',0,?3,?3,?4)",params![id,agent_label(agent)?,timestamp,profile.map(serde_json::to_string).transpose()?])?;
+        Ok(())
     }
 
     pub(crate) fn native_account_active_count(&self, agent: &str, native_id: &str) -> Result<i64> {
