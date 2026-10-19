@@ -33,6 +33,7 @@ use crate::{
 
 use super::{
     HOST_PROTOCOL_VERSION, HostConfig, HostEvent, HostEventPage, HostRequest, HostResponse,
+    accounts::AccountSnapshotRef,
 };
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -108,8 +109,6 @@ enum HostError {
     Invalid(String),
     #[error("command conflicts with an earlier command ID")]
     Conflict,
-    #[error("managed account and API profile execution are unsupported by this Host")]
-    UnsupportedManagedAccount,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -123,6 +122,8 @@ enum HostError {
 struct StartPayload {
     session: CreateAgentSession,
     prompt: String,
+    #[serde(default)]
+    account_snapshot: Option<AccountSnapshotRef>,
 }
 
 #[derive(Deserialize)]
@@ -355,6 +356,7 @@ async fn serve_connection(stream: UnixStream, runtime: Runtime) -> std::io::Resu
                     "durable_command_journal".into(),
                     "ordered_event_replay".into(),
                     "native_agent_accounts".into(),
+                    "managed_account_snapshots".into(),
                 ],
                 unresolved_attempts: journal.active.len(),
             }
@@ -412,12 +414,13 @@ impl Runtime {
             .commands
             .get(command_id)
             .cloned()?;
-        let proven = self
-            .journal
-            .lock()
-            .await
-            .canonical_exit_proof(&initial.command.identity)
-            .is_some();
+        let safe_without_owner = {
+            let journal = self.journal.lock().await;
+            journal
+                .canonical_exit_proof(&initial.command.identity)
+                .is_some()
+                || journal.snapshot_rejected_before_driver(&initial.command.identity)
+        };
         let owned = self
             .owned
             .lock()
@@ -425,7 +428,7 @@ impl Runtime {
             .contains(&initial.command.identity.attempt_id);
         if initial.command.kind == HostCommandKind::Stop
             && initial.receipt.state == HostCommandState::Unknown
-            && (owned || proven)
+            && (owned || safe_without_owner)
             && let Ok(_execution) = self.execution.try_lock()
         {
             let command = {
@@ -440,6 +443,7 @@ impl Runtime {
                     && (journal
                         .canonical_exit_proof(&current.command.identity)
                         .is_some()
+                        || journal.snapshot_rejected_before_driver(&current.command.identity)
                         || (owned && original_owner))
                     && validate_identity(&self.config, &current.command.identity).is_ok()
                     && !self.closing.load(Ordering::Acquire)
@@ -554,15 +558,22 @@ impl Runtime {
             ));
         }
         let payload: StartPayload = serde_json::from_str(&command.payload)?;
-        if payload.session.account_id.is_some()
-            || matches!(payload.session.agent, crate::protocol::AgentKind::Opencode)
+        validate_start_payload(&payload)?;
+        if let Some(reference) = &payload.account_snapshot
+            && super::accounts::install(
+                &self.database,
+                &self.config.data_dir,
+                reference,
+                payload.session.agent,
+            )
+            .await
+            .is_err()
         {
-            return Err(HostError::UnsupportedManagedAccount);
-        }
-        if payload.session.resume.is_some() {
-            return Err(HostError::Invalid(
-                "resuming provider sessions is not supported by this Host adapter".into(),
-            ));
+            return Ok((
+                    HostCommandState::Rejected,
+                    ControlEffectState::Failed,
+                    Some(json!({"code": "ACCOUNT_SNAPSHOT_INVALID", "error": "account snapshot could not be installed before driver creation"}).to_string()),
+                ));
         }
         self.agents
             .set_execution_environment(
@@ -640,16 +651,19 @@ impl Runtime {
             .lock()
             .await
             .contains(&command.identity.attempt_id);
-        let has_start = self
-            .journal
-            .lock()
-            .await
-            .commands
-            .values()
-            .any(|record| record.command.kind == HostCommandKind::Start);
+        let (has_start, snapshot_rejected) = {
+            let journal = self.journal.lock().await;
+            (
+                journal
+                    .commands
+                    .values()
+                    .any(|record| record.command.kind == HostCommandKind::Start),
+                journal.snapshot_rejected_before_driver(&command.identity),
+            )
+        };
         if owned {
             self.agents.close(&command.identity.attempt_id).await?;
-        } else if has_start {
+        } else if has_start && !snapshot_rejected {
             return Err(HostError::Invalid(
                 "Host cannot verify a driver owned by a prior process".into(),
             ));
@@ -681,7 +695,8 @@ impl Runtime {
                     "identity": command.identity,
                     "commandId": command.command_id,
                     "ownedDriverReapedAndOutputDrained": owned,
-                "emptyScopeFencedBeforeStart": !has_start,
+                    "emptyScopeFencedBeforeStart": !has_start,
+                    "accountSnapshotRejectedBeforeDriver": snapshot_rejected,
                 }))?
                 .as_bytes(),
             ),
@@ -1095,6 +1110,33 @@ impl Journal {
             },
         );
         Ok((receipt, true))
+    }
+
+    fn snapshot_rejected_before_driver(&self, identity: &ExecutionIdentity) -> bool {
+        let mut found = false;
+        for record in self
+            .commands
+            .values()
+            .filter(|record| record.command.kind == HostCommandKind::Start)
+        {
+            found = true;
+            if record.command.identity != *identity
+                || record.receipt.state != HostCommandState::Rejected
+                || record.receipt.effect_state != ControlEffectState::Failed
+                || record
+                    .receipt
+                    .receipt
+                    .as_deref()
+                    .and_then(|receipt| serde_json::from_str::<Value>(receipt).ok())
+                    .is_none_or(|receipt| {
+                        receipt.get("code").and_then(Value::as_str)
+                            != Some("ACCOUNT_SNAPSHOT_INVALID")
+                    })
+            {
+                return false;
+            }
+        }
+        found
     }
 
     fn canonical_exit_proof(&self, identity: &ExecutionIdentity) -> Option<VerifiedExitProof> {
@@ -1529,16 +1571,7 @@ fn validate_command(config: &HostConfig, command: &HostCommand) -> Result<(), Ho
     }
     if command.kind == HostCommandKind::Start {
         let payload: StartPayload = serde_json::from_str(&command.payload)?;
-        if payload.session.account_id.is_some()
-            || matches!(payload.session.agent, crate::protocol::AgentKind::Opencode)
-        {
-            return Err(HostError::UnsupportedManagedAccount);
-        }
-        if payload.session.resume.is_some() {
-            return Err(HostError::Invalid(
-                "resuming provider sessions is not supported by this Host adapter".into(),
-            ));
-        }
+        validate_start_payload(&payload)?;
     }
     if command.kind == HostCommandKind::Stop {
         let _ = stop_generation(command)?;
@@ -1561,6 +1594,50 @@ fn validate_command(config: &HostConfig, command: &HostCommand) -> Result<(), Ho
                 "interaction reply contains no decision".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_start_payload(payload: &StartPayload) -> Result<(), HostError> {
+    match (&payload.session.account_id, &payload.account_snapshot) {
+        (Some(account_id), Some(reference)) => {
+            if account_id != &reference.account_id || payload.session.agent != reference.engine {
+                return Err(HostError::Invalid(
+                    "account snapshot does not match the session account and engine".into(),
+                ));
+            }
+            crate::database::validate_id(account_id)?;
+            crate::database::validate_id(&reference.snapshot_id)?;
+            if reference.digest.len() != 64
+                || !reference
+                    .digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(HostError::Invalid("invalid account snapshot digest".into()));
+            }
+        }
+        (Some(_), None) => {
+            return Err(HostError::Invalid(
+                "managed account requires an account snapshot".into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(HostError::Invalid(
+                "account snapshot requires a session account".into(),
+            ));
+        }
+        (None, None) if payload.session.agent == crate::protocol::AgentKind::Opencode => {
+            return Err(HostError::Invalid(
+                "OpenCode requires a managed account snapshot".into(),
+            ));
+        }
+        (None, None) => {}
+    }
+    if payload.session.resume.is_some() {
+        return Err(HostError::Invalid(
+            "resuming provider sessions is not supported by this Host adapter".into(),
+        ));
     }
     Ok(())
 }
@@ -1675,7 +1752,6 @@ fn error_code(error: &HostError) -> &'static str {
         HostError::Config(_) => "HOST_CONFIG",
         HostError::Invalid(_) => "INVALID_COMMAND",
         HostError::Conflict => "COMMAND_CONFLICT",
-        HostError::UnsupportedManagedAccount => "CAPABILITY_UNSUPPORTED",
         HostError::Io(_) => "HOST_STORAGE",
         HostError::Json(_) => "INVALID_PAYLOAD",
         HostError::Agent(_) => "DRIVER_OUTCOME_UNKNOWN",
@@ -1779,6 +1855,75 @@ mod tests {
         };
         command.fingerprint = host_command_fingerprint(&command).unwrap();
         command
+    }
+
+    fn start_command(agent: &str, account: Option<&str>, snapshot: Option<Value>) -> HostCommand {
+        let mut command = command(HostCommandKind::Start, "start");
+        let mut payload = json!({
+            "session": {
+                "agent": agent,
+                "title": "Hosted account",
+                "workspace": "/tmp",
+                "accountId": account,
+            },
+            "prompt": "run",
+        });
+        if let Some(snapshot) = snapshot {
+            payload["accountSnapshot"] = snapshot;
+        }
+        command.payload = payload.to_string();
+        command.fingerprint = host_command_fingerprint(&command).unwrap();
+        command
+    }
+
+    fn account_reference(engine: &str) -> Value {
+        json!({
+            "accountId": "account",
+            "snapshotId": "snapshot",
+            "digest": "b".repeat(64),
+            "engine": engine,
+        })
+    }
+
+    #[test]
+    fn start_requires_bound_snapshot_for_managed_accounts_and_keeps_native_compatibility() {
+        for engine in ["claude", "codex", "deepseek"] {
+            validate_command(&config(), &start_command(engine, None, None)).unwrap();
+        }
+        for engine in ["claude", "codex", "opencode"] {
+            validate_command(
+                &config(),
+                &start_command(engine, Some("account"), Some(account_reference(engine))),
+            )
+            .unwrap();
+            assert!(
+                validate_command(&config(), &start_command(engine, Some("account"), None)).is_err()
+            );
+        }
+        assert!(validate_command(&config(), &start_command("opencode", None, None)).is_err());
+        assert!(
+            validate_command(
+                &config(),
+                &start_command("claude", None, Some(account_reference("claude"))),
+            )
+            .is_err()
+        );
+        for (field, value) in [
+            ("accountId", json!("other")),
+            ("snapshotId", json!("../snapshot")),
+            ("digest", json!("not-a-digest")),
+            ("engine", json!("opencode")),
+        ] {
+            let mut snapshot = account_reference("claude");
+            snapshot[field] = value;
+            assert!(
+                validate_command(
+                    &config(),
+                    &start_command("claude", Some("account"), Some(snapshot)),
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1958,6 +2103,62 @@ mod tests {
             inflight: Arc::new(AtomicUsize::new(0)),
             pump_sequence: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_snapshot_is_durable_and_stop_proves_no_driver_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal");
+        let journal = Journal::open(path.clone(), "host".into(), "epoch".into()).unwrap();
+        let mut runtime = runtime_fixture(directory.path(), journal).await;
+        runtime.config.data_dir = directory.path().into();
+        let start = start_command("claude", Some("account"), Some(account_reference("claude")));
+        runtime.journal.lock().await.accept(start.clone()).unwrap();
+        runtime.execute(start.clone()).await.unwrap();
+        let detail = runtime.command_detail(&start.command_id).await.unwrap();
+        assert_eq!(detail.receipt.state, HostCommandState::Rejected);
+        assert_eq!(detail.receipt.effect_state, ControlEffectState::Failed);
+        let receipt: Value =
+            serde_json::from_str(detail.receipt.receipt.as_deref().unwrap()).unwrap();
+        assert_eq!(receipt["code"], "ACCOUNT_SNAPSHOT_INVALID");
+        assert!(runtime.owned.lock().await.is_empty());
+        assert_eq!(runtime.agents.count(), 0);
+        assert!(matches!(
+            runtime
+                .database
+                .call(|store| store.agent_run("attempt"))
+                .await,
+            Err(crate::error::Error::NotFound)
+        ));
+        let stop = command(HostCommandKind::Stop, "stop");
+        runtime.journal.lock().await.accept(stop.clone()).unwrap();
+        drop(runtime);
+        let mut journal = Journal::open(path, "host".into(), "epoch".into()).unwrap();
+        journal.mark_restarted_attempts().unwrap();
+        assert_eq!(
+            journal.commands[&stop.command_id].receipt.state,
+            HostCommandState::Unknown
+        );
+        let runtime = runtime_fixture(directory.path(), journal).await;
+        let _ = tokio::join!(
+            runtime.command_detail(&stop.command_id),
+            runtime.command_detail(&stop.command_id)
+        );
+        let detail = runtime.command_detail(&stop.command_id).await.unwrap();
+        assert_eq!(detail.receipt.state, HostCommandState::Completed);
+        let proof: VerifiedExitProof =
+            serde_json::from_str(detail.receipt.receipt.as_deref().unwrap()).unwrap();
+        assert_eq!(proof.attempt_id, start.identity.attempt_id);
+        assert_eq!(proof.kind, ExitProofKind::DriverQuiescence);
+        assert_eq!(runtime.agents.count(), 0);
+        assert!(
+            runtime
+                .journal
+                .lock()
+                .await
+                .canonical_exit_proof(&start.identity)
+                .is_some()
+        );
     }
 
     #[tokio::test]

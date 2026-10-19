@@ -20,6 +20,10 @@ pub struct HostHandle {
     pub manifest: HostManifest,
 }
 impl HostHandle {
+    pub(crate) fn directory(&self) -> Result<&Path> {
+        Err(unsupported())
+    }
+
     pub fn open(_data_dir: &Path, _identity: &HostIdentity) -> Result<Self> {
         Err(unsupported())
     }

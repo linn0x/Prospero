@@ -248,6 +248,10 @@ fn pin_runtime(data_dir: &Path, binary: &Path) -> Result<(String, PathBuf)> {
 }
 
 impl HostHandle {
+    pub(crate) fn directory(&self) -> Result<&Path> {
+        Ok(&self.directory)
+    }
+
     pub fn open(data_dir: &Path, identity: &HostIdentity) -> Result<Self> {
         let directory = host_directory(data_dir, identity)?;
         private_directory(&data_dir.join("execution-hosts"))?;
