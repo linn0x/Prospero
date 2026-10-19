@@ -60,6 +60,7 @@ export function createLegacyDesktopProjection(source: unknown, sourceMtimeNs?: b
       const result = typeof task["result"] === "string" ? task["result"] : null;
       return {
         id: task["id"],
+        ...(task["runtime"] ? { runtime: task["runtime"] } : {}),
         runId: task["runId"],
         title: task["title"],
         skills: task["skills"] ?? [],

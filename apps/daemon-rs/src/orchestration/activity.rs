@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params_from_iter, types::Value as SqlValue};
+use rusqlite::{OptionalExtension, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -68,6 +68,23 @@ pub struct TaskActivity {
     pub last_output_at: Option<i64>,
     #[ts(type = "number | null")]
     pub last_progress_at: Option<i64>,
+    #[serde(default)]
+    pub execution: Option<ExecutionRecord>,
+    #[serde(default)]
+    pub latest_operation: Option<OperationView>,
+    #[serde(default)]
+    pub structured_error: Option<crate::protocol::DriverError>,
+    #[ts(type = "number")]
+    #[serde(default)]
+    pub reserved_resources: i64,
+    #[ts(type = "number")]
+    #[serde(default)]
+    pub quarantined_resources: i64,
+    #[serde(default)]
+    pub execution_unknown: bool,
+    #[ts(type = "number")]
+    #[serde(default)]
+    pub observed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -214,6 +231,27 @@ impl Store {
             .iter()
             .map(|row| (row.id.clone(), row.status))
             .collect::<HashMap<_, _>>();
+        let observed_at = crate::database::now();
+        let mut runtime_statement = tx.prepare(&format!(
+            "SELECT e.task_id,e.attempt_id,(SELECT o.operation_id FROM orch_operations_v2 o WHERE o.attempt_id=e.attempt_id ORDER BY o.updated_at DESC,o.operation_id DESC LIMIT 1), \
+             (SELECT count(*) FROM orch_resource_reservations r WHERE r.attempt_id=e.attempt_id AND r.state IN ('held','quarantined')), \
+             (SELECT count(*) FROM orch_resource_reservations r WHERE r.attempt_id=e.attempt_id AND r.state='quarantined') \
+             FROM orch_executions e WHERE e.task_id IN ({placeholders}) AND e.execution_epoch=(SELECT max(latest.execution_epoch) FROM orch_executions latest WHERE latest.task_id=e.task_id)"
+        ))?;
+        let runtime_rows = runtime_statement
+            .query_map(params_from_iter(query.task_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        drop(runtime_statement);
         let mut activities = Vec::with_capacity(query.task_ids.len());
         for id in query.task_ids {
             let row = all_rows
@@ -284,7 +322,37 @@ impl Store {
                     _ => None,
                 }
             });
+            let runtime = runtime_rows.get(&id);
+            let execution = runtime
+                .map(|row| Store::get_execution_in_transaction(&tx, &row.0))
+                .transpose()?;
+            let latest_operation = runtime
+                .and_then(|row| row.1.as_ref())
+                .map(|id| Store::get_operation_in_transaction(&tx, id))
+                .transpose()?;
+            let (structured_error, execution_unknown) = if let Some(dispatch) = dispatch.as_ref() {
+                let scope = format!("timeline:{}", dispatch.session_id);
+                let error = tx.query_row("SELECT payload FROM change_events WHERE scope=?1 AND kind='agent.driver_error' ORDER BY seq DESC LIMIT 1", [&scope], |row| row.get::<_, String>(0)).optional()?.map(|value| serde_json::from_str(&value)).transpose()?;
+                let unknown = tx
+                    .query_row(
+                        "SELECT execution_unknown=1 FROM agent_runs WHERE session_id=?1",
+                        [&dispatch.session_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                (error, unknown)
+            } else {
+                (None, false)
+            };
             activities.push(TaskActivity {
+                execution,
+                latest_operation,
+                structured_error,
+                reserved_resources: runtime.map_or(0, |row| row.2),
+                quarantined_resources: runtime.map_or(0, |row| row.3),
+                execution_unknown,
+                observed_at,
                 task_status: task.status,
                 dispatch_state: dispatch.as_ref().map(|value| value.state),
                 session_status: session.as_ref().map(|value| value.status),

@@ -108,6 +108,18 @@ pub(super) async fn launch_worker_start(
         "yolo" => true,
         _ => return Err(Error::Invalid("approvalPolicy is invalid".into())),
     };
+    let hosted = super::reliability_operations::hosted_workers_enabled()?;
+    if hosted
+        && (input
+            .account_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && id != crate::accounts::NATIVE_CLAUDE_ID)
+            || input.agent == crate::protocol::AgentKind::Opencode)
+    {
+        return Err(Error::Invalid(
+            "execution Host currently requires a native Claude/Codex/DeepSeek account".into(),
+        ));
+    }
     let account_id = match input.account_id.as_deref() {
         None | Some("") if input.agent == crate::protocol::AgentKind::Opencode => {
             return Err(Error::Invalid(
@@ -284,6 +296,28 @@ pub(super) async fn launch_worker_start(
             }
         }
     };
+
+    if hosted {
+        let session_id = super::start::worker_session_id(operation_id);
+        let prompt = worker_prompt(
+            &task,
+            &session_id,
+            &worker_cwd,
+            run.coordinator_session_id.as_deref(),
+            &skill_names,
+        );
+        return super::reliability_operations::launch_hosted_worker(
+            database,
+            input,
+            operation_id,
+            task,
+            worker_cwd,
+            asset,
+            prompt,
+            policy,
+        )
+        .await;
+    }
 
     // ── Agent session ──────────────────────────────────────────────────────
     let title = {
@@ -463,6 +497,63 @@ pub async fn stop_worker(
             ));
         }
     };
+    let hosted = {
+        use rusqlite::OptionalExtension;
+        let task_id = input.task_id.clone();
+        database.read("worker.stop.execution",move|store|{
+            let attempt=store.connection.query_row("SELECT attempt_id FROM orch_executions WHERE task_id=?1 AND host_id IS NOT NULL AND state!='finalized' ORDER BY execution_epoch DESC LIMIT 1",[task_id],|row|row.get::<_,String>(0)).optional()?;
+            attempt.map(|id|store.get_reliability_execution(&id)).transpose()
+        }).await?
+    };
+    if let Some(execution) = hosted {
+        let request = serde_json::json!({"reason":reason,"finalStatus":input.final_status});
+        let operation_id = match input.operation_id {
+            Some(id) => {
+                crate::database::validate_id(&id)?;
+                id
+            }
+            None => format!(
+                "worker-stop-{}",
+                super::reliability::request_fingerprint(
+                    super::reliability::OperationKind::Stop,
+                    1,
+                    &serde_json::json!({"attempt":execution.identity.attempt_id,"request":request})
+                )
+            ),
+        };
+        let operation = super::reliability_operations::submit_execution_operation(
+            database,
+            &execution.identity.attempt_id,
+            &operation_id,
+            super::reliability::OperationKind::Stop,
+            request,
+        )
+        .await?;
+        let dispatch_id = execution.identity.dispatch_id.ok_or(Error::Conflict)?;
+        let reason = reason.clone();
+        let mut outcome = database
+            .call_control("worker.stop.hosted", move |store| {
+                let dispatch = store.dispatch(&dispatch_id)?;
+                if dispatch.state.active() {
+                    store.abandon_dispatch(&dispatch_id, &reason, final_status)
+                } else {
+                    let task = store.task(&dispatch.task_id)?;
+                    Ok(SettleOutcome {
+                        task,
+                        dispatch,
+                        execution_pending: None,
+                        operation_id: None,
+                        operation_location: None,
+                    })
+                }
+            })
+            .await?;
+        outcome.execution_pending =
+            Some(operation.state != super::reliability::OperationState::Succeeded);
+        outcome.operation_location = Some(format!("/v1/operations/{operation_id}"));
+        outcome.operation_id = Some(operation_id);
+        return Ok(outcome);
+    }
     let live = {
         let id = input.task_id.clone();
         database
@@ -488,7 +579,13 @@ pub async fn stop_worker(
             Ok(()) | Err(Error::NotFound) => {}
             Err(error) => return Err(error),
         }
-        return Ok(SettleOutcome { task, dispatch });
+        return Ok(SettleOutcome {
+            task,
+            dispatch,
+            execution_pending: None,
+            operation_id: None,
+            operation_location: None,
+        });
     };
     let dispatch_id = dispatch.id.clone();
     let reason_text = reason.clone();

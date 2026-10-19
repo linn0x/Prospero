@@ -203,6 +203,36 @@ impl Api {
         tokio::spawn(async move {
             monitor.monitor_control_health().await;
         });
+        let event_database = database.clone();
+        let event_directory = database.directory().to_path_buf();
+        let event_stopping = shared_api.stopping.subscribe();
+        let event_agents = agents.clone();
+        tokio::spawn(async move {
+            if let Err(error) = orchestration::reliability_events::run_host_event_importer(
+                event_database,
+                event_directory,
+                event_agents,
+                event_stopping,
+            )
+            .await
+            {
+                eprintln!("Host event importer stopped: {error}");
+            }
+        });
+        let operation_database = database.clone();
+        let operation_directory = database.directory().to_path_buf();
+        let operation_stopping = shared_api.stopping.subscribe();
+        tokio::spawn(async move {
+            if let Err(error) = orchestration::reliability_operations::run_outbox_dispatcher(
+                operation_database,
+                operation_directory,
+                operation_stopping,
+            )
+            .await
+            {
+                eprintln!("execution operation dispatcher stopped: {error}");
+            }
+        });
         shared_api
     }
 
@@ -242,14 +272,22 @@ impl Api {
                             .iter()
                             .map(|dispatch| dispatch.run_id.clone())
                             .collect::<Vec<_>>();
-                        Ok((activity, queued, recovered_run_ids, stale_idle_workers))
+                        let reliability = store.runtime_reliability_health()?;
+                        Ok((
+                            activity,
+                            queued,
+                            recovered_run_ids,
+                            stale_idle_workers,
+                            reliability,
+                        ))
                     }),
             )
             .await
             .unwrap_or(Err(Error::Timeout));
             match sample {
-                Ok((activity, queued, recovered_run_ids, stale_idle_workers)) => {
+                Ok((activity, queued, recovered_run_ids, stale_idle_workers, reliability)) => {
                     if let Ok(mut health) = self.control_health.lock() {
+                        health.reliability = Some(reliability);
                         health.stale_dispatch_count = activity.stale_dispatch_count;
                         health.terminal_misalignment_count = activity.terminal_misalignment_count;
                         health.queued_start_count = queued;
@@ -530,6 +568,12 @@ impl Api {
             .route("/v1/tasks/{id}/complete", post(complete_task))
             .route("/v1/tasks/{id}/fail", post(fail_task))
             .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+            .route("/v1/operations/{id}", get(reliability_operation))
+            .route("/v1/executions/{id}", get(reliability_execution))
+            .route("/v1/executions/{id}/stop", post(reliability_stop))
+            .route("/v1/executions/{id}/reconcile", post(reliability_reconcile))
+            .route("/v1/executions/{id}/messages", post(reliability_message))
+            .route("/v1/executions/{id}/results", post(reliability_result))
             .route("/v1/workers/start", post(start_worker_route))
             .route(
                 "/v1/workers/start-operations/{id}",
@@ -879,6 +923,10 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
 
 fn control_request(path: &str) -> bool {
     matches!(path, "/v1/workers/stop" | "/v1/shutdown")
+        || (path.starts_with("/v1/executions/")
+            && ["/stop", "/results", "/reconcile"]
+                .iter()
+                .any(|suffix| path.ends_with(suffix)))
         || ((path.starts_with("/v1/tasks/") || path.starts_with("/v1/runs/"))
             && ["/complete", "/fail", "/cancel", "/abandon"]
                 .iter()
@@ -1208,6 +1256,8 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
         "agent.deepseek-harness.v1",
         "model.sources.v1",
         "orchestration.automation.v1",
+        "operations.query.v1",
+        "executions.query.v1",
         "scheduled-agents.v1",
     ];
     if cfg!(windows) {
@@ -1320,6 +1370,9 @@ async fn route_remote_ws_message(
         | "schedule.delete"
         | "schedule.run" => {
             remote_schedule_control(api, socket, channel, device, protocol_version, message).await
+        }
+        "orchestration.operation.get" | "orchestration.execution.get" => {
+            remote_execution_query(api, socket, channel, device, message).await
         }
         "orchestration.snapshot" => {
             let snapshot = load_orchestration_snapshot(api).await?;
@@ -1877,6 +1930,7 @@ async fn remote_usage(
 async fn load_orchestration_snapshot(api: &Api) -> Result<JsonValue> {
     let schedules = api.schedules.status_list_async().await?;
     api.call(move |store| {
+        let runtime = store.runtime_reliability_snapshot()?;
         Ok(json!({
             "runs": store.list_runs()?,
             "tasks": store.list_tasks(None)?,
@@ -1884,6 +1938,10 @@ async fn load_orchestration_snapshot(api: &Api) -> Result<JsonValue> {
             "gates": store.list_gates(None, None)?,
             "worktreeAssets": store.list_worktree_assets(None)?,
             "schedules": schedules,
+            "executions": runtime["executions"],
+            "operations": runtime["operations"],
+            "executionsTruncated": runtime["executionsTruncated"],
+            "operationsTruncated": runtime["operationsTruncated"],
         }))
     })
     .await
@@ -1986,6 +2044,49 @@ fn schedule_payload(mut message: JsonValue) -> JsonValue {
         object.remove("requestId");
     }
     message
+}
+
+async fn remote_execution_query(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    device: &DeviceRecord,
+    message: JsonValue,
+) -> Result<()> {
+    let request_id = require_str(&message, "requestId")?;
+    crate::database::validate_id(request_id)?;
+    let operation = require_str(&message, "type")? == "orchestration.operation.get";
+    let response_type = if operation {
+        "orchestration.operation.result"
+    } else {
+        "orchestration.execution.result"
+    };
+    let result = if !device.can_orchestrate() {
+        Err(Error::Forbidden)
+    } else if operation {
+        let id = require_str(&message, "operationId")?;
+        orchestration::reliability_operations::get_operation(&api.database, id)
+            .await
+            .and_then(|value| serde_json::to_value(value).map_err(Error::from))
+    } else {
+        let id = require_str(&message, "attemptId")?.to_owned();
+        crate::database::validate_id(&id)?;
+        api.database
+            .read("execution.get", move |store| {
+                store.get_reliability_execution(&id)
+            })
+            .await
+            .and_then(|value| serde_json::to_value(value).map_err(Error::from))
+    };
+    let response = match result {
+        Ok(value) => {
+            let mut response = json!({"type":response_type,"requestId":request_id});
+            response[if operation { "operation" } else { "execution" }] = value;
+            response
+        }
+        Err(error) => json!({"type":response_type,"requestId":request_id,"error":error.public()}),
+    };
+    send_remote_json(socket, channel, &response).await
 }
 
 async fn remote_orchestration_control(
@@ -2139,6 +2240,10 @@ async fn remote_orchestration_control(
         }
         "orchestration.worker.stop" => {
             let input = StopWorker {
+                operation_id: message
+                    .get("operationId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
                 task_id: require_str(&message, "taskId")?.to_owned(),
                 reason: message
                     .get("reason")
@@ -3236,7 +3341,7 @@ fn timeline_record_events(store: &mut Store, sid: &str, record: &TimelineRecord)
                 "preview":summary,
             }
         })],
-        TimelineBody::Error => vec![json!({
+        TimelineBody::Error { .. } => vec![json!({
             "kind":"agent.error",
             "message":timeline_text_or_preview(store, sid, record),
         })],
@@ -3617,6 +3722,19 @@ async fn runtime_health(api: &Api) -> Result<Health> {
                 .map_err(|_| Error::Closed)?
         }
     };
+    if let Some(reliability) = control.reliability.as_mut() {
+        reliability.liveness = if database.alive {
+            RuntimeHealthStatus::Healthy
+        } else {
+            RuntimeHealthStatus::Unhealthy
+        };
+        if database.degraded
+            || control.sampling_error.is_some()
+            || crate::database::now().saturating_sub(reliability.observed_at) > 15_000
+        {
+            reliability.readiness = RuntimeHealthStatus::Degraded;
+        }
+    }
     let mut capabilities = health_capabilities();
     if api.terminals.detached() {
         capabilities.push("terminal.detached-host.v1".into());
@@ -3926,6 +4044,7 @@ fn health_capabilities() -> Vec<String> {
         "orchestration.worker-start-operations.v1",
         "orchestration.task-activities.v1",
         "health.control-pressure.v1",
+        "operations.query.v1",
         "database.concurrent-reads.v1",
         "terminal.pty",
         #[cfg(unix)]
@@ -6975,29 +7094,131 @@ async fn retry_task(
 struct TaskDelivery {
     body: String,
     #[serde(default)]
+    operation_id: Option<String>,
+    #[serde(default)]
     actor_session_id: Option<String>,
 }
 
 async fn complete_task(
     State(api): State<Api>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: std::result::Result<Json<TaskDelivery>, axum::extract::rejection::JsonRejection>,
-) -> JsonResult<orchestration::Task> {
-    let Json(input) = body.map_err(|_| Error::Invalid("invalid task delivery".into()))?;
+) -> std::result::Result<Response, ApiError> {
+    let Json(mut input) = body.map_err(|_| Error::Invalid("invalid task delivery".into()))?;
+    reconcile_idempotency_key(&headers, &mut input.operation_id)?;
+    if let Some(response) = hosted_task_delivery(&api, &id, &input, true).await? {
+        return Ok(response);
+    }
     let task = settle_task_delivery(&api, &id, input, true).await?;
     api.publish();
-    Ok(Json(task))
+    Ok(Json(task).into_response())
 }
 
 async fn fail_task(
     State(api): State<Api>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: std::result::Result<Json<TaskDelivery>, axum::extract::rejection::JsonRejection>,
-) -> JsonResult<orchestration::Task> {
-    let Json(input) = body.map_err(|_| Error::Invalid("invalid task delivery".into()))?;
+) -> std::result::Result<Response, ApiError> {
+    let Json(mut input) = body.map_err(|_| Error::Invalid("invalid task delivery".into()))?;
+    reconcile_idempotency_key(&headers, &mut input.operation_id)?;
+    if let Some(response) = hosted_task_delivery(&api, &id, &input, false).await? {
+        return Ok(response);
+    }
     let task = settle_task_delivery(&api, &id, input, false).await?;
     api.publish();
-    Ok(Json(task))
+    Ok(Json(task).into_response())
+}
+
+async fn hosted_task_delivery(
+    api: &Api,
+    task_id: &str,
+    input: &TaskDelivery,
+    success: bool,
+) -> Result<Option<Response>> {
+    use rusqlite::OptionalExtension;
+    crate::database::validate_id(task_id)?;
+    crate::database::validate_text(&input.body, 8192, false)?;
+    let query = task_id.to_owned();
+    let actor = input.actor_session_id.clone();
+    let execution=api.database.call_control("task.delivery.execution",move |store| {
+        let attempt=store.connection.query_row("SELECT attempt_id FROM orch_executions WHERE task_id=?1 AND host_id IS NOT NULL ORDER BY execution_epoch DESC LIMIT 1",[query],|row|row.get::<_,String>(0)).optional()?;
+        let Some(attempt)=attempt else {return Ok(None);};
+        let execution=store.get_reliability_execution(&attempt)?;
+        if let Some(actor)=actor {
+            let dispatch=store.dispatch(execution.identity.dispatch_id.as_deref().ok_or(Error::Conflict)?)?;
+            if actor!=dispatch.session_id {return Err(Error::Forbidden);}
+        }
+        Ok(Some(execution))
+    }).await?;
+    let Some(execution) = execution else {
+        return Ok(None);
+    };
+    let payload = json!({"success":success,"outcome":input.body});
+    let operation_id = input.operation_id.clone().unwrap_or_else(|| {
+        format!(
+            "delivery-{}",
+            orchestration::reliability::request_fingerprint(
+                orchestration::reliability::OperationKind::Result,
+                1,
+                &json!({"identity":execution.identity,"payload":payload})
+            )
+        )
+    });
+    let operation = orchestration::reliability_operations::submit_execution_operation(
+        &api.database,
+        &execution.identity.attempt_id,
+        &operation_id,
+        orchestration::reliability::OperationKind::Result,
+        payload,
+    )
+    .await?;
+    let mut response = (StatusCode::ACCEPTED, Json(operation)).into_response();
+    response.headers_mut().insert(
+        "location",
+        format!("/v1/operations/{operation_id}")
+            .parse()
+            .map_err(|_| Error::Invalid("invalid operation id".into()))?,
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", "1".parse().unwrap());
+    api.publish();
+    Ok(Some(response))
+}
+
+fn schedule_dispatch_close(
+    database: Database,
+    agents: Agents,
+    session_id: String,
+    kick_run: Option<String>,
+) {
+    tokio::spawn(async move {
+        for attempt in 0..8 {
+            match agents.close(&session_id).await {
+                Ok(()) | Err(Error::NotFound) => {
+                    if let Some(run_id) = kick_run {
+                        orchestration::kick_automation(&database, &agents, &run_id).await;
+                    }
+                    return;
+                }
+                Err(Error::Backpressure(_) | Error::Busy | Error::Timeout)
+                    if database.health().alive && attempt < 7 =>
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => {
+                    database.record_recent_error(
+                        "worker.close",
+                        "agent_sessions",
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            }
+        }
+    });
 }
 
 async fn settle_task_delivery(
@@ -7074,30 +7295,13 @@ async fn settle_task_delivery(
         )
         .await?;
     if let Some(session_id) = session_id {
-        let agents = api.agents.clone();
-        let database = api.database.clone();
-        tokio::spawn(async move {
-            loop {
-                match agents.close(&session_id).await {
-                    Ok(()) | Err(Error::NotFound) => break,
-                    Err(Error::Backpressure(_) | Error::Busy | Error::Timeout)
-                        if database.health().alive =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(250)).await
-                    }
-                    Err(error) => {
-                        database.record_recent_error(
-                            "worker.close",
-                            "agent_sessions",
-                            &error.to_string(),
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-    }
-    if let Some(run_id) = kick_run {
+        schedule_dispatch_close(
+            api.database.clone(),
+            api.agents.clone(),
+            session_id,
+            kick_run,
+        );
+    } else if let Some(run_id) = kick_run {
         orchestration::kick_automation(&api.database, &api.agents, &run_id).await;
     }
     Ok(task)
@@ -7125,13 +7329,33 @@ async fn dispatch_task(
 
 // ── Workers & worktrees (Stage 8) ─────────────────────────────────────────
 
+fn reconcile_idempotency_key(headers: &HeaderMap, operation_id: &mut Option<String>) -> Result<()> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    if let Some(value) = values.next() {
+        if values.next().is_some() {
+            return Err(Error::Invalid("multiple idempotency keys".into()));
+        }
+        let key = value
+            .to_str()
+            .map_err(|_| Error::Invalid("invalid idempotency key".into()))?;
+        crate::database::validate_id(key)?;
+        if operation_id.as_deref().is_some_and(|id| id != key) {
+            return Err(Error::Conflict);
+        }
+        *operation_id = Some(key.to_owned());
+    }
+    Ok(())
+}
+
 async fn start_worker_route(
     State(api): State<Api>,
     headers: HeaderMap,
     Query(options): Query<WorkerStartOptions>,
     body: std::result::Result<Json<StartWorker>, axum::extract::rejection::JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
-    let Json(input) = body.map_err(|_| Error::Invalid("invalid worker start request".into()))?;
+    let Json(mut input) =
+        body.map_err(|_| Error::Invalid("invalid worker start request".into()))?;
+    reconcile_idempotency_key(&headers, &mut input.operation_id)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(175);
     let submission = orchestration::submit_worker_start(&api.database, &api.agents, input)
         .await
@@ -7229,6 +7453,161 @@ struct WorkerStartOptions {
     queued: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecutionOperationRequest {
+    #[serde(default)]
+    operation_id: Option<String>,
+    payload: JsonValue,
+}
+
+async fn submit_execution_request(
+    api: Api,
+    attempt_id: String,
+    headers: HeaderMap,
+    mut input: ExecutionOperationRequest,
+    kind: orchestration::reliability::OperationKind,
+) -> std::result::Result<Response, ApiError> {
+    reconcile_idempotency_key(&headers, &mut input.operation_id)?;
+    let operation_id = input
+        .operation_id
+        .ok_or_else(|| Error::Invalid("operationId or Idempotency-Key is required".into()))?;
+    let operation = orchestration::reliability_operations::submit_execution_operation(
+        &api.database,
+        &attempt_id,
+        &operation_id,
+        kind,
+        input.payload,
+    )
+    .await?;
+    let complete = matches!(
+        operation.state,
+        orchestration::reliability::OperationState::Succeeded
+            | orchestration::reliability::OperationState::Failed
+            | orchestration::reliability::OperationState::Cancelled
+    );
+    let mut response = (
+        if complete {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(operation),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        "location",
+        format!("/v1/operations/{operation_id}")
+            .parse()
+            .map_err(|_| Error::Invalid("invalid operation id".into()))?,
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", "1".parse().unwrap());
+    api.publish();
+    Ok(response)
+}
+
+async fn reliability_reconcile(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ExecutionOperationRequest>,
+) -> std::result::Result<Response, ApiError> {
+    submit_execution_request(
+        api,
+        id,
+        headers,
+        input,
+        orchestration::reliability::OperationKind::Reconcile,
+    )
+    .await
+}
+
+async fn reliability_stop(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ExecutionOperationRequest>,
+) -> std::result::Result<Response, ApiError> {
+    submit_execution_request(
+        api,
+        id,
+        headers,
+        input,
+        orchestration::reliability::OperationKind::Stop,
+    )
+    .await
+}
+
+async fn reliability_message(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ExecutionOperationRequest>,
+) -> std::result::Result<Response, ApiError> {
+    submit_execution_request(
+        api,
+        id,
+        headers,
+        input,
+        orchestration::reliability::OperationKind::Message,
+    )
+    .await
+}
+
+async fn reliability_result(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<ExecutionOperationRequest>,
+) -> std::result::Result<Response, ApiError> {
+    submit_execution_request(
+        api,
+        id,
+        headers,
+        input,
+        orchestration::reliability::OperationKind::Result,
+    )
+    .await
+}
+
+async fn reliability_operation(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::reliability::OperationView> {
+    let query = id.clone();
+    let operation = api
+        .database
+        .read("operation.get", move |store| {
+            store.get_reliability_operation(&query)
+        })
+        .await;
+    match operation {
+        Ok(operation) => Ok(Json(operation)),
+        Err(Error::NotFound) => {
+            let legacy = orchestration::get_worker_start(&api.database, &id).await?;
+            Ok(Json(
+                orchestration::reliability::worker_start_operation_view(&legacy),
+            ))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn reliability_execution(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::reliability::ExecutionRecord> {
+    Ok(Json(
+        api.database
+            .read("execution.get", move |store| {
+                store.get_reliability_execution(&id)
+            })
+            .await?,
+    ))
+}
+
 async fn worker_start_operation(
     State(api): State<Api>,
     Path(id): Path<String>,
@@ -7277,9 +7656,11 @@ fn worker_start_error(error: Error) -> Error {
 
 async fn stop_worker_route(
     State(api): State<Api>,
+    headers: HeaderMap,
     body: std::result::Result<Json<StopWorker>, axum::extract::rejection::JsonRejection>,
 ) -> JsonResult<orchestration::SettleOutcome> {
-    let Json(input) = body.map_err(|_| Error::Invalid("invalid worker stop request".into()))?;
+    let Json(mut input) = body.map_err(|_| Error::Invalid("invalid worker stop request".into()))?;
+    reconcile_idempotency_key(&headers, &mut input.operation_id)?;
     let outcome = orchestration::stop_worker(&api.database, &api.agents, input).await?;
     api.publish();
     Ok(Json(outcome))
@@ -7375,16 +7756,43 @@ async fn settle_dispatch(
     State(api): State<Api>,
     Path(id): Path<String>,
     body: std::result::Result<Json<SettleDispatch>, axum::extract::rejection::JsonRejection>,
-) -> JsonResult<orchestration::SettleOutcome> {
+) -> std::result::Result<Response, ApiError> {
     let Json(request) = body.map_err(|_| Error::Invalid("invalid settle request".into()))?;
-    let outcome = api
+    let query = id.clone();
+    let task_id = api
+        .database
+        .call_control("dispatch.delivery.task", move |store| {
+            Ok(store.dispatch(&query)?.task_id)
+        })
+        .await?;
+    if let Some(response) = hosted_task_delivery(
+        &api,
+        &task_id,
+        &TaskDelivery {
+            body: request.outcome.clone(),
+            operation_id: None,
+            actor_session_id: None,
+        },
+        request.success,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    let mut outcome = api
         .call_control("dispatch.settle", move |store| {
             store.settle_dispatch(&id, request.success, &request.outcome)
         })
         .await?;
-    orchestration::kick_automation(&api.database, &api.agents, &outcome.task.run_id).await;
+    outcome.execution_pending = Some(true);
+    schedule_dispatch_close(
+        api.database.clone(),
+        api.agents.clone(),
+        outcome.dispatch.session_id.clone(),
+        Some(outcome.task.run_id.clone()),
+    );
     api.publish();
-    Ok(Json(outcome))
+    Ok(Json(outcome).into_response())
 }
 
 async fn abandon_dispatch(
@@ -7652,6 +8060,23 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
         assert_eq!(body["operation"]["phase"], "queued");
         assert_eq!(body["sideEffectCommitted"], false);
+        let unified = api
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/operations/queued-test-start")
+                    .header("authorization", format!("Bearer {}", "a".repeat(64)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unified.status(), StatusCode::OK);
+        let unified: JsonValue =
+            serde_json::from_slice(&to_bytes(unified.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(unified["operationId"], "queued-test-start");
+        assert_eq!(unified["state"], "WAITING");
+        assert!(unified["attemptId"].is_null());
         for method in ["GET", "DELETE"] {
             let response = api
                 .router()
@@ -8223,5 +8648,28 @@ mod tests {
             exit_code: None,
         };
         assert!(terminal_page_output_b64(&page).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reliability_header_tests {
+    use super::*;
+
+    #[test]
+    fn header_and_body_id_must_agree() {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "op-one".parse().unwrap());
+        let mut operation = Some("op-two".into());
+        assert!(matches!(
+            reconcile_idempotency_key(&headers, &mut operation),
+            Err(Error::Conflict)
+        ));
+        assert_eq!(operation.as_deref(), Some("op-two"));
+        operation = None;
+        reconcile_idempotency_key(&headers, &mut operation).unwrap();
+        assert_eq!(operation.as_deref(), Some("op-one"));
+        reconcile_idempotency_key(&headers, &mut operation).unwrap();
+        headers.append("idempotency-key", "op-one".parse().unwrap());
+        assert!(reconcile_idempotency_key(&headers, &mut operation).is_err());
     }
 }

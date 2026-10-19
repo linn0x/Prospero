@@ -11,13 +11,21 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
+pub(crate) struct OwnerLock(File);
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 pub struct Store {
     pub(crate) connection: Connection,
-    _lock: Arc<File>,
+    _lock: Arc<OwnerLock>,
 }
 
 pub(crate) fn label<T: Serialize>(value: T) -> Result<String> {
@@ -104,14 +112,23 @@ impl Store {
             ));
         }
         fs::create_dir_all(directory)?;
+        if directory
+            .join("RESTORE_REQUIRES_RECONCILIATION.json")
+            .exists()
+        {
+            return Err(Error::Invalid(
+                "restored database requires execution reconciliation before admission".into(),
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
-        let lock = Arc::new(private_file(&directory.join("owner.lock"))?);
+        let lock = private_file(&directory.join("owner.lock"))?;
         lock.try_lock_exclusive()
             .map_err(|_| Error::AlreadyRunning)?;
+        let lock = Arc::new(OwnerLock(lock));
         let database = directory.join("prospero.sqlite");
         let existed = database.try_exists()?;
         let file = private_file(&database)?;
@@ -163,6 +180,7 @@ impl Store {
             transaction.execute_batch(include_str!("orchestration/schema-v32.sql"))?;
             transaction.execute_batch(include_str!("orchestration/schema-v33.sql"))?;
             transaction.execute_batch(include_str!("agent/schema-v34.sql"))?;
+            transaction.execute_batch(include_str!("orchestration/schema-v35.sql"))?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -257,6 +275,9 @@ impl Store {
             if version <= 33 {
                 transaction.execute_batch(include_str!("agent/schema-v34.sql"))?;
             }
+            if version <= 34 {
+                transaction.execute_batch(include_str!("orchestration/schema-v35.sql"))?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -279,11 +300,11 @@ impl Store {
         })
     }
 
-    pub(crate) fn owner_lock(&self) -> Arc<File> {
+    pub(crate) fn owner_lock(&self) -> Arc<OwnerLock> {
         self._lock.clone()
     }
 
-    pub(crate) fn open_reader(directory: &Path, lock: Arc<File>) -> Result<Self> {
+    pub(crate) fn open_reader(directory: &Path, lock: Arc<OwnerLock>) -> Result<Self> {
         let database = directory.join("prospero.sqlite");
         let connection = Connection::open_with_flags(
             database,

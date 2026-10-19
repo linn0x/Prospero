@@ -10,6 +10,10 @@
 mod activity;
 mod automation;
 mod gitops;
+pub mod reliability;
+pub mod reliability_admission;
+pub mod reliability_events;
+pub mod reliability_operations;
 mod start;
 mod store;
 mod workers;
@@ -27,6 +31,11 @@ pub use automation::{kick_automation, pause_automation, start_automation, tick_a
 pub use gitops::{
     WorktreeCreate, create_worktree, inspect_asset, remove_worktree, repo_root,
     worktree_default_path,
+};
+pub use reliability::{
+    CommandReceipt, ControlEffectState, ExecutionIdentity, ExecutionRecord, ExecutionState,
+    HostCommand, HostCommandKind, HostCommandState, HostIdentity, InteractionReply, OperationKind,
+    OperationState, OperationView, ResultState, WaitReason,
 };
 pub use start::{
     cancel_worker_start, get_worker_start, recover_worker_starts, start_worker, submit_worker_start,
@@ -310,6 +319,9 @@ fn default_worktree_mode() -> String {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StopWorker {
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub operation_id: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
     /// `failed` (default) or `cancelled`.

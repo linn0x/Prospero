@@ -299,6 +299,8 @@ pub enum RuntimeHealthStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ControlPlaneHealth {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reliability: Option<RuntimeReliabilityHealth>,
     pub http_requests_active: usize,
     pub http_requests_capacity: usize,
     pub control_requests_active: usize,
@@ -319,6 +321,33 @@ pub struct ControlPlaneHealth {
     #[ts(type = "number | null")]
     pub sampled_at: Option<i64>,
     pub sampling_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeReliabilityHealth {
+    pub liveness: RuntimeHealthStatus,
+    pub readiness: RuntimeHealthStatus,
+    pub progress: RuntimeHealthStatus,
+    pub consistency: RuntimeHealthStatus,
+    #[ts(type = "number")]
+    pub observed_at: i64,
+    #[ts(type = "number")]
+    pub operation_unknown_age_ms: i64,
+    #[ts(type = "number")]
+    pub stop_unconfirmed_count: i64,
+    #[ts(type = "number")]
+    pub unreachable_host_count: i64,
+    #[ts(type = "number")]
+    pub quarantined_capacity: i64,
+    #[ts(type = "number")]
+    pub result_pending_cleanup_count: i64,
+    #[ts(type = "number")]
+    pub recovery_backlog: i64,
+    #[ts(type = "number")]
+    pub manual_intervention_count: i64,
+    #[ts(type = "number")]
+    pub event_gap_count: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -478,6 +507,58 @@ pub enum ToolState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ControlEffectState {
+    None,
+    Received,
+    Delivered,
+    Unknown,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverErrorCategory {
+    Capacity,
+    RateLimit,
+    Configuration,
+    Authentication,
+    Transport,
+    ExecutorExit,
+    Storage,
+    Validation,
+    Ownership,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverPhase {
+    Create,
+    Send,
+    Observe,
+    Interrupt,
+    Terminate,
+    AwaitQuiescence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DriverError {
+    pub category: DriverErrorCategory,
+    pub code: String,
+    pub phase: DriverPhase,
+    pub retryable: bool,
+    #[ts(type = "number | null")]
+    pub retry_after_ms: Option<u64>,
+    pub control_effect_state: ControlEffectState,
+    pub attempt_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub diagnostic_ref: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
@@ -579,7 +660,10 @@ pub enum TimelineBody {
         #[ts(type = "number")]
         updated_at: i64,
     },
-    Error,
+    Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        driver_error: Option<DriverError>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

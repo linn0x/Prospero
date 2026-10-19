@@ -97,3 +97,13 @@ describe("orchestration task board presentation", () => {
     expect(states.get("failed")).toBe("review");
   });
 });
+
+it("keeps business completion visible while preventing dependent execution before cleanup", async () => {
+  const { taskRuntimeNotice, taskExecutionPending } = await import("../src/renderer/src/orchestration-utils");
+  const delivered: JsonObject = { id: "delivered", status: "done", runtime: { execution: { state: "STOP_UNKNOWN", resultState: "ACCEPTED" } } };
+  expect(taskRuntimeNotice(delivered)?.zh).toContain("未知");
+  expect(taskExecutionPending(delivered)).toBe(true);
+  const states = deriveTaskBoardStates([delivered, { id: "dependent", status: "pending", deps: ["delivered"] }]);
+  expect(states.get("delivered")).toBe("done");
+  expect(states.get("dependent")).toBe("queued");
+});

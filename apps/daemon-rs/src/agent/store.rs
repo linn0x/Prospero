@@ -1087,6 +1087,53 @@ impl Store {
         )
     }
 
+    pub(crate) fn agent_execution_unknown(&self, id: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT execution_unknown=1 FROM agent_runs WHERE session_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    pub(crate) fn agent_execution_stopped(&self, id: &str) -> Result<bool> {
+        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM agent_runs a JOIN orch_recovery_jobs j ON j.kind='legacy_session' AND j.object_id=a.session_id AND j.state='complete' WHERE a.session_id=?1 AND a.active=0 AND a.execution_unknown=0)", [id], |row| row.get(0)).map_err(Into::into)
+    }
+
+    pub(crate) fn clear_agent_execution_unknown(&mut self, id: &str) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        Self::resolve_agent_requests_in_transaction(&transaction, id)?;
+        transaction.execute(
+            "UPDATE agent_runs SET execution_unknown=0 WHERE session_id=?1",
+            [id],
+        )?;
+        transaction.execute("UPDATE orch_recovery_jobs SET state='complete',revision=revision+1,updated_at=max(updated_at,?2) WHERE kind='legacy_session' AND object_id=?1", params![id, crate::database::now()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_agent_execution_unknown(&mut self, id: &str) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        Self::mark_agent_execution_unknown_in_transaction(&transaction, id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn mark_agent_execution_unknown_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        id: &str,
+    ) -> Result<()> {
+        let timestamp = crate::database::now();
+        transaction.execute(
+            "UPDATE agent_runs SET execution_unknown=1 WHERE session_id=?1",
+            [id],
+        )?;
+        transaction.execute("INSERT INTO orch_recovery_jobs(job_id,kind,object_id,state,owner,next_check_at,revision,detail,created_at,updated_at) VALUES(?1,'legacy_session',?2,'manual_required','manual-legacy-session-cleanup',?3,1,'Verify the original direct executor has exited before releasing its session occupancy',?4,?4) ON CONFLICT(kind,object_id) DO UPDATE SET state='manual_required',next_check_at=excluded.next_check_at,revision=orch_recovery_jobs.revision+1,updated_at=max(orch_recovery_jobs.updated_at,excluded.updated_at)", params![format!("legacy-session-{}", uuid::Uuid::new_v4().simple()), id, timestamp.saturating_add(60_000), timestamp])?;
+        Ok(())
+    }
+
     pub(crate) fn agent_run(&self, id: &str) -> Result<AgentRun> {
         crate::database::validate_id(id)?;
         type Row = (
@@ -1268,7 +1315,7 @@ impl Store {
 
     pub(crate) fn begin_agent_turn(&mut self, id: &str) -> Result<(i64, Option<String>)> {
         let run = self.agent_run(id)?;
-        if !run.active {
+        if !run.active || self.agent_execution_unknown(id)? {
             return Err(Error::Conflict);
         }
         let turn = run.turn + 1;
@@ -1352,22 +1399,17 @@ impl Store {
         crate::database::validate_id(session_id)?;
         crate::database::validate_id(record_id)?;
         let transaction = self.connection.transaction()?;
-        let updated = transaction.execute(
-            "UPDATE timeline_records SET revision=revision+1, \
-             body=json_set(body,'$.resolved',json('true')) \
-             WHERE session_id=?1 AND id=?2 AND json_extract(body,'$.kind')=?3 \
-             AND coalesce(json_extract(body,'$.resolved'),0)=0",
+        let (position, revision): (i64, i64) = transaction.query_row(
+            "UPDATE timeline_records SET revision=revision+1, body=json_set(body,'$.resolved',json('true')) WHERE session_id=?1 AND id=?2 AND json_extract(body,'$.kind')=?3 AND coalesce(json_extract(body,'$.resolved'),0)=0 RETURNING position,revision",
             params![session_id, record_id, kind],
-        )?;
-        if updated != 1 {
-            return Err(Error::NotFound);
-        }
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.ok_or(Error::NotFound)?;
         Self::append_event(
             &transaction,
             &format!("timeline:{session_id}"),
             "timeline.updated",
             record_id,
-            serde_json::json!({"resolved": true}),
+            serde_json::json!({"position": position, "revision": revision, "resolved": true}),
         )?;
         transaction.commit()?;
         Ok(())
@@ -1379,40 +1421,69 @@ impl Store {
     pub(crate) fn resolve_all_agent_requests(&mut self, session_id: &str) -> Result<usize> {
         crate::database::validate_id(session_id)?;
         let transaction = self.connection.transaction()?;
-        let mut resolved = Vec::new();
-        {
-            let mut statement = transaction.prepare(
-                "SELECT id FROM timeline_records WHERE session_id=?1 \
-                 AND json_extract(body,'$.kind') IN ('permission_request','question') \
-                 AND coalesce(json_extract(body,'$.resolved'),0)=0",
-            )?;
-            let rows = statement.query_map(params![session_id], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                resolved.push(row?);
+        let resolved = Self::resolve_agent_requests_in_transaction(&transaction, session_id)?;
+        transaction.commit()?;
+        Ok(resolved)
+    }
+
+    fn resolve_agent_requests_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        session_id: &str,
+    ) -> Result<usize> {
+        let pending = {
+            let mut statement = transaction.prepare("SELECT id,position,revision FROM timeline_records WHERE session_id=?1 AND json_extract(body,'$.kind') IN ('permission_request','question') AND coalesce(json_extract(body,'$.resolved'),0)=0 ORDER BY position")?;
+            statement
+                .query_map([session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (record_id, position, revision) in &pending {
+            let changed = transaction.execute("UPDATE timeline_records SET revision=revision+1, body=json_set(body,'$.resolved',json('true')) WHERE session_id=?1 AND id=?2 AND revision=?3", params![session_id, record_id, revision])?;
+            if changed != 1 {
+                return Err(Error::Conflict);
             }
-        }
-        for record_id in &resolved {
-            transaction.execute(
-                "UPDATE timeline_records SET revision=revision+1, \
-                 body=json_set(body,'$.resolved',json('true')) WHERE id=?1",
-                [record_id],
-            )?;
             Self::append_event(
-                &transaction,
+                transaction,
                 &format!("timeline:{session_id}"),
                 "timeline.updated",
                 record_id,
-                serde_json::json!({"resolved": true}),
+                serde_json::json!({"position": position, "revision": revision + 1, "resolved": true}),
             )?;
         }
-        transaction.commit()?;
-        Ok(resolved.len())
+        Ok(pending.len())
     }
 
     pub fn archive_agent_session(&mut self, id: &str, failed: bool) -> Result<SessionHead> {
+        self.archive_agent_session_inner(id, failed, false)
+    }
+
+    pub(crate) fn archive_agent_session_for_stop(
+        &mut self,
+        id: &str,
+        failed: bool,
+    ) -> Result<bool> {
+        let previous_unknown = self.agent_execution_unknown(id)?;
+        self.archive_agent_session_inner(id, failed, true)?;
+        Ok(previous_unknown)
+    }
+
+    fn archive_agent_session_inner(
+        &mut self,
+        id: &str,
+        failed: bool,
+        stop_pending: bool,
+    ) -> Result<SessionHead> {
         let head = self.session(id)?;
         let run = self.agent_run(id)?;
         if !run.active {
+            if stop_pending {
+                self.mark_agent_execution_unknown(id)?;
+            }
             return Ok(head);
         }
         self.update_session_with(
@@ -1428,6 +1499,7 @@ impl Store {
                 }),
             },
             |tx| {
+                if stop_pending { Self::mark_agent_execution_unknown_in_transaction(tx, id)?; }
                 tx.execute("UPDATE agent_runs SET active=0 WHERE session_id=?", [id])?;
                 // Queued text can never be delivered to a dead process, and
                 // pending approvals/questions must not survive archiving.
@@ -1440,14 +1512,7 @@ impl Store {
                     params![crate::database::now(), id],
                 )?;
                 tx.execute("DELETE FROM agent_message_queue WHERE session_id=?", [id])?;
-                tx.execute(
-                    "UPDATE timeline_records SET revision=revision+1, \
-                     body=json_set(body,'$.resolved',json('true')) \
-                     WHERE session_id=?1 \
-                     AND json_extract(body,'$.kind') IN ('permission_request','question') \
-                     AND coalesce(json_extract(body,'$.resolved'),0)=0",
-                    [id],
-                )?;
+                Self::resolve_agent_requests_in_transaction(tx, id)?;
                 Ok(())
             },
         )
@@ -1480,7 +1545,7 @@ impl Store {
         }
         let run_active: Option<bool> = transaction
             .query_row(
-                "SELECT active=1 FROM agent_runs WHERE session_id=?",
+                "SELECT active=1 AND execution_unknown=0 FROM agent_runs WHERE session_id=?",
                 [session_id],
                 |r| r.get(0),
             )
@@ -1674,6 +1739,48 @@ impl Store {
         }
         transaction.commit()?;
         Ok(row)
+    }
+}
+
+impl Store {
+    pub(crate) fn append_agent_driver_error(
+        &mut self,
+        session_id: &str,
+        turn: i64,
+        failure: &super::lifecycle::DriverError,
+    ) -> Result<()> {
+        crate::database::validate_id(session_id)?;
+        if turn <= 0 {
+            return Err(Error::Invalid("agent turn must be positive".into()));
+        }
+        let scope = format!("timeline:{session_id}");
+        let event_id = format!("turn{turn}-error");
+        let payload = serde_json::to_value(failure)?;
+        let encoded = serde_json::to_string(&payload)?;
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT payload FROM change_events WHERE scope=?1 AND kind='agent.driver_error' AND entity_id=?2 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![scope, event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != encoded {
+                return Err(Error::Conflict);
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        Self::append_event(
+            &transaction,
+            &scope,
+            "agent.driver_error",
+            &event_id,
+            payload,
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 }
 
@@ -2197,7 +2304,7 @@ mod tests {
             let store = Store::open(directory.path()).unwrap();
             store
                 .connection
-                .execute_batch("DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; DROP INDEX orch_worker_starts_dispatch_owner; DROP INDEX orch_dispatch_active_session; DROP INDEX cross_model_checks_parent_state; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; DROP TABLE orch_worker_starts; DROP TABLE timeline_checkpoints; PRAGMA user_version=28;")
+                .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA foreign_keys=ON; DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; DROP INDEX orch_worker_starts_dispatch_owner; DROP INDEX orch_dispatch_active_session; DROP INDEX cross_model_checks_parent_state; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; DROP TABLE orch_worker_starts; DROP TABLE timeline_checkpoints; PRAGMA user_version=28;")
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
@@ -2221,7 +2328,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
         assert_eq!(columns, 5);
         assert_eq!(queue_columns, 1);
     }
@@ -2687,5 +2794,284 @@ mod tests {
             .len()
                 <= 8_192
         );
+    }
+
+    #[test]
+    fn unknown_direct_session_and_manual_responsibility_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let id = active_child_session(&mut store, "legacy unknown");
+        store.connection.execute_batch("CREATE TRIGGER reject_legacy_responsibility BEFORE INSERT ON orch_recovery_jobs WHEN NEW.kind='legacy_session' BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        assert!(store.mark_agent_execution_unknown(&id).is_err());
+        assert!(!store.agent_execution_unknown(&id).unwrap());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_legacy_responsibility")
+            .unwrap();
+        store.mark_agent_execution_unknown(&id).unwrap();
+        assert!(store.agent_execution_unknown(&id).unwrap());
+        let responsibility: (String, String, i64) = store.connection.query_row("SELECT state,owner,next_check_at FROM orch_recovery_jobs WHERE kind='legacy_session' AND object_id=?1", [&id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(responsibility.0, "manual_required");
+        assert_eq!(responsibility.1, "manual-legacy-session-cleanup");
+        assert!(responsibility.2 > 0);
+        store.clear_agent_execution_unknown(&id).unwrap();
+        assert!(!store.agent_execution_unknown(&id).unwrap());
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM orch_recovery_jobs WHERE kind='legacy_session' AND object_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "complete");
+    }
+
+    #[test]
+    fn stop_archival_keeps_the_execution_fence_until_exit_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let id = active_child_session(&mut store, "stop intent");
+        store.connection.execute_batch("CREATE TRIGGER reject_stop_responsibility BEFORE INSERT ON orch_recovery_jobs WHEN NEW.kind='legacy_session' BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        assert!(store.archive_agent_session_for_stop(&id, true).is_err());
+        assert!(store.agent_run(&id).unwrap().active);
+        assert!(!store.agent_execution_unknown(&id).unwrap());
+        assert_eq!(
+            store.session(&id).unwrap().lifecycle,
+            SessionLifecycle::Active
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_stop_responsibility")
+            .unwrap();
+        assert!(!store.archive_agent_session_for_stop(&id, true).unwrap());
+        assert!(!store.agent_run(&id).unwrap().active);
+        assert!(store.agent_execution_unknown(&id).unwrap());
+        assert!(store.begin_agent_turn(&id).is_err());
+        assert!(!store.agent_execution_stopped(&id).unwrap());
+        store.clear_agent_execution_unknown(&id).unwrap();
+        assert!(store.agent_execution_stopped(&id).unwrap());
+        assert!(!store.agent_execution_unknown(&id).unwrap());
+    }
+
+    fn seed_shared_pending_requests(store: &mut Store, session_id: &str) {
+        for (id, body) in [
+            (
+                "shared-permission",
+                TimelineBody::PermissionRequest {
+                    request_id: "permission-request".into(),
+                    tool: "Bash".into(),
+                    resolved: false,
+                    subagent: None,
+                },
+            ),
+            (
+                "shared-question",
+                TimelineBody::Question {
+                    request_id: "question-request".into(),
+                    questions: Vec::new(),
+                    resolved: false,
+                    subagent: None,
+                },
+            ),
+        ] {
+            store
+                .write_timeline(
+                    session_id,
+                    TimelineWrite {
+                        id: id.into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body,
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn resolved_request_events_replay_scoped_revisions_for_interrupt_and_archive() {
+        for archive in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = Store::open(directory.path()).unwrap();
+            let target = active_child_session(&mut store, "target");
+            let other = active_child_session(&mut store, "other");
+            seed_shared_pending_requests(&mut store, &target);
+            seed_shared_pending_requests(&mut store, &other);
+            let scope = format!("timeline:{target}");
+            let other_scope = format!("timeline:{other}");
+            let before = store.events(&scope, 0, 40).unwrap().latest_seq;
+            let other_before = store.events(&other_scope, 0, 40).unwrap().latest_seq;
+            if archive {
+                store.archive_agent_session_for_stop(&target, true).unwrap();
+            } else {
+                assert_eq!(store.resolve_all_agent_requests(&target).unwrap(), 2);
+            }
+            let events = store.events(&scope, before, 40).unwrap();
+            assert_eq!(events.items.len(), 2);
+            assert_eq!(events.latest_seq, before + 2);
+            let replay = store
+                .timeline_lookup(
+                    &target,
+                    events
+                        .items
+                        .iter()
+                        .map(|event| event.entity_id.clone())
+                        .collect(),
+                )
+                .unwrap();
+            assert_eq!(replay.items.len(), 2);
+            for event in &events.items {
+                assert_eq!(event.kind, "timeline.updated");
+                assert_eq!(event.data["resolved"], true);
+                let record = replay
+                    .items
+                    .iter()
+                    .find(|record| record.id == event.entity_id)
+                    .unwrap();
+                assert_eq!(record.revision, 2);
+                assert_eq!(event.data["revision"], record.revision);
+                assert_eq!(event.data["position"], record.position);
+                assert!(matches!(
+                    &record.body,
+                    TimelineBody::PermissionRequest { resolved: true, .. }
+                        | TimelineBody::Question { resolved: true, .. }
+                ));
+                let untouched = store.timeline_record(&other, &record.id).unwrap();
+                assert_eq!(untouched.revision, 1);
+                assert!(matches!(
+                    &untouched.body,
+                    TimelineBody::PermissionRequest {
+                        resolved: false,
+                        ..
+                    } | TimelineBody::Question {
+                        resolved: false,
+                        ..
+                    }
+                ));
+            }
+            assert!(
+                store
+                    .events(&other_scope, other_before, 40)
+                    .unwrap()
+                    .items
+                    .is_empty()
+            );
+            assert_eq!(store.resolve_all_agent_requests(&target).unwrap(), 0);
+            assert!(
+                store
+                    .events(&scope, events.latest_seq, 40)
+                    .unwrap()
+                    .items
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn request_resolution_event_failure_rolls_back_archive_and_stop_responsibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let target = active_child_session(&mut store, "archive atomicity");
+        seed_shared_pending_requests(&mut store, &target);
+        let scope = format!("timeline:{target}");
+        let before = store.events(&scope, 0, 40).unwrap().latest_seq;
+        store.connection.execute_batch("CREATE TRIGGER reject_resolved_request_event BEFORE INSERT ON change_events WHEN NEW.kind='timeline.updated' AND json_extract(NEW.payload,'$.resolved')=1 BEGIN SELECT RAISE(ABORT,'injected event failure'); END;").unwrap();
+        assert!(store.archive_agent_session_for_stop(&target, true).is_err());
+        assert!(store.agent_run(&target).unwrap().active);
+        assert!(!store.agent_execution_unknown(&target).unwrap());
+        assert_eq!(
+            store.session(&target).unwrap().lifecycle,
+            SessionLifecycle::Active
+        );
+        let responsibilities: i64 = store.connection.query_row("SELECT count(*) FROM orch_recovery_jobs WHERE kind='legacy_session' AND object_id=?1", [&target], |row| row.get(0)).unwrap();
+        assert_eq!(responsibilities, 0);
+        for id in ["shared-permission", "shared-question"] {
+            let record = store.timeline_record(&target, id).unwrap();
+            assert_eq!(record.revision, 1);
+            assert!(matches!(
+                record.body,
+                TimelineBody::PermissionRequest {
+                    resolved: false,
+                    ..
+                } | TimelineBody::Question {
+                    resolved: false,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(store.events(&scope, before, 40).unwrap().latest_seq, before);
+        assert!(store.resolve_all_agent_requests(&target).is_err());
+        assert_eq!(
+            store
+                .timeline_record(&target, "shared-permission")
+                .unwrap()
+                .revision,
+            1
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_resolved_request_event")
+            .unwrap();
+        store.archive_agent_session_for_stop(&target, true).unwrap();
+        assert_eq!(store.events(&scope, before, 40).unwrap().items.len(), 2);
+        store
+            .write_timeline(
+                &target,
+                TimelineWrite {
+                    id: "late-permission".into(),
+                    turn_id: "turn1".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::PermissionRequest {
+                        request_id: "late-request".into(),
+                        tool: "Bash".into(),
+                        resolved: false,
+                        subagent: None,
+                    },
+                    text: String::new(),
+                    replace: false,
+                    subagent_id: None,
+                },
+            )
+            .unwrap();
+        let after_late = store.events(&scope, before, 40).unwrap().latest_seq;
+        store.connection.execute_batch("CREATE TRIGGER reject_resolved_request_event BEFORE INSERT ON change_events WHEN NEW.kind='timeline.updated' AND json_extract(NEW.payload,'$.resolved')=1 BEGIN SELECT RAISE(ABORT,'injected event failure'); END;").unwrap();
+        assert!(store.clear_agent_execution_unknown(&target).is_err());
+        assert!(store.agent_execution_unknown(&target).unwrap());
+        assert_eq!(
+            store
+                .timeline_record(&target, "late-permission")
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(
+            store
+                .events(&scope, after_late, 40)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_resolved_request_event")
+            .unwrap();
+        store.clear_agent_execution_unknown(&target).unwrap();
+        assert!(!store.agent_execution_unknown(&target).unwrap());
+        let resolved = store.events(&scope, after_late, 40).unwrap();
+        assert_eq!(resolved.items.len(), 1);
+        assert_eq!(resolved.items[0].entity_id, "late-permission");
+        assert_eq!(resolved.items[0].data["revision"], 2);
+        assert_eq!(resolved.items[0].data["resolved"], true);
+        assert!(matches!(
+            store
+                .timeline_record(&target, "late-permission")
+                .unwrap()
+                .body,
+            TimelineBody::PermissionRequest { resolved: true, .. }
+        ));
     }
 }

@@ -11,9 +11,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use super::claude::{AdapterEvent, TurnOptions};
+use super::lifecycle::{ChildGuard, ProcessLifecycle, terminate_child};
 use super::store::ApprovalPolicy;
 use super::{AgentModelCatalog, LaunchModelCatalog, LaunchModelInfo};
 use crate::error::{Error, Result};
+use crate::orchestration::reliability::ControlEffectState;
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,7 +30,7 @@ pub(super) struct OpencodeTurn {
     workspace: String,
     model: Option<String>,
     isolated: bool,
-    child_pid: u32,
+    lifecycle: ProcessLifecycle,
 }
 
 struct EventLoop {
@@ -40,6 +42,7 @@ struct EventLoop {
     events: mpsc::Sender<AdapterEvent>,
     ready: oneshot::Sender<Result<()>>,
     child: Child,
+    lifecycle: ProcessLifecycle,
 }
 
 struct EventContext<'a> {
@@ -82,7 +85,10 @@ fn parse_port(output: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
-async fn start_process(workspace: &str, environment: &[(String, String)]) -> Result<(Child, u16)> {
+async fn start_process(
+    workspace: &str,
+    environment: &[(String, String)],
+) -> Result<(ChildGuard, u16)> {
     let isolated = environment
         .iter()
         .any(|(key, _)| key == "PROSPERO_API_PROFILE_CONFIG");
@@ -104,36 +110,39 @@ async fn start_process(workspace: &str, environment: &[(String, String)]) -> Res
     for (key, value) in environment {
         command.env(key, value);
     }
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().map_err(|error| {
+    super::lifecycle::configure_process_group(&mut command);
+    let child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Error::Feature("agent_unavailable".into(), "未安装 opencode".into())
         } else {
             Error::Io(error)
         }
     })?;
-    let stdout = child.stdout.take().ok_or(Error::Closed)?;
-    let stderr = child.stderr.take().ok_or(Error::Closed)?;
+    let mut guard = ChildGuard::new(child)?;
+    let stdout = guard.child_mut().stdout.take().ok_or(Error::Closed)?;
+    let stderr = guard.child_mut().stderr.take().ok_or(Error::Closed)?;
     let (ports_tx, mut ports_rx) = mpsc::unbounded_channel();
     tokio::spawn(drain_output(BufReader::new(stdout), ports_tx.clone()));
     tokio::spawn(drain_output(BufReader::new(stderr), ports_tx));
     let port = tokio::time::timeout(START_TIMEOUT, async {
         tokio::select! {
             port = ports_rx.recv() => port.ok_or(Error::Closed),
-            status = child.wait() => Err(Error::Invalid(format!("opencode serve 启动时退出: {:?}", status.ok()))),
+            status = guard.wait_for_exit() => Err(Error::Invalid(format!("opencode serve 启动时退出: {status:?}"))),
         }
     })
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok((child, port))
+    .await;
+    let port = match port {
+        Ok(Ok(port)) => port,
+        Ok(Err(error)) => {
+            let quiescence = guard.terminate(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
+        }
+        Err(_) => {
+            let quiescence = guard.terminate(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(Error::Timeout, quiescence));
+        }
+    };
+    Ok((guard, port))
 }
 
 async fn drain_output<R>(mut reader: BufReader<R>, ports: mpsc::UnboundedSender<u16>)
@@ -184,10 +193,7 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|error| Error::Invalid(format!("OpenCode HTTP failed: {error}")))?;
     if !response.status().is_success() {
-        return Err(Error::Invalid(format!(
-            "OpenCode HTTP {}",
-            response.status()
-        )));
+        return Err(super::lifecycle::http_response_error("OpenCode", response).await);
     }
     if response.status().as_u16() == 204 {
         return serde_json::from_value(Value::Null)
@@ -388,60 +394,67 @@ pub(super) async fn spawn_turn(
         ));
     }
     let (mut child, port) = start_process(workspace, &options.environment).await?;
-    let child_pid = child.id().ok_or(Error::Closed)?;
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{port}");
     let expected = options
         .environment
         .iter()
         .find_map(|(key, value)| (key == "PROSPERO_API_PROFILE_MODEL").then_some(value.as_str()));
-    if let Err(error) = wait_catalog(&client, &base_url, workspace, expected).await {
-        cleanup_child(&mut child).await;
-        return Err(error);
-    }
-    let model = default_model(&client, &base_url, workspace).await?;
-    if let Some(expected) = expected {
-        let actual = model
-            .as_ref()
-            .map(|(provider, model)| format!("{provider}/{model}"));
-        if actual.as_deref() != Some(expected) {
-            cleanup_child(&mut child).await;
-            return Err(Error::Invalid(
-                "OpenCode API Profile 模型配置被其他配置覆盖".into(),
-            ));
+    let setup = async {
+        wait_catalog(&client, &base_url, workspace, expected).await?;
+        let model = default_model(&client, &base_url, workspace).await?;
+        if let Some(expected) = expected {
+            let actual = model
+                .as_ref()
+                .map(|(provider, model)| format!("{provider}/{model}"));
+            if actual.as_deref() != Some(expected) {
+                return Err(Error::Invalid(
+                    "OpenCode API Profile 模型配置被其他配置覆盖".into(),
+                ));
+            }
         }
+        let session_id = if let Some(id) = native_id {
+            let _: Value = fetch_json(
+                &client,
+                format!(
+                    "{base_url}/api/session/{}?{}",
+                    url_encode(id),
+                    location_query(workspace)
+                ),
+                "GET",
+                None,
+            )
+            .await?;
+            id.to_owned()
+        } else {
+            let mut body = serde_json::Map::new();
+            body.insert("location".into(), json!({"directory":workspace}));
+            if let Some((provider, model)) = &model {
+                body.insert("model".into(), json!({"providerID":provider,"id":model}));
+            }
+            fetch_json::<Value>(
+                &client,
+                format!("{base_url}/api/session"),
+                "POST",
+                Some(Value::Object(body)),
+            )
+            .await?
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Invalid("OpenCode 未返回 session id".into()))?
+            .to_owned()
+        };
+        Ok((model, session_id))
     }
-    let session_id = if let Some(id) = native_id {
-        let _: Value = fetch_json(
-            &client,
-            format!(
-                "{base_url}/api/session/{}?{}",
-                url_encode(id),
-                location_query(workspace)
-            ),
-            "GET",
-            None,
-        )
-        .await?;
-        id.to_owned()
-    } else {
-        let mut body = serde_json::Map::new();
-        body.insert("location".into(), json!({"directory":workspace}));
-        if let Some((provider, model)) = &model {
-            body.insert("model".into(), json!({"providerID":provider,"id":model}));
+    .await;
+    let (model, session_id) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            let quiescence = child.terminate(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
         }
-        fetch_json::<Value>(
-            &client,
-            format!("{base_url}/api/session"),
-            "POST",
-            Some(Value::Object(body)),
-        )
-        .await?
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::Invalid("OpenCode 未返回 session id".into()))?
-        .to_owned()
     };
+    let lifecycle = child.lifecycle();
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
     let _ = events_tx.try_send(AdapterEvent::NativeId(session_id.clone()));
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -453,16 +466,27 @@ pub(super) async fn spawn_turn(
         auto_approve: options.policy == ApprovalPolicy::Auto,
         events: events_tx.clone(),
         ready: ready_tx,
-        child,
+        child: child.into_child().0,
+        lifecycle: lifecycle.clone(),
     }));
     match tokio::time::timeout(START_TIMEOUT, ready_rx).await {
         Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => return Err(error),
-        Ok(Err(_)) => return Err(Error::Closed),
-        Err(_) => return Err(Error::Timeout),
+        Ok(Ok(Err(error))) => {
+            let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
+        }
+        Ok(Err(_)) => {
+            let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
+        }
+        Err(_) => {
+            lifecycle.request_termination().await;
+            let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(Error::Timeout, quiescence));
+        }
     }
     let prompt_provider = expected.and_then(|model| model.split_once('/').map(|value| value.0));
-    send_prompt(
+    if let Err(error) = send_prompt(
         &client,
         &base_url,
         workspace,
@@ -470,7 +494,12 @@ pub(super) async fn spawn_turn(
         prompt_provider,
         prompt,
     )
-    .await?;
+    .await
+    {
+        lifecycle.request_termination().await;
+        let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+        return Err(super::lifecycle::cleanup_error(error, quiescence));
+    }
     Ok(OpencodeTurn {
         client,
         base_url,
@@ -479,7 +508,7 @@ pub(super) async fn spawn_turn(
         workspace: workspace.to_owned(),
         model: model.map(|(provider, model)| format!("{provider}/{model}")),
         isolated: expected.is_some(),
-        child_pid,
+        lifecycle,
     })
 }
 
@@ -495,7 +524,7 @@ async fn run_events(mut loop_state: EventLoop) {
             let _ = loop_state
                 .ready
                 .send(Err(Error::Invalid("OpenCode 事件流不可用".into())));
-            cleanup_child(&mut loop_state.child).await;
+            cleanup_child_with_lifecycle(&mut loop_state.child, &loop_state.lifecycle).await;
             return;
         }
     };
@@ -509,7 +538,7 @@ async fn run_events(mut loop_state: EventLoop) {
         let _ = loop_state
             .ready
             .send(Err(Error::Invalid("OpenCode 事件流不可用".into())));
-        cleanup_child(&mut loop_state.child).await;
+        cleanup_child_with_lifecycle(&mut loop_state.child, &loop_state.lifecycle).await;
         return;
     }
     let _ = loop_state.ready.send(Ok(()));
@@ -582,7 +611,7 @@ async fn run_events(mut loop_state: EventLoop) {
             })
             .await;
     }
-    cleanup_child(&mut loop_state.child).await;
+    cleanup_child_with_lifecycle(&mut loop_state.child, &loop_state.lifecycle).await;
 }
 
 async fn consume_event(
@@ -953,7 +982,7 @@ pub(super) async fn launch_catalog(workspace: &Path) -> Result<LaunchModelCatalo
         })
     }
     .await;
-    cleanup_child(&mut child).await;
+    child.terminate(Duration::from_secs(2)).await;
     result
 }
 
@@ -1018,44 +1047,34 @@ impl OpencodeTurn {
         Ok(())
     }
 
-    pub(super) fn interrupt(&self) {
-        let client = self.client.clone();
-        let base_url = self.base_url.clone();
-        let session_id = self.session_id.clone();
-        tokio::spawn(async move {
-            let _ = fetch_json::<Value>(
-                &client,
-                format!("{base_url}/api/session/{session_id}/interrupt"),
-                "POST",
-                Some(json!({})),
-            )
-            .await;
-        });
+    pub(super) async fn interrupt(&self) -> ControlEffectState {
+        match fetch_json::<Value>(
+            &self.client,
+            format!(
+                "{}/api/session/{}/interrupt",
+                self.base_url, self.session_id
+            ),
+            "POST",
+            Some(json!({})),
+        )
+        .await
+        {
+            Ok(_) => ControlEffectState::Received,
+            Err(_) => ControlEffectState::Unknown,
+        }
     }
 
-    pub(super) fn kill(&self) {
-        kill_process_group(self.child_pid);
+    pub(super) async fn kill(&self) -> ControlEffectState {
+        self.lifecycle.request_termination().await
     }
-}
 
-async fn cleanup_child(child: &mut Child) {
-    let pid = child.id().unwrap_or(0);
-    kill_process_group(pid);
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-}
-
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-        libc::kill(pid as i32, libc::SIGKILL);
+    pub(super) fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle.clone()
     }
 }
 
-#[cfg(not(unix))]
-fn kill_process_group(pid: u32) {
-    let _ = pid;
+async fn cleanup_child_with_lifecycle(child: &mut Child, lifecycle: &ProcessLifecycle) {
+    terminate_child(child, lifecycle, Duration::from_secs(2)).await;
 }
 
 #[cfg(test)]

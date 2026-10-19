@@ -6,6 +6,8 @@ pub mod control_cli;
 pub mod cross_model_tool;
 pub mod database;
 pub mod error;
+pub mod execution_budget;
+pub mod execution_host;
 pub mod orchestration;
 pub mod pairing;
 pub mod plugins;

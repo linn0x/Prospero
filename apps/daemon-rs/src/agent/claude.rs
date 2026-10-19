@@ -13,11 +13,13 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use super::lifecycle::{ChildGuard, ProcessLifecycle, Quiescence, await_child_exit};
 use super::store::{ApprovalPolicy, PermissionMode};
 use crate::error::{Error, Result};
+use crate::orchestration::reliability::ControlEffectState;
 
 /// One AskUserQuestion entry, normalized from the tool input.
 #[derive(Debug, Clone)]
@@ -117,8 +119,7 @@ pub(super) struct ClaudeTurn {
     /// Live control requests awaiting their correlated `control_response`.
     controls: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     events: Option<mpsc::Receiver<AdapterEvent>>,
-    child_pid: u32,
-    kill: Box<dyn Fn() + Send + Sync>,
+    lifecycle: ProcessLifecycle,
 }
 
 fn binary() -> String {
@@ -306,19 +307,6 @@ fn parse_catalog_models(payload: &Value) -> Result<Vec<crate::agent::LaunchModel
     Ok(models)
 }
 
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(pid: u32) {
-    let _ = pid;
-}
-
 /// Per-turn CLI selections persisted on the session run.
 pub(super) struct TurnOptions {
     pub(super) policy: ApprovalPolicy,
@@ -374,19 +362,12 @@ pub(super) fn spawn_turn(
     if let Some(effort) = &options.effort {
         command.args(["--effort", effort]);
     }
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child: Child = command.spawn()?;
-    let child_pid = child.id().ok_or(Error::Closed)?;
-    let mut stdin = child.stdin.take().ok_or(Error::Closed)?;
-    let stdout = child.stdout.take().ok_or(Error::Closed)?;
+    super::lifecycle::configure_process_group(&mut command);
+    let child = command.spawn()?;
+    let mut guard = ChildGuard::new(child)?;
+    let lifecycle = guard.lifecycle();
+    let mut stdin = guard.child_mut().stdin.take().ok_or(Error::Closed)?;
+    let stdout = guard.child_mut().stdout.take().ok_or(Error::Closed)?;
 
     let (frames_tx, mut frames_rx) = mpsc::channel::<(String, Option<oneshot::Sender<()>>)>(32);
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
@@ -428,6 +409,8 @@ pub(super) fn spawn_turn(
         .any(|(key, value)| key == "PROSPERO_API_PROFILE_MODEL" && !value.trim().is_empty());
     let reader_writer = frames_tx.clone();
     let reader_controls = controls.clone();
+    let reader_lifecycle = lifecycle.clone();
+    let (mut child, _) = guard.into_child();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut translator = Translator::default();
@@ -452,6 +435,8 @@ pub(super) fn spawn_turn(
             }
             for outgoing in translator.feed(message, auto, profile_model, &reader_writer) {
                 if events_tx.send(outgoing).await.is_err() {
+                    reader_lifecycle.request_termination().await;
+                    await_child_exit(&mut child, &reader_lifecycle).await;
                     return;
                 }
             }
@@ -459,18 +444,27 @@ pub(super) fn spawn_turn(
                 // The CLI delivered its result but would otherwise stay alive
                 // waiting for another prompt on stdin; end the process group
                 // (multi-turn conversations resume via --resume).
-                kill_process_group(child_pid);
+                let _ = reader_lifecycle.request_termination().await;
                 break;
             }
         }
-        let _ = child.wait().await;
+        if !translator.finished {
+            reader_lifecycle.request_termination().await;
+        }
+        let wait_error = match await_child_exit(&mut child, &reader_lifecycle).await {
+            Quiescence::Confirmed | Quiescence::DirectChildExited if translator.finished => None,
+            Quiescence::Confirmed | Quiescence::DirectChildExited => {
+                Some("Claude event stream closed before a terminal result".into())
+            }
+            Quiescence::Unknown => Some("Claude executor process group exit is unknown".into()),
+        };
         events_tx
             .send(AdapterEvent::Finish {
                 interrupted: translator.interrupted,
                 error: if translator.aborted {
                     None
                 } else {
-                    translator.error
+                    translator.error.or(wait_error)
                 },
                 cost_usd: translator.cost_usd,
                 input_tokens: translator.input_tokens,
@@ -481,14 +475,11 @@ pub(super) fn spawn_turn(
             .ok();
     });
 
-    let kill_group = { Box::new(move || kill_process_group(child_pid)) };
-
     Ok(ClaudeTurn {
         stdin: frames_tx,
         controls,
         events: Some(events_rx),
-        child_pid,
-        kill: kill_group,
+        lifecycle,
     })
 }
 
@@ -497,14 +488,18 @@ impl ClaudeTurn {
         self.events.take()
     }
 
-    pub(super) fn interrupt(&self) {
+    pub(super) fn interrupt(&self) -> ControlEffectState {
         let frame = serde_json::json!({
             "type": "control_request",
             "request_id": uuid::Uuid::new_v4().to_string(),
             "request": {"subtype": "interrupt"}
         })
         .to_string();
-        let _ = self.stdin.try_send((frame, None));
+        if self.stdin.try_send((frame, None)).is_ok() {
+            ControlEffectState::Received
+        } else {
+            ControlEffectState::Failed
+        }
     }
 
     /// Send an extra user message into the running turn ("引导"). The
@@ -537,8 +532,12 @@ impl ClaudeTurn {
         ack_rx.await.map_err(|_| Error::Closed)
     }
 
-    pub(super) fn kill(&self) {
-        (self.kill)();
+    pub(super) async fn kill(&self) -> ControlEffectState {
+        self.lifecycle.request_termination().await
+    }
+
+    pub(super) fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle.clone()
     }
 
     /// Switch the live turn's model/effort via the CLI's control channel.
@@ -602,7 +601,7 @@ impl ClaudeTurn {
 
     #[allow(dead_code)]
     pub(super) fn pid(&self) -> u32 {
-        self.child_pid
+        self.lifecycle.pid()
     }
 }
 

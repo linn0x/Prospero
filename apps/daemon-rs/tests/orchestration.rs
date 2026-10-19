@@ -1311,7 +1311,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, 35);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -1322,6 +1322,22 @@ fn schema_indexes_survive_reopen() {
         )
         .unwrap();
     assert_eq!(indexed, 5);
+    let reliability_indexes: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('orch_execution_task_unsettled','orch_operations_state_due','orch_host_commands_outbox','orch_resource_reservations_state','orch_recovery_jobs_due')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reliability_indexes, 5);
+    let reliability_tables: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('orch_executions','orch_operations_v2','orch_host_commands','orch_result_receipts','orch_host_registry','orch_exit_proofs','orch_resource_reservations','orch_recovery_jobs','orch_host_events','orch_host_event_cursors')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reliability_tables, 10);
     let automation_columns: i64 = connection
         .query_row(
             "SELECT count(*) FROM pragma_table_info('orch_runs') WHERE name='automation'",
@@ -1549,7 +1565,7 @@ fn v8_database_is_migrated_forward_to_current_schema() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, 35);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
@@ -1561,7 +1577,7 @@ fn v32_database_adds_monitor_lookup_indexes() {
     let connection = raw(&directory);
     connection
         .execute_batch(
-            "DROP INDEX orch_worker_starts_dispatch_owner; \
+            "PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA foreign_keys=ON; DROP INDEX orch_worker_starts_dispatch_owner; \
              DROP INDEX orch_dispatch_active_session; \
              DROP INDEX cross_model_checks_parent_state; \
              PRAGMA user_version=32;",
@@ -1574,7 +1590,7 @@ fn v32_database_adds_monitor_lookup_indexes() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, 35);
     let count: i64 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ( \
@@ -1585,6 +1601,194 @@ fn v32_database_adds_monitor_lookup_indexes() {
         )
         .unwrap();
     assert_eq!(count, 3);
+}
+
+#[test]
+fn v35_migration_is_atomic_repeatable_and_preserves_legacy_start_rows() {
+    let directory = TempDir::new().unwrap();
+    drop(Store::open(directory.path()).unwrap());
+    let connection = raw(&directory);
+    connection
+        .execute(
+            "INSERT INTO orch_worker_starts(operation_id,fingerprint,request,phase,task_id,run_id,agent,account_scope,plugin_scope,profile_scope,ticket,session_id,dispatch_id,error,created_at,updated_at) VALUES('legacy-operation',?, '{}','delivery_unknown','legacy-task','legacy-run','claude','legacy-account','legacy-plugin','legacy-profile',1,'legacy-session','legacy-dispatch','historical failure',10,11)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA user_version=34;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = directory.path().join("prospero.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let transaction = connection.unchecked_transaction().unwrap();
+    transaction
+        .execute_batch(include_str!("../src/orchestration/schema-v35.sql"))
+        .unwrap();
+    drop(transaction);
+    let version_after_interruption: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version_after_interruption, 34);
+    let absent_after_interruption: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='orch_executions'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(absent_after_interruption, 0);
+    drop(connection);
+
+    drop(Store::open(directory.path()).unwrap());
+    drop(Store::open(directory.path()).unwrap());
+    let connection = raw(&directory);
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 35);
+    let legacy: (String, String, String) = connection
+        .query_row(
+            "SELECT phase,session_id,error FROM orch_worker_starts WHERE operation_id='legacy-operation'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        legacy,
+        (
+            "delivery_unknown".into(),
+            "legacy-session".into(),
+            "historical failure".into()
+        )
+    );
+    let synthesized_executions: i64 = connection
+        .query_row("SELECT count(*) FROM orch_executions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(synthesized_executions, 0);
+}
+
+#[test]
+fn unknown_schema_version_is_rejected() {
+    let directory = TempDir::new().unwrap();
+    drop(Store::open(directory.path()).unwrap());
+    raw(&directory)
+        .pragma_update(None, "user_version", 36)
+        .unwrap();
+    assert!(matches!(Store::open(directory.path()), Err(Error::Schema)));
+}
+
+#[test]
+fn restored_database_marker_blocks_writer_open() {
+    let directory = TempDir::new().unwrap();
+    drop(Store::open(directory.path()).unwrap());
+    std::fs::write(
+        directory
+            .path()
+            .join("RESTORE_REQUIRES_RECONCILIATION.json"),
+        "{\"admissionAllowed\":false}",
+    )
+    .unwrap();
+    let error = match Store::open(directory.path()) {
+        Ok(_) => panic!("writer open must wait for reconciliation"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, Error::Invalid(message) if message.contains("requires execution reconciliation"))
+    );
+}
+
+#[test]
+fn reliability_database_constraints_bind_unknown_attempt_and_exit_proof_identity() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let (run_id, ids) = make_run(&mut store, "op-reliability-constraints", chain(2));
+    let task_id = ids["n0"].clone();
+    let other_task_id = ids["n1"].clone();
+    let connection = raw(&directory);
+    let digest = "a".repeat(64);
+    connection
+        .execute(
+            "INSERT INTO orch_recovery_jobs(job_id,kind,object_id,state,owner,next_check_at,revision,detail,created_at,updated_at) VALUES('recover-attempt','execution','attempt-one','pending','test',100,1,NULL,1,1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO orch_executions(attempt_id,task_id,execution_epoch,config_digest,state,created_at,updated_at) VALUES('attempt-one',?1,1,?2,'start_unknown',1,1)",
+            [&task_id, &digest],
+        )
+        .unwrap();
+    assert!(connection
+        .execute(
+            "INSERT INTO orch_executions(attempt_id,task_id,execution_epoch,config_digest,state,created_at,updated_at) VALUES('attempt-two',?1,2,?2,'planned',2,2)",
+            [&task_id, &digest],
+        )
+        .is_err());
+    assert!(
+        connection
+            .execute(
+                "UPDATE orch_executions SET state='quiesced' WHERE attempt_id='attempt-one'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(connection
+        .execute(
+            "INSERT INTO orch_exit_proofs(id,attempt_id,execution_epoch,host_id,host_epoch,config_digest,proof_kind,verifier,evidence_digest,verified_at) VALUES('wrong-proof','attempt-one',1,NULL,NULL,?1,'startup_not_started','startup_coordinator',?1,10)",
+            [&"b".repeat(64)],
+        )
+        .is_err());
+    connection
+        .execute(
+            "INSERT INTO orch_exit_proofs(id,attempt_id,execution_epoch,host_id,host_epoch,config_digest,proof_kind,verifier,evidence_digest,verified_at) VALUES('exit-proof','attempt-one',1,NULL,NULL,?1,'startup_not_started','startup_coordinator',?1,10)",
+            [&digest],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE orch_executions SET state='quiesced',exit_proof_id='exit-proof' WHERE attempt_id='attempt-one'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO orch_operations_v2(operation_id,kind,request_version,fingerprint,request,state,task_id,attempt_id,execution_epoch,effect_state,revision,created_at,updated_at) VALUES('bad-binding','stop',1,?1,'{}','accepted',?2,'attempt-one',1,'none',1,1,1)",
+            [&digest, &other_task_id],
+        )
+        .unwrap_err();
+    connection
+        .execute(
+            "INSERT INTO orch_resource_reservations(reservation_id,attempt_id,resource_kind,resource_scope,state,created_at,updated_at) VALUES('reservation-one','attempt-one','execution','local','held',1,1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE orch_resource_reservations SET state='released' WHERE reservation_id='reservation-one'",
+            [],
+        )
+        .unwrap_err();
+    connection
+        .execute(
+            "UPDATE orch_resource_reservations SET state='released',release_proof_id='exit-proof' WHERE reservation_id='reservation-one'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let operation = store.get_reliability_execution("attempt-one").unwrap();
+    assert_eq!(operation.identity.task_id, task_id);
+    assert_eq!(
+        operation.result_state,
+        prosperod_rs::orchestration::ResultState::None
+    );
+    assert_eq!(operation.exit_proof_id.as_deref(), Some("exit-proof"));
+    let unknown = prosperod_rs::orchestration::ExecutionState::StartUnknown;
+    assert!(unknown.holds_task());
+    assert!(!prosperod_rs::orchestration::ExecutionState::Finalized.holds_task());
+    assert!(!run_id.is_empty());
 }
 
 #[test]
@@ -1612,7 +1816,7 @@ fn v9_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        33
+        35
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -1671,7 +1875,7 @@ fn v10_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        33
+        35
     );
     let mode: String = connection
         .query_row(
@@ -1731,7 +1935,7 @@ fn v11_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        33
+        35
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1828,7 +2032,7 @@ fn v12_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        33
+        35
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1926,7 +2130,7 @@ fn v13_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        33
+        35
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -2014,7 +2218,7 @@ fn v14_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        33
+        35
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -2122,7 +2326,7 @@ fn v15_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        33
+        35
     );
     let has_engine_validation_column: i64 = connection
         .query_row(
@@ -2413,4 +2617,39 @@ fn deleting_a_run_detaches_worktree_assets_but_keeps_them_indexed() {
         store.list_worktree_assets(Some(&run_id)).unwrap()[0].state,
         WorktreeAssetState::Preserved
     );
+}
+
+#[test]
+fn task_activity_keeps_accepted_result_and_unknown_execution_visible() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let (run_id, ids) = make_run(&mut store, "op-runtime-activity", chain(1));
+    let connection = rusqlite::Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    connection.execute("INSERT INTO orch_recovery_jobs(job_id,kind,object_id,state,owner,next_check_at,revision,created_at,updated_at) VALUES('runtime-recovery','execution','attempt-runtime','pending','test',1,1,1,1)", []).unwrap();
+    connection.execute("INSERT INTO orch_executions(attempt_id,task_id,execution_epoch,config_digest,state,result_state,created_at,updated_at) VALUES('attempt-runtime',?1,1,?2,'stop_unknown','accepted',1,1)", rusqlite::params![ids["n0"], "a".repeat(64)]).unwrap();
+    connection.execute("INSERT INTO orch_resource_reservations(reservation_id,attempt_id,resource_kind,resource_scope,state,created_at,updated_at) VALUES('runtime-reservation','attempt-runtime','execution','host','quarantined',1,1)", []).unwrap();
+    let activity = store
+        .task_activities(
+            &run_id,
+            TaskActivityQuery {
+                task_ids: vec![ids["n0"].clone()],
+            },
+        )
+        .unwrap()
+        .activities
+        .remove(0);
+    let execution = activity.execution.unwrap();
+    assert_eq!(execution.identity.attempt_id, "attempt-runtime");
+    assert_eq!(
+        execution.state,
+        prosperod_rs::orchestration::ExecutionState::StopUnknown
+    );
+    assert_eq!(
+        execution.result_state,
+        prosperod_rs::orchestration::ResultState::Accepted
+    );
+    assert_eq!(activity.reserved_resources, 1);
+    assert_eq!(activity.quarantined_resources, 1);
+    assert!(activity.observed_at > 0);
+    assert!(!activity.execution_unknown);
 }

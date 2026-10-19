@@ -211,6 +211,9 @@ pub async fn pause_automation(database: &Database, run_id: &str) -> Result<Run> 
 
 pub async fn kick_automation(database: &Database, agents: &Agents, run_id: &str) {
     if let Err(error) = tick_automation(database, agents, run_id).await {
+        if pending_execution_error(&error) {
+            return;
+        }
         let run_id = run_id.to_owned();
         let _ = database
             .call(move |store| {
@@ -227,7 +230,7 @@ pub async fn kick_automation(database: &Database, agents: &Agents, run_id: &str)
 
 pub async fn tick_automation(database: &Database, agents: &Agents, run_id: &str) -> Result<()> {
     let run_id = run_id.to_owned();
-    let (run, tasks, ready, dispatches) = database
+    let (run, tasks, ready, dispatches, pending_execution) = database
         .call({
             let run_id = run_id.clone();
             move |store| {
@@ -236,6 +239,7 @@ pub async fn tick_automation(database: &Database, agents: &Agents, run_id: &str)
                     store.list_tasks(Some(&run_id))?,
                     store.list_ready_tasks(&run_id)?,
                     store.list_dispatches(Some(&run_id))?,
+                    store.run_has_pending_execution(&run_id)?,
                 ))
             }
         })
@@ -250,14 +254,17 @@ pub async fn tick_automation(database: &Database, agents: &Agents, run_id: &str)
         pause_with_error(database, &run_id, "任务图为空，自动执行已暂停").await?;
         return Ok(());
     }
-    if dispatches.iter().any(|dispatch| dispatch.state.active()) {
+    if pending_execution || dispatches.iter().any(|dispatch| dispatch.state.active()) {
         return Ok(());
     }
     if tasks.iter().all(|task| task.status == TaskStatus::Done) {
-        database
+        return match database
             .call(move |store| store.complete_run_from_automation(&run_id).map(|_| ()))
-            .await?;
-        return Ok(());
+            .await
+        {
+            Err(error) if pending_execution_error(&error) => Ok(()),
+            result => result,
+        };
     }
     if let Some(stopped) = tasks.iter().find(|task| {
         matches!(
@@ -300,6 +307,18 @@ pub async fn tick_automation(database: &Database, agents: &Agents, run_id: &str)
         operation_id: Some(format!("automation-{run_id}-{}", next.id)),
     };
     if let Err(error) = start_worker(database, agents, input).await {
+        if pending_execution_error(&error) {
+            return Ok(());
+        }
+        let id = run_id.clone();
+        if database
+            .call_control("automation.physical_wait", move |store| {
+                store.run_has_pending_execution(&id)
+            })
+            .await?
+        {
+            return Ok(());
+        }
         pause_with_error(
             database,
             &run_id,
@@ -308,6 +327,10 @@ pub async fn tick_automation(database: &Database, agents: &Agents, run_id: &str)
         .await?;
     }
     Ok(())
+}
+
+fn pending_execution_error(error: &Error) -> bool {
+    matches!(error,Error::Feature(code,_) if matches!(code.as_str(),"execution_pending"|"operation_pending"))
 }
 
 async fn pause_with_error(database: &Database, run_id: &str, message: &str) -> Result<()> {
@@ -320,4 +343,161 @@ async fn pause_with_error(database: &Database, run_id: &str, message: &str) -> R
                 .map(|_| ())
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::reliability::{
+        ExecutionIdentity, ExecutionState, ExitProofKind, ExitProofVerifier, HostIdentity,
+        NewExecution, VerifiedExitProof,
+    };
+    use crate::orchestration::{CreateRun, CreateTask};
+    use crate::protocol::{AgentKind, SessionKind};
+    use rusqlite::params;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        database: Database,
+        agents: Agents,
+        run_id: String,
+        session_id: String,
+        identity: Option<ExecutionIdentity>,
+    }
+
+    async fn delivered_fixture(hosted: bool) -> Fixture {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let (run_id,session_id,identity)=database.call_control("test.automation.fixture",move|store|{
+            let run=store.create_run(CreateRun{objective:"physical completion gate".into(),coordinator_session_id:None})?;
+            let task=store.create_task(CreateTask{run_id:run.id.clone(),title:"delivered".into(),spec:"explicit delivery".into(),skills:vec![],deps:vec![],parent_id:None})?;
+            let session=if hosted {
+                store.create_session(crate::protocol::CreateSession{agent:AgentKind::Claude,kind:SessionKind::Structured,title:"hosted placeholder".into(),workspace:"/tmp".into()})?
+            }else{
+                store.create_agent_session(crate::agent::CreateAgentSession{agent:AgentKind::Claude,title:"direct worker".into(),workspace:"/tmp".into(),auto_approve:false,mode:None,model:None,effort:None,agent_preset:None,account_id:None,resume:None},crate::agent::ApprovalPolicy::Manual)?
+            };
+            let dispatch=store.dispatch_task(&task.id,&session.id,None,None)?.dispatch;
+            let identity=if hosted {
+                let identity=ExecutionIdentity{task_id:task.id,dispatch_id:Some(dispatch.id.clone()),attempt_id:session.id.clone(),execution_epoch:1,host:Some(HostIdentity{host_id:"automation-host".into(),host_epoch:"automation-epoch".into()}),config_digest:"a".repeat(64)};
+                store.connection.execute("INSERT INTO orch_host_registry(host_id,host_epoch,protocol_version,runtime_digest,capabilities,registered_at,state) VALUES('automation-host','automation-epoch',1,?1,'[]',?2,'active')",params!["b".repeat(64),now()])?;
+                store.reliability_transaction(|tx|{
+                    super::super::reliability::insert_execution(tx,&NewExecution{identity:identity.clone(),state:ExecutionState::StopRequested,created_at:now()})?;
+                    super::super::reliability::update_result_state(tx,&identity.attempt_id,1,super::super::reliability::ResultState::Accepted,now())
+                })?;
+                Some(identity)
+            }else{None};
+            store.settle_dispatch(&dispatch.id,true,"verified delivery")?;
+            store.set_run_automation(&run.id,Some(RunAutomation{state:AutomationState::Running,agent:AgentKind::Claude,account_id:None,approval_policy:"standard".into(),workspace:AutomationWorkspace::Current,cwd:"/tmp".into(),workspace_path:"/tmp".into(),branch:None,started_at:now(),updated_at:now(),last_error:None}))?;
+            Ok((run.id,session.id,identity))
+        }).await.unwrap();
+        Fixture {
+            _directory: directory,
+            database,
+            agents,
+            run_id,
+            session_id,
+            identity,
+        }
+    }
+
+    async fn assert_waiting(fixture: &Fixture) {
+        kick_automation(&fixture.database, &fixture.agents, &fixture.run_id).await;
+        let id = fixture.run_id.clone();
+        let run = fixture
+            .database
+            .call_control("test.automation.run", move |store| store.orch_run(&id))
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Active);
+        let automation = run.automation.unwrap();
+        assert_eq!(automation.state, AutomationState::Running);
+        assert!(automation.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn delivered_hosted_task_waits_without_pausing_until_exit_proof_then_completes() {
+        let fixture = delivered_fixture(true).await;
+        assert_waiting(&fixture).await;
+        let identity = fixture.identity.clone().unwrap();
+        let proof = VerifiedExitProof {
+            proof_id: "automation-proof".into(),
+            attempt_id: identity.attempt_id.clone(),
+            execution_epoch: 1,
+            host: identity.host.clone(),
+            config_digest: identity.config_digest.clone(),
+            kind: ExitProofKind::DriverQuiescence,
+            verifier: ExitProofVerifier::Driver,
+            evidence_digest: "c".repeat(64),
+            verified_at: now(),
+        };
+        let run = super::super::reliability_operations::confirm_execution_exit(
+            &fixture.database,
+            identity.clone(),
+            proof.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(run, fixture.run_id);
+        assert_eq!(
+            super::super::reliability_operations::confirm_execution_exit(
+                &fixture.database,
+                identity,
+                proof
+            )
+            .await
+            .unwrap(),
+            fixture.run_id
+        );
+        kick_automation(&fixture.database, &fixture.agents, &run).await;
+        assert_eq!(
+            fixture
+                .database
+                .call_control("test.automation.completed", move |store| Ok(store
+                    .orch_run(&run)?
+                    .status))
+                .await
+                .unwrap(),
+            RunStatus::Completed
+        );
+        fixture.database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delivered_direct_task_waits_for_active_and_unknown_ownership_without_pausing() {
+        let fixture = delivered_fixture(false).await;
+        assert_waiting(&fixture).await;
+        let session = fixture.session_id.clone();
+        fixture
+            .database
+            .call_control("test.automation.stopping", move |store| {
+                store
+                    .archive_agent_session_for_stop(&session, false)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        assert_waiting(&fixture).await;
+        let session = fixture.session_id.clone();
+        fixture
+            .database
+            .call_control("test.automation.proved_idle", move |store| {
+                store.clear_agent_execution_unknown(&session)
+            })
+            .await
+            .unwrap();
+        kick_automation(&fixture.database, &fixture.agents, &fixture.run_id).await;
+        let id = fixture.run_id.clone();
+        assert_eq!(
+            fixture
+                .database
+                .call_control("test.automation.completed", move |store| Ok(store
+                    .orch_run(&id)?
+                    .status))
+                .await
+                .unwrap(),
+            RunStatus::Completed
+        );
+        fixture.database.shutdown().await.unwrap();
+    }
 }

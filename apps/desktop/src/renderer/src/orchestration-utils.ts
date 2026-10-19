@@ -1,3 +1,5 @@
+import { executionPending, runtimeStatus } from "@prospero/protocol";
+import type { ExecutionRecord, OperationView } from "@prospero/protocol/rust-daemon";
 import type { JsonObject } from "../../shared/types";
 
 const TERMINAL_WORKTREE_STATES = new Set(["cleaned", "missing"]);
@@ -104,7 +106,7 @@ export function deriveTaskBoardStates(tasks: JsonObject[]): Map<string, TaskBoar
       const deps = Array.isArray(task["deps"])
         ? task["deps"].map(String)
         : [];
-      states.set(id, deps.every((dependency) => completed.has(dependency)) ? "ready" : "queued");
+      states.set(id, !taskExecutionPending(task) && deps.every((dependency) => completed.has(dependency) && !tasks.some(task => task["id"] === dependency && taskExecutionPending(task))) ? "ready" : "queued");
     } else if (status === "ready") {
       states.set(id, "ready");
     } else if (["dispatched", "running", "starting"].includes(status)) {
@@ -116,4 +118,18 @@ export function deriveTaskBoardStates(tasks: JsonObject[]): Map<string, TaskBoar
     }
   }
   return states;
+}
+
+export function taskExecutionPending(task: JsonObject): boolean {
+  const runtime = valueRecord(task["runtime"]);
+  return runtime["executionUnknown"] === true || typeof runtime["observationError"] === "string" ||
+    executionPending(runtime["execution"] as ExecutionRecord | null | undefined);
+}
+
+export function taskRuntimeNotice(task: JsonObject): { zh: string; en: string; pending: boolean } | null {
+  const runtime = valueRecord(task["runtime"]);
+  if (runtime["executionUnknown"] === true || typeof runtime["observationError"] === "string") {
+    return { zh: "执行状态未知，等待对账", en: "Execution unknown; reconciliation pending", pending: true };
+  }
+  return runtimeStatus(runtime["execution"] as ExecutionRecord | null | undefined, runtime["latestOperation"] as OperationView | null | undefined);
 }

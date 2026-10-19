@@ -105,6 +105,13 @@ elif scenario == "backpressure":
         time.sleep(0.01)
     text_block("pressure recovered")
     result()
+elif scenario == "usagepartial":
+    result(input_tokens=0)
+elif scenario == "usagemissing":
+    result()
+elif scenario == "usageduplicate":
+    result(input_tokens=12, output_tokens=7, cost_usd=0.25)
+    result(input_tokens=12, output_tokens=7, cost_usd=0.25)
 elif scenario == "usage":
     text_block("usage counted")
     result(input_tokens=12, output_tokens=7, cost_usd=0.25)
@@ -790,7 +797,7 @@ async fn timeline_backpressure_retries_without_loss_or_duplicate_terminal_record
     assert!(
         !records
             .iter()
-            .any(|(_, body, _)| matches!(body, TimelineBody::Error))
+            .any(|(_, body, _)| matches!(body, TimelineBody::Error { .. }))
     );
     assert_eq!(
         harness.status(&head.id).await,
@@ -1022,7 +1029,7 @@ async fn codex_turn_start_retries_legacy_sandbox_policy_for_old_app_server() {
     assert!(
         records
             .iter()
-            .all(|(_, body, _)| !matches!(body, TimelineBody::Error))
+            .all(|(_, body, _)| !matches!(body, TimelineBody::Error { .. }))
     );
     assert_eq!(
         harness.status(&head.id).await,
@@ -1081,7 +1088,7 @@ async fn codex_thread_start_rpc_error_exposes_diagnostics() {
     assert!(!error.contains("sk-profile-secret"), "{error}");
     let records = harness.records(&head.id).await;
     assert!(records.iter().any(|(_, body, preview)| {
-        matches!(body, TimelineBody::Error)
+        matches!(body, TimelineBody::Error { .. })
             && preview.contains("codex thread/start JSON-RPC error")
             && preview.contains("provider stderr says bad gateway")
     }));
@@ -1122,7 +1129,7 @@ async fn codex_turn_start_rpc_error_marks_failed_with_diagnostics() {
     let error = records
         .iter()
         .find_map(|(_, body, preview)| {
-            matches!(body, TimelineBody::Error).then_some(preview.clone())
+            matches!(body, TimelineBody::Error { .. }).then_some(preview.clone())
         })
         .unwrap_or_default();
 
@@ -2325,9 +2332,9 @@ async fn provider_failure_marks_turn_and_session_failed() {
         })
         .await;
     assert!(
-        records
-            .iter()
-            .any(|(_, body, preview)| matches!(body, TimelineBody::Error) && preview == "boom")
+        records.iter().any(
+            |(_, body, preview)| matches!(body, TimelineBody::Error { .. }) && preview == "boom"
+        )
     );
     assert_eq!(
         harness.status(&head.id).await,
@@ -3486,4 +3493,72 @@ async fn usage_accumulates_tokens_from_result_frames() {
     assert_eq!(usage.output_tokens, Some(7));
     assert_eq!(usage.cost_usd, Some(0.25));
     assert!(usage.windows.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_unknown_execution_reserves_capacity_across_recovery_and_close() {
+    let _serial = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let head = harness.create().await;
+    let connection =
+        rusqlite::Connection::open(harness._data.path().join("prospero.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE agent_runs SET execution_unknown=1 WHERE session_id=?1",
+            [&head.id],
+        )
+        .unwrap();
+    let recovered = Agents::new(harness.database.clone());
+    assert_eq!(recovered.recover().await.unwrap(), 0);
+    assert_eq!(recovered.count(), 1);
+    assert!(
+        recovered
+            .send(&head.id, "do not replay".into(), None, Vec::new())
+            .await
+            .is_err()
+    );
+    assert!(recovered.close(&head.id).await.is_err());
+    assert_eq!(recovered.count(), 1);
+    assert!(recovered.shutdown().await.is_err());
+    assert_eq!(recovered.count(), 1);
+    let unknown: bool = connection
+        .query_row(
+            "SELECT execution_unknown=1 FROM agent_runs WHERE session_id=?1",
+            [&head.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(unknown);
+    assert!(!harness.workspace.path().join("turns.log").exists());
+}
+
+#[tokio::test]
+async fn usage_keeps_missing_metrics_unknown_and_deduplicates_terminal_frames() {
+    let _guard = SERIAL.lock().await;
+    for (scenario, input, output, cost, complete) in [
+        ("usagepartial", Some(0), None, None, false),
+        ("usagemissing", None, None, None, false),
+        ("usageduplicate", Some(12), Some(7), Some(0.25), true),
+    ] {
+        let harness = Harness::new(scenario).await;
+        let head = harness.create().await;
+        harness
+            .agents
+            .send(&head.id, "count".into(), None, Vec::new())
+            .await
+            .unwrap();
+        harness
+            .wait_for(&head.id, |records| {
+                records
+                    .iter()
+                    .any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { .. }))
+            })
+            .await;
+        let usage = harness.agents.usage(&head.id).await.unwrap().unwrap();
+        assert_eq!(usage.input_tokens, input);
+        assert_eq!(usage.output_tokens, output);
+        assert_eq!(usage.cost_usd, cost);
+        assert_eq!(usage.usage_complete, Some(complete));
+        assert_eq!(usage.usage_finalized, Some(true));
+    }
 }

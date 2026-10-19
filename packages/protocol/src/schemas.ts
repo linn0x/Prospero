@@ -3,6 +3,7 @@
  * daemon 校验 C2S,客户端校验 S2C;类型经 z.infer 从这里导出。
  */
 import { z } from "zod";
+import type { ExecutionRecord, OperationView, ErrorBody } from "./rust-daemon.js";
 import { fromB64 } from "./b64.js";
 import { ProtocolError } from "./errors.js";
 import { RelayPairingSchema } from "./relay.js";
@@ -1160,7 +1161,48 @@ export const OrchestrationGateSchema = z.object({
   resolvedAt: z.number().int().nonnegative().nullable(),
 });
 
+function runtimeRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const RuntimeOperationSchema = z.custom<OperationView>((value) => runtimeRecord(value) &&
+  typeof value["operationId"] === "string" && typeof value["state"] === "string" &&
+  typeof value["effectState"] === "string" && Number.isSafeInteger(value["revision"]));
+const RuntimeExecutionSchema = z.custom<ExecutionRecord>((value) => runtimeRecord(value) &&
+  runtimeRecord(value["identity"]) && typeof value["identity"]["attemptId"] === "string" &&
+  typeof value["identity"]["taskId"] === "string" && Number.isSafeInteger(value["identity"]["executionEpoch"]) &&
+  typeof value["state"] === "string" && typeof value["resultState"] === "string");
+const RuntimeErrorSchema = z.custom<ErrorBody>((value) => runtimeRecord(value) &&
+  typeof value["code"] === "string" && typeof value["message"] === "string");
+
+export const C2SOrchestrationOperationGetSchema = z.object({
+  type: z.literal("orchestration.operation.get"),
+  requestId: z.string().min(1).max(200),
+  operationId: z.string().min(1).max(128),
+});
+export const C2SOrchestrationExecutionGetSchema = z.object({
+  type: z.literal("orchestration.execution.get"),
+  requestId: z.string().min(1).max(200),
+  attemptId: z.string().min(1).max(128),
+});
+export const S2COrchestrationOperationResultSchema = z.object({
+  type: z.literal("orchestration.operation.result"),
+  requestId: z.string().min(1).max(200),
+  operation: RuntimeOperationSchema.optional(),
+  error: RuntimeErrorSchema.optional(),
+});
+export const S2COrchestrationExecutionResultSchema = z.object({
+  type: z.literal("orchestration.execution.result"),
+  requestId: z.string().min(1).max(200),
+  execution: RuntimeExecutionSchema.optional(),
+  error: RuntimeErrorSchema.optional(),
+});
+
 export const OrchestrationSnapshotSchema = z.object({
+  executions: z.array(RuntimeExecutionSchema).max(5_000).optional(),
+  operations: z.array(RuntimeOperationSchema).max(5_000).optional(),
+  executionsTruncated: z.boolean().optional(),
+  operationsTruncated: z.boolean().optional(),
   runs: z.array(OrchestrationRunSchema).max(500),
   tasks: z.array(OrchestrationTaskSchema).max(5_000),
   dispatches: z.array(OrchestrationDispatchSchema).max(5_000),
@@ -1470,6 +1512,8 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SGitCommitSchema,
   C2SUsageGetSchema,
   C2SOrchestrationSnapshotSchema,
+  C2SOrchestrationOperationGetSchema,
+  C2SOrchestrationExecutionGetSchema,
   C2SOrchestrationGateResolveSchema,
   C2SOrchestrationRunCreateSchema,
   C2SOrchestrationRunCompleteSchema,
@@ -2149,6 +2193,8 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CGitDoneSchema,
   S2CUsageSchema,
   S2COrchestrationSnapshotSchema,
+  S2COrchestrationOperationResultSchema,
+  S2COrchestrationExecutionResultSchema,
 ]);
 
 // ---------------------------------------------------------------- 配对 QR 载荷

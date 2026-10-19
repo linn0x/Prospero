@@ -25,6 +25,14 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    Operation {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
@@ -172,12 +180,16 @@ enum TaskCommand {
         id: String,
         #[arg(long)]
         body: String,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
     },
     Fail {
         #[arg(long)]
         id: String,
         #[arg(long)]
         body: String,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
     },
     Retry {
         #[arg(long)]
@@ -216,6 +228,8 @@ enum WorkerCommand {
         account_id: Option<String>,
         #[arg(long = "operation-id")]
         operation_id: Option<String>,
+        #[arg(long)]
+        queued: bool,
     },
     Stop {
         #[arg(long)]
@@ -531,6 +545,10 @@ fn command_request(
     session: Option<String>,
 ) -> prosperod_rs::error::Result<(&'static str, Value)> {
     let request = match command {
+        Command::Operation { id, wait, timeout } => (
+            "operation.get",
+            json!({"operationId": id, "wait": wait, "timeout": timeout}),
+        ),
         Command::Run { command } => match command {
             RunCommand::Create {
                 objective,
@@ -576,13 +594,21 @@ fn command_request(
             ),
             TaskCommand::List { run } => ("task.list", json!({"runId": run})),
             TaskCommand::Get { id } => ("task.get", json!({"taskId": id})),
-            TaskCommand::Done { id, body } => (
+            TaskCommand::Done {
+                id,
+                body,
+                operation_id,
+            } => (
                 "task.done",
-                json!({"taskId": id, "body": require_text(body, "--body")?, "actorSessionId": session}),
+                json!({"taskId": id, "body": require_text(body, "--body")?, "actorSessionId": session, "operationId": operation_id}),
             ),
-            TaskCommand::Fail { id, body } => (
+            TaskCommand::Fail {
+                id,
+                body,
+                operation_id,
+            } => (
                 "task.fail",
-                json!({"taskId": id, "body": require_text(body, "--body")?, "actorSessionId": session}),
+                json!({"taskId": id, "body": require_text(body, "--body")?, "actorSessionId": session, "operationId": operation_id}),
             ),
             TaskCommand::Retry { id, operation_id } => (
                 "task.retry",
@@ -608,9 +634,10 @@ fn command_request(
                 skill,
                 account_id,
                 operation_id,
+                queued,
             } => (
                 "worker.start",
-                json!({"taskId": task, "agent": agent, "worktree": worktree, "cwd": absolute(cwd)?, "kind": kind, "approvalPolicy": approval_policy, "skills": skill, "accountId": account_id, "operationId": operation_id, "actorSessionId": session}),
+                json!({"taskId": task, "agent": agent, "worktree": worktree, "cwd": absolute(cwd)?, "kind": kind, "approvalPolicy": approval_policy, "skills": skill, "accountId": account_id, "operationId": operation_id, "actorSessionId": session, "queued": queued}),
             ),
             WorkerCommand::Stop {
                 task,

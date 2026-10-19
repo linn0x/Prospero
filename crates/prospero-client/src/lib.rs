@@ -152,6 +152,16 @@ impl Client {
         self.get("v1/health", &[]).await
     }
 
+    pub async fn operation(&self, operation_id: &str) -> Result<serde_json::Value, Error> {
+        let id = record_id(operation_id)?;
+        self.get(&format!("v1/operations/{id}"), &[]).await
+    }
+
+    pub async fn execution(&self, attempt_id: &str) -> Result<serde_json::Value, Error> {
+        let id = record_id(attempt_id)?;
+        self.get(&format!("v1/executions/{id}"), &[]).await
+    }
+
     pub async fn diagnostics(&self) -> Result<serde_json::Value, Error> {
         self.get("v1/diagnostics", &[]).await
     }

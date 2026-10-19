@@ -16,7 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { RunGraph } from "./RunGraph";
 import { array, reportError, number, record, text } from "./state";
 import { useLocale } from "./locale";
-import { deriveTaskBoardStates, prioritizeRuns, prioritizeWorktrees, runListLabel, runTimelineItems, worktreeNeedsAttention, type TaskBoardColumnId } from "./orchestration-utils";
+import { deriveTaskBoardStates, taskExecutionPending, taskRuntimeNotice, prioritizeRuns, prioritizeWorktrees, runListLabel, runTimelineItems, worktreeNeedsAttention, type TaskBoardColumnId } from "./orchestration-utils";
 import {
   defaultSessionLaunchAccountId,
   isLaunchableWorktreeAsset,
@@ -229,6 +229,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   }, [selectedWorkerAccountId]);
   const parseSkills = (value: string): string[] => [...new Set(value.split(/[,\s]+/).map((skill) => skill.trim().replace(/^\$/, "")).filter(Boolean))].slice(0, 5);
 
+  const actionOperationIds = useRef(new Map<string, { fingerprint: string; id: string }>());
   const perform = async (
     key: string,
     method: string,
@@ -238,7 +239,16 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     if (busyRef.current) return undefined;
     busyRef.current = key;
     setBusy(key);
-    try { const result = await window.prospero.orchestrationAction(method, params); setActionError(undefined); return result; }
+    const actionKey = `${method}:${key}`;
+    if (typeof params["operationId"] === "string") {
+      const { operationId: ignored, ...payload } = params;
+      const fingerprint = JSON.stringify(payload);
+      const previous = actionOperationIds.current.get(actionKey);
+      if (previous?.fingerprint === fingerprint) params["operationId"] = previous.id;
+      else actionOperationIds.current.set(actionKey, { fingerprint, id: String(params["operationId"]) });
+      void ignored;
+    }
+    try { const result = await window.prospero.orchestrationAction(method, params); actionOperationIds.current.delete(actionKey); setActionError(undefined); return result; }
     catch (reason) { setActionError(reportError(reason)); return undefined; }
     finally { busyRef.current = undefined; setBusy(undefined); }
   };
@@ -458,11 +468,14 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   };
 
   const taskCard = (task: JsonObject) => {
+    const runtimeNotice = taskRuntimeNotice(task);
+    const runtime = record(task["runtime"]);
+    const operation = record(runtime["latestOperation"]);
     const taskId = text(task["id"]); const deps = array(task["deps"]).map(String); const dispatch = dispatchByTaskId.get(taskId);
-    return <Card size="sm" className="run-task-card" key={taskId}><CardHeader><div className="flex items-start justify-between gap-2"><CardTitle>{text(task["title"])}</CardTitle><span className={`status-dot ${text(task["status"])}`} /></div><CardDescription>{text(task["spec"])}</CardDescription></CardHeader><CardContent className="flex flex-col gap-2">{deps.length > 0 && <Badge variant="outline" className="w-fit"><GitPullRequestArrow />{deps.length} {t("个依赖", "dependencies")}</Badge>}{dispatch && <div className="task-assignee"><Bot /><span>{text(dispatch["agent"], effectiveWorkerAgent)}</span><small>{text(dispatch["branch"], t("隔离工作树", "isolated worktree"))}</small></div>}</CardContent><CardFooter className="flex-wrap">
+    return <Card size="sm" className="run-task-card" key={taskId}><CardHeader><div className="flex items-start justify-between gap-2"><CardTitle>{text(task["title"])}</CardTitle><span className={`status-dot ${text(task["status"])}`} /></div><CardDescription>{text(task["spec"])}</CardDescription></CardHeader><CardContent className="flex flex-col gap-2">{runtimeNotice && <p role="status" className="text-xs text-muted-foreground">{t(runtimeNotice.zh, runtimeNotice.en)}</p>}{text(operation["operationId"]) && <code className="text-xs break-all">{text(operation["operationId"])} · {text(operation["state"])}</code>}{deps.length > 0 && <Badge variant="outline" className="w-fit"><GitPullRequestArrow />{deps.length} {t("个依赖", "dependencies")}</Badge>}{dispatch && <div className="task-assignee"><Bot /><span>{text(dispatch["agent"], effectiveWorkerAgent)}</span><small>{text(dispatch["branch"], t("隔离工作树", "isolated worktree"))}</small></div>}</CardContent><CardFooter className="flex-wrap">
       <Button variant="ghost" size="sm" onClick={() => void openTaskDetail(task)}>{t("详情", "Details")}</Button>
       {taskBoardStates.get(taskId) === "ready" && <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => void startWorker(task)}><Bot data-icon="inline-start" />{t("启动", "Start")}</Button>}
-      {text(task["status"]) === "failed" && <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => void perform(taskId, "task.retry", { operationId: operationId(), taskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
+      {text(task["status"]) === "failed" && !taskExecutionPending(task) && <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => void perform(taskId, "task.retry", { operationId: operationId(), taskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
       {dispatch && <Button variant="ghost" size="sm" onClick={() => onOpenSession(text(dispatch["sessionId"]))}>{t("打开会话", "Open session")}</Button>}
       {text(task["status"]) === "dispatched" && <Button variant="destructive" size="sm" disabled={Boolean(busy)} onClick={() => void perform(taskId, "worker.stop", { operationId: operationId(), taskId, reason: "Stopped from Prospero desktop" })}><Square data-icon="inline-start" />{t("停止", "Stop")}</Button>}
       {manualDeliverySupported && dispatch && ["starting", "running"].includes(text(dispatch["state"])) && <>
@@ -507,7 +520,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           {manualDeliverySupported
             ? <button disabled title={t("自动执行 DAG 尚未接入 Rust daemon", "Automatic DAG execution is not available in Rust mode yet")}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>
             : text(record(selectedRun["automation"])["state"]) === "running" ? <button disabled={Boolean(busy)} onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", automationStartParams(workerSelection, runId, operationId()))} disabled={!workerProject || Boolean(busy)}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
-          {text(selectedRun["status"]) === "active" && <button disabled={Boolean(busy)} onClick={() => void perform("complete", "run.complete", { operationId: operationId(), runId })}><CheckCircle2 size={14} />{t("标记完成", "Mark complete")}</button>}
+          {text(selectedRun["status"]) === "active" && <button disabled={Boolean(busy) || runTasks.some(taskExecutionPending)} onClick={() => void perform("complete", "run.complete", { operationId: operationId(), runId })}><CheckCircle2 size={14} />{t("标记完成", "Mark complete")}</button>}
           {text(selectedRun["status"]) === "active" && <button className="danger" disabled={Boolean(busy)} onClick={() => setAbandonRun({ id: runId, objective: text(selectedRun["objective"]) })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
           {text(selectedRun["status"]) !== "active" && <button className="danger" disabled={Boolean(busy)} onClick={() => void perform("delete", "run.delete", { operationId: operationId(), runId })}><Trash2 size={14} />{t("删除记录", "Delete record")}</button>}
         </div></div>
@@ -542,11 +555,12 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           <DialogTitle>{text(detailedTask?.["title"], t("任务详情", "Task details"))}</DialogTitle>
           <DialogDescription>{detailedTaskId} · {status(text(detailedTask?.["status"]))}</DialogDescription>
         </DialogHeader>
+        {detailedTask && taskRuntimeNotice(detailedTask) && <p role="status" className="text-sm text-muted-foreground">{t(taskRuntimeNotice(detailedTask)!.zh, taskRuntimeNotice(detailedTask)!.en)}</p>}
         {taskDetail?.loading ? <div className="flex items-center justify-center gap-2 py-12 text-muted-foreground"><LoaderCircle className="animate-spin" />{t("正在读取完整任务…", "Loading full task…")}</div> : <div className="grid min-h-0 gap-4"><section className="grid gap-2"><strong>{t("任务要求", "Requirements")}</strong><pre className="max-h-[38vh] overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-3 text-xs leading-relaxed">{text(detailedTask?.["spec"], t("暂无要求", "No requirements"))}</pre></section>{text(detailedTask?.["result"]) && <section className="grid gap-2"><strong>{t("执行结果", "Result")}</strong><pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-3 text-xs leading-relaxed">{text(detailedTask?.["result"])}</pre></section>}</div>}
         {taskDetail?.error && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法读取完整任务", "Unable to load full task")}</AlertTitle><AlertDescription>{taskDetail.error}</AlertDescription></Alert>}
         <DialogFooter className="flex-wrap">
           {detailedBoardState === "ready" && detailedTask && <Button variant="outline" disabled={Boolean(busy)} onClick={() => void startWorker(detailedTask)}><Bot data-icon="inline-start" />{t("启动", "Start")}</Button>}
-          {text(detailedTask?.["status"]) === "failed" && <Button variant="outline" disabled={Boolean(busy)} onClick={() => void perform(detailedTaskId, "task.retry", { operationId: operationId(), taskId: detailedTaskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
+          {text(detailedTask?.["status"]) === "failed" && detailedTask && !taskExecutionPending(detailedTask) && <Button variant="outline" disabled={Boolean(busy)} onClick={() => void perform(detailedTaskId, "task.retry", { operationId: operationId(), taskId: detailedTaskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
           {detailedDispatch && <Button variant="outline" onClick={() => onOpenSession(text(detailedDispatch["sessionId"]))}>{t("打开会话", "Open session")}</Button>}
           {manualDeliverySupported && detailedDispatch && ["starting", "running"].includes(text(detailedDispatch["state"])) && <>
             <Button variant="outline" disabled={Boolean(busy)} onClick={() => openDelivery(detailedDispatch, detailedTask ?? undefined, true)}>{t("标记完成", "Mark done")}</Button>

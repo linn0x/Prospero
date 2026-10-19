@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stageExecutionHost } from "./runtime-manifest.mjs";
 
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(appRoot, "..", "..");
@@ -57,6 +58,7 @@ copyFileSync(rustBinary, stagedRustBinary);
 chmodSync(stagedRustBinary, 0o755);
 copyFileSync(rustCli, stagedRustCli);
 chmodSync(stagedRustCli, 0o755);
+stageExecutionHost(path.join(repoRoot, "target", "release"), runtimeRoot, process.platform, arch);
 const launchAgentInstaller = path.join(appRoot, "scripts", "install-rust-daemon-launchagent.mjs");
 const stagedLaunchAgentInstaller = path.join(runtimeRoot, "install-rust-daemon-launchagent.mjs");
 copyFileSync(launchAgentInstaller, stagedLaunchAgentInstaller);

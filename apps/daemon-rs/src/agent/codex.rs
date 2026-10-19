@@ -18,8 +18,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::claude::{AdapterEvent, QuestionOptionSpec, QuestionReply, QuestionSpec, TurnOptions};
+use super::lifecycle::{ProcessLifecycle, Quiescence, terminate_child};
 use super::store::{ApprovalPolicy, PermissionMode};
 use crate::error::{Error, Result};
+use crate::orchestration::reliability::ControlEffectState;
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -988,6 +990,7 @@ pub async fn app_server_diagnostics(data: &Path) -> Result<Vec<AppServerDiagnost
 #[derive(Clone)]
 pub(crate) struct AppServerCleanup {
     child_pid: u32,
+    lifecycle: ProcessLifecycle,
     codex_home: Option<PathBuf>,
     lease_path: Option<PathBuf>,
 }
@@ -1005,6 +1008,7 @@ impl AppServerCleanup {
         };
         Ok(Self {
             child_pid,
+            lifecycle: ProcessLifecycle::new(child_pid),
             codex_home,
             lease_path,
         })
@@ -1027,15 +1031,18 @@ impl AppServerCleanup {
         }
     }
 
-    pub(crate) async fn terminate(&self, child: &mut Child) {
-        kill_process_group(self.child_pid);
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-        if !process_alive(self.child_pid)
+    pub(crate) async fn terminate(&self, child: &mut Child) -> Quiescence {
+        let quiescence = terminate_child(child, &self.lifecycle, Duration::from_secs(2)).await;
+        if quiescence == Quiescence::Confirmed
             && let Some(path) = self.lease_path.as_ref()
         {
             let _ = std::fs::remove_file(path);
         }
+        quiescence
+    }
+
+    pub(crate) fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle.clone()
     }
 }
 
@@ -1392,7 +1399,7 @@ pub(super) struct CodexTurn {
     model: Option<String>,
     effort: Option<String>,
     mode: PermissionMode,
-    child_pid: u32,
+    lifecycle: ProcessLifecycle,
     responses: PendingResponses,
     diagnostics: ProcessDiagnostics,
 }
@@ -1444,15 +1451,7 @@ impl StartingRpc {
         for (key, value) in environment {
             command.env(key, value);
         }
-        #[cfg(unix)]
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        super::lifecycle::configure_process_group(&mut command);
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Error::Feature("agent_unavailable".into(), "未安装 codex".into())
@@ -1467,10 +1466,9 @@ impl StartingRpc {
         let cleanup = match AppServerCleanup::new(data, child_pid, environment) {
             Ok(cleanup) => cleanup,
             Err(error) => {
-                kill_process_group(child_pid);
-                let _ = child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-                return Err(error);
+                let mut guard = super::lifecycle::ChildGuard::new(child)?;
+                let quiescence = guard.terminate(Duration::from_secs(2)).await;
+                return Err(super::lifecycle::cleanup_error(error, quiescence));
             }
         };
         if let Some(stderr) = child.stderr.take() {
@@ -1479,15 +1477,15 @@ impl StartingRpc {
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                cleanup.terminate(&mut child).await;
-                return Err(Error::Closed);
+                let quiescence = cleanup.terminate(&mut child).await;
+                return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
             }
         };
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                cleanup.terminate(&mut child).await;
-                return Err(Error::Closed);
+                let quiescence = cleanup.terminate(&mut child).await;
+                return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
             }
         };
         Ok(Self {
@@ -1592,11 +1590,12 @@ pub(super) async fn spawn_turn(
             crate::accounts::profile::codex_app_server_args(profile),
         )
     } else {
-        let (_home, environment) = super::usage::native_codex_environment(data)?;
+        let (_home, mut environment) = super::usage::native_codex_environment(data)?;
+        environment.extend(options.environment.iter().cloned());
         (environment, Vec::new())
     };
     let mut rpc = StartingRpc::start(data, workspace, &environment, &app_server_args).await?;
-    let child_pid = rpc.cleanup.child_pid;
+    let lifecycle = rpc.cleanup.lifecycle();
     let policy = execution_policy(workspace, options.policy);
     let startup = async {
         rpc.request(
@@ -1648,8 +1647,8 @@ pub(super) async fn spawn_turn(
     let thread_id = match startup {
         Ok(thread_id) => thread_id,
         Err(error) => {
-            rpc.cleanup.terminate(&mut rpc.child).await;
-            return Err(error);
+            let quiescence = rpc.cleanup.terminate(&mut rpc.child).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
         }
     };
     rpc.cleanup.record_thread(&thread_id);
@@ -1754,7 +1753,7 @@ pub(super) async fn spawn_turn(
         model: options.model.clone(),
         effort: options.effort.clone(),
         mode: options.mode,
-        child_pid,
+        lifecycle,
         responses,
         diagnostics,
     })
@@ -3522,7 +3521,27 @@ impl CodexTurn {
         result.map_err(Error::Invalid)
     }
 
-    pub(super) fn kill(&self) {
-        kill_process_group(self.child_pid);
+    pub(super) async fn interrupt(&self) -> ControlEffectState {
+        let Some(turn_id) = self.current_turn.lock().await.clone() else {
+            return ControlEffectState::None;
+        };
+        match self
+            .send_request_value(
+                "turn/interrupt",
+                json!({"threadId":self.thread_id,"turnId":turn_id}),
+            )
+            .await
+        {
+            Ok(_) => ControlEffectState::Received,
+            Err(_) => ControlEffectState::Unknown,
+        }
+    }
+
+    pub(super) async fn kill(&self) -> ControlEffectState {
+        self.lifecycle.request_termination().await
+    }
+
+    pub(super) fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle.clone()
     }
 }

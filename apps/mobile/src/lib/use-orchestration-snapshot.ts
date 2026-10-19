@@ -26,6 +26,7 @@ export function useOrchestrationSnapshot(
       }
 
       let active = true;
+      setReceived(null);
       const refresh = (): void => conn.orchestrationSnapshot();
       const offSnapshot = conn.events.on("orchestrationSnapshot", (message) => {
         if (active) setReceived({ conn, snapshot: message.snapshot });
@@ -51,5 +52,5 @@ export function useOrchestrationSnapshot(
   );
 
   // Switching hosts must not briefly classify the new host using the old host's worktrees.
-  return received?.conn === conn ? received.snapshot : null;
+  return status === "connected" && received?.conn === conn ? received.snapshot : null;
 }

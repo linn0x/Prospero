@@ -11,8 +11,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::claude::{AdapterEvent, QuestionOptionSpec, QuestionSpec, TurnOptions};
+use super::lifecycle::{ChildGuard, ProcessLifecycle, terminate_child};
 use super::{AgentModelCatalog, AgentPresetInfo, LaunchModelCatalog, LaunchModelInfo};
 use crate::error::{Error, Result};
+use crate::orchestration::reliability::ControlEffectState;
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,7 +28,7 @@ pub(super) struct DeepseekTurn {
     session_id: String,
     current_model: Option<String>,
     current_effort: Option<String>,
-    child_pid: u32,
+    lifecycle: ProcessLifecycle,
 }
 
 struct EventLoop {
@@ -38,6 +40,7 @@ struct EventLoop {
     auto: bool,
     ready: oneshot::Sender<Result<()>>,
     child: Child,
+    lifecycle: ProcessLifecycle,
 }
 
 fn binary() -> String {
@@ -104,7 +107,10 @@ fn clean_text(value: &str, maximum: usize) -> String {
     out
 }
 
-async fn start_process(workspace: &str, environment: &[(String, String)]) -> Result<(Child, u16)> {
+async fn start_process(
+    workspace: &str,
+    environment: &[(String, String)],
+) -> Result<(ChildGuard, u16)> {
     let mut command = Command::new(binary());
     command
         .args(["web", "--host", "127.0.0.1", "--port", "0"])
@@ -116,24 +122,17 @@ async fn start_process(workspace: &str, environment: &[(String, String)]) -> Res
     for (key, value) in environment {
         command.env(key, value);
     }
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().map_err(|error| {
+    super::lifecycle::configure_process_group(&mut command);
+    let child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Error::Feature("agent_unavailable".into(), "未安装 dsh".into())
         } else {
             Error::Io(error)
         }
     })?;
-    let stdout = child.stdout.take().ok_or(Error::Closed)?;
-    let stderr = child.stderr.take().ok_or(Error::Closed)?;
+    let mut guard = ChildGuard::new(child)?;
+    let stdout = guard.child_mut().stdout.take().ok_or(Error::Closed)?;
+    let stderr = guard.child_mut().stderr.take().ok_or(Error::Closed)?;
     let (ports_tx, mut ports_rx) = mpsc::unbounded_channel();
     tokio::spawn(drain_deepseek_output(
         BufReader::new(stdout),
@@ -143,12 +142,22 @@ async fn start_process(workspace: &str, environment: &[(String, String)]) -> Res
     let port = tokio::time::timeout(START_TIMEOUT, async {
         tokio::select! {
             port = ports_rx.recv() => port.ok_or(Error::Closed),
-            status = child.wait() => Err(Error::Invalid(format!("dsh web 启动时退出: {:?}", status.ok()))),
+            status = guard.wait_for_exit() => Err(Error::Invalid(format!("dsh web 启动时退出: {status:?}"))),
         }
     })
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok((child, port))
+    .await;
+    let port = match port {
+        Ok(Ok(port)) => port,
+        Ok(Err(error)) => {
+            let quiescence = guard.terminate(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
+        }
+        Err(_) => {
+            let quiescence = guard.terminate(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(Error::Timeout, quiescence));
+        }
+    };
+    Ok((guard, port))
 }
 
 async fn drain_deepseek_output<R>(mut reader: BufReader<R>, ports: mpsc::UnboundedSender<u16>)
@@ -204,10 +213,7 @@ async fn call_rpc<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|error| Error::Invalid(format!("DeepSeek Harness HTTP failed: {error}")))?;
     if !response.status().is_success() {
-        return Err(Error::Invalid(format!(
-            "DeepSeek Harness HTTP {}",
-            response.status()
-        )));
+        return Err(super::lifecycle::http_response_error("DeepSeek Harness", response).await);
     }
     let envelope = response
         .json::<Value>()
@@ -266,14 +272,12 @@ pub(super) async fn spawn_turn(
     options: &TurnOptions,
 ) -> Result<DeepseekTurn> {
     let (mut child, port) = start_process(workspace, &options.environment).await?;
-    let child_pid = child.id().ok_or(Error::Closed)?;
+    let lifecycle = child.lifecycle();
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{port}");
     if let Err(error) = wait_ready(&client, &base_url).await {
-        kill_process_group(child_pid);
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-        return Err(error);
+        let quiescence = child.terminate(Duration::from_secs(2)).await;
+        return Err(super::lifecycle::cleanup_error(error, quiescence));
     }
     let mut create = serde_json::Map::new();
     create.insert("cwd".into(), json!(workspace));
@@ -282,14 +286,32 @@ pub(super) async fn spawn_turn(
     } else if let Some(preset) = options.agent_preset.as_ref() {
         create.insert("agentPreset".into(), json!(preset));
     }
-    let session =
-        call_rpc::<Value>(&client, &base_url, "session.create", Value::Object(create)).await?;
-    let session_id = session
+    let session = match call_rpc::<Value>(
+        &client,
+        &base_url,
+        "session.create",
+        Value::Object(create),
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            let quiescence = child.terminate(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
+        }
+    };
+    let Some(session_id) = session
         .get("sessionId")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::Invalid("DeepSeek Harness 未返回 sessionId".into()))?
-        .to_owned();
+        .map(str::to_owned)
+    else {
+        let quiescence = child.terminate(Duration::from_secs(2)).await;
+        return Err(super::lifecycle::cleanup_error(
+            Error::Invalid("DeepSeek Harness 未返回 sessionId".into()),
+            quiescence,
+        ));
+    };
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
     let _ = events_tx.try_send(AdapterEvent::NativeId(session_id.clone()));
     let websocket = format!("ws://127.0.0.1:{port}/api/events.mux");
@@ -303,13 +325,24 @@ pub(super) async fn spawn_turn(
         base_url: base_url.clone(),
         auto,
         ready: ready_tx,
-        child,
+        child: child.into_child().0,
+        lifecycle: lifecycle.clone(),
     }));
     match tokio::time::timeout(START_TIMEOUT, ready_rx).await {
         Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => return Err(error),
-        Ok(Err(_)) => return Err(Error::Closed),
-        Err(_) => return Err(Error::Timeout),
+        Ok(Ok(Err(error))) => {
+            let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
+        }
+        Ok(Err(_)) => {
+            let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
+        }
+        Err(_) => {
+            lifecycle.request_termination().await;
+            let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(Error::Timeout, quiescence));
+        }
     }
     let _ = call_rpc::<Value>(
         &client,
@@ -318,23 +351,31 @@ pub(super) async fn spawn_turn(
         json!({"sessionId": session_id, "maxMessages": 50}),
     )
     .await;
-    if let Some(model) = options.model.as_ref() {
-        select_model(
+    if let Some(model) = options.model.as_ref()
+        && let Err(error) = select_model(
             &client,
             &base_url,
             &session_id,
             model,
             options.effort.as_deref(),
         )
-        .await?;
+        .await
+    {
+        lifecycle.request_termination().await;
+        let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+        return Err(super::lifecycle::cleanup_error(error, quiescence));
     }
-    call_rpc::<Value>(
+    if let Err(error) = call_rpc::<Value>(
         &client,
         &base_url,
         "session.prompt",
         json!({"sessionId":session_id,"mode":"queue","content":prompt_content(prompt, attachments)}),
     )
-    .await?;
+    .await {
+        lifecycle.request_termination().await;
+        let quiescence = lifecycle.await_quiescence(Duration::from_secs(2)).await;
+            return Err(super::lifecycle::cleanup_error(error, quiescence));
+    }
     Ok(DeepseekTurn {
         client,
         base_url,
@@ -343,7 +384,7 @@ pub(super) async fn spawn_turn(
         session_id,
         current_model: options.model.clone(),
         current_effort: options.effort.clone(),
-        child_pid,
+        lifecycle,
     })
 }
 
@@ -357,6 +398,7 @@ async fn run_events(loop_state: EventLoop) {
         auto,
         ready,
         mut child,
+        lifecycle,
     } = loop_state;
     let mut socket = match tokio_tungstenite::connect_async(url).await {
         Ok((socket, _)) => {
@@ -367,10 +409,7 @@ async fn run_events(loop_state: EventLoop) {
             let _ = ready.send(Err(Error::Invalid(
                 "DeepSeek Harness 事件连接不可用".into(),
             )));
-            let child_pid = child.id().unwrap_or(0);
-            kill_process_group(child_pid);
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            terminate_child(&mut child, &lifecycle, Duration::from_secs(2)).await;
             return;
         }
     };
@@ -460,10 +499,7 @@ async fn run_events(loop_state: EventLoop) {
             })
             .await;
     }
-    let child_pid = child.id().unwrap_or(0);
-    kill_process_group(child_pid);
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    terminate_child(&mut child, &lifecycle, Duration::from_secs(2)).await;
 }
 
 async fn handle_approval(
@@ -1128,7 +1164,6 @@ async fn read_catalog(
 
 async fn transient_catalog(workspace: &str, native_id: Option<&str>) -> Result<LaunchModelCatalog> {
     let (mut child, port) = start_process(workspace, &[]).await?;
-    let child_pid = child.id().unwrap_or(0);
     let result = async {
         let client = reqwest::Client::new();
         let base_url = format!("http://127.0.0.1:{port}");
@@ -1152,9 +1187,7 @@ async fn transient_catalog(workspace: &str, native_id: Option<&str>) -> Result<L
         read_catalog(&client, &base_url, session_id.as_deref(), None).await
     }
     .await;
-    kill_process_group(child_pid);
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    child.terminate(Duration::from_secs(2)).await;
     result
 }
 
@@ -1187,7 +1220,6 @@ pub(super) async fn search_conversations(
     let limit = limit.unwrap_or(20).clamp(1, 50);
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let (mut child, port) = start_process(&home, &[]).await?;
-    let child_pid = child.id().unwrap_or(0);
     let result = async {
         let client = reqwest::Client::new();
         let base_url = format!("http://127.0.0.1:{port}");
@@ -1209,9 +1241,7 @@ pub(super) async fn search_conversations(
             .collect::<Vec<_>>())
     }
     .await;
-    kill_process_group(child_pid);
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    child.terminate(Duration::from_secs(2)).await;
     result
 }
 
@@ -1277,19 +1307,18 @@ impl DeepseekTurn {
         self.events.take()
     }
 
-    pub(super) fn interrupt(&self) {
-        let client = self.client.clone();
-        let base_url = self.base_url.clone();
-        let session_id = self.session_id.clone();
-        tokio::spawn(async move {
-            let _ = call_rpc::<Value>(
-                &client,
-                &base_url,
-                "session.cancel",
-                json!({"sessionId":session_id}),
-            )
-            .await;
-        });
+    pub(super) async fn interrupt(&self) -> ControlEffectState {
+        match call_rpc::<Value>(
+            &self.client,
+            &self.base_url,
+            "session.cancel",
+            json!({"sessionId":self.session_id}),
+        )
+        .await
+        {
+            Ok(_) => ControlEffectState::Received,
+            Err(_) => ControlEffectState::Unknown,
+        }
     }
 
     pub(super) async fn steer(
@@ -1372,22 +1401,13 @@ impl DeepseekTurn {
         })
     }
 
-    pub(super) fn kill(&self) {
-        kill_process_group(self.child_pid);
+    pub(super) async fn kill(&self) -> ControlEffectState {
+        self.lifecycle.request_termination().await
     }
-}
 
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-        libc::kill(pid as i32, libc::SIGKILL);
+    pub(super) fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle.clone()
     }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(pid: u32) {
-    let _ = pid;
 }
 
 #[cfg(test)]

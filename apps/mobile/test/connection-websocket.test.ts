@@ -646,3 +646,58 @@ describe("HostConnection WebSocket candidates", () => {
     connection.stop();
   });
 });
+
+describe("runtime reliability control", () => {
+  it("gates operation queries and correlates immutable execution identity", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set();
+    await expect(connection.operation("op")).rejects.toThrow("不支持");
+    expect(socket.sent).toHaveLength(0);
+    internals.advertisedCapabilities = new Set(["operations.query.v1", "executions.query.v1"]);
+    const pending = connection.operation("op");
+    const request = JSON.parse(socket.sent.at(-1)!);
+    expect(request).toMatchObject({ type: "orchestration.operation.get", operationId: "op" });
+    internals.onMessage(JSON.stringify({ type: "orchestration.operation.result", requestId: request.requestId, operation: { operationId: "op", kind: "stop", state: "OUTCOME_UNKNOWN", effectState: "UNKNOWN", revision: 2 } }));
+    await expect(pending).resolves.toMatchObject({ operationId: "op", state: "OUTCOME_UNKNOWN" });
+    const readExecution = connection.execution("attempt");
+    const executionRequest = JSON.parse(socket.sent.at(-1)!);
+    internals.onMessage(JSON.stringify({ type: "orchestration.execution.result", requestId: executionRequest.requestId, execution: { identity: { attemptId: "another-attempt", taskId: "task", executionEpoch: 1 }, state: "RUNNING", resultState: "NONE" } }));
+    await expect(readExecution).rejects.toThrow("身份不匹配");
+    expect(connection.queuedCount).toBe(0);
+    connection.stop();
+  });
+
+  it("keeps the same worker operation ID across repeated buttons and reconnects", () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set(["orchestration.manual.v1", "orchestration.lifecycle.v1"]);
+    vi.mocked(randomUUID).mockReturnValueOnce("first-operation").mockReturnValueOnce("unexpected-operation");
+    const input = { taskId: "task", agent: "claude" as const, worktree: "none" as const, cwd: "/tmp/workspace" };
+    expect(connection.startOrchestrationWorker(input)).toBe(true);
+    socket.readyState = 3;
+    expect(connection.startOrchestrationWorker(input)).toBe(true);
+    expect(JSON.parse(socket.sent[0]!).operationId).toBe("first-operation");
+    expect(connection.queuedCount).toBe(1);
+    const queued = (connection as unknown as { queue: { take(): { operationId: string } } }).queue.take();
+    expect(queued.operationId).toBe("first-operation");
+    connection.stop();
+  });
+});

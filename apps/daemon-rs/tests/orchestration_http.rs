@@ -894,6 +894,26 @@ async fn saturated_read_pool_does_not_block_control_writes_or_fresh_reads() {
     }
 }
 
+async fn wait_for_automation_response(
+    api: &Api,
+    uri: &str,
+    ready: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, value) = send(api, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        if ready(&value) {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "automation did not converge at {uri}: {value}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn automation_current_dispatches_and_advances_chain() {
     let _serial = AUTOMATION_CLI_SERIAL.lock().await;
@@ -937,7 +957,13 @@ async fn automation_current_dispatches_and_advances_chain() {
     .await;
     assert_eq!(status, StatusCode::OK, "{settled}");
 
-    let (_, dispatches) = send(&api, "GET", &format!("/v1/dispatches?runId={run_id}"), None).await;
+    let dispatches =
+        wait_for_automation_response(&api, &format!("/v1/dispatches?runId={run_id}"), |value| {
+            value
+                .as_array()
+                .is_some_and(|items| items.len() == 2 && items[1]["state"] == "running")
+        })
+        .await;
     assert_eq!(dispatches.as_array().unwrap().len(), 2, "{dispatches}");
     let dispatch_b = dispatches[1]["id"].as_str().unwrap().to_owned();
     assert_eq!(dispatches[1]["taskId"], task_b);
@@ -951,9 +977,13 @@ async fn automation_current_dispatches_and_advances_chain() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (_, snapshot) = send(&api, "GET", &format!("/v1/runs/{run_id}"), None).await;
+    let snapshot = wait_for_automation_response(&api, &format!("/v1/runs/{run_id}"), |value| {
+        value["run"]["status"] == "completed"
+    })
+    .await;
     assert_eq!(snapshot["run"]["status"], "completed");
     assert_eq!(snapshot["run"]["automation"]["state"], "completed");
+    api.agents.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1003,6 +1033,7 @@ async fn automation_pause_prevents_next_dispatch() {
     assert_eq!(status, StatusCode::OK);
     let (_, dispatches) = send(&api, "GET", &format!("/v1/dispatches?runId={run_id}"), None).await;
     assert_eq!(dispatches.as_array().unwrap().len(), 1, "{dispatches}");
+    api.agents.shutdown().await.unwrap();
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) {
@@ -1036,10 +1067,18 @@ fn init_repo(root: &std::path::Path) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn automation_run_workspace_registers_shared_worktree_asset() {
+    let _serial = AUTOMATION_CLI_SERIAL.lock().await;
     let (directory, api) = fixture().await;
+    let _cli = install_fake_automation_cli(&directory);
     let repo = init_repo(directory.path());
     let subdir = repo.join("crates/app");
     std::fs::create_dir_all(&subdir).unwrap();
+    std::fs::write(subdir.join("fixture.txt"), "tracked worktree fixture").unwrap();
+    git(&repo, &["add", "crates/app/fixture.txt"]);
+    git(
+        &repo,
+        &["commit", "-q", "-m", "tracked automation workspace"],
+    );
     let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
     let run_id = created["run"]["id"].as_str().unwrap().to_owned();
 
@@ -1079,6 +1118,8 @@ async fn automation_run_workspace_registers_shared_worktree_asset() {
     assert_eq!(assets.len(), 1, "{assets:?}");
     assert_eq!(assets[0]["kind"], "run");
     assert!(std::path::Path::new(assets[0]["path"].as_str().unwrap()).is_dir());
+    assert_eq!(run["automation"]["state"], "running");
+    api.agents.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1154,4 +1195,5 @@ async fn running_automation_rejects_graph_edits_and_manual_dispatch() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    api.agents.shutdown().await.unwrap();
 }

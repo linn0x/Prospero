@@ -400,7 +400,7 @@ fn v31_migration_does_not_invent_timeline_checkpoint_timestamps() {
     drop(store);
     let connection = Connection::open(directory.path().join("prospero.sqlite")).unwrap();
     connection
-        .execute_batch("DROP TABLE timeline_checkpoints; PRAGMA user_version=31;")
+        .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; DROP TABLE timeline_checkpoints; DROP INDEX orch_worker_starts_dispatch_owner; DROP INDEX orch_dispatch_active_session; DROP INDEX cross_model_checks_parent_state; PRAGMA user_version=31;")
         .unwrap();
     drop(connection);
     let mut store = Store::open(directory.path()).unwrap();

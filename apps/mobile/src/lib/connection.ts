@@ -9,6 +9,8 @@
  * - 失败诊断:逐地址记录失败原因,合成一条用户能照做的提示;
  * - 发送排队:断线瞬间的用户操作不丢,重连后按序补发。
  */
+import type { OperationView, ExecutionRecord } from "@prospero/protocol/rust-daemon";
+import { waitForOperation } from "./runtime-operation-wait";
 import { AppState, Platform } from "react-native";
 import { randomUUID } from "expo-crypto";
 import {
@@ -177,6 +179,7 @@ export class HostConnection {
   private readonly sessionCreates = new SessionCreateTracker();
   private readonly terminalCloses = new TerminalCloseTracker();
   private readonly deletedTerminalIds = new Set<string>();
+  private readonly orchestrationOperationIds = new Map<string, { fingerprint: string; id: string }>();
   /**
    * A cold session route can request the same chat twice: the route asks for
    * missing session metadata, then ChatView asks for the chat snapshot when it
@@ -858,6 +861,8 @@ export class HostConnection {
       case "orchestration.snapshot":
         this.events.emit("orchestrationSnapshot", msg);
         return;
+      case "orchestration.operation.result":
+      case "orchestration.execution.result":
       case "workspace.listing":
       case "workspace.summary.result":
       case "conversation.results":
@@ -927,7 +932,11 @@ export class HostConnection {
               ? "#model-sources"
           : (msg.sid ?? "#account");
     const responsePath =
-      msg.type === "workspace.summary.result"
+      msg.type === "orchestration.operation.result"
+        ? `#orchestration.operation:${msg.requestId}`
+        : msg.type === "orchestration.execution.result"
+          ? `#orchestration.execution:${msg.requestId}`
+        : msg.type === "workspace.summary.result"
         ? `#workspace.summary:${msg.requestId}`
         : msg.type === "chat.suggestions"
         ? `#chat.suggestions:${msg.requestId}`
@@ -1465,6 +1474,43 @@ export class HostConnection {
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
   }
 
+  async operation(operationId: string): Promise<OperationView> {
+    if (!this.supportsCapability("operations.query.v1")) throw new Error("主机不支持持久操作查询");
+    const requestId = this.agentRequestId();
+    const response = await this.fsRequest<Extract<S2CMessage, { type: "orchestration.operation.result" }>>(
+      "#account", `#orchestration.operation:${requestId}`,
+      { type: "orchestration.operation.get", requestId, operationId }, 7_000, false,
+    );
+    if (response.error) throw new Error(response.error.message);
+    if (!response.operation || response.operation.operationId !== operationId) throw new Error("操作回执身份不匹配");
+    return response.operation;
+  }
+
+  async execution(attemptId: string): Promise<ExecutionRecord> {
+    if (!this.supportsCapability("executions.query.v1")) throw new Error("主机不支持执行状态查询");
+    const requestId = this.agentRequestId();
+    const response = await this.fsRequest<Extract<S2CMessage, { type: "orchestration.execution.result" }>>(
+      "#account", `#orchestration.execution:${requestId}`,
+      { type: "orchestration.execution.get", requestId, attemptId }, 7_000, false,
+    );
+    if (response.error) throw new Error(response.error.message);
+    if (!response.execution || response.execution.identity.attemptId !== attemptId) throw new Error("执行回执身份不匹配");
+    return response.execution;
+  }
+
+  waitOperation(operationId: string, timeoutMs = 30_000, signal?: AbortSignal): ReturnType<typeof waitForOperation> {
+    return waitForOperation(operationId, (id) => this.operation(id), timeoutMs, signal);
+  }
+
+  private orchestrationOperationId(key: string, payload: unknown): string {
+    const fingerprint = JSON.stringify(payload);
+    const previous = this.orchestrationOperationIds.get(key);
+    if (previous?.fingerprint === fingerprint) return previous.id;
+    const id = randomUUID();
+    this.orchestrationOperationIds.set(key, { fingerprint, id });
+    return id;
+  }
+
   /** 拉取 daemon 的编排快照；前台定时刷新能跨 iOS/Android 后台恢复。 */
   orchestrationSnapshot(): void {
     if (!this.supportsOrchestrationSnapshot) return;
@@ -1578,6 +1624,8 @@ export class HostConnection {
 
   retryOrchestrationTask(taskId: string): boolean {
     if (!this.supportsOrchestrationLifecycle) return false;
+    this.orchestrationOperationIds.delete(`start:${taskId}`);
+    this.orchestrationOperationIds.delete(`stop:${taskId}`);
     return this.send({
       type: "orchestration.task.retry",
       taskId,
@@ -1602,7 +1650,7 @@ export class HostConnection {
       ...(input.accountId ? { accountId: input.accountId } : {}),
       worktree: input.worktree,
       cwd: input.cwd,
-      operationId: randomUUID(),
+      operationId: this.orchestrationOperationId(`start:${input.taskId}`, input),
       ...(input.kind ? { kind: input.kind } : {}),
       ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
     }, true).accepted;
@@ -1613,7 +1661,7 @@ export class HostConnection {
     return this.send({
       type: "orchestration.worker.stop",
       taskId,
-      operationId: randomUUID(),
+      operationId: this.orchestrationOperationId(`stop:${taskId}`, { taskId, reason }),
       ...(reason ? { reason } : {}),
     }, true).accepted;
   }
