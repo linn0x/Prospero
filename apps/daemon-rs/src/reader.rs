@@ -325,7 +325,7 @@ impl Drop for Alive {
 impl ReaderPool {
     pub(crate) async fn open(
         directory: PathBuf,
-        lock: Arc<std::fs::File>,
+        lock: Arc<crate::database::OwnerLock>,
         options: ReaderOptions,
     ) -> Result<Self> {
         let state = Arc::new(State {

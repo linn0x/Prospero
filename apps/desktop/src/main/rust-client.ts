@@ -15,7 +15,7 @@ import type {
   Run, DeleteRun, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, Skill, SkillSuggestion,
   ScheduleCreate, ScheduleRunResult, ScheduleUpdate, ScheduledAgentTask,
   StartAutomation, StartWorker, StopWorker, Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection,
-  WorkerStartOutcome, WorkerStartOperation, WorkerStartSubmission, TaskActivities,
+  WorkerStartOutcome, WorkerStartOperation, WorkerStartSubmission, TaskActivities, OperationView, ExecutionRecord,
 } from "@prospero/protocol/rust-daemon";
 
 
@@ -436,6 +436,33 @@ export class RustClient {
         await delay(Math.min(error.retryAfterMs, Math.max(1, deadline - Date.now())), undefined, { signal: signal ?? undefined });
       }
     }
+  }
+  operation(operationId: string, signal: AbortSignal | null = null, timeoutMs = 7000): Promise<OperationView> {
+    return this.json(`/v1/operations/${id(operationId)}`, { signal, timeoutMs });
+  }
+  execution(attemptId: string, signal: AbortSignal | null = null): Promise<ExecutionRecord> {
+    return this.json(`/v1/executions/${id(attemptId)}`, { signal });
+  }
+  async waitOperation(operationId: string, timeoutMs = 30_000, signal: AbortSignal | null = null): Promise<{ operationId: string; operation: OperationView | null; waitTimedOut: boolean }> {
+    id(operationId);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("Invalid operation wait timeout");
+    const deadline = performance.now() + timeoutMs;
+    let operation: OperationView | null = null;
+    while (performance.now() < deadline) {
+      signal?.throwIfAborted();
+      try {
+        operation = await this.operation(operationId, signal, Math.max(1, Math.ceil(deadline - performance.now())));
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        if (performance.now() >= deadline) break;
+        throw new Error(`Operation ${operationId} remains queryable; waiting failed`, { cause: error });
+      }
+      if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(operation.state)) return { operationId, operation, waitTimedOut: false };
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
+      await delay(Math.min(Math.max(100, operation.retryAfterMs ?? 250), 5000, remaining), undefined, { signal: signal ?? undefined });
+    }
+    return { operationId, operation, waitTimedOut: true };
   }
   workerStartOperation(operationId: string, signal: AbortSignal | null = null): Promise<WorkerStartOperation> {
     return this.json(`/v1/workers/start-operations/${id(operationId)}`, { signal });

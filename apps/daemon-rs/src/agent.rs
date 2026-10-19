@@ -2,6 +2,7 @@ mod claude;
 mod codex;
 pub(crate) mod conversations;
 mod deepseek;
+pub(crate) mod lifecycle;
 mod opencode;
 mod runtime;
 mod store;
@@ -317,6 +318,10 @@ pub struct UsageDailyBucket {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct UsageReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_finalized: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

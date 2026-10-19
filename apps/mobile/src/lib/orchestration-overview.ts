@@ -1,3 +1,4 @@
+import { executionPending, latestExecution, runtimeStatus } from "@prospero/protocol";
 import type {
   OrchestrationDispatch,
   OrchestrationGate,
@@ -138,8 +139,9 @@ export function orchestrationRunCurrentState(
   const blocked = tasks.filter((task) => task.status === "blocked").length;
   const cancelled = tasks.filter((task) => task.status === "cancelled").length;
   const pending = tasks.filter((task) => task.status === "pending");
-  const readyTasks = pending.filter((task) =>
-    task.deps.every((dependencyId) => taskById.get(dependencyId)?.status === "done"),
+  const unsettled = new Set(tasks.filter((task) => executionPending(latestExecution(snapshot.executions, task.id))).map((task) => task.id));
+  const readyTasks = pending.filter((task) => !unsettled.has(task.id) &&
+    task.deps.every((dependencyId) => taskById.get(dependencyId)?.status === "done" && !unsettled.has(dependencyId)),
   );
   const readyIds = new Set(readyTasks.map((task) => task.id));
   const waitingTasks = pending.filter((task) => !readyIds.has(task.id));
@@ -152,6 +154,7 @@ export function orchestrationRunCurrentState(
   const canComplete = !readOnly &&
     pendingGates.length === 0 &&
     currentDispatches.length === 0 &&
+    unsettled.size === 0 && snapshot.executionsTruncated !== true &&
     !automationRunning &&
     tasks.every((task) => task.status === "done" || task.status === "cancelled");
 
@@ -171,6 +174,17 @@ export function orchestrationRunCurrentState(
       gateId: gate.id,
       taskId: gate.taskId,
     };
+  } else if (snapshot.executionsTruncated === true) {
+    guide = { kind: "waiting", text: "执行状态快照不完整，请查询执行详情后再操作。", gateId: null, taskId: null };
+  } else if (tasks.some((task) => {
+    const execution = latestExecution(snapshot.executions, task.id);
+    return execution && executionPending(execution) && (execution.resultState === "ACCEPTED" || ["STOPPING", "STOP_REQUESTED", "START_UNKNOWN", "STOP_UNKNOWN", "OWNER_UNREACHABLE", "MANUAL_REQUIRED"].includes(execution.state));
+  })) {
+    const task = tasks.find((task) => {
+      const execution = latestExecution(snapshot.executions, task.id);
+      return execution && executionPending(execution) && (execution.resultState === "ACCEPTED" || ["STOPPING", "STOP_REQUESTED", "START_UNKNOWN", "STOP_UNKNOWN", "OWNER_UNREACHABLE", "MANUAL_REQUIRED"].includes(execution.state));
+    });
+    guide = { kind: "waiting", text: runtimeStatus(latestExecution(snapshot.executions, task?.id ?? ""))?.zh ?? "执行等待收尾", gateId: null, taskId: task?.id ?? null };
   } else if (failed > 0) {
     guide = {
       kind: "failed",

@@ -12,10 +12,12 @@ use tokio::sync::{Mutex, MutexGuard, Semaphore, oneshot, watch};
 use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, TurnOptions, spawn_turn};
 use super::codex::CodexTurn;
 use super::deepseek::DeepseekTurn;
+use super::lifecycle::{ProcessLifecycle, driver_error_from_error, driver_error_from_message};
 use super::opencode::OpencodeTurn;
 use super::store::{ApprovalPolicy, PermissionMode, QueuedRow};
 use super::*;
 use crate::error::{Error, Result};
+use crate::orchestration::reliability::ControlEffectState;
 use crate::protocol::*;
 use crate::worker::Database;
 
@@ -204,32 +206,48 @@ impl Driver {
         }
     }
 
-    fn interrupt(&self) {
+    async fn interrupt(&self) -> ControlEffectState {
         match self {
             Driver::Claude(driver) => driver.interrupt(),
-            Driver::Codex(driver) => driver.kill(),
-            Driver::Deepseek(driver) => driver.interrupt(),
-            Driver::Opencode(driver) => driver.interrupt(),
+            Driver::Codex(driver) => driver.interrupt().await,
+            Driver::Deepseek(driver) => driver.interrupt().await,
+            Driver::Opencode(driver) => driver.interrupt().await,
         }
     }
 
-    async fn steer(&self, text: &str, attachments: &[AttachmentInput]) -> Result<()> {
+    async fn steer(
+        &self,
+        text: &str,
+        attachments: &[AttachmentInput],
+    ) -> Result<ControlEffectState> {
         match self {
-            Driver::Claude(driver) => driver.steer(text, attachments).await,
+            Driver::Claude(driver) => driver
+                .steer(text, attachments)
+                .await
+                .map(|_| ControlEffectState::Received),
             Driver::Codex(driver) => {
                 if !attachments.is_empty() {
                     return Err(Error::Invalid("Codex 同轮引导暂不支持附件".into()));
                 }
-                driver.steer(text).await
+                driver
+                    .steer(text)
+                    .await
+                    .map(|_| ControlEffectState::Delivered)
             }
-            Driver::Deepseek(driver) => driver.steer(text, attachments).await,
+            Driver::Deepseek(driver) => driver
+                .steer(text, attachments)
+                .await
+                .map(|_| ControlEffectState::Delivered),
             Driver::Opencode(driver) => {
                 if !attachments.is_empty() {
                     return Err(Error::Invalid(
                         "OpenCode structured runtime 暂不支持图片附件".into(),
                     ));
                 }
-                driver.steer(text).await
+                driver
+                    .steer(text)
+                    .await
+                    .map(|_| ControlEffectState::Delivered)
             }
         }
     }
@@ -243,9 +261,12 @@ impl Driver {
         }
     }
 
-    async fn send_to_subagent(&self, subagent: &str, text: &str) -> Result<()> {
+    async fn send_to_subagent(&self, subagent: &str, text: &str) -> Result<ControlEffectState> {
         match self {
-            Driver::Codex(driver) => driver.send_to_subagent(subagent, text).await,
+            Driver::Codex(driver) => driver
+                .send_to_subagent(subagent, text)
+                .await
+                .map(|_| ControlEffectState::Delivered),
             Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) => {
                 Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into()))
             }
@@ -279,18 +300,30 @@ impl Driver {
         }
     }
 
-    fn kill(&self) {
+    async fn terminate(&self) -> ControlEffectState {
         match self {
-            Driver::Claude(driver) => driver.kill(),
-            Driver::Codex(driver) => driver.kill(),
-            Driver::Deepseek(driver) => driver.kill(),
-            Driver::Opencode(driver) => driver.kill(),
+            Driver::Claude(driver) => driver.kill().await,
+            Driver::Codex(driver) => driver.kill().await,
+            Driver::Deepseek(driver) => driver.kill().await,
+            Driver::Opencode(driver) => driver.kill().await,
+        }
+    }
+
+    fn lifecycle(&self) -> ProcessLifecycle {
+        match self {
+            Driver::Claude(driver) => driver.lifecycle(),
+            Driver::Codex(driver) => driver.lifecycle(),
+            Driver::Deepseek(driver) => driver.lifecycle(),
+            Driver::Opencode(driver) => driver.lifecycle(),
         }
     }
 }
 
 struct Handle {
     driver: Mutex<Driver>,
+    quiesced: watch::Sender<bool>,
+    turn_finished: watch::Sender<bool>,
+    quiescence_unknown: AtomicBool,
     replies: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// request id -> timeline record id of pending approvals.
     records: Mutex<HashMap<String, String>>,
@@ -311,9 +344,9 @@ struct QuestionPending {
 }
 
 struct Session {
+    execution_unknown: AtomicBool,
     handle: Mutex<Option<Arc<Handle>>>,
     usage: Mutex<UsageReport>,
-    ended: watch::Sender<()>,
     /// Serializes drain loops so only the turn that just finished chains the
     /// queued turns (mirrors the legacy `drainingQueue` guard).
     draining: Mutex<()>,
@@ -333,6 +366,7 @@ struct State {
     failed: AtomicBool,
     changed: watch::Sender<u64>,
     control_environment: std::sync::Mutex<Option<crate::control_cli::ControlEnvironment>>,
+    execution_environment: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 fn profile_model_catalog(
@@ -373,7 +407,43 @@ impl Agents {
             failed: AtomicBool::new(false),
             changed: watch::channel(0).0,
             control_environment: std::sync::Mutex::new(None),
+            execution_environment: Mutex::new(HashMap::new()),
         }))
+    }
+
+    pub async fn set_execution_environment(
+        &self,
+        session_id: &str,
+        environment: Vec<(String, String)>,
+    ) -> Result<()> {
+        crate::database::validate_id(session_id)?;
+        if environment.len() != 3
+            || ![
+                "PROSPERO_EXECUTION_HOST_SOCKET",
+                "PROSPERO_EXECUTION_HOST_TOKEN_PATH",
+                "PROSPERO_EXECUTION_IDENTITY_JSON",
+            ]
+            .iter()
+            .all(|required| {
+                environment
+                    .iter()
+                    .filter(|(key, value)| key == required && !value.is_empty())
+                    .count()
+                    == 1
+            })
+        {
+            return Err(Error::Invalid("invalid execution Host environment".into()));
+        }
+        let mut environments = self.0.execution_environment.lock().await;
+        if let Some(existing) = environments.get(session_id) {
+            return if existing == &environment {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        environments.insert(session_id.to_owned(), environment);
+        Ok(())
     }
 
     pub fn count(&self) -> usize {
@@ -1035,16 +1105,15 @@ impl Agents {
                 store.create_agent_session_with_id(create, policy, id)
             })
             .await?;
-        let (ended, _) = watch::channel(());
         self.0.entries.lock().await.insert(
             head.id.clone(),
             Arc::new(Session {
+                execution_unknown: AtomicBool::new(false),
                 handle: Mutex::new(None),
                 usage: Mutex::new(UsageReport {
                     windows: Vec::new(),
                     ..Default::default()
                 }),
-                ended,
                 draining: Mutex::new(()),
                 permit: Mutex::new(Some(permit)),
             }),
@@ -1299,12 +1368,12 @@ impl Agents {
             self.0.entries.lock().await.insert(
                 child_session_id.to_owned(),
                 Arc::new(Session {
+                    execution_unknown: AtomicBool::new(false),
                     handle: Mutex::new(None),
                     usage: Mutex::new(UsageReport {
                         windows: Vec::new(),
                         ..Default::default()
                     }),
-                    ended: watch::channel(()).0,
                     draining: Mutex::new(()),
                     permit: Mutex::new(permit),
                 }),
@@ -1673,6 +1742,13 @@ impl Agents {
         validate_message(&text, &attachments)?;
         let entry = self.session_entry(id).await?;
         let mut guard = entry.handle.lock().await;
+        if self.0.closed.load(Ordering::Acquire) || entry.execution_unknown.load(Ordering::Acquire)
+        {
+            return Err(Error::Feature(
+                "driver_exit_unknown".into(),
+                "Executor is stopping or requires reconciliation".into(),
+            ));
+        }
         let Some(handle) = guard.clone() else {
             // Idle: start a fresh turn immediately.
             let claimed = cross_model_claim_id.is_some();
@@ -1692,6 +1768,9 @@ impl Agents {
                 ParentReportDelivery::Submitted
             });
         };
+        if handle.quiescence_unknown.load(Ordering::Acquire) {
+            return Err(Error::Timeout);
+        }
         // Busy turn: either steer the live CLI or park the message in the
         // persistent queue for the turn-end drain.
         let row = QueuedRow {
@@ -1869,12 +1948,28 @@ impl Agents {
         if self.0.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
+        if self
+            .session_entry(id)
+            .await
+            .is_ok_and(|session| session.execution_unknown.load(Ordering::Acquire))
+        {
+            return Err(Error::Feature(
+                "driver_exit_unknown".into(),
+                "Previous executor exit requires reconciliation".into(),
+            ));
+        }
         let run = {
             let id = id.to_owned();
             self.0
                 .database
                 .call_control("session.launch", move |store| {
                     let run = store.agent_run(&id)?;
+                    if store.agent_execution_unknown(&id)? {
+                        return Err(Error::Feature(
+                            "driver_exit_unknown".into(),
+                            "Previous executor exit requires reconciliation".into(),
+                        ));
+                    }
                     if !run.active {
                         return Err(Error::Conflict);
                     }
@@ -1882,6 +1977,9 @@ impl Agents {
                 })
                 .await?
         };
+        if let Ok(session) = self.session_entry(id).await {
+            session.usage.lock().await.usage_finalized = Some(false);
+        }
         let (turn, native_id) = {
             let id = id.to_owned();
             self.0
@@ -1946,6 +2044,9 @@ impl Agents {
         {
             environment.extend(control.vars(Some(id)));
         }
+        if let Some(execution) = self.0.execution_environment.lock().await.get(id) {
+            environment.extend(execution.iter().cloned());
+        }
         let options = TurnOptions {
             policy: run.policy,
             mode: run.mode,
@@ -2009,17 +2110,46 @@ impl Agents {
         } {
             Ok(driver) => driver,
             Err(error) => {
+                if let Ok(session) = self.session_entry(id).await {
+                    let mut usage = session.usage.lock().await;
+                    usage.usage_complete = Some(false);
+                    usage.usage_finalized = Some(!super::lifecycle::exit_unknown(&error));
+                }
+                if super::lifecycle::exit_unknown(&error) {
+                    if let Ok(session) = self.session_entry(id).await {
+                        session.execution_unknown.store(true, Ordering::Release);
+                    }
+                    let session_id = id.to_owned();
+                    self.0
+                        .database
+                        .call_control("agent.exit_unknown", move |store| {
+                            store.mark_agent_execution_unknown(&session_id)
+                        })
+                        .await?;
+                }
                 if let Some(claim_id) = cross_model_claim_id {
                     self.rollback_cross_model_fan_in_delivery(id, claim_id)
                         .await;
                 }
+                let mut driver_error =
+                    driver_error_from_error(&error, crate::protocol::DriverPhase::Create);
+                driver_error.diagnostic_ref = Some(format!("timeline:{id}:turn{turn}-error"));
                 let message = error.to_string();
+                if let Err(storage) = self
+                    .append_driver_error_resilient(id, turn, &driver_error)
+                    .await
+                    && !matches!(storage, Error::Closed)
+                {
+                    self.0.failed.store(true, Ordering::Release);
+                }
                 let terminal = vec![
                     TimelineWrite {
                         id: format!("turn{turn}-error"),
                         turn_id: format!("turn{turn}"),
                         expected_revision: 0,
-                        body: TimelineBody::Error,
+                        body: TimelineBody::Error {
+                            driver_error: Some(driver_error),
+                        },
                         text: bounded_text(message),
                         replace: false,
                         subagent_id: None,
@@ -2057,6 +2187,9 @@ impl Agents {
         };
         let handle = Arc::new(Handle {
             driver: Mutex::new(driver),
+            quiesced: watch::channel(false).0,
+            turn_finished: watch::channel(false).0,
+            quiescence_unknown: AtomicBool::new(false),
             replies: Mutex::new(HashMap::new()),
             records: Mutex::new(HashMap::new()),
             questions: Mutex::new(HashMap::new()),
@@ -2076,6 +2209,33 @@ impl Agents {
             let mut handle = first_handle;
             loop {
                 runtime.run_turn(id.clone(), turn, handle.clone()).await;
+                handle.turn_finished.send_replace(true);
+                let lifecycle = handle.driver.lock().await.lifecycle();
+                if !lifecycle
+                    .await_quiescence(Duration::from_secs(3))
+                    .await
+                    .permits_direct_release()
+                {
+                    handle.quiescence_unknown.store(true, Ordering::Release);
+                    if let Ok(session) = runtime.session_entry(&id).await {
+                        session.execution_unknown.store(true, Ordering::Release);
+                    }
+                    let session_id = id.clone();
+                    if runtime
+                        .0
+                        .database
+                        .call_control("agent.exit_unknown", move |store| {
+                            store.mark_agent_execution_unknown(&session_id)
+                        })
+                        .await
+                        .is_err()
+                    {
+                        runtime.0.failed.store(true, Ordering::Release);
+                    }
+                    runtime.publish();
+                    break;
+                }
+                handle.quiesced.send_replace(true);
                 let Ok(entry) = runtime.session_entry(&id).await else {
                     break;
                 };
@@ -2085,11 +2245,29 @@ impl Agents {
                 let mut guard = entry.handle.lock().await;
                 if guard
                     .as_ref()
-                    .is_some_and(|live| Arc::ptr_eq(live, &handle))
+                    .is_none_or(|live| !Arc::ptr_eq(live, &handle))
                 {
-                    *guard = None;
+                    break;
                 }
-                entry.ended.send_replace(());
+                let session_id = id.clone();
+                if runtime
+                    .0
+                    .database
+                    .call_control("agent.exit_confirmed", move |store| {
+                        store.clear_agent_execution_unknown(&session_id)
+                    })
+                    .await
+                    .is_err()
+                {
+                    entry.execution_unknown.store(true, Ordering::Release);
+                    handle.quiescence_unknown.store(true, Ordering::Release);
+                    runtime.0.failed.store(true, Ordering::Release);
+                    runtime.publish();
+                    break;
+                }
+                entry.execution_unknown.store(false, Ordering::Release);
+                handle.quiescence_unknown.store(false, Ordering::Release);
+                *guard = None;
                 runtime.publish();
                 let queued = {
                     let id = id.clone();
@@ -2196,6 +2374,33 @@ impl Agents {
         }
     }
 
+    async fn append_driver_error_resilient(
+        &self,
+        id: &str,
+        turn: i64,
+        failure: &DriverError,
+    ) -> Result<()> {
+        for attempt in 0..3 {
+            let session_id = id.to_owned();
+            let failure = failure.clone();
+            let result = self
+                .0
+                .database
+                .call_control("agent.driver_error", move |store| {
+                    store.append_agent_driver_error(&session_id, turn, &failure)
+                })
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(Error::Backpressure(_) | Error::Busy) if attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Closed)
+    }
+
     async fn set_native_id_resilient(&self, id: &str, turn: i64, native_id: &str) -> Result<()> {
         loop {
             if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
@@ -2225,7 +2430,7 @@ impl Agents {
             id: format!("turn{turn}-drain-error"),
             turn_id: format!("turn{turn}"),
             expected_revision: 0,
-            body: TimelineBody::Error,
+            body: TimelineBody::Error { driver_error: None },
             text: bounded_text(message.to_owned()),
             replace: false,
             subagent_id: None,
@@ -2758,7 +2963,7 @@ impl Agents {
                             id: format!("turn{turn}-compact-error"),
                             turn_id: format!("turn{turn}"),
                             expected_revision: 0,
-                            body: TimelineBody::Error,
+                            body: TimelineBody::Error { driver_error: None },
                             text: bounded_text(message),
                             replace: false,
                             subagent_id: None,
@@ -2775,17 +2980,24 @@ impl Agents {
                     diffs,
                 } => {
                     handle.steerable.store(false, Ordering::Release);
-                    let has_usage = cost_usd.unwrap_or(0.0) > 0.0
-                        || input_tokens.unwrap_or(0) > 0
-                        || output_tokens.unwrap_or(0) > 0;
-                    if has_usage && let Ok(session) = self.session_entry(&id).await {
+                    if let Ok(session) = self.session_entry(&id).await {
                         let mut usage = session.usage.lock().await;
-                        usage.cost_usd =
-                            Some(usage.cost_usd.unwrap_or(0.0) + cost_usd.unwrap_or(0.0));
-                        usage.input_tokens =
-                            Some(usage.input_tokens.unwrap_or(0) + input_tokens.unwrap_or(0));
-                        usage.output_tokens =
-                            Some(usage.output_tokens.unwrap_or(0) + output_tokens.unwrap_or(0));
+                        let complete =
+                            cost_usd.is_some() && input_tokens.is_some() && output_tokens.is_some();
+                        usage.usage_complete =
+                            Some(usage.usage_complete.unwrap_or(true) && complete);
+                        usage.usage_finalized = Some(true);
+                        if let Some(value) = cost_usd {
+                            usage.cost_usd = Some(usage.cost_usd.unwrap_or(0.0) + value);
+                        }
+                        if let Some(value) = input_tokens {
+                            usage.input_tokens =
+                                Some(usage.input_tokens.unwrap_or(0).saturating_add(value));
+                        }
+                        if let Some(value) = output_tokens {
+                            usage.output_tokens =
+                                Some(usage.output_tokens.unwrap_or(0).saturating_add(value));
+                        }
                     }
                     interrupted = was_interrupted;
                     turn_diffs = diffs;
@@ -2811,11 +3023,23 @@ impl Agents {
         };
         let mut terminal = Vec::new();
         if let Some(message) = &failure {
+            let mut driver_error =
+                driver_error_from_message(message.clone(), crate::protocol::DriverPhase::Observe);
+            driver_error.diagnostic_ref = Some(format!("timeline:{id}:turn{turn}-error"));
+            if let Err(storage) = self
+                .append_driver_error_resilient(&id, turn, &driver_error)
+                .await
+                && !matches!(storage, Error::Closed)
+            {
+                self.0.failed.store(true, Ordering::Release);
+            }
             terminal.push(TimelineWrite {
                 id: format!("turn{turn}-error"),
                 turn_id: format!("turn{turn}"),
                 expected_revision: 0,
-                body: TimelineBody::Error,
+                body: TimelineBody::Error {
+                    driver_error: Some(driver_error),
+                },
                 text: bounded_text(message.clone()),
                 replace: false,
                 subagent_id: None,
@@ -3371,9 +3595,10 @@ impl Agents {
     pub async fn usage(&self, id: &str) -> Result<Option<UsageReport>> {
         let entry = self.session_entry(id).await?;
         let report = entry.usage.lock().await.clone();
-        if report.cost_usd.unwrap_or(0.0) == 0.0
-            && report.input_tokens.unwrap_or(0) == 0
-            && report.output_tokens.unwrap_or(0) == 0
+        if report.cost_usd.is_none()
+            && report.input_tokens.is_none()
+            && report.output_tokens.is_none()
+            && report.usage_finalized.is_none()
             && report.windows.is_empty()
             && report.subscription.is_none()
         {
@@ -3410,9 +3635,10 @@ impl Agents {
             });
             let report = if let Some((_, _, entry)) = live {
                 let report = entry.usage.lock().await.clone();
-                (report.cost_usd.unwrap_or(0.0) > 0.0
-                    || report.input_tokens.unwrap_or(0) > 0
-                    || report.output_tokens.unwrap_or(0) > 0
+                (report.cost_usd.is_some()
+                    || report.input_tokens.is_some()
+                    || report.output_tokens.is_some()
+                    || report.usage_finalized.is_some()
                     || !report.windows.is_empty()
                     || report.subscription.is_some())
                 .then_some(report)
@@ -3902,6 +4128,7 @@ impl Agents {
             .await
             .send_to_subagent(&subagent_id, &text)
             .await
+            .map(|_| ())
     }
 
     /// On-demand transcript for a Task-tool subagent's "查看执行详情" pane.
@@ -4030,23 +4257,59 @@ impl Agents {
         // Tell the CLI to stop after it finishes the current response.
         let entry = self.session_entry(id).await?;
         if let Some(handle) = entry.handle.lock().await.as_ref() {
-            handle.driver.lock().await.interrupt();
+            match handle.driver.lock().await.interrupt().await {
+                ControlEffectState::Received | ControlEffectState::Delivered => {}
+                ControlEffectState::Unknown => return Err(Error::Timeout),
+                ControlEffectState::Failed => return Err(Error::Closed),
+                ControlEffectState::None => return Err(Error::Conflict),
+            }
         }
         Ok(())
     }
 
     pub async fn close(&self, id: &str) -> Result<()> {
-        // Archive first: active=0 plus the queue delete closes the window in
-        // which a finishing chain could pop a queued row and relaunch a CLI
-        // for a session the user just killed.
+        let entry = self.session_entry(id).await.ok();
+        let _drain = match entry.as_ref() {
+            Some(entry) => Some(entry.draining.lock().await),
+            None => None,
+        };
+        let handle = match entry.as_ref() {
+            Some(entry) => Some(entry.handle.lock().await),
+            None => None,
+        };
+        let local_idle = handle.as_ref().is_some_and(|handle| handle.is_none());
+        let previous_memory = entry
+            .as_ref()
+            .is_some_and(|entry| entry.execution_unknown.swap(true, Ordering::AcqRel));
         let archived = id.to_owned();
-        self.0
+        let stop_intent = self
+            .0
             .database
             .call_control("agent.close", move |store| {
-                store.archive_agent_session(&archived, true)
+                let stopped = store.agent_execution_stopped(&archived)?;
+                let previous = store.archive_agent_session_for_stop(&archived, true)?;
+                Ok((previous, stopped))
             })
-            .await?;
-        self.finish_close(id, false).await
+            .await;
+        let (previous_unknown, previously_stopped) = match stop_intent {
+            Ok(intent) => intent,
+            Err(error) => {
+                if local_idle
+                    && !previous_memory
+                    && let Some(entry) = entry.as_ref()
+                {
+                    entry.execution_unknown.store(false, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
+        drop(handle);
+        self.finish_close(
+            id,
+            false,
+            !previous_memory && !previous_unknown && (local_idle || previously_stopped),
+        )
+        .await
     }
 
     /// Expire only an idle worker with an overdue, still-live dispatch. The
@@ -4057,23 +4320,58 @@ impl Agents {
         id: &str,
         stale_before: i64,
     ) -> Result<Option<Vec<String>>> {
+        let entry = self.session_entry(id).await.ok();
+        let _drain = match entry.as_ref() {
+            Some(entry) => Some(entry.draining.lock().await),
+            None => None,
+        };
+        let handle = match entry.as_ref() {
+            Some(entry) => Some(entry.handle.lock().await),
+            None => None,
+        };
+        let local_idle = handle.as_ref().is_some_and(|handle| handle.is_none());
+        let previous_memory = entry
+            .as_ref()
+            .is_some_and(|entry| entry.execution_unknown.load(Ordering::Acquire));
         let session_id = id.to_owned();
-        let run_ids = self
+        let (previous_unknown, run_ids) = self
             .0
             .database
             .call_control("worker.idle_timeout", move |store| {
-                store.archive_stale_idle_worker_session(&session_id, stale_before)
+                let previous = store.agent_execution_unknown(&session_id)?;
+                let run_ids = store.archive_stale_idle_worker_session(&session_id, stale_before)?;
+                Ok((previous, run_ids))
             })
             .await?;
         if run_ids.is_some() {
-            self.finish_close(id, true).await?;
+            if let Some(entry) = entry.as_ref() {
+                entry.execution_unknown.store(true, Ordering::Release);
+            }
+            drop(handle);
+            self.finish_close(
+                id,
+                true,
+                local_idle && !previous_memory && !previous_unknown,
+            )
+            .await?;
         }
         Ok(run_ids)
     }
 
-    async fn finish_close(&self, id: &str, idle_timeout: bool) -> Result<()> {
+    async fn finish_close(&self, id: &str, idle_timeout: bool, known_idle: bool) -> Result<()> {
+        let session_id = id.to_owned();
+        let execution_unknown = self
+            .0
+            .database
+            .call_control("agent.close", move |store| {
+                store.agent_execution_unknown(&session_id)
+            })
+            .await?;
         if let Ok(entry) = self.session_entry(id).await {
-            if let Some(handle) = entry.handle.lock().await.take() {
+            let execution_unknown =
+                execution_unknown || entry.execution_unknown.load(Ordering::Acquire);
+            let handle = { entry.handle.lock().await.as_ref().cloned() };
+            if let Some(handle) = handle {
                 let pending = std::mem::take(&mut *handle.replies.lock().await);
                 // Dropping pending question senders makes the translator
                 // answer deny; no explicit send needed.
@@ -4084,12 +4382,75 @@ impl Agents {
                     // would write the frame twice.
                     let _ = reply.send(false);
                 }
-                handle.driver.lock().await.kill();
-                let mut ended = entry.ended.subscribe();
-                let _ = tokio::time::timeout(Duration::from_secs(3), ended.changed()).await;
+                let lifecycle = {
+                    let driver = handle.driver.lock().await;
+                    driver.lifecycle()
+                };
+                let stop_effect = handle.driver.lock().await.terminate().await;
+                let mut turn_finished = handle.turn_finished.subscribe();
+                let (process_exit, turn_quiescence) = tokio::join!(
+                    lifecycle.await_quiescence(Duration::from_secs(3)),
+                    wait_for_quiescence(&mut turn_finished, Duration::from_secs(3)),
+                );
+                if !process_exit.permits_direct_release() || !turn_quiescence {
+                    entry.execution_unknown.store(true, Ordering::Release);
+                    let session_id = id.to_owned();
+                    self.0
+                        .database
+                        .call_control("agent.exit_unknown", move |store| {
+                            store.mark_agent_execution_unknown(&session_id)
+                        })
+                        .await?;
+                    return Err(Error::Timeout);
+                }
+                let session_id = id.to_owned();
+                self.0
+                    .database
+                    .call_control("agent.exit_confirmed", move |store| {
+                        store.clear_agent_execution_unknown(&session_id)
+                    })
+                    .await?;
+                entry.execution_unknown.store(false, Ordering::Release);
+                handle.quiesced.send_replace(true);
+                let _ = stop_effect;
+                let mut slot = entry.handle.lock().await;
+                if slot
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                {
+                    slot.take();
+                }
+            } else if known_idle {
+                let session_id = id.to_owned();
+                self.0
+                    .database
+                    .call_control("agent.exit_confirmed", move |store| {
+                        store.clear_agent_execution_unknown(&session_id)
+                    })
+                    .await?;
+                entry.execution_unknown.store(false, Ordering::Release);
+            } else if execution_unknown {
+                return Err(Error::Feature(
+                    "driver_exit_unknown".into(),
+                    "Executor exit requires reconciliation".into(),
+                ));
             }
             entry.permit.lock().await.take();
             self.0.entries.lock().await.remove(id);
+            self.0.execution_environment.lock().await.remove(id);
+        } else if known_idle {
+            let session_id = id.to_owned();
+            self.0
+                .database
+                .call_control("agent.exit_confirmed", move |store| {
+                    store.clear_agent_execution_unknown(&session_id)
+                })
+                .await?;
+        } else if execution_unknown {
+            return Err(Error::Feature(
+                "driver_exit_unknown".into(),
+                "Executor exit requires reconciliation".into(),
+            ));
         }
         let archived = id.to_owned();
         self.0
@@ -4109,13 +4470,44 @@ impl Agents {
     /// Archive runs left active by a previous daemon process. The provider
     /// process is gone with that daemon, so turns are never replayed.
     pub async fn recover(&self) -> Result<usize> {
+        let unknown: Vec<String> = self.0.database.call_control("agent.recover", |store| {
+            let mut statement = store.connection.prepare("SELECT session_id FROM agent_runs WHERE execution_unknown=1 ORDER BY session_id")?;
+            let ids = statement.query_map([], |row| row.get(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(ids)
+        }).await?;
+        for id in unknown {
+            let mut entries = self.0.entries.lock().await;
+            if entries.contains_key(&id) {
+                continue;
+            }
+            let permit = match self.0.slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.0.closed.store(true, Ordering::Release);
+                    return Err(Error::Feature(
+                        "driver_exit_unknown".into(),
+                        "Unresolved executor occupancy exceeds capacity".into(),
+                    ));
+                }
+            };
+            entries.insert(
+                id,
+                Arc::new(Session {
+                    execution_unknown: AtomicBool::new(true),
+                    handle: Mutex::new(None),
+                    usage: Mutex::new(UsageReport::default()),
+                    draining: Mutex::new(()),
+                    permit: Mutex::new(Some(permit)),
+                }),
+            );
+        }
         let _ = super::codex::cleanup_stale_app_servers(self.0.database.directory()).await;
         let ids: Vec<String> = self
             .0
             .database
             .call_control("agent.close", |store| {
                 let mut statement = store.connection.prepare(
-                    "SELECT session_id FROM agent_runs WHERE active=1 ORDER BY session_id",
+                    "SELECT session_id FROM agent_runs WHERE active=1 AND execution_unknown=0 ORDER BY session_id",
                 )?;
                 let ids = statement
                     .query_map([], |row| row.get::<_, String>(0))?
@@ -4204,24 +4596,126 @@ impl Agents {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.0.closed.store(true, Ordering::Release);
-        let sessions: Vec<Arc<Session>> = self.0.entries.lock().await.values().cloned().collect();
-        for session in &sessions {
-            if let Some(handle) = session.handle.lock().await.take() {
+        let sessions: Vec<(String, Arc<Session>)> = self
+            .0
+            .entries
+            .lock()
+            .await
+            .iter()
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect();
+        let mut all_confirmed = true;
+        for (session_id, session) in &sessions {
+            let _drain = session.draining.lock().await;
+            let slot = session.handle.lock().await;
+            let handle = slot.as_ref().cloned();
+            let previous_memory = session.execution_unknown.swap(true, Ordering::AcqRel);
+            let id = session_id.clone();
+            let stop_intent = self
+                .0
+                .database
+                .call_control("agent.shutdown", move |store| {
+                    let previous = store.agent_execution_unknown(&id)?;
+                    store.mark_agent_execution_unknown(&id)?;
+                    Ok(previous)
+                })
+                .await;
+            let previous_unknown = match stop_intent {
+                Ok(previous) => previous,
+                Err(error) => {
+                    if handle.is_none() && !previous_memory {
+                        session.execution_unknown.store(false, Ordering::Release);
+                    }
+                    return Err(error);
+                }
+            };
+            let execution_unknown = previous_unknown || previous_memory;
+            drop(slot);
+            if let Some(handle) = handle {
                 let pending = std::mem::take(&mut *handle.replies.lock().await);
                 std::mem::take(&mut *handle.questions.lock().await);
                 for (_request_id, reply) in pending {
                     // See close(): the translator task writes the deny frame.
                     let _ = reply.send(false);
                 }
-                handle.driver.lock().await.kill();
+                let lifecycle = {
+                    let driver = handle.driver.lock().await;
+                    driver.lifecycle()
+                };
+                let stop_effect = handle.driver.lock().await.terminate().await;
+                let mut turn_finished = handle.turn_finished.subscribe();
+                let (process_exit, turn_quiescence) = tokio::join!(
+                    lifecycle.await_quiescence(Duration::from_secs(3)),
+                    wait_for_quiescence(&mut turn_finished, Duration::from_secs(3)),
+                );
+                if process_exit.permits_direct_release() && turn_quiescence {
+                    let id = session_id.clone();
+                    self.0
+                        .database
+                        .call_control("agent.exit_confirmed", move |store| {
+                            store.clear_agent_execution_unknown(&id)
+                        })
+                        .await?;
+                    session.execution_unknown.store(false, Ordering::Release);
+                    handle.quiesced.send_replace(true);
+                    let mut slot = session.handle.lock().await;
+                    if slot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                    {
+                        slot.take();
+                    }
+                    session.permit.lock().await.take();
+                } else {
+                    session.execution_unknown.store(true, Ordering::Release);
+                    let id = session_id.clone();
+                    self.0
+                        .database
+                        .call_control("agent.exit_unknown", move |store| {
+                            store.mark_agent_execution_unknown(&id)
+                        })
+                        .await?;
+                    all_confirmed = false;
+                }
+                let _ = stop_effect;
+            } else if execution_unknown {
+                all_confirmed = false;
+            } else {
+                let id = session_id.clone();
+                self.0
+                    .database
+                    .call_control("agent.exit_confirmed", move |store| {
+                        store.clear_agent_execution_unknown(&id)
+                    })
+                    .await?;
+                session.execution_unknown.store(false, Ordering::Release);
+                session.permit.lock().await.take();
             }
         }
-        for session in &sessions {
-            let mut ended = session.ended.subscribe();
-            let _ = tokio::time::timeout(Duration::from_secs(3), ended.changed()).await;
+        if !all_confirmed {
+            return Err(Error::Timeout);
         }
-        self.check()
+        self.0.entries.lock().await.clear();
+        self.0.execution_environment.lock().await.clear();
+        Ok(())
     }
+}
+
+/// Cap text persisted with a single streaming rewrite.
+async fn wait_for_quiescence(receiver: &mut watch::Receiver<bool>, timeout: Duration) -> bool {
+    if *receiver.borrow() {
+        return true;
+    }
+    tokio::time::timeout(timeout, async {
+        while !*receiver.borrow_and_update() {
+            if receiver.changed().await.is_err() {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Cap text persisted with a single streaming rewrite.
@@ -4276,6 +4770,137 @@ mod persistence_tests {
             .unwrap();
         assert_eq!(current.lifecycle, SessionLifecycle::Archived);
         assert_eq!(current.status, SessionStatus::Failed);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_close_clears_only_its_new_stop_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let create = |title: &str| CreateAgentSession {
+            agent: AgentKind::Claude,
+            title: title.into(),
+            workspace: root.path().to_string_lossy().into_owned(),
+            auto_approve: false,
+            mode: None,
+            model: None,
+            effort: None,
+            agent_preset: None,
+            account_id: None,
+            resume: None,
+        };
+        let idle = agents.create(create("idle")).await.unwrap();
+        database.call_control("test.reject_stop", |store| {
+            store.connection.execute_batch("CREATE TRIGGER reject_idle_stop BEFORE INSERT ON orch_recovery_jobs WHEN NEW.kind='legacy_session' BEGIN SELECT RAISE(ABORT,'injected failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        assert!(agents.close(&idle.id).await.is_err());
+        assert_eq!(agents.count(), 1);
+        assert!(
+            !agents
+                .session_entry(&idle.id)
+                .await
+                .unwrap()
+                .execution_unknown
+                .load(Ordering::Acquire)
+        );
+        database
+            .call_control("test.allow_stop", |store| {
+                store
+                    .connection
+                    .execute_batch("DROP TRIGGER reject_idle_stop")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        agents.close(&idle.id).await.unwrap();
+        agents.close(&idle.id).await.unwrap();
+        assert_eq!(agents.count(), 0);
+        let closed_id = idle.id.clone();
+        assert!(
+            database
+                .call_control("test.stopped", move |store| store
+                    .agent_execution_stopped(&closed_id))
+                .await
+                .unwrap()
+        );
+        let unresolved = agents.create(create("unresolved")).await.unwrap();
+        let unknown_id = unresolved.id.clone();
+        database
+            .call_control("test.unknown", move |store| {
+                store.mark_agent_execution_unknown(&unknown_id)
+            })
+            .await
+            .unwrap();
+        assert!(agents.close(&unresolved.id).await.is_err());
+        assert_eq!(agents.count(), 1);
+        let unknown_id = unresolved.id.clone();
+        assert!(
+            database
+                .call_control("test.unknown", move |store| store
+                    .agent_execution_unknown(&unknown_id))
+                .await
+                .unwrap()
+        );
+        assert!(agents.shutdown().await.is_err());
+        assert_eq!(agents.count(), 1);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_confirms_only_owned_known_idle_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let idle = agents
+            .create(CreateAgentSession {
+                agent: AgentKind::Claude,
+                title: "idle shutdown".into(),
+                workspace: root.path().to_string_lossy().into_owned(),
+                auto_approve: false,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id: None,
+                resume: None,
+            })
+            .await
+            .unwrap();
+        agents.shutdown().await.unwrap();
+        assert_eq!(agents.count(), 0);
+        assert!(
+            !database
+                .call_control("test.unknown", move |store| store
+                    .agent_execution_unknown(&idle.id))
+                .await
+                .unwrap()
+        );
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_a_never_created_session_reports_not_found_without_unknown_occupancy() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        assert!(matches!(
+            agents.close("never-created").await,
+            Err(Error::NotFound)
+        ));
+        assert_eq!(agents.count(), 0);
+        let responsibilities: i64 = database
+            .call_control("test.no_session", |store| {
+                Ok(store.connection.query_row(
+                    "SELECT count(*) FROM orch_recovery_jobs WHERE kind='legacy_session'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(responsibilities, 0);
         database.shutdown().await.unwrap();
     }
 }

@@ -579,6 +579,118 @@ mod worker_start_tests {
             WorkerStartPhase::DeliveryUnknown
         );
     }
+    fn native_session(store: &mut Store, title: &str) -> crate::protocol::SessionHead {
+        store
+            .create_agent_session(
+                crate::agent::CreateAgentSession {
+                    agent: AgentKind::Claude,
+                    title: title.into(),
+                    workspace: "/tmp".into(),
+                    auto_approve: false,
+                    mode: None,
+                    model: None,
+                    effort: None,
+                    agent_preset: None,
+                    account_id: None,
+                    resume: None,
+                },
+                crate::agent::ApprovalPolicy::Manual,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn unknown_legacy_worker_blocks_retry_after_logical_stop_until_verified_clear() {
+        let (_directory, mut store, run_id, ids) = setup(1);
+        let old = native_session(&mut store, "old direct worker");
+        let dispatch = store
+            .dispatch_task(&ids[0], &old.id, None, None)
+            .unwrap()
+            .dispatch;
+        store.mark_agent_execution_unknown(&old.id).unwrap();
+        store
+            .abandon_dispatch(
+                &dispatch.id,
+                "logical stop; physical exit unknown",
+                TaskStatus::Failed,
+            )
+            .unwrap();
+        assert!(
+            matches!(store.retry_task(&ids[0]),Err(Error::Feature(code,_)) if code=="execution_pending")
+        );
+        let replacement = native_session(&mut store, "replacement");
+        assert!(store.connection.execute("INSERT INTO orch_dispatches(id,run_id,task_id,session_id,state,started_at) VALUES('unsafe-active',?1,?2,?3,'starting',?4)",params![run_id,ids[0],replacement.id,now()]).is_err());
+        store.connection.execute("INSERT INTO orch_dispatches(id,run_id,task_id,session_id,state,started_at) VALUES('unsafe-update',?1,?2,?3,'abandoned',?4)",params![run_id,ids[0],old.id,now()]).unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE orch_dispatches SET state='starting' WHERE id='unsafe-update'",
+                    []
+                )
+                .is_err()
+        );
+        store.clear_agent_execution_unknown(&old.id).unwrap();
+        assert!(
+            matches!(store.retry_task(&ids[0]),Err(Error::Feature(code,_)) if code=="execution_pending")
+        );
+        store.archive_agent_session(&old.id, true).unwrap();
+        assert_eq!(
+            store.retry_task(&ids[0]).unwrap().status,
+            TaskStatus::Pending
+        );
+        assert!(
+            store
+                .dispatch_task(&ids[0], &replacement.id, None, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unknown_legacy_delivery_blocks_dependency_readiness_and_run_completion() {
+        let (_directory, mut store, run_id, ids) = setup(1);
+        let old = native_session(&mut store, "delivered direct worker");
+        let dispatch = store
+            .dispatch_task(&ids[0], &old.id, None, None)
+            .unwrap()
+            .dispatch;
+        store.mark_agent_execution_unknown(&old.id).unwrap();
+        store
+            .settle_dispatch(&dispatch.id, true, "explicit verified business delivery")
+            .unwrap();
+        assert!(
+            store
+                .complete_run(&run_id, false)
+                .unwrap_err()
+                .to_string()
+                .contains("cleanup is pending")
+        );
+        let successor = store
+            .create_task(CreateTask {
+                run_id: run_id.clone(),
+                title: "successor".into(),
+                spec: "shared workspace successor".into(),
+                skills: vec![],
+                deps: vec![ids[0].clone()],
+                parent_id: None,
+            })
+            .unwrap();
+        assert!(store.list_ready_tasks(&run_id).unwrap().is_empty());
+        assert!(store.run_snapshot(&run_id).unwrap().ready.is_empty());
+        let replacement = native_session(&mut store, "successor worker");
+        assert!(
+            matches!(store.dispatch_task(&successor.id,&replacement.id,None,None),Err(Error::Feature(code,_)) if code=="execution_pending")
+        );
+        store.clear_agent_execution_unknown(&old.id).unwrap();
+        assert!(store.list_ready_tasks(&run_id).unwrap().is_empty());
+        store.archive_agent_session(&old.id, false).unwrap();
+        assert_eq!(store.list_ready_tasks(&run_id).unwrap()[0].id, successor.id);
+        assert!(
+            store
+                .dispatch_task(&successor.id, &replacement.id, None, None)
+                .is_ok()
+        );
+    }
 }
 
 enum Idempotent<T> {
@@ -621,6 +733,15 @@ fn operation_guard<T: DeserializeOwned>(
 pub struct SettleOutcome {
     pub task: Task,
     pub dispatch: Dispatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub execution_pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub operation_location: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -1479,7 +1600,7 @@ impl Store {
              AND NOT EXISTS ( \
                SELECT 1 FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id \
                WHERE d.run_id=?1 AND d.task_id=t.id AND x.status<>'done' \
-             ) ORDER BY t.created_at,t.id",
+             ) AND NOT EXISTS(SELECT 1 FROM orch_executions e WHERE e.state!='finalized' AND (e.task_id=t.id OR e.task_id IN (SELECT dep_id FROM orch_task_deps WHERE task_id=t.id))) AND NOT EXISTS(SELECT 1 FROM orch_dispatches legacy JOIN agent_runs a ON a.session_id=legacy.session_id WHERE (a.active=1 OR a.execution_unknown=1) AND (legacy.task_id=t.id OR legacy.task_id IN (SELECT dep_id FROM orch_task_deps WHERE task_id=t.id))) ORDER BY t.created_at,t.id",
         )?;
         let ready = ready_statement
             .query_map([run_id], |row| row.get::<_, String>(0))?
@@ -1513,7 +1634,7 @@ impl Store {
              AND NOT EXISTS ( \
                SELECT 1 FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id \
                WHERE d.run_id=?1 AND d.task_id=orch_tasks.id AND x.status<>'done' \
-             ) ORDER BY created_at,id",
+             ) AND NOT EXISTS(SELECT 1 FROM orch_executions e WHERE e.state!='finalized' AND (e.task_id=orch_tasks.id OR e.task_id IN (SELECT dep_id FROM orch_task_deps WHERE task_id=orch_tasks.id))) AND NOT EXISTS(SELECT 1 FROM orch_dispatches legacy JOIN agent_runs a ON a.session_id=legacy.session_id WHERE (a.active=1 OR a.execution_unknown=1) AND (legacy.task_id=orch_tasks.id OR legacy.task_id IN (SELECT dep_id FROM orch_task_deps WHERE task_id=orch_tasks.id))) ORDER BY created_at,id",
         )?;
         let ids = statement
             .query_map([run_id], |row| row.get::<_, String>(0))?
@@ -2296,6 +2417,17 @@ impl Store {
         Ok(updated)
     }
 
+    fn require_execution_admission_tx(tx: &Transaction<'_>, task_id: &str) -> Result<()> {
+        let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM orch_executions e WHERE e.state!='finalized' AND (e.task_id=?1 OR e.task_id IN (SELECT dep_id FROM orch_task_deps WHERE task_id=?1))) OR EXISTS(SELECT 1 FROM orch_dispatches legacy JOIN agent_runs a ON a.session_id=legacy.session_id WHERE (a.active=1 OR a.execution_unknown=1) AND (legacy.task_id=?1 OR legacy.task_id IN (SELECT dep_id FROM orch_task_deps WHERE task_id=?1)))",[task_id],|row|row.get(0))?;
+        if conflict {
+            return Err(Error::Feature(
+                "execution_pending".into(),
+                "execution is awaiting confirmed cleanup".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn retry_task(&mut self, task_id: &str) -> Result<Task> {
         validate_id(task_id)?;
         let tx = self.connection.transaction()?;
@@ -2305,6 +2437,7 @@ impl Store {
         if task.status != TaskStatus::Failed {
             return Err(invalid("only failed tasks can be retried"));
         }
+        Self::require_execution_admission_tx(&tx, task_id)?;
         let updated = Self::set_task_status(&tx, task_id, TaskStatus::Pending, Some(None))?;
         tx.commit()?;
         Ok(updated)
@@ -2836,10 +2969,28 @@ impl Store {
         session_id: &str,
         worktree_path: Option<&str>,
     ) -> Result<SettleOutcome> {
+        let tx = self.connection.transaction()?;
+        let outcome = Self::commit_worker_start_dispatch_tx(
+            &tx,
+            operation_id,
+            task_id,
+            session_id,
+            worktree_path,
+        )?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub(super) fn commit_worker_start_dispatch_tx(
+        tx: &Transaction<'_>,
+        operation_id: &str,
+        task_id: &str,
+        session_id: &str,
+        worktree_path: Option<&str>,
+    ) -> Result<SettleOutcome> {
         validate_id(operation_id)?;
         validate_id(task_id)?;
         validate_id(session_id)?;
-        let tx = self.connection.transaction()?;
         let (phase, asset_id): (String, Option<String>) = tx.query_row(
             "SELECT phase,asset_id FROM orch_worker_starts WHERE operation_id=?1 AND task_id=?2 AND session_id=?3",
             params![operation_id, task_id, session_id],
@@ -2848,9 +2999,10 @@ impl Store {
         if phase != "session_created" {
             return Err(Error::Conflict);
         }
-        let task = Self::task_row(&tx, task_id)?;
-        Self::require_active_run(&tx, &task.run_id)?;
-        if Self::active_dispatch(&tx, task_id)?.is_some() {
+        Self::require_execution_admission_tx(tx, task_id)?;
+        let task = Self::task_row(tx, task_id)?;
+        Self::require_active_run(tx, &task.run_id)?;
+        if Self::active_dispatch(tx, task_id)?.is_some() {
             return Err(Error::Feature(
                 "task_not_editable".into(),
                 "the task already has a live worker; settle it first".into(),
@@ -2879,15 +3031,15 @@ impl Store {
             "INSERT INTO orch_dispatches(id,run_id,task_id,session_id,state,outcome,started_at,settled_at,worktree_path) VALUES(?1,?2,?3,?4,'starting',NULL,?5,NULL,?6)",
             params![dispatch_id, task.run_id, task_id, session_id, timestamp, worktree_path],
         )?;
-        let task = Self::set_task_status(&tx, task_id, TaskStatus::Dispatched, None)?;
+        let task = Self::set_task_status(tx, task_id, TaskStatus::Dispatched, None)?;
         if let Some(asset_id) = asset_id {
             tx.execute(
                 "UPDATE orch_worktree_assets SET dispatch_id=?1,updated_at=?2 WHERE id=?3 AND run_id=?4 AND task_id=?5",
                 params![dispatch_id, timestamp, asset_id, task.run_id, task_id],
             )?;
-            let asset = Self::asset_row(&tx, &asset_id)?;
+            let asset = Self::asset_row(tx, &asset_id)?;
             Self::emit(
-                &tx,
+                tx,
                 "worktree_asset.updated",
                 &asset_id,
                 serde_json::to_value(asset)?,
@@ -2897,15 +3049,20 @@ impl Store {
             "UPDATE orch_worker_starts SET phase='dispatch_committed',dispatch_id=?1,updated_at=?2 WHERE operation_id=?3",
             params![dispatch_id, timestamp, operation_id],
         )?;
-        let dispatch = Self::dispatch_row(&tx, &dispatch_id)?;
+        let dispatch = Self::dispatch_row(tx, &dispatch_id)?;
         Self::emit(
-            &tx,
+            tx,
             "dispatch.updated",
             &dispatch_id,
             serde_json::to_value(&dispatch)?,
         )?;
-        tx.commit()?;
-        Ok(SettleOutcome { task, dispatch })
+        Ok(SettleOutcome {
+            task,
+            dispatch,
+            execution_pending: None,
+            operation_id: None,
+            operation_location: None,
+        })
     }
 
     pub fn mark_worker_start_delivering(&mut self, operation_id: &str) -> Result<()> {
@@ -3121,7 +3278,7 @@ impl Store {
         }
         let session_ids = {
             let mut statement = self.connection.prepare(
-                "SELECT DISTINCT session_id FROM orch_worker_starts WHERE session_id IS NOT NULL AND phase IN ('preparing','worktree_created','session_created','dispatch_committed','delivering','delivery_unknown')",
+                "SELECT DISTINCT session_id FROM orch_worker_starts WHERE session_id IS NOT NULL AND phase IN ('preparing','worktree_created','session_created','dispatch_committed','delivering','delivery_unknown') AND NOT EXISTS(SELECT 1 FROM orch_operations_v2 o WHERE o.operation_id=orch_worker_starts.operation_id AND o.kind='start')",
             )?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
@@ -3133,7 +3290,7 @@ impl Store {
                 [&session_id],
                 |row| row.get::<_, bool>(0),
             )? {
-                self.archive_agent_session(&session_id, true)?;
+                self.archive_agent_session_for_stop(&session_id, true)?;
             }
         }
         let tx = self.connection.transaction()?;
@@ -3147,7 +3304,7 @@ impl Store {
         let mut interrupted = Vec::new();
         {
             let mut statement = tx.prepare(
-                "SELECT operation_id,phase,dispatch_id,session_id,asset_id FROM orch_worker_starts WHERE phase IN ('preparing','worktree_created','session_created','dispatch_committed','delivering','delivery_unknown')",
+                "SELECT operation_id,phase,dispatch_id,session_id,asset_id FROM orch_worker_starts WHERE phase IN ('preparing','worktree_created','session_created','dispatch_committed','delivering','delivery_unknown') AND NOT EXISTS(SELECT 1 FROM orch_operations_v2 o WHERE o.operation_id=orch_worker_starts.operation_id AND o.kind='start')",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
@@ -3240,6 +3397,7 @@ impl Store {
         {
             return Ok(result);
         }
+        Self::require_execution_admission_tx(&tx, task_id)?;
         let task = Self::task_row(&tx, task_id)?;
         Self::require_active_run(&tx, &task.run_id)?;
         if Self::active_dispatch(&tx, task_id)?.is_some() {
@@ -3277,7 +3435,13 @@ impl Store {
             &dispatch.id,
             serde_json::to_value(&dispatch)?,
         )?;
-        let outcome = SettleOutcome { task, dispatch };
+        let outcome = SettleOutcome {
+            task,
+            dispatch,
+            execution_pending: None,
+            operation_id: None,
+            operation_location: None,
+        };
         if let Some(operation_id) = &operation_id {
             Self::remember(&tx, operation_id, &guard_fingerprint, &outcome)?;
         }
@@ -3350,10 +3514,21 @@ impl Store {
         success: bool,
         outcome: &str,
     ) -> Result<SettleOutcome> {
+        let tx = self.connection.transaction()?;
+        let result = Self::settle_dispatch_tx(&tx, dispatch_id, success, outcome)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(super) fn settle_dispatch_tx(
+        tx: &Transaction<'_>,
+        dispatch_id: &str,
+        success: bool,
+        outcome: &str,
+    ) -> Result<SettleOutcome> {
         validate_id(dispatch_id)?;
         validate_text(outcome, 8192, false)?;
-        let tx = self.connection.transaction()?;
-        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        let dispatch = Self::dispatch_row(tx, dispatch_id)?;
         if !dispatch.state.active() {
             return Err(invalid("the dispatch has already settled"));
         }
@@ -3364,7 +3539,7 @@ impl Store {
         };
         let now = now();
         let task = Self::set_task_status(
-            &tx,
+            tx,
             &dispatch.task_id,
             task_status,
             Some(Some(outcome.to_owned())),
@@ -3374,19 +3549,24 @@ impl Store {
             params![dispatch_state.label(), outcome, now, dispatch_id],
         )?;
         Self::preserve_dispatch_assets_tx(
-            &tx,
+            tx,
             dispatch_id,
             Some("worker 已交付；工作树默认保留，需显式检查或清理"),
         )?;
-        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        let dispatch = Self::dispatch_row(tx, dispatch_id)?;
         Self::emit(
-            &tx,
+            tx,
             "dispatch.updated",
             dispatch_id,
             serde_json::to_value(&dispatch)?,
         )?;
-        tx.commit()?;
-        Ok(SettleOutcome { task, dispatch })
+        Ok(SettleOutcome {
+            task,
+            dispatch,
+            execution_pending: None,
+            operation_id: None,
+            operation_location: None,
+        })
     }
 
     /// Settle a live dispatch whose worker is gone. An explicit done/failed
@@ -3398,17 +3578,28 @@ impl Store {
         reason: &str,
         final_status: TaskStatus,
     ) -> Result<SettleOutcome> {
+        let tx = self.connection.transaction()?;
+        let outcome = Self::abandon_dispatch_tx(&tx, dispatch_id, reason, final_status)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub(super) fn abandon_dispatch_tx(
+        tx: &Transaction<'_>,
+        dispatch_id: &str,
+        reason: &str,
+        final_status: TaskStatus,
+    ) -> Result<SettleOutcome> {
         validate_id(dispatch_id)?;
         validate_text(reason, 8192, false)?;
         if !matches!(final_status, TaskStatus::Failed | TaskStatus::Cancelled) {
             return Err(invalid("finalStatus must be failed or cancelled"));
         }
-        let tx = self.connection.transaction()?;
-        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        let dispatch = Self::dispatch_row(tx, dispatch_id)?;
         if !dispatch.state.active() {
             return Err(invalid("the dispatch has already settled"));
         }
-        let task = Self::task_row(&tx, &dispatch.task_id)?;
+        let task = Self::task_row(tx, &dispatch.task_id)?;
         let now = now();
         let (state, outcome_text, task_target) = match task.status {
             TaskStatus::Done => (
@@ -3431,28 +3622,28 @@ impl Store {
             ),
         };
         if let Some(target) = task_target {
-            Self::set_task_status(
-                &tx,
-                &dispatch.task_id,
-                target,
-                Some(Some(reason.to_owned())),
-            )?;
+            Self::set_task_status(tx, &dispatch.task_id, target, Some(Some(reason.to_owned())))?;
         }
         tx.execute(
             "UPDATE orch_dispatches SET state=?1,outcome=?2,settled_at=?3 WHERE id=?4",
             params![state.label(), outcome_text, now, dispatch_id],
         )?;
-        Self::preserve_dispatch_assets_tx(&tx, dispatch_id, Some(reason))?;
-        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
-        let task = Self::task_row(&tx, &dispatch.task_id)?.task();
+        Self::preserve_dispatch_assets_tx(tx, dispatch_id, Some(reason))?;
+        let dispatch = Self::dispatch_row(tx, dispatch_id)?;
+        let task = Self::task_row(tx, &dispatch.task_id)?.task();
         Self::emit(
-            &tx,
+            tx,
             "dispatch.updated",
             dispatch_id,
             serde_json::to_value(&dispatch)?,
         )?;
-        tx.commit()?;
-        Ok(SettleOutcome { task, dispatch })
+        Ok(SettleOutcome {
+            task,
+            dispatch,
+            execution_pending: None,
+            operation_id: None,
+            operation_location: None,
+        })
     }
 
     pub fn recover_dispatches(&mut self) -> Result<RecoveryReport> {
@@ -3544,7 +3735,7 @@ impl Store {
         if run_ids.is_empty() {
             return Ok(None);
         }
-        self.archive_agent_session(session_id, true)?;
+        self.archive_agent_session_for_stop(session_id, true)?;
         Ok(Some(run_ids))
     }
 
@@ -3566,6 +3757,7 @@ impl Store {
                  LEFT JOIN agent_runs a ON a.session_id=d.session_id \
                  WHERE d.state IN ('starting','running') \
                    AND (?1 IS NULL OR d.session_id=?1) \
+                   AND NOT EXISTS(SELECT 1 FROM orch_executions e WHERE e.dispatch_id=d.id AND e.state!='finalized') \
                    AND (h.id IS NULL OR h.lifecycle='archived' OR ( \
                      json_extract(h.payload,'$.kind')='structured' AND (a.session_id IS NULL OR a.active=0) \
                    )) \
@@ -3660,6 +3852,14 @@ impl Store {
 
     // ── Run lifecycle ────────────────────────────────────────────────────
 
+    pub(super) fn run_has_pending_execution(&self, run_id: &str) -> Result<bool> {
+        Self::run_has_pending_execution_from(&self.connection, run_id)
+    }
+
+    fn run_has_pending_execution_from(connection: &Connection, run_id: &str) -> Result<bool> {
+        connection.query_row("SELECT EXISTS(SELECT 1 FROM orch_executions e JOIN orch_tasks t ON t.id=e.task_id WHERE t.run_id=?1 AND e.state!='finalized') OR EXISTS(SELECT 1 FROM orch_dispatches legacy JOIN agent_runs a ON a.session_id=legacy.session_id WHERE legacy.run_id=?1 AND (a.active=1 OR a.execution_unknown=1))",[run_id],|row|row.get(0)).map_err(Error::from)
+    }
+
     pub fn complete_run(&mut self, run_id: &str, allow_failed: bool) -> Result<Run> {
         validate_id(run_id)?;
         let tx = self.connection.transaction()?;
@@ -3676,6 +3876,13 @@ impl Store {
         ) {
             return Err(invalid(
                 "automation is still running; pause it before completing the run",
+            ));
+        }
+        let pending_execution = Self::run_has_pending_execution_from(&tx, run_id)?;
+        if pending_execution {
+            return Err(Error::Feature(
+                "execution_pending".into(),
+                "run execution cleanup is pending".into(),
             ));
         }
         let unfinished: i64 = tx.query_row(
@@ -3732,6 +3939,13 @@ impl Store {
             Some(AutomationState::Running)
         ) {
             return Err(invalid("automation is not running"));
+        }
+        let pending_execution = Self::run_has_pending_execution_from(&tx, run_id)?;
+        if pending_execution {
+            return Err(Error::Feature(
+                "execution_pending".into(),
+                "run execution cleanup is pending".into(),
+            ));
         }
         let unfinished: i64 = tx.query_row(
             "SELECT count(*) FROM orch_tasks WHERE run_id=?1 AND status<>'done'",

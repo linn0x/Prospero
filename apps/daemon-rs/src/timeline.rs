@@ -933,7 +933,7 @@ pub(crate) fn timeline_chat_event(
             "summary": record.preview,
             "resolved": resolved,
         }),
-        TimelineBody::Error => json!({ "kind": "agent.error", "message": record.preview }),
+        TimelineBody::Error { .. } => json!({ "kind": "agent.error", "message": record.preview }),
         // Questions in a subagent transcript render with the same card shape
         // as main-timeline questions.
         TimelineBody::Question {

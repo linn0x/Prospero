@@ -80,6 +80,7 @@ fn schema_34_recovers_existing_terminal_account_bindings() {
             [&head.id],
         )
         .unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown;").unwrap();
     connection.pragma_update(None, "user_version", 33).unwrap();
     drop(connection);
     let store = Store::open(directory.path()).unwrap();

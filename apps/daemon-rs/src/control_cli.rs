@@ -280,8 +280,19 @@ fn valid_token(value: &str) -> bool {
 }
 
 pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<Value> {
+    if matches!(method, "task.done" | "task.fail")
+        && std::env::var_os("PROSPERO_EXECUTION_HOST_SOCKET").is_some()
+    {
+        return submit_host_delivery(method, &params).await;
+    }
     let client = ControlClient::from_env_or_home(home)?.with_timeout(timeout_for(method, &params));
     match method {
+        "operation.get" => {
+            let id = required_id(&params, "operationId")?;
+            let wait = params.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            let timeout = params.get("timeout").and_then(Value::as_u64).unwrap_or(30);
+            wait_operation(&client, &id, wait, Duration::from_secs(timeout.min(86400))).await
+        }
         "cross_model.child.sources" => {
             let sources: Value = client.post(
                 "/v1/model-sources",
@@ -736,7 +747,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                 .post(
                     &format!("/v1/tasks/{}/complete", path_component(&task_id)),
                     strip_empty(
-                        json!({"body": required_text(&params, "body")?, "actorSessionId": optional_text(&params, "actorSessionId")}),
+                        json!({"body": required_text(&params, "body")?, "actorSessionId": optional_text(&params, "actorSessionId"), "operationId": optional_text(&params, "operationId")}),
                         &[],
                     ),
                 )
@@ -748,7 +759,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                 .post(
                     &format!("/v1/tasks/{}/fail", path_component(&task_id)),
                     strip_empty(
-                        json!({"body": required_text(&params, "body")?, "actorSessionId": optional_text(&params, "actorSessionId")}),
+                        json!({"body": required_text(&params, "body")?, "actorSessionId": optional_text(&params, "actorSessionId"), "operationId": optional_text(&params, "operationId")}),
                         &[],
                     ),
                 )
@@ -790,6 +801,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                     strip_empty(
                         json!({
                         "taskId": required_id(&params, "taskId")?,
+                        "operationId": optional_text(&params, "operationId"),
                         "reason": optional_text(&params, "reason"),
                         "finalStatus": optional_text(&params, "finalStatus"),
                         }),
@@ -1198,4 +1210,189 @@ fn path_component(value: &str) -> String {
 
 fn query_component(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+pub async fn wait_operation(
+    client: &ControlClient,
+    id: &str,
+    wait: bool,
+    timeout: Duration,
+) -> Result<Value> {
+    crate::database::validate_id(id)?;
+    let path = format!("/v1/operations/{}", path_component(id));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut latest = Value::Null;
+    loop {
+        let request = client.get::<Value>(&path);
+        let response = if wait {
+            match tokio::time::timeout_at(deadline, request).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Ok(
+                        json!({"operationId": id, "waitTimedOut": true, "location": path, "operation": latest}),
+                    );
+                }
+            }
+        } else {
+            request.await
+        }?;
+        if !wait
+            || matches!(
+                response.get("state").and_then(Value::as_str),
+                Some("SUCCEEDED" | "FAILED" | "CANCELLED")
+            )
+        {
+            return Ok(response);
+        }
+        let delay = response
+            .get("retryAfterMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(250)
+            .clamp(100, 5000);
+        latest = response;
+        if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(delay)))
+            .await
+            .is_err()
+        {
+            return Ok(
+                json!({"operationId": id, "waitTimedOut": true, "location": path, "operation": latest}),
+            );
+        }
+    }
+}
+
+async fn submit_host_delivery(method: &str, params: &Value) -> Result<Value> {
+    use crate::execution_host::HostClient;
+    use crate::orchestration::reliability::{
+        ExecutionIdentity, HostCommand, HostCommandKind, OperationKind, host_command_fingerprint,
+        request_fingerprint,
+    };
+    let socket = std::env::var_os("PROSPERO_EXECUTION_HOST_SOCKET")
+        .map(PathBuf::from)
+        .ok_or(Error::Conflict)?;
+    let token = std::env::var_os("PROSPERO_EXECUTION_HOST_TOKEN_PATH")
+        .map(PathBuf::from)
+        .ok_or(Error::Conflict)?;
+    let raw = std::env::var("PROSPERO_EXECUTION_IDENTITY_JSON")
+        .map_err(|_| Error::Invalid("Host execution identity is missing".into()))?;
+    if raw.len() > 16384 {
+        return Err(Error::Invalid(
+            "Host execution identity exceeds limit".into(),
+        ));
+    }
+    let identity: ExecutionIdentity = serde_json::from_str(&raw)?;
+    if required_id(params, "taskId")? != identity.task_id {
+        return Err(Error::Forbidden);
+    }
+    let body = required_text(params, "body")?;
+    crate::database::validate_text(&body, 8192, false)?;
+    let payload = json!({"success":method=="task.done","outcome":body});
+    let operation_id = optional_text(params, "operationId").unwrap_or_else(|| {
+        format!(
+            "submission-{}",
+            request_fingerprint(
+                OperationKind::Result,
+                1,
+                &json!({"identity":identity,"payload":payload})
+            )
+        )
+    });
+    crate::database::validate_id(&operation_id)?;
+    let command_id = format!(
+        "result-{}",
+        request_fingerprint(
+            OperationKind::Result,
+            1,
+            &json!({"operationId":operation_id,"identity":identity})
+        )
+    );
+    let host = identity.host.clone().ok_or(Error::Conflict)?;
+    let client = HostClient::from_token_file_for_host(socket, token, host)?;
+    let mut command = HostCommand {
+        command_id: command_id.clone(),
+        operation_id: operation_id.clone(),
+        identity,
+        kind: HostCommandKind::Result,
+        fingerprint: String::new(),
+        payload: payload.to_string(),
+    };
+    command.fingerprint = host_command_fingerprint(&command)?;
+    let receipt=tokio::time::timeout(Duration::from_secs(5),client.command(command)).await
+        .map_err(|_|Error::Feature("delivery_outcome_unknown".into(),format!("delivery {operation_id} has unknown receipt; query Host command {command_id} before retrying")))?
+        .map_err(|error|Error::Feature("delivery_outcome_unknown".into(),format!("delivery {operation_id} remains queryable as Host command {command_id}: {error}")))?;
+    Ok(
+        json!({"operationId":operation_id,"submissionId":operation_id,"commandId":command_id,"receiptState":"RECEIVED","businessAccepted":false,"receipt":receipt}),
+    )
+}
+
+#[cfg(test)]
+mod operation_wait_tests {
+    use super::*;
+    use axum::{Json, Router, routing::get};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    async fn fixture(
+        state: &'static str,
+        count: Arc<AtomicUsize>,
+    ) -> (ControlClient, tokio::task::JoinHandle<()>) {
+        let router = Router::new().route(
+            "/v1/operations/op-test",
+            get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"operationId":"op-test", "state":state, "retryAfterMs":100}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ControlClient {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test".into(),
+            timeout: Duration::from_secs(1),
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_unknown_operation_without_mutation() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (client, server) = fixture("OUTCOME_UNKNOWN", count.clone()).await;
+        let result = wait_operation(&client, "op-test", true, Duration::from_millis(180))
+            .await
+            .unwrap();
+        assert_eq!(result["waitTimedOut"], true);
+        assert_eq!(result["operationId"], "op-test");
+        assert_eq!(result["operation"]["state"], "OUTCOME_UNKNOWN");
+        assert!(count.load(Ordering::SeqCst) <= 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn completed_operation_returns_without_polling() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (client, server) = fixture("SUCCEEDED", count.clone()).await;
+        let result = wait_operation(&client, "op-test", true, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(result["state"], "SUCCEEDED");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn query_without_wait_returns_unknown_immediately() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (client, server) = fixture("OUTCOME_UNKNOWN", count.clone()).await;
+        let result = wait_operation(&client, "op-test", false, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(result["state"], "OUTCOME_UNKNOWN");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
 }

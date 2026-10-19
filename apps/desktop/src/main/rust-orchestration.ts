@@ -75,6 +75,7 @@ export async function readOrchestrationWindow(
   const dispatches: Awaited<ReturnType<RustClient["listDispatches"]>> = [];
   const gates: Awaited<ReturnType<RustClient["listGates"]>> = [];
   const worktreeAssets: Awaited<ReturnType<RustClient["listWorktreeAssets"]>> = [];
+  const runtimeByTask = new Map<string, JsonObject>();
   for (const run of projectedRuns) {
     signal.throwIfAborted();
     await Promise.all([
@@ -83,9 +84,28 @@ export async function readOrchestrationWindow(
       appendRunItems(gates, PROJECTED_GATE_LIMIT, run.id, runId => client.listGates(runId, signal)),
       appendRunItems(worktreeAssets, PROJECTED_WORKTREE_LIMIT, run.id, runId => client.listWorktreeAssets(runId, signal)),
     ]);
+    const runTasks = tasks.filter(task => task.runId === run.id);
+    for (let offset = 0; offset < runTasks.length; offset += 200) {
+      const page = runTasks.slice(offset, offset + 200);
+      try {
+        const activity = await client.taskActivities(run.id, page.map(task => task.id), signal);
+        for (const item of activity.activities) runtimeByTask.set(item.task.id, {
+          execution: item.execution,
+          latestOperation: item.latestOperation,
+          structuredError: item.structuredError,
+          reservedResources: item.reservedResources,
+          quarantinedResources: item.quarantinedResources,
+          executionUnknown: item.executionUnknown,
+          observedAt: item.observedAt,
+        });
+      } catch (error) {
+        signal.throwIfAborted();
+        for (const task of page) runtimeByTask.set(task.id, { observationError: error instanceof Error ? error.message : String(error) });
+      }
+    }
   }
   return createLegacyDesktopProjection(
-    { eventSeq, runs: projectedRuns, tasks, dispatches, gates, worktreeAssets },
+    { eventSeq, runs: projectedRuns, tasks: tasks.map(task => ({ ...task, runtime: runtimeByTask.get(task.id) })), dispatches, gates, worktreeAssets },
   );
 }
 
@@ -98,6 +118,12 @@ export async function orchestrationAction(
 ): Promise<JsonObject> {
   const params = record(rawParams);
   switch (method) {
+    case "operation.get":
+      return client.operation(required(params, "operationId"), signal) as Promise<JsonObject>;
+    case "execution.get":
+      return client.execution(required(params, "attemptId"), signal) as Promise<JsonObject>;
+    case "task.activities":
+      return client.taskActivities(required(params, "runId"), stringList(params["taskIds"]), signal) as Promise<JsonObject>;
     case "run.create": {
       const input: CreateRun = {
         objective: required(params, "objective"),
@@ -172,6 +198,7 @@ export async function orchestrationAction(
     }
     case "worker.stop": {
       const input: StopWorker = {
+        ...(text(params["operationId"]) ? { operationId: text(params["operationId"]) } : {}),
         taskId: required(params, "taskId"),
         reason: optionalText(params["reason"]),
         finalStatus: params["finalStatus"] === "cancelled" ? "cancelled" : null,

@@ -126,8 +126,16 @@ async fn finalize_failed_worker_start(
     error_code: &str,
     message: &str,
 ) {
+    if error_code == "driver_exit_unknown" {
+        let _ =
+            super::reliability_operations::quarantine_legacy_start(database, operation_id, message)
+                .await;
+        return;
+    }
     let session_id = worker_session_id(operation_id);
+    let mut cleanup_attempts = 0;
     loop {
+        cleanup_attempts += 1;
         match agents.close(&session_id).await {
             Ok(()) | Err(Error::NotFound) => break,
             Err(
@@ -137,12 +145,23 @@ async fn finalize_failed_worker_start(
                 | Error::DatabaseUnavailable(_)
                 | Error::DatabaseOperationFailed(_),
             ) if database.health().alive && !agents.worker_starts_closed() => {
+                if cleanup_attempts >= 8 {
+                    let _ = super::reliability_operations::quarantine_legacy_start(
+                        database,
+                        operation_id,
+                        "worker startup cleanup could not confirm process exit",
+                    )
+                    .await;
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(_) => return,
         }
     }
+    let mut persist_attempts = 0;
     loop {
+        persist_attempts += 1;
         let result = database
             .call_control("worker.start.fail", {
                 let operation_id = operation_id.to_owned();
@@ -160,7 +179,10 @@ async fn finalize_failed_worker_start(
                 | Error::Closed
                 | Error::DatabaseUnavailable(_)
                 | Error::DatabaseOperationFailed(_),
-            ) if database.health().alive && !agents.worker_starts_closed() => {
+            ) if database.health().alive
+                && !agents.worker_starts_closed()
+                && persist_attempts < 8 =>
+            {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(_) => return,
@@ -274,7 +296,16 @@ pub async fn start_worker(
 ) -> Result<WorkerStartOutcome> {
     let submitted = submit_worker_start(database, agents, input).await?;
     let operation_id = submitted.operation.operation_id;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Feature(
+                "operation_pending".into(),
+                format!(
+                    "worker start remains active; query /v1/workers/start-operations/{operation_id}"
+                ),
+            ));
+        }
         let operation = get_worker_start(database, &operation_id).await?;
         match operation.phase {
             WorkerStartPhase::Running => return operation.outcome.ok_or(Error::Closed),
@@ -317,6 +348,18 @@ pub async fn cancel_worker_start(
 }
 
 pub async fn recover_worker_starts(database: &Database, agents: &Agents) -> Result<()> {
+    let unknown=database.call_control("worker.start.unknown",|store|{
+        let mut statement=store.connection.prepare("SELECT w.operation_id FROM orch_worker_starts w JOIN agent_runs a ON a.session_id=w.session_id WHERE a.execution_unknown=1 AND w.phase NOT IN ('running','failed','cancelled') LIMIT 128")?;
+        Ok(statement.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }).await?;
+    for id in unknown {
+        super::reliability_operations::quarantine_legacy_start(
+            database,
+            &id,
+            "legacy driver startup outcome remains unknown after restart",
+        )
+        .await?;
+    }
     database
         .call_control("worker.start.recover", |store| {
             store.recover_worker_start_operations()

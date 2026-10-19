@@ -5582,7 +5582,7 @@ impl Desktop {
             ),
             TimelineBody::TurnEnd { .. } => ("本轮完成", tokens.success, false),
             TimelineBody::Subagent { .. } => ("子 Agent", tokens.accent, false),
-            TimelineBody::Error => ("错误", tokens.danger, false),
+            TimelineBody::Error { .. } => ("错误", tokens.danger, false),
         };
         let body: Element<'a, Message> = if markdown_body {
             markdown::view(

@@ -529,6 +529,7 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
         &database,
         &agents,
         StopWorker {
+            operation_id: None,
             task_id: task_id.clone(),
             reason: Some("Stopped from Prospero desktop".into()),
             final_status: None,
@@ -552,6 +553,7 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
         &database,
         &agents,
         StopWorker {
+            operation_id: None,
             task_id: task_id.clone(),
             reason: None,
             final_status: None,
@@ -699,6 +701,7 @@ async fn concurrent_start_retries_survive_caller_cancellation_and_create_one_wor
         &database,
         &agents,
         StopWorker {
+            operation_id: None,
             task_id,
             reason: Some("cancel concurrent worker".into()),
             final_status: Some("cancelled".into()),
@@ -892,6 +895,7 @@ async fn worker_expands_bound_skill_into_the_delivered_brief() {
         &database,
         &agents,
         StopWorker {
+            operation_id: None,
             task_id: task_id.clone(),
             reason: Some("test teardown".into()),
             final_status: None,

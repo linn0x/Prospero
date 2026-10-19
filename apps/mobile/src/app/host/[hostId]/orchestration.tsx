@@ -14,6 +14,7 @@ import {
 import { randomUUID } from "expo-crypto";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import Svg, { Path } from "react-native-svg";
+import { executionPending, latestExecution, latestOperation, runtimeStatus } from "@prospero/protocol";
 import type {
   AgentAccount,
   AgentKind,
@@ -851,7 +852,7 @@ export default function OrchestrationScreen() {
     if (!conn || !canManageLifecycle) return;
     Alert.alert(
       "停止这个 worker？",
-      `“${task.title}”当前会话会被终止，本次派发记为已放弃，任务进入失败状态后可以重试。`,
+      `请求停止“${task.title}”。停止确认前仍保留执行占用，确认退出后才能重试。`,
       [
         { text: "取消", style: "cancel" },
         {
@@ -1895,7 +1896,13 @@ export default function OrchestrationScreen() {
                 ? tasks
                 : tasks.filter((task) => task.id === activeTopologyTaskId)
               ).map((task) => {
-                const ready = selectedRunState?.readyTaskIds.has(task.id) ?? false;
+                const execution = latestExecution(snapshot?.executions, task.id);
+                const operation = latestOperation(snapshot?.operations, task.id);
+                const executionNotice = runtimeStatus(execution, operation);
+                const attemptId = execution?.identity.attemptId ?? operation?.attemptId;
+                const unresolved = executionPending(execution);
+                const incomplete = snapshot?.executionsTruncated === true && !execution;
+                const ready = !incomplete && (selectedRunState?.readyTaskIds.has(task.id) ?? false);
                 const dependencyNames = task.deps
                   .map((id) => tasks.find((candidate) => candidate.id === id)?.title ?? id)
                   .join("、");
@@ -1920,9 +1927,19 @@ export default function OrchestrationScreen() {
                         </Text>
                       </View>
                     </View>
+                    {executionNotice && <Text accessibilityLiveRegion="polite" style={styles.taskMeta}>{executionNotice.zh}</Text>}
+                    {operation && <Text selectable style={styles.taskMeta}>{`操作：${operation.operationId} · ${operation.state}`}</Text>}
+                    {execution && <Text selectable style={styles.taskMeta}>{`执行：${execution.identity.attemptId} · 代次 ${String(execution.identity.executionEpoch)}`}</Text>}
+                    {incomplete && <Text style={styles.taskMeta}>执行状态快照不完整，等待查询确认。</Text>}
                     <Text style={styles.taskSpec}>{task.spec}</Text>
                     {task.result && <Text style={styles.taskResult}>{task.result}</Text>}
                     <View style={styles.taskActions}>
+                      {attemptId && conn?.supportsCapability("executions.query.v1") && <Pressable style={styles.taskButton} accessibilityRole="button" accessibilityLabel="查询执行状态" onPress={() => {
+                        void conn.execution(attemptId).then(detail => Alert.alert("执行状态", `${runtimeStatus(detail)?.zh ?? detail.state}\n${detail.identity.attemptId}\n代次 ${String(detail.identity.executionEpoch)} · ${detail.resultState}`)).catch(error => setBanner(error instanceof Error ? error.message : String(error)));
+                      }}><Text style={styles.taskButtonText}>执行详情</Text></Pressable>}
+                      {operation && conn?.supportsCapability("operations.query.v1") && <Pressable style={styles.taskButton} accessibilityRole="button" accessibilityLabel="查询原操作回执" onPress={() => {
+                        void conn.operation(operation.operationId).then(detail => Alert.alert("操作回执", `${detail.operationId}\n${detail.state} · ${detail.effectState}\n${detail.waitReason ?? ""}`)).catch(error => setBanner(error instanceof Error ? error.message : String(error)));
+                      }}><Text style={styles.taskButtonText}>查询操作</Text></Pressable>}
                       {selectedRun.status === "active" && canManageLifecycle && workerActive && (
                         <Pressable
                           style={[styles.taskButton, styles.taskButtonDanger]}
@@ -1942,7 +1959,7 @@ export default function OrchestrationScreen() {
                         </Pressable>
                       )}
                       {selectedRun.status === "active" && canManageLifecycle &&
-                        task.status === "failed" && (
+                        task.status === "failed" && !unresolved && !incomplete && (
                         <Pressable style={styles.taskButton} onPress={() => retryTask(task)}>
                           <Icon name="arrow.clockwise" size={11} color={color.accent} />
                           <Text style={styles.taskButtonText}>重试</Text>

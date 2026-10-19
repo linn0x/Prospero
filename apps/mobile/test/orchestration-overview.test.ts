@@ -374,3 +374,14 @@ describe("orchestration overview", () => {
     expect(state.guide.text).toContain("只读");
   });
 });
+
+it("keeps accepted delivery distinct from unresolved execution and blocks downstream launch", () => {
+  const selected = run("state-run", 10);
+  const value = snapshot([selected], [], [task("delivered", "done"), task("next", "pending", ["delivered"])]);
+  value.executions = [{ identity: { taskId: "delivered", dispatchId: null, attemptId: "attempt", executionEpoch: 1, host: null, configDigest: "digest" }, state: "STOP_UNKNOWN", resultState: "ACCEPTED", stopGeneration: 1, exitProofId: null, createdAt: 1, updatedAt: 2 }];
+  const current = orchestrationRunCurrentState(selected, value);
+  expect(current.done).toBe(1);
+  expect(current.readyTaskIds.has("next")).toBe(false);
+  expect(current.canComplete).toBe(false);
+  expect(current.guide.text).toContain("未知");
+});
