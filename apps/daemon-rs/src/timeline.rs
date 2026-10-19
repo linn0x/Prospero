@@ -9,6 +9,30 @@ use crate::protocol::*;
 const MAX_POSITION: i64 = 9_007_199_254_740_991;
 const MAX_BODY: i64 = 1024 * 1024 * 1024;
 const PREVIEW_BYTES: usize = 4096;
+fn fit_diff_metadata(mut body: TimelineBody) -> Result<TimelineBody> {
+    if serde_json::to_vec(&body)?.len() > 1024 * 1024 {
+        return Err(Error::Invalid("timeline metadata exceeds limit".into()));
+    }
+    while serde_json::to_vec(&body)?.len() > 8192 {
+        let diff = match &mut body {
+            TimelineBody::Tool { diff, .. } => diff.as_mut(),
+            TimelineBody::TurnEnd { diffs, .. } => {
+                diffs.iter_mut().max_by_key(|diff| diff.patch.len())
+            }
+            _ => None,
+        };
+        let Some(diff) = diff.filter(|diff| !diff.patch.is_empty()) else {
+            return Err(Error::Invalid("timeline metadata exceeds limit".into()));
+        };
+        let mut boundary = diff.patch.len() / 2;
+        while !diff.patch.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        diff.patch.truncate(boundary);
+        diff.truncated = true;
+    }
+    Ok(body)
+}
 const COLUMNS: &str =
     "r.id,r.turn_id,r.position,r.revision,r.generation,r.body,r.preview,c.bytes,r.subagent_id";
 const SOURCE: &str =
@@ -248,7 +272,7 @@ impl Store {
     pub fn write_timeline(
         &mut self,
         session_id: &str,
-        input: TimelineWrite,
+        mut input: TimelineWrite,
     ) -> Result<TimelineRecord> {
         self.session(session_id)?;
         validate_id(&input.id)?;
@@ -273,10 +297,8 @@ impl Store {
             }
             _ => {}
         }
+        input.body = fit_diff_metadata(input.body)?;
         let body = serde_json::to_string(&input.body)?;
-        if body.len() > 8192 {
-            return Err(Error::Invalid("timeline metadata exceeds limit".into()));
-        }
         let previous = match self.timeline_record(session_id, &input.id) {
             Ok(record) => Some(record),
             Err(Error::NotFound) => None,
@@ -328,7 +350,7 @@ impl Store {
         validate_id(session_id)?;
         self.session(session_id)?;
         let transaction = self.connection.transaction()?;
-        for input in writes {
+        for mut input in writes {
             validate_record_id(&input.id)?;
             validate_id(&input.turn_id)?;
             if let Some(subagent) = &input.subagent_id {
@@ -370,10 +392,8 @@ impl Store {
                     return Err(Error::Invalid("invalid subagent card".into()));
                 }
             }
+            input.body = fit_diff_metadata(input.body)?;
             let body = serde_json::to_string(&input.body)?;
-            if body.len() > 8192 {
-                return Err(Error::Invalid("timeline metadata exceeds limit".into()));
-            }
             let previous = transaction
                 .query_row(
                     &format!("SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND r.id=?2"),
@@ -995,5 +1015,102 @@ fn subagent_chat_event(
     match &record.body {
         TimelineBody::Subagent { .. } | TimelineBody::TurnEnd { .. } => None,
         _ => timeline_chat_event(record, full_text),
+    }
+}
+
+#[cfg(test)]
+mod diff_metadata_tests {
+    use super::*;
+    use tempfile::TempDir;
+    fn session(store: &mut Store) -> String {
+        store
+            .create_session(CreateSession {
+                agent: AgentKind::Codex,
+                kind: SessionKind::Structured,
+                title: "Example".into(),
+                workspace: "/synthetic".into(),
+            })
+            .unwrap()
+            .id
+    }
+
+    fn write(id: &str, revision: i64, text: &str) -> TimelineWrite {
+        TimelineWrite {
+            id: id.into(),
+            turn_id: "turn".into(),
+            expected_revision: revision,
+            body: TimelineBody::Message {
+                role: MessageRole::Assistant,
+                final_answer: true,
+                attachments: Vec::new(),
+            },
+            text: text.into(),
+            replace: false,
+            subagent_id: None,
+        }
+    }
+
+    #[test]
+    fn large_diff_metadata_survives_single_and_batched_writes() {
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let id = session(&mut store);
+        let diff = FileDiff {
+            path: "result.json".into(),
+            patch: "\"中\n".repeat(2400),
+            additions: 2400,
+            deletions: 0,
+            truncated: false,
+        };
+        let mut tool = write("large-tool", 0, "");
+        tool.body = TimelineBody::Tool {
+            name: "apply_patch".into(),
+            state: ToolState::Success,
+            summary: "write result".into(),
+            diff: Some(diff.clone()),
+            has_more: false,
+        };
+        assert!(serde_json::to_vec(&tool.body).unwrap().len() > 8192);
+        let stored = store.write_timeline(&id, tool).unwrap();
+        assert!(serde_json::to_vec(&stored.body).unwrap().len() <= 8192);
+        assert!(
+            matches!(&stored.body, TimelineBody::Tool { diff: Some(value), .. }
+            if value.truncated && value.additions == 2400)
+        );
+        let mut end = write("large-end", 0, "");
+        end.body = TimelineBody::TurnEnd {
+            finish: "completed".into(),
+            diffs: vec![diff.clone(), diff],
+        };
+        store.append_agent_records(&id, vec![end]).unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.timeline_record(&id, "large-tool").unwrap(), stored);
+        assert!(
+            matches!(store.timeline_record(&id, "large-end").unwrap().body,
+        TimelineBody::TurnEnd { ref finish, ref diffs } if finish == "completed" && diffs.len() == 2)
+        );
+    }
+
+    #[test]
+    fn diff_metadata_remains_bounded() {
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let id = session(&mut store);
+        let mut input = write("oversized", 0, "");
+        input.body = TimelineBody::TurnEnd {
+            finish: "completed".into(),
+            diffs: vec![FileDiff {
+                path: "huge".into(),
+                patch: "x".repeat(1024 * 1024),
+                additions: 1,
+                deletions: 0,
+                truncated: false,
+            }],
+        };
+        let single = serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+        assert!(store.write_timeline(&id, single).is_err());
+        assert!(store.append_agent_records(&id, vec![input]).is_err());
+        assert!(store.timeline_record(&id, "oversized").is_err());
     }
 }
