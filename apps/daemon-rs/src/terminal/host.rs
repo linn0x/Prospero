@@ -19,6 +19,12 @@ use std::{
     process::Stdio,
 };
 
+const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn drain_terminal_streams(terminal: &Terminal) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    terminal.drain_streams(STREAM_DRAIN_TIMEOUT).await
+}
+
 #[derive(Serialize, Deserialize)]
 struct Launch {
     argv: Vec<std::ffi::OsString>,
@@ -486,9 +492,16 @@ pub fn run(directory: PathBuf) -> Result<()> {
                     }
                 })
                 .await;
+            // Axum stops accepting normally on graceful shutdown, but upgraded
+            // websocket streams live in detached tasks. Keep the PTY reader and
+            // output journal alive until viewers ACK final output and receive
+            // Exit; cap the wait so a stalled/disconnected viewer cannot pin
+            // the owner.
+            let stream_drain = drain_terminal_streams(&owner.terminal).await;
             owner.terminal.stop();
             owner.terminal.wait_exited().await;
             let _ = std::fs::remove_file(directory.join("host.json"));
+            drop(stream_drain);
             result.map_err(Error::from)
         });
     drop(lock);
@@ -630,6 +643,212 @@ pub(crate) fn owner_alive(directory: &std::path::Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn stream_for_drain_test(
+        axum::extract::State(terminal): axum::extract::State<Terminal>,
+        ws: WebSocketUpgrade,
+    ) -> Response {
+        ws.on_upgrade(move |socket| async move {
+            let _ = super::super::stream_session::serve(socket, terminal).await;
+        })
+    }
+
+    /// A detached websocket must be able to flush the final finite output and
+    /// receive Exit after the listener has stopped accepting connections.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_host_shutdown_drains_acknowledged_final_output() {
+        use axum::routing::get;
+        use futures_util::{SinkExt, StreamExt};
+        use portable_pty::CommandBuilder;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("IFS= read -r start; printf 'BEGIN\\n'; head -c 768000 /dev/zero | tr '\\000' x; printf '\\nEND\\n'");
+        let terminal = super::super::native::spawn(command, size).unwrap();
+        let epoch = terminal.epoch().to_owned();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let serving_terminal = terminal.clone();
+        let server = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/stream", get(stream_for_drain_test))
+                .with_state(serving_terminal.clone());
+            let result = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+            let drain = drain_terminal_streams(&serving_terminal).await;
+            serving_terminal.stop();
+            serving_terminal.wait_exited().await;
+            drop(drain);
+            result
+        });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        let attach = super::super::stream::Frame {
+            kind: super::super::stream::Kind::Attach,
+            sequence: 0,
+            payload: serde_json::json!({ "wantControl": true })
+                .to_string()
+                .into_bytes(),
+        };
+        socket
+            .send(Message::Binary(
+                super::super::stream::encode(&attach).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut last_applied = 0;
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Binary(bytes) = message else {
+                continue;
+            };
+            let frame = super::super::stream::decode(&bytes).unwrap();
+            match frame.kind {
+                super::super::stream::Kind::Snapshot => {
+                    last_applied = frame.sequence;
+                    let applied = super::super::stream::Frame {
+                        kind: super::super::stream::Kind::Applied,
+                        sequence: last_applied,
+                        payload: vec![],
+                    };
+                    socket
+                        .send(Message::Binary(
+                            super::super::stream::encode(&applied).unwrap().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                super::super::stream::Kind::Ready => break,
+                _ => {}
+            }
+        }
+        let input = super::super::stream::Frame {
+            kind: super::super::stream::Kind::Input,
+            sequence: 1,
+            payload: b"go\r".to_vec(),
+        };
+        socket
+            .send(Message::Binary(
+                super::super::stream::encode(&input).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+        // Leave credit outstanding without requiring an exact window-sized
+        // boundary; an output chunk can be rejected just below the limit.
+        let mut received_bytes = 0usize;
+        while received_bytes < super::super::stream::WINDOW_BYTES / 2 {
+            let message = tokio::time::timeout(Duration::from_secs(10), socket.next())
+                .await
+                .expect("stream should deliver up to its credit window")
+                .unwrap()
+                .unwrap();
+            let Message::Binary(bytes) = message else {
+                continue;
+            };
+            let frame = super::super::stream::decode(&bytes).unwrap();
+            if matches!(
+                frame.kind,
+                super::super::stream::Kind::Output | super::super::stream::Kind::Resize
+            ) {
+                received_bytes += frame.payload.len();
+                last_applied = frame.sequence;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if terminal.activity().unwrap().exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finite child should exit while stream credit is held");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !server.is_finished(),
+            "host must wait for the attached stream"
+        );
+
+        let applied = super::super::stream::Frame {
+            kind: super::super::stream::Kind::Applied,
+            sequence: last_applied,
+            payload: vec![],
+        };
+        socket
+            .send(Message::Binary(
+                super::super::stream::encode(&applied).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut output = Vec::new();
+        let exit_code = loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), socket.next())
+                .await
+                .expect("host drain should preserve the stream")
+                .unwrap()
+                .unwrap();
+            let Message::Binary(bytes) = message else {
+                continue;
+            };
+            let frame = super::super::stream::decode(&bytes).unwrap();
+            match frame.kind {
+                super::super::stream::Kind::Output | super::super::stream::Kind::Resize => {
+                    last_applied = frame.sequence;
+                    if frame.kind == super::super::stream::Kind::Output {
+                        output.extend(frame.payload);
+                    }
+                    let applied = super::super::stream::Frame {
+                        kind: super::super::stream::Kind::Applied,
+                        sequence: last_applied,
+                        payload: vec![],
+                    };
+                    socket
+                        .send(Message::Binary(
+                            super::super::stream::encode(&applied).unwrap().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                super::super::stream::Kind::Exit => {
+                    break serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                        .unwrap()["exitCode"]
+                        .as_u64()
+                        .unwrap();
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(exit_code, 0);
+        assert!(output.windows(3).any(|bytes| bytes == b"END"));
+        assert_eq!(
+            terminal.epoch(),
+            epoch,
+            "drain must not spawn a replacement PTY"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("host cleanup should finish after Exit")
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn pinned_runtime_is_immutable_when_the_application_binary_changes() {
         use sha2::{Digest, Sha256};

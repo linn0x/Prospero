@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Columns2, Files, FolderKanban, FolderPlus, GitBranch, Plus, Search, X } from "lucide-react";
-import type { DesktopSnapshot, SessionInfo } from "../../../shared/types";
+import type { DesktopSnapshot, NativeTerminalState, SessionInfo } from "../../../shared/types";
 import { Button } from "../components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../components/ui/empty";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "../components/ui/sheet";
@@ -16,6 +16,7 @@ import { ContextDock } from "./ContextDock";
 import { clampDockWidth, DOCK_DEFAULT_WIDTH, DOCK_MIN_WIDTH, workspaceDockLayout, openDockTool, sessionDockState, supportsTrajectory, readDockPreferences, updateDockPreferences, writeDockPreferences, type DockState } from "./dock-state";
 import { DockSlot } from "./DockSlot";
 import { SessionToolbar } from "./SessionToolbar";
+import { NativeTerminalPane, supportsNativeTerminal } from "../NativeTerminalPane";
 import { retainTerminalIds } from "./retained-terminals";
 import { sessionLabel } from "./session-presentation";
 import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_EVENT } from "./TerminalMouseToggle";
@@ -23,7 +24,7 @@ import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_E
 const ChatPane = lazy(() => import("../ChatPane").then((module) => ({ default: module.ChatPane })));
 const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
 
-function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, onMissingSession, empty, active = true, focused = true, primary = true }: { active?: boolean; focused?: boolean; primary?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void; onMissingSession: (id: string) => void }) {
+function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, onMissingSession, onNativeFocus, empty, active = true, focused = true, primary = true }: { active?: boolean; focused?: boolean; primary?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void; onMissingSession: (id: string) => void; onNativeFocus?: (id: string) => void }) {
   const { t } = useLocale();
   const host = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(0);
@@ -37,6 +38,14 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   const { width: effectiveWidth, maxWidth, overlay } = workspaceDockLayout(available, autoWidth ? available * .48 : width);
   const [dock, setDock] = useState<DockState>(() => sessionDockState(readDockPreferences().sessions.find((item) => item.id === dockId)?.state, trajectory));
   const [localSelection, setLocalSelection] = useState(() => readTerminalMousePreference(undefined, session?.id));
+  const [nativeAvailable, setNativeAvailable] = useState(false);
+  const [nativeState, setNativeState] = useState<NativeTerminalState>({ connected: false, syncing: true, controller: false, exited: false, readOnly: true });
+  const updateNativeAvailability = useCallback((available: boolean): void => setNativeAvailable(available), []);
+  const updateNativeState = useCallback((state: NativeTerminalState): void => setNativeState(state), []);
+  const nativeAction = useCallback((action: "acquire" | "takeover" | "release" | "reconnect"): void => {
+    if (!session) return;
+    window.dispatchEvent(new CustomEvent("prospero:native-terminal-action", { detail: { sessionId: session.id, action } }));
+  }, [session?.id]);
   useEffect(() => {
     setLocalSelection(readTerminalMousePreference(undefined, session?.id));
     const sync = (event: Event): void => {
@@ -61,6 +70,13 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   const widthRef = useRef(width);
   widthRef.current = width;
   const chromeVisible = workspaceChromeVisible(focus);
+  const nativeTerminal = Boolean(session && supportsNativeTerminal(session));
+  useEffect(() => {
+    if (!nativeTerminal) {
+      setNativeAvailable(false);
+      setNativeState({ connected: false, syncing: true, controller: false, exited: false, readOnly: true });
+    }
+  }, [nativeTerminal]);
   const visible = active && focused && chromeVisible && dock.visible && available > 0;
   useEffect(() => { if (visible) setDockVisited(true); }, [visible]);
   useEffect(() => {
@@ -118,7 +134,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   };
   const account = snapshot.accounts.find((item) => text(item["id"]) === session?.accountId);
   const toolbar = <>
-    {chromeVisible && session && <SessionToolbar localSelection={localSelection} onLocalSelectionChange={setLocalSelection} session={session} account={account} unread={snapshot.unreadSessionIds.includes(session.id)} contextVisible={dock.visible} onToggleContext={() => setState({ ...dock, visible: !dock.visible })} onToggleFocus={onToggleFocus} />}
+    {chromeVisible && session && <SessionToolbar localSelection={localSelection} onLocalSelectionChange={setLocalSelection} nativeTerminal={nativeAvailable} nativeTerminalState={nativeState} onNativeTerminalAction={nativeAction} session={session} account={account} unread={snapshot.unreadSessionIds.includes(session.id)} contextVisible={dock.visible} onToggleContext={() => setState({ ...dock, visible: !dock.visible })} onToggleFocus={onToggleFocus} />}
     {chromeVisible && !session && <header className="pane-toolbar project-workspace-toolbar">
       <NativeSelect size="sm" aria-label={t("当前项目", "Current project")} value={root} onChange={event => setSelectedRoot(event.target.value)}>
         {!root && <NativeSelectOption value="">{t("选择项目", "Select project")}</NativeSelectOption>}
@@ -135,9 +151,9 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
     <div className={cn("workspace-grid", visible && !overlay && "has-dock")} style={{ "--context-dock-width": `${effectiveWidth}px` } as CSSProperties}>
       <main id={active ? primary ? "workspace-session-panel" : "workspace-secondary-panel" : undefined} role="tabpanel" aria-labelledby={chromeVisible && session ? `workspace-tab-${session.id}` : undefined} aria-label={focus && session ? sessionLabel(session) : undefined} className="workspace-primary">
         {toolbar}
-        {focus && session?.kind === "pty" && <div className="workspace-focus-controls"><TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={setLocalSelection} /></div>}
+        {focus && session?.kind === "pty" && !nativeAvailable && <div className="workspace-focus-controls"><TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={setLocalSelection} /></div>}
         <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载会话…", "Loading session…")}</div>}>
-          {!session ? empty : session.kind === "pty" ? <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
+          {!session ? empty : session.kind === "pty" ? nativeTerminal ? <NativeTerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} onToggleFocus={onToggleFocus} onNativeFocus={onNativeFocus ?? (() => undefined)} onNativeAvailabilityChange={updateNativeAvailability} onNativeStateChange={updateNativeState} /> : <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
         </Suspense>
       </main>
       {visible && !overlay && <>
@@ -238,7 +254,7 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
         const primary = item.id === activeId;
         const visible = active && (primary || item.id === splitSession?.id);
         return <div key={item.id} className="workspace-session-slot" data-position={primary ? "primary" : "secondary"} data-focused={focusedId === item.id || undefined} inert={!visible} aria-hidden={!visible} style={visible ? undefined : { position: "absolute", inset: 0, visibility: "hidden", pointerEvents: "none" }} onPointerDownCapture={() => visible && focusSession(item.id)} onFocusCapture={() => visible && focusSession(item.id)}>
-          <WorkspaceSession session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} />
+          <WorkspaceSession session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
         </div>;
       })}
       {splitSession && <div className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => setRatio(50)} onPointerDown={event => {

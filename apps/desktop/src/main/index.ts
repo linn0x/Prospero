@@ -25,6 +25,7 @@ import { RemoteHostStore } from "./remote-host-store";
 import { modelSourceRequest, modelSourceResult } from "../shared/model-sources";
 import { RemoteShellManager } from "./remote-shell-manager";
 import { TerminalStreamBridge } from "./terminal-stream-bridge";
+import { NativeGhosttyManager } from "./native-ghostty";
 import { RemoteWorkspaces, RemoteWorkspaceStore } from "./remote-workspaces";
 import { remoteDirectoryRequest } from "../shared/remote-workspaces";
 import { ProjectTools } from "./project-tools";
@@ -117,6 +118,24 @@ const terminalStreamBridge = new TerminalStreamBridge((sessionId) => {
   if (!(runtime instanceof RustRuntime)) throw new Error("Terminal streaming is unavailable for this backend");
   return runtime.createTerminalStreamSocket(sessionId);
 });
+const nativeGhosttyManager = new NativeGhosttyManager(
+  app.getAppPath(),
+  sessionId => {
+    if (!(runtime instanceof RustRuntime)) throw new Error("Native terminals require the Rust daemon backend");
+    return runtime.createTerminalStreamSocket(sessionId);
+  },
+  async sessionId => RUST_BACKEND && runtime instanceof RustRuntime && runtime.supportsTerminalStream(sessionId),
+  (id, state) => mainWindow?.webContents.send("native-terminal:state", { id, state }),
+  (id, message) => mainWindow?.webContents.send("native-terminal:error", { id, message }),
+  (id, action) => mainWindow?.webContents.send("native-terminal:shortcut", { id, action }),
+  (id, focused) => mainWindow?.webContents.send("native-terminal:focus", { id, focused }),
+  id => {
+    const window = mainWindow;
+    if (!window || window.isDestroyed()) return false;
+    try { window.webContents.send("native-terminal:shortcut", { id, action: "paste-image" }); return true; }
+    catch { return false; }
+  },
+);
 let daemonStartRequest: Promise<{ ok: boolean; error?: string }> | undefined;
 function publishRuntimeSwitch(): void {
   store.setRuntimeSwitch(readRuntimeSwitch(RUNTIME_SWITCH_PATH, RUST_BACKEND ? "rust" : "legacy", backendSelection, {
@@ -398,10 +417,13 @@ function createWindow(): BrowserWindow {
   // lease before the replacement renderer can attach, rather than waiting for
   // garbage collection to close the transferred port.
   contents.on("did-start-navigation", (_event, _url, _inPlace, isMainFrame) => {
-    if (isMainFrame) terminalStreamBridge.closeAllForId(contents.id);
+    if (isMainFrame) {
+      terminalStreamBridge.closeAllForId(contents.id);
+      nativeGhosttyManager.closeAllForContents(contents.id);
+    }
   });
-  contents.on("render-process-gone", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); });
-  contents.once("destroyed", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); });
+  contents.on("render-process-gone", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); nativeGhosttyManager.closeAllForContents(contents.id); });
+  contents.once("destroyed", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); nativeGhosttyManager.closeAllForContents(contents.id); });
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   window.webContents.session.setPermissionCheckHandler(() => false);
   window.once("ready-to-show", () => { if (!START_HIDDEN) window.show(); });
@@ -417,6 +439,7 @@ function createWindow(): BrowserWindow {
   });
   window.on("closed", () => {
     terminalStreamBridge.closeAllForId(contents.id);
+    nativeGhosttyManager.closeAllForContents(contents.id);
     if (mainWindow === window) mainWindow = undefined;
     if (!quitting && !store.settingsSnapshot().minimizeToTray) {
       quitting = true;
@@ -1068,6 +1091,77 @@ function installIpc(): void {
     await terminalStreamBridge.open(event.sender, sessionId, requestId);
     return { supported: true };
   });
+  ipcMain.handle("native-terminal:available", (event) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (process.env["PROSPERO_NATIVE_GHOSTTY"] === "0") return { available: false, reason: "Native Ghostty is disabled" };
+    if (!RUST_BACKEND) return { available: false, reason: "Native terminals require the Rust daemon backend" };
+    return nativeGhosttyManager.availability();
+  });
+  ipcMain.handle("native-terminal:open", async (event, rawSessionId: unknown, rawFontSize: unknown, rawFontFamily: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (process.env["PROSPERO_NATIVE_GHOSTTY"] === "0") throw new Error("Native Ghostty is disabled");
+    if (!RUST_BACKEND || !(runtime instanceof RustRuntime)) throw new Error("Native terminals require the Rust daemon backend");
+    const sessionId = requireId(rawSessionId, "终端会话");
+    const fontSize = rawFontSize === undefined ? 13 : rawFontSize;
+    if (typeof fontSize !== "number" || !Number.isFinite(fontSize)) throw new Error("Invalid native terminal font size");
+    if (rawFontFamily !== undefined && (typeof rawFontFamily !== "string" || Buffer.byteLength(rawFontFamily, "utf8") > 200 || /[\u0000-\u001f\u007f]/.test(rawFontFamily))) throw new Error("Invalid native terminal font family");
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || window !== mainWindow || window.isDestroyed()) throw new Error("无效的窗口 / Invalid window");
+    const id = await nativeGhosttyManager.open(window, event.sender.id, sessionId, fontSize, rawFontFamily as string | undefined);
+    return { id };
+  });
+  ipcMain.handle("native-terminal:update", (event, rawId: unknown, rawBounds: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (typeof rawId !== "number" || !Number.isSafeInteger(rawId)) throw new Error("Native terminal id is invalid");
+    const value = requireObject(rawBounds);
+    const bounds = {
+      x: value["x"], y: value["y"], width: value["width"], height: value["height"],
+      visible: value["visible"], ...(value["focus"] === undefined ? {} : { focus: value["focus"] }),
+    };
+    if (![bounds.x, bounds.y, bounds.width, bounds.height].every(item => typeof item === "number" && Number.isFinite(item)) || typeof bounds.visible !== "boolean" || (bounds.focus !== undefined && typeof bounds.focus !== "boolean")) throw new Error("Native terminal bounds are invalid");
+    // DOM rectangles are CSS pixels; AppKit frames use unzoomed window points.
+    const zoom = event.sender.getZoomFactor();
+    nativeGhosttyManager.update(rawId, {
+      ...(bounds as { x: number; y: number; width: number; height: number; visible: boolean; focus?: boolean }),
+      x: (bounds.x as number) * zoom, y: (bounds.y as number) * zoom,
+      width: (bounds.width as number) * zoom, height: (bounds.height as number) * zoom,
+    });
+    return { ok: true };
+  });
+  ipcMain.handle("native-terminal:close", (event, rawId: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (typeof rawId !== "number" || !Number.isSafeInteger(rawId)) throw new Error("Native terminal id is invalid");
+    nativeGhosttyManager.close(rawId);
+    return { ok: true };
+  });
+  ipcMain.handle("native-terminal:action", async (event, rawId: unknown, rawAction: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (typeof rawId !== "number" || !Number.isSafeInteger(rawId)) throw new Error("Native terminal id is invalid");
+    if (rawAction !== "acquire" && rawAction !== "takeover" && rawAction !== "release") throw new Error("Native terminal action is invalid");
+    await nativeGhosttyManager.action(rawId, rawAction);
+    return { ok: true };
+  });
+  ipcMain.handle("native-terminal:search", (event, rawId: unknown, rawText: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (typeof rawId !== "number" || !Number.isSafeInteger(rawId)) throw new Error("Native terminal id is invalid");
+    if (typeof rawText !== "string" || Buffer.byteLength(rawText, "utf8") > 4096 || rawText.includes("\0")) throw new Error("Native terminal search text is invalid");
+    nativeGhosttyManager.search(rawId, rawText);
+    return { ok: true };
+  });
+  ipcMain.handle("native-terminal:search-step", (event, rawId: unknown, rawStep: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (typeof rawId !== "number" || !Number.isSafeInteger(rawId)) throw new Error("Native terminal id is invalid");
+    if (rawStep !== "next" && rawStep !== "previous" && rawStep !== "end") throw new Error("Native terminal search step is invalid");
+    nativeGhosttyManager.searchStep(rawId, rawStep);
+    return { ok: true };
+  });
+  ipcMain.handle("native-terminal:input-text", (event, rawId: unknown, rawText: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+    if (typeof rawId !== "number" || !Number.isSafeInteger(rawId)) throw new Error("Native terminal id is invalid");
+    if (typeof rawText !== "string" || Buffer.byteLength(rawText, "utf8") > 8192 || rawText.includes("\0")) throw new Error("Native terminal input is invalid");
+    nativeGhosttyManager.inputText(rawId, rawText);
+    return { ok: true };
+  });
   ipcMain.handle("clipboard:write", (_event, value: unknown) => {
     if (typeof value !== "string") throw new Error("剪贴板内容无效");
     // 终端可能选中极长的输出,截断避免把几百 MB 塞进系统剪贴板。
@@ -1503,7 +1597,7 @@ function installIpc(): void {
   });
 }
 
-app.on("before-quit", () => { quitting = true; remoteShellManager.close(); if (mainWindow) terminalStreamBridge.closeAll(mainWindow.webContents); });
+app.on("before-quit", () => { quitting = true; remoteShellManager.close(); nativeGhosttyManager.closeAll(); if (mainWindow) terminalStreamBridge.closeAll(mainWindow.webContents); });
 app.on("window-all-closed", () => { /* The window close handler applies the background-running preference. */ });
 app.on("activate", () => {
   showMainWindow();

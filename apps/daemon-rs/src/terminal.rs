@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 pub const RETAINED_BYTES: usize = 1024 * 1024;
 pub const RETAINED_EVENTS: usize = 512;
 pub const INPUT_BYTES: usize = 8192;
+pub(crate) const STREAM_VIEWER_SLOTS: u32 = 16;
 const PAGE_BYTES: usize = 64 * 1024;
 const ACTIVITY_IDLE_MS: i64 = 30_000;
 const ACTIVITY_TAIL_LINES: usize = 10;
@@ -403,6 +404,25 @@ impl Terminal {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)
+    }
+    /// Hold every viewer slot while the host is shutting down. Upgraded
+    /// websocket tasks are detached from Axum's graceful-shutdown tracking;
+    /// this keeps their stream sessions alive long enough to send final output
+    /// and Exit before the PTY owner is stopped.
+    pub(crate) async fn drain_streams(
+        &self,
+        timeout: Duration,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        tokio::time::timeout(
+            timeout,
+            self.0
+                .stream_slots
+                .clone()
+                .acquire_many_owned(STREAM_VIEWER_SLOTS),
+        )
+        .await
+        .ok()?
+        .ok()
     }
     pub(crate) async fn wait_output(&self, after: i64) {
         let mut changed = self.0.changed.clone();

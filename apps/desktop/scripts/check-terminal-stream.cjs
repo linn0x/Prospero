@@ -1,4 +1,6 @@
-// Isolated Electron -> MessagePort -> Rust daemon -> detached PTY owner check.
+// Isolated xterm -> MessagePort -> Rust daemon -> detached PTY owner check.
+// Native NSView coverage lives in check-native-terminal.cjs.
+process.env.PROSPERO_NATIVE_GHOSTTY = '0';
 const {app}=require('electron');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),assert=require('node:assert/strict');
 const {pathToFileURL}=require('node:url');

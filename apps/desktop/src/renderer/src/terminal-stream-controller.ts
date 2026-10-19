@@ -60,6 +60,7 @@ export class TerminalStreamController {
   private readonly pending = new Map<number, { resolve: () => void; reject: (reason: Error) => void; bytes: number }>();
   private pendingBytes = 0;
   private state: TerminalStreamState = { connected: false, syncing: true, readOnly: true, exited: false, controller: false };
+  private publishedState: TerminalStreamState | undefined;
   private clientId: string | undefined;
   private ready = false;
   private committedCursor: number;
@@ -280,7 +281,15 @@ export class TerminalStreamController {
   }
 
   private canControl(): boolean { return this.ready && this.state.connected && !this.state.syncing && !this.state.readOnly && !this.state.exited && this.state.controller; }
-  private publish(): void { this.options.onState(this.state); }
+  private publish(): void {
+    const state = this.state;
+    const previous = this.publishedState;
+    if (previous && previous.connected === state.connected && previous.syncing === state.syncing &&
+      previous.readOnly === state.readOnly && previous.exited === state.exited &&
+      previous.controller === state.controller && previous.epoch === state.epoch) return;
+    this.publishedState = { ...state };
+    this.options.onState(state);
+  }
   private fail(message: string, recoverable: boolean): void {
     if (this.disposed) return;
     if (!this.cleanExit && !this.freshReloadRequired) this.options.onError(message, recoverable);

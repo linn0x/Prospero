@@ -59,7 +59,13 @@ describe("runtime packaging guard", () => {
     writeFileSync(join(root, ".runtime", "prospero"), macho(0x0100000c));
     writeFileSync(join(root, ".runtime", "install-rust-daemon-launchagent.sh"), "");
     expect(runtimeCheck.machoArchitecture(join(root, ".runtime", "prosperod-rs"))).toBe("arm64");
+    expect(() => runtimeCheck(context(root, "darwin", 3))).toThrow(/Native Ghostty is missing/);
+    mkdirSync(join(root, ".native", "ghostty"), { recursive: true });
+    writeFileSync(join(root, ".native", "ghostty", "ghostty.node"), macho(0x0100000c));
+    writeFileSync(join(root, ".native", "ghostty", "prospero-terminal-relay"), macho(0x0100000c));
     expect(() => runtimeCheck(context(root, "darwin", 3))).not.toThrow();
     expect(() => runtimeCheck(context(root, "darwin", 1))).toThrow(/matching prosperod-rs/);
+    writeFileSync(join(root, ".native", "ghostty", "ghostty.node"), macho(0x01000007));
+    expect(() => runtimeCheck(context(root, "darwin", 3))).toThrow(/matching native Ghostty/);
   });
 });

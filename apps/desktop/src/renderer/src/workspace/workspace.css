@@ -93,6 +93,14 @@
 .dock-terminal-toolbar > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-focus-controls { display: flex; flex: none; min-height: 34px; align-items: center; justify-content: flex-end; padding: 3px 10px; border-bottom: 1px solid var(--border); background: var(--background); }
 .workspace-focus-controls:hover, .workspace-focus-controls:focus-within { opacity: 1; }
+.terminal-shell.native-terminal-shell { display: flex; height: 100%; min-height: 0; flex: 1; flex-direction: column; }
+.native-terminal-host { order: 1; flex: 1; min-width: 0; min-height: 0; background: #1a1b26; }
+.native-terminal-find { order: 0; display: flex; min-height: 32px; flex: none; align-items: center; gap: 4px; padding: 2px 8px; border-bottom: 1px solid #2a2c3d; background: #1f2130; }
+.native-terminal-find[hidden] { display: none; }
+.native-terminal-find input { width: min(420px, 60%); height: 26px; padding: 3px 8px; border: 1px solid #383b52; border-radius: var(--ui-radius-control); outline: none; background: #1a1b26; color: #c0caf5; font: var(--ui-text-caption)/1.4 var(--ui-font-mono); }
+.native-terminal-find input:focus { border-color: var(--ring); }
+.native-terminal-find button { width: 26px; height: 26px; border: 0; border-radius: var(--ui-radius-control); background: transparent; color: #c0caf5; cursor: pointer; }
+.native-terminal-find button:hover { background: #383b52; }
 .dock-terminal .terminal-toolbar { min-height: 30px; }
 @container workspace-primary (max-width: 640px) { .session-toolbar-identity small { display: none; } }
 @container workspace-primary (max-width: 480px) { .session-toolbar-identity > span:not(.status-mark) { display: none; } }
