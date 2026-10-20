@@ -471,6 +471,18 @@ pub fn run(directory: PathBuf) -> Result<()> {
                     }),
                 )
                 .route(
+                    "/reclaim",
+                    post(
+                        |State(o): State<Owner>, Json(before): Json<i64>| async move {
+                            if o.terminal.reclaim_if_idle_prompt(before)? {
+                                Ok(Json(true))
+                            } else {
+                                Err(ApiError(Error::Conflict))
+                            }
+                        },
+                    ),
+                )
+                .route(
                     "/release",
                     post(|State(o): State<Owner>| async move {
                         if !o.terminal.activity()?.exited {

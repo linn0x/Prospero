@@ -72,6 +72,27 @@ impl Handle {
             Self::Hosted(h) => h.get("activity").await,
         }
     }
+    pub async fn reclaim_if_idle_prompt(&self, before: i64) -> Result<bool> {
+        match self {
+            Self::Local(t) => t.reclaim_if_idle_prompt(before),
+            Self::Hosted(h) => {
+                // Hosts from an older app version deserialize without the new
+                // marker. Do not call an endpoint they do not implement.
+                let activity: TerminalActivity = h.get("activity").await?;
+                if !activity
+                    .idle_prompt_since
+                    .is_some_and(|since| since < before)
+                {
+                    return Ok(false);
+                }
+                match h.post("reclaim", &before).await {
+                    Ok(()) => Ok(true),
+                    Err(Error::Conflict) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
     pub async fn input(&self, i: TerminalInput) -> Result<()> {
         match self {
             Self::Local(t) => t.input(i).await,

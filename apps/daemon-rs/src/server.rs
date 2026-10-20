@@ -96,17 +96,33 @@ pub struct Api {
 }
 
 const DEFAULT_DISPATCH_TIMEOUT_MS: i64 = 6 * 60 * 60 * 1000;
+/// Idle worker sessions (structured or pty) are returned to the terminal
+/// session pool much sooner than a stale dispatch so parked/abandoned workers
+/// don't pile up and crowd out new session creation. The pool then maintains
+/// itself and users rarely perceive the terminal capacity cap.
+const DEFAULT_IDLE_WORKER_TIMEOUT_MS: i64 = 30 * 60 * 1000;
+/// Manual Agent PTYs are user-owned, so reclaim them much more conservatively
+/// and only after the terminal runtime verifies a recognized idle prompt.
+const DEFAULT_IDLE_TERMINAL_TIMEOUT_MS: i64 = 6 * 60 * 60 * 1000;
+const TERMINAL_RECLAIM_HIGH_WATER: usize = 12;
 
-fn configured_dispatch_thresholds(value: impl Fn(&str) -> Option<String>) -> (i64, i64) {
-    let positive = |name| {
+fn configured_dispatch_thresholds(value: impl Fn(&str) -> Option<String>) -> (i64, i64, i64) {
+    let read = |name: &str, fallback: i64| {
         value(name)
             .and_then(|raw| raw.parse::<i64>().ok())
             .filter(|millis| *millis > 0)
-            .unwrap_or(DEFAULT_DISPATCH_TIMEOUT_MS)
+            .unwrap_or(fallback)
     };
     (
-        positive("PROSPERO_STALE_DISPATCH_MS"),
-        positive("PROSPERO_IDLE_WORKER_TIMEOUT_MS"),
+        read("PROSPERO_STALE_DISPATCH_MS", DEFAULT_DISPATCH_TIMEOUT_MS),
+        read(
+            "PROSPERO_IDLE_WORKER_TIMEOUT_MS",
+            DEFAULT_IDLE_WORKER_TIMEOUT_MS,
+        ),
+        read(
+            "PROSPERO_IDLE_TERMINAL_TIMEOUT_MS",
+            DEFAULT_IDLE_TERMINAL_TIMEOUT_MS,
+        ),
     )
 }
 
@@ -240,7 +256,7 @@ impl Api {
         let mut stopped = self.stopping.subscribe();
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let (stale_after, idle_worker_timeout) =
+        let (stale_after, idle_worker_timeout, idle_terminal_timeout) =
             configured_dispatch_thresholds(|name| std::env::var(name).ok());
         loop {
             tokio::select! {
@@ -323,6 +339,26 @@ impl Api {
                                 .await;
                             api.publish();
                         });
+                    }
+                    let terminal_count = self.terminals.count();
+                    if terminal_count >= TERMINAL_RECLAIM_HIGH_WATER {
+                        let target = terminal_count - (TERMINAL_RECLAIM_HIGH_WATER - 1);
+                        match self
+                            .terminals
+                            .reclaim_idle_manual(
+                                crate::database::now().saturating_sub(idle_terminal_timeout),
+                                target,
+                            )
+                            .await
+                        {
+                            Ok(reclaimed) if reclaimed > 0 => self.publish(),
+                            Ok(_) => {}
+                            Err(error) => self.database.record_recent_error(
+                                "terminal.idle_timeout",
+                                "terminal_sessions",
+                                &error.to_string(),
+                            ),
+                        }
                     }
                 }
                 Err(error) => {
@@ -7945,16 +7981,22 @@ mod tests {
     #[test]
     fn idle_worker_timeout_is_independent_of_stale_health_threshold() {
         use super::*;
-        let (stale, idle) = configured_dispatch_thresholds(|name| match name {
+        let (stale, idle, terminal) = configured_dispatch_thresholds(|name| match name {
             "PROSPERO_STALE_DISPATCH_MS" => Some("1000".into()),
             "PROSPERO_IDLE_WORKER_TIMEOUT_MS" => Some("7200000".into()),
+            "PROSPERO_IDLE_TERMINAL_TIMEOUT_MS" => Some("10800000".into()),
             _ => None,
         });
         assert_eq!(stale, 1_000);
         assert_eq!(idle, 7_200_000);
+        assert_eq!(terminal, 10_800_000);
         assert_eq!(
             configured_dispatch_thresholds(|_| None),
-            (DEFAULT_DISPATCH_TIMEOUT_MS, DEFAULT_DISPATCH_TIMEOUT_MS)
+            (
+                DEFAULT_DISPATCH_TIMEOUT_MS,
+                DEFAULT_IDLE_WORKER_TIMEOUT_MS,
+                DEFAULT_IDLE_TERMINAL_TIMEOUT_MS,
+            )
         );
     }
 
