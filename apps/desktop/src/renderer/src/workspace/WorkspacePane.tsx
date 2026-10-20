@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Columns2, Files, FolderKanban, FolderPlus, GitBranch, Plus, Search, X } from "lucide-react";
+import { Columns2, Files, FolderKanban, FolderPlus, Plus, X } from "lucide-react";
 import type { DesktopSnapshot, NativeTerminalState, SessionInfo } from "../../../shared/types";
 import { Button } from "../components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../components/ui/empty";
@@ -24,7 +24,7 @@ import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_E
 const ChatPane = lazy(() => import("../ChatPane").then((module) => ({ default: module.ChatPane })));
 const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
 
-function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, onMissingSession, onNativeFocus, empty, active = true, focused = true, primary = true }: { active?: boolean; focused?: boolean; primary?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void; onMissingSession: (id: string) => void; onNativeFocus?: (id: string) => void }) {
+function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, onMissingSession, onNativeFocus, empty, onSplit, active = true, focused = true, primary = true }: { onSplit?: (() => void) | undefined; active?: boolean; focused?: boolean; primary?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void; onMissingSession: (id: string) => void; onNativeFocus?: (id: string) => void }) {
   const { t } = useLocale();
   const host = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(0);
@@ -134,16 +134,14 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   };
   const account = snapshot.accounts.find((item) => text(item["id"]) === session?.accountId);
   const toolbar = <>
-    {chromeVisible && session && <SessionToolbar localSelection={localSelection} onLocalSelectionChange={setLocalSelection} nativeTerminal={nativeAvailable} nativeTerminalState={nativeState} onNativeTerminalAction={nativeAction} session={session} account={account} unread={snapshot.unreadSessionIds.includes(session.id)} contextVisible={dock.visible} onToggleContext={() => setState({ ...dock, visible: !dock.visible })} onToggleFocus={onToggleFocus} />}
+    {chromeVisible && session && <SessionToolbar onSplit={onSplit} localSelection={localSelection} onLocalSelectionChange={setLocalSelection} nativeTerminal={nativeAvailable} nativeTerminalState={nativeState} onNativeTerminalAction={nativeAction} session={session} account={account} unread={snapshot.unreadSessionIds.includes(session.id)} contextVisible={dock.visible} onToggleContext={() => setState({ ...dock, visible: !dock.visible })} onToggleFocus={onToggleFocus} />}
     {chromeVisible && !session && <header className="pane-toolbar project-workspace-toolbar">
       <NativeSelect size="sm" aria-label={t("当前项目", "Current project")} value={root} onChange={event => setSelectedRoot(event.target.value)}>
         {!root && <NativeSelectOption value="">{t("选择项目", "Select project")}</NativeSelectOption>}
         {[...new Set([root, ...snapshot.projects].filter(Boolean))].map(project => <NativeSelectOption key={project} value={project}>{snapshot.projectAliases[project.toLowerCase()] || fileName(project)}</NativeSelectOption>)}
       </NativeSelect>
       <div className="pane-toolbar-actions">
-        <Button variant="ghost" size="icon-sm" disabled={!root} aria-label={t("浏览项目文件", "Browse project files")} onClick={() => openTool("files")}><Files /></Button>
-        <Button variant="ghost" size="icon-sm" disabled={!root} aria-label={t("搜索项目内容", "Search project contents")} onClick={() => openTool("search")}><Search /></Button>
-        <Button variant="ghost" size="icon-sm" disabled={!root} aria-label={t("查看 Git 变更", "Review Git changes")} onClick={() => openTool("git")}><GitBranch /></Button>
+        <Button variant="ghost" size="sm" disabled={!root} aria-label={t("切换工具栏", "Toggle tools")} aria-pressed={dock.visible} onClick={() => setState({ ...dock, visible: !dock.visible })}><Files />{t("工具", "Tools")}</Button>
       </div>
     </header>}
   </>;
@@ -153,7 +151,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
         {toolbar}
         {focus && session?.kind === "pty" && !nativeAvailable && <div className="workspace-focus-controls"><TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={setLocalSelection} /></div>}
         <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载会话…", "Loading session…")}</div>}>
-          {!session ? empty : session.kind === "pty" ? nativeTerminal ? <NativeTerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} onToggleFocus={onToggleFocus} onNativeFocus={onNativeFocus ?? (() => undefined)} onNativeAvailabilityChange={updateNativeAvailability} onNativeStateChange={updateNativeState} /> : <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} />}
+          {!session ? empty : session.kind === "pty" ? nativeTerminal ? <NativeTerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} onToggleFocus={onToggleFocus} onNativeFocus={onNativeFocus ?? (() => undefined)} onNativeAvailabilityChange={updateNativeAvailability} onNativeStateChange={updateNativeState} /> : <TerminalPane localSelection={localSelection} key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} focused={focused} onMissingSession={onMissingSession} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={text(dispatch?.["runId"]) ? () => onOpenRun(text(dispatch?.["runId"])) : undefined} onMissingSession={onMissingSession} />}
         </Suspense>
       </main>
       {visible && !overlay && <>
@@ -245,8 +243,8 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
   return <div className="workspace-view workspace-view-single workspace-multipane">
-    {session?.kind === "pty" && (candidates.length > 0 || splitId) && <div className="workspace-split-controls">
-      <Button size="xs" variant={splitSession ? "secondary" : "ghost"} aria-pressed={Boolean(splitSession)} disabled={!splitSession && candidates.length === 0} onClick={() => splitSession ? closeSplit() : setSplitId(candidates[0]?.id)}><Columns2 />{t("分屏", "Split view")}</Button>
+    {session?.kind === "pty" && splitSession && <div className="workspace-split-controls">
+      <span className="workspace-split-label"><Columns2 />{t("分屏", "Split view")}</span>
       {splitSession && <><NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => setSplitId(event.target.value)}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect><Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button></>}
     </div>}
     <div ref={stack} className={cn("workspace-session-stack", splitSession && "is-split", stacked && "is-stacked")} style={splitSession ? { [stacked ? "gridTemplateRows" : "gridTemplateColumns"]: `${ratio}fr 6px ${100 - ratio}fr` } : undefined}>
@@ -254,7 +252,7 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
         const primary = item.id === activeId;
         const visible = active && (primary || item.id === splitSession?.id);
         return <div key={item.id} className="workspace-session-slot" data-position={primary ? "primary" : "secondary"} data-focused={focusedId === item.id || undefined} inert={!visible} aria-hidden={!visible} style={visible ? undefined : { position: "absolute", inset: 0, visibility: "hidden", pointerEvents: "none" }} onPointerDownCapture={() => visible && focusSession(item.id)} onFocusCapture={() => visible && focusSession(item.id)}>
-          <WorkspaceSession session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
+          <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => setSplitId(candidates[0]?.id) : undefined} session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
         </div>;
       })}
       {splitSession && <div className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => setRatio(50)} onPointerDown={event => {

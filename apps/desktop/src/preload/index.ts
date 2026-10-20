@@ -113,6 +113,7 @@ const api: DesktopApi = {
   getSessionView: (sessionId: string, query?: Record<string, number>) => ipcRenderer.invoke("session:view", sessionId, query),
   cancelSessionView: (sessionId: string) => ipcRenderer.invoke("session:view:cancel", sessionId),
   interact: (sessionId: string, message: JsonObject) => ipcRenderer.invoke("session:interact", sessionId, message),
+  forkSession: (sessionId: string) => ipcRenderer.invoke("session:fork", sessionId),
   interruptSession: (sessionId: string) => ipcRenderer.invoke("session:interrupt", sessionId),
   killSession: (sessionId: string) => ipcRenderer.invoke("session:kill", sessionId),
   getToolOutput: (sessionId: string, callId: string) => ipcRenderer.invoke("session:tool-output", sessionId, callId),

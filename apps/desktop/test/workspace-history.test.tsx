@@ -57,48 +57,11 @@ describe("WorkspaceHistory", () => {
     expect(html).not.toContain("data-testid");
   });
 
-  it("renders all historical sessions when expanded even if they are in archived list", async () => {
+  it("hides archived chats from normal history but keeps them searchable", async () => {
+    const { sidebarProjectSessions } = await import("../src/renderer/src/workspace-sidebar-state");
     const items = [session("s1"), session("s2"), session("s3")];
-    const listSessions = vi.fn(async () => ({ items, total: 3, active: 0, terminal: 3 }));
-    vi.stubGlobal("window", {
-      prospero: {
-        listSessions,
-        cancelSessionPage: vi.fn(async () => {}),
-      },
-    });
-    const { WorkspaceSessionPager } = await import("../src/renderer/src/workspace-session-pager");
-    // Create pager and expand it
-    const pager = new WorkspaceSessionPager(window.prospero, "/workspace");
-    pager.setActive(true);
-    await pager.expand();
-    expect(pager.getSnapshot().expanded).toBe(true);
-
-    // Test with all items archived
-    const archived = ["s1", "s2", "s3"];
-    // Pass to WorkspaceHistory
-    const html = renderToStaticMarkup(
-      <WorkspaceHistory
-        workspace="/workspace"
-        name="诊断"
-        enabled={true}
-        revision="1"
-        preview={items}
-        activeId={undefined}
-        pinned={[]}
-        unread={[]}
-        archived={archived}
-        query=""
-        onTotal={() => {}}
-        renderRow={(item) => <div key={item.id} data-testid={item.id}>{item.title}</div>}
-      />,
-    );
-    // In initial render, if pager state is not yet expanded, items are preview.
-    // But let's verify sortSidebarSessions with candidate logic:
-    const { filterSessionsByQuery, sidebarProjectSessions } = await import("../src/renderer/src/workspace-sidebar-state");
-    // When expanded, filterSessionsByQuery retains all items
-    expect(filterSessionsByQuery(items, "")).toEqual(items);
-    // Whereas collapsed sidebarProjectSessions strips them
-    expect(sidebarProjectSessions(items, archived, "")).toEqual([]);
+    expect(sidebarProjectSessions(items, ["s2"], "").map(item => item.id)).toEqual(["s1", "s3"]);
+    expect(sidebarProjectSessions(items, ["s2"], "Session s2").map(item => item.id)).toEqual(["s2"]);
   });
 
   it("does not render show-more button when all sessions are visible", () => {

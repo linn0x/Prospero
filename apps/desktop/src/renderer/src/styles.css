@@ -347,6 +347,9 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
   padding: 8px 12px;
 }
 .sidebar-shell-header button { -webkit-app-region: no-drag; }
+.sidebar-shell-header .sidebar-new-session { width: auto; min-width: 28px; padding-inline: 7px; gap: 5px; }
+.sidebar-new-session-label { font-size: var(--ui-text-caption); white-space: nowrap; }
+[data-state="collapsed"] .sidebar-new-session-label { display: none; }
 .sidebar-header-toggle {
   width: 28px;
   height: 28px;
@@ -369,8 +372,8 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 .sidebar-nav-fixed [data-sidebar="menu"] { gap: 4px; }
 .sidebar-nav-fixed [data-sidebar="menu-button"] { position: relative; padding-inline: 12px; gap: 10px; transition: background-color 120ms ease, box-shadow 120ms ease, color 120ms ease; }
 .sidebar-nav-fixed [data-sidebar="menu-button"][data-active] {
-  background: linear-gradient(120deg, color-mix(in srgb, var(--sidebar-primary) 20%, transparent), color-mix(in srgb, var(--sidebar-primary) 9%, transparent));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sidebar-primary) 32%, transparent), inset 0 1px 0 color-mix(in srgb, var(--sidebar-foreground) 8%, transparent);
+  background: var(--sidebar-accent);
+  box-shadow: none;
 }
 .sidebar-nav-fixed [data-sidebar="menu-button"][data-active]::before { position: absolute; top: 7px; bottom: 7px; left: 0; width: 3px; border-radius: 3px; background: var(--sidebar-primary); content: ""; }
 .prospero-sidebar [data-sidebar="separator"] { width: auto; margin-inline: 12px; background: color-mix(in srgb, var(--sidebar-border) 72%, transparent); }
@@ -431,7 +434,7 @@ kbd {
   background-color: var(--card);
   box-shadow: 0 8px 24px #263a5e0a;
 }
-.overview-view [data-slot="card"] { min-width: 0; border: 1px solid var(--glass-border); background-color: var(--overview-card-fill); box-shadow: inset 0 1px 0 var(--chrome-highlight), 0 4px 16px var(--liquid-shadow); }
+.overview-view [data-slot="card"] { min-width: 0; border: 1px solid var(--border); background-color: var(--card); box-shadow: none; }
 .overview-grid > [data-slot="card"] > [data-slot="card-content"] { flex: 1; min-width: 0; }
 .overview-view [data-slot="card-footer"] { min-height: 52px; padding-block: 10px; border-color: var(--glass-border); background: transparent; }
 .attention-row {
@@ -664,6 +667,10 @@ kbd {
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="menu-button"] { height: 28px; min-height: 28px; padding-block: 4px; }
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { height: 22px; }
 .sidebar-workspace-scroll { min-height: 96px; flex: 1 0 96px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.sidebar-resource-nav { margin-bottom: 8px; max-height: 35vh; overflow-y: auto; scrollbar-width: thin; }
+.sidebar-resource-nav [data-sidebar="group"] { padding: 0; }
+.sidebar-resource-nav [data-sidebar="menu-button"] { height: 30px; font-size: var(--ui-text-small); }
+.sidebar-resource-nav [data-sidebar="group-label"] { height: 26px; }
 .sidebar-shell-footer { position: relative; flex: none; padding: 10px 12px; }
 .sidebar-shell-footer::before { position: absolute; top: 0; right: 12px; left: 12px; height: 1px; background: color-mix(in srgb, var(--sidebar-border) 72%, transparent); content: ""; }
 .sidebar-footer-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
@@ -685,7 +692,7 @@ kbd {
 [data-collapsible="icon"] .prospero-sidebar .sidebar-detail-section { display: none; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="group"] { padding-right: 8px; padding-left: 8px; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-item"] { display: flex; justify-content: center; }
-[data-collapsible="icon"] .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { display: none; }
+[data-collapsible="icon"] .prospero-sidebar :is(.sidebar-nav-fixed, .sidebar-resource-nav) [data-sidebar="group-label"] { display: none; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { justify-content: center; width: 28px !important; height: 28px !important; min-height: 28px; padding: 6px !important; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] > svg { width: 16px; height: 16px; }
 [data-collapsible="icon"] .prospero-sidebar .sidebar-footer-actions { grid-template-columns: minmax(0, 1fr); }
@@ -1161,8 +1168,8 @@ kbd {
    chat and terminal surfaces keep their opaque reading backgrounds. No overlay
    elements are added, so hit testing, drag regions and scrolling are unchanged. */
 .prospero-sidebar [data-slot="sidebar-inner"] {
-  background-image: linear-gradient(118deg, var(--chrome-highlight), transparent 46%, #8ab5ff06);
-  box-shadow: inset 0 1px 0 var(--chrome-highlight);
+  background-image: none;
+  box-shadow: none;
 }
 :root[data-native-glass="true"],
 :root[data-native-glass="true"] body,
@@ -1187,100 +1194,43 @@ kbd {
 
 .glass-scrim { background: var(--glass-scrim); }
 
-/* Interactive material stays on controls and floating surfaces. These two
-   decorative layers never receive input; pointer movement updates only the
-   hovered surface, once per frame, with no persistent animation or GPU hint. */
+/* Native vibrancy supplies the material. Controls use quiet, stable fills;
+   no cursor spotlights, nested refraction or animated surface displacement. */
 :root[data-platform="darwin"][data-native-glass="true"] {
-[data-liquid-glass] {
-  --liquid-x: 50%;
-  --liquid-y: 50%;
-  --liquid-active: 0;
-  --liquid-resting: 0;
-  isolation: isolate;
-}
-:is([data-liquid-glass="nav"], [data-liquid-glass="control"], [data-liquid-glass="tab"]),
-[data-slot="card"][data-liquid-glass="panel"] {
-  position: relative;
-}
-[data-liquid-glass]::before,
-[data-liquid-glass]::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  -webkit-app-region: no-drag;
-}
-[data-liquid-glass]::before {
-  background: radial-gradient(ellipse 130px 85px at var(--liquid-x) var(--liquid-y), var(--liquid-light), transparent 78%);
-  opacity: var(--liquid-active);
-  transition: opacity 180ms ease-out;
-}
-[data-liquid-glass]::after {
-  border: 1px solid var(--liquid-edge);
-  box-shadow: inset 0 1px 0 #ffffff24, inset 0 -1px 0 #00000012;
-  opacity: max(var(--liquid-active), var(--liquid-resting));
-  transition: opacity 180ms ease-out;
-}
-.prospero-sidebar [data-liquid-glass="nav"] {
-  border-radius: var(--ui-radius-panel);
-  transition: background-color 160ms ease, box-shadow 180ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
-}
-.prospero-sidebar [data-liquid-glass="nav"][data-active] {
-  --liquid-resting: 1;
-  color: var(--sidebar-foreground);
-  background-color: var(--liquid-tint);
-  background-image: linear-gradient(125deg, #ffffff1f, transparent 65%);
-  box-shadow: 0 3px 9px var(--liquid-shadow), inset 0 1px 0 var(--chrome-highlight);
-}
-.liquid-button {
-  --liquid-resting: 1;
-  border-radius: 999px;
-  border-color: transparent;
-  background-color: var(--liquid-fill);
-  background-image: linear-gradient(145deg, #ffffff24, transparent 65%);
-  box-shadow: 0 4px 12px var(--liquid-shadow), inset 0 1px 0 var(--chrome-highlight);
-  transition: transform 180ms cubic-bezier(.2,.8,.2,1), box-shadow 180ms ease, background-color 180ms ease;
-}
-.liquid-button.liquid-primary {
-  --liquid-edge: #ffffff52;
-  --liquid-light: #ffffff47;
-  min-height: 34px;
-  padding-inline: 14px;
-  color: var(--primary-foreground);
-  background-color: var(--primary);
-  background-image: linear-gradient(160deg, #ffffff28, transparent 60%, #18357716);
-  box-shadow: 0 4px 12px color-mix(in srgb, var(--primary) 22%, transparent), inset 0 1px 0 #ffffff4d;
-}
-[data-liquid-glass="tab"]:is(.is-active, [data-active], [aria-selected="true"], [aria-pressed="true"]) { --liquid-resting: 1; }
-[data-liquid-glass="panel"] {
-  --liquid-resting: 1;
-  background-image: linear-gradient(145deg, #ffffff0d, transparent 38%, #172c5808);
-}
-[data-liquid-glass="panel"]::before {
-  background: radial-gradient(ellipse 240px 160px at var(--liquid-x) var(--liquid-y), var(--chrome-highlight), transparent 80%);
-}
-:is([data-liquid-glass="nav"], .liquid-button):focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 3px;
-}
-@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
-  .liquid-button:not(:disabled):not([aria-disabled="true"]):hover {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 16px var(--liquid-shadow), inset 0 1px 0 var(--liquid-edge);
+  :is([data-liquid-glass="nav"], [data-liquid-glass="control"], [data-liquid-glass="tab"]),
+  [data-slot="card"][data-liquid-glass="panel"] {
+    position: relative;
   }
-  :is([data-liquid-glass="nav"], .liquid-button):not(:disabled):not([aria-disabled="true"]):active {
-    transform: translateY(1px) scale(.985);
+  [data-liquid-glass]::before,
+  [data-liquid-glass]::after {
+    pointer-events: none;
+    display: none;
   }
-}
-@media (prefers-reduced-motion: reduce) {
-  [data-liquid-glass], [data-liquid-glass]::before, [data-liquid-glass]::after {
-    transition: none !important;
-    animation: none !important;
+  .prospero-sidebar [data-liquid-glass="nav"][data-active] {
+    color: var(--sidebar-accent-foreground);
+    background: var(--sidebar-accent);
+    box-shadow: none;
   }
-  [data-liquid-glass]::before { display: none; }
-}
-
+  .liquid-button {
+    border-radius: var(--ui-radius-panel);
+    border-color: var(--border);
+    background: var(--secondary);
+    box-shadow: none;
+    transition: background-color 120ms ease;
+  }
+  .liquid-button.liquid-primary {
+    min-height: 34px;
+    padding-inline: 14px;
+    color: var(--primary-foreground);
+    border-color: transparent;
+    background: var(--primary);
+  }
+  .liquid-button:not(:disabled):not([aria-disabled="true"]):hover { background: var(--surface-3); }
+  .liquid-button.liquid-primary:not(:disabled):not([aria-disabled="true"]):hover { background: var(--primary-hover); }
+  :is([data-liquid-glass="nav"], .liquid-button):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
 }
 
 @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
@@ -1566,12 +1516,17 @@ label.check-row { display: flex; }
 :root[data-platform="darwin"] { --radius: 8px; --ui-radius-control: 6px; --ui-radius-panel: 8px; --ui-radius-window: 12px; }
 :root[data-platform="win32"] .windows-titlebar { border-bottom: 0; }
 :root[data-platform="win32"] .sidebar-content-shell { padding-top: 0; }
-.create-dialog-tabs { gap: 16px; min-width: 0; }
+/* Keep the decision and action visible while the form itself scrolls. */
+.new-session-dialog { overflow: hidden; display: flex; flex-direction: column; }
+.session-create-fields { min-width: 0; min-height: 0; margin: 0; padding: 2px; border: 0; overflow-y: auto; overscroll-behavior: contain; }
+.create-dialog-tabs { gap: 16px; min-width: 0; min-height: 0; overflow: hidden; }
+.create-dialog-tabs > [data-slot="tabs-list"] { flex-shrink: 0; }
+.new-session-dialog > [data-slot="dialog-header"] { flex-shrink: 0; }
 .create-dialog-tabs > [data-slot="tabs-list"] { width: 100%; justify-content: flex-start; border-bottom: 1px solid var(--border); padding: 0 0 8px; height: auto; }
 .create-dialog-tabs > [data-slot="tabs-list"] > [data-slot="tabs-trigger"] { flex: none; padding: 5px 12px; font-weight: 400; }
-.create-dialog-panel:not([hidden]) { display: flex; flex-direction: column; gap: 20px; }
+.create-dialog-panel:not([hidden]) { display: flex; flex-direction: column; gap: 16px; min-height: 0; overflow-y: auto; }
 .create-dialog-panel[hidden] { display: none; }
-.create-dialog-panel > [data-slot="dialog-footer"] { margin: 0; }
+.create-dialog-panel > [data-slot="dialog-footer"] { flex-shrink: 0; margin: 0; padding-top: 12px; border-top: 1px solid var(--border); background: var(--popover); }
 
 .create-dialog-tabs > [data-slot="tabs-list"] > [data-active] { color: var(--foreground); }
 
@@ -1579,3 +1534,53 @@ label.check-row { display: flex; }
 :root[data-platform="win32"] .prospero-sidebar[data-mobile="true"] > [data-slot="sheet-close"] { display: inline-flex; top: 8px; right: 8px; }
 
 :root[data-platform="win32"] .sidebar-shell-header { justify-content: flex-start; }
+
+/* Keep the setup return path outside the scrolling account editor. */
+.session-draft-banner { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.session-draft-banner > div { flex: 1 1 180px; min-width: 0; }
+.session-draft-banner strong { font-size: var(--ui-text-small); }
+.session-draft-banner p { margin: 3px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); font-size: var(--ui-text-caption); }
+
+.main-viewport.has-session-draft { display: flex; flex-direction: column; }
+.main-viewport.has-session-draft > .accounts-page { flex: 1; min-height: 0; height: auto; }
+
+.create-dialog-panel > [data-slot="dialog-footer"] { flex-wrap: wrap; flex-direction: row; }
+.session-create-status { flex: 0 0 100%; margin: 0; color: var(--muted-foreground); font-size: var(--ui-text-caption); line-height: 1.5; }
+
+/* Secondary tab actions stay discoverable on hover and keyboard focus. */
+@media (hover: hover) and (pointer: fine) {
+  .workspace-tab-action { opacity: 0; pointer-events: none; }
+  .workspace-tab:hover .workspace-tab-action,
+  .workspace-tab:focus-within .workspace-tab-action,
+  .workspace-tab-action.is-pinned,
+  .workspace-tab.is-active [data-slot="workspace-tab-close"] { opacity: 1; pointer-events: auto; }
+}
+.workspace-split-label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: var(--ui-text-caption); }
+.workspace-split-label svg { width: 14px; height: 14px; }
+.chat-composer-options { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 0; }
+.chat-composer-options[hidden] { display: none; }
+
+/* Chat actions replace the status indicator on hover, without shifting titles. */
+.workspace-session-item { position: relative; }
+.workspace-session-link { padding-right: 62px; }
+.workspace-session-pin, .workspace-pinned-item > .session-pin-action { right: 30px; }
+.workspace-session-archive { position: absolute; top: 50%; right: 5px; transform: translateY(-50%); display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: var(--ui-radius-control); background: transparent; color: var(--muted-foreground); opacity: 0; pointer-events: none; }
+.workspace-session-archive svg { width: 14px; height: 14px; }
+.workspace-session-item:hover > .workspace-session-archive,
+.workspace-session-item:focus-within > .workspace-session-archive,
+.workspace-session-item:focus-within > .workspace-session-pin { opacity: 1; pointer-events: auto; }
+.workspace-session-item:hover .workspace-session-link > .status-mark,
+.workspace-session-item:focus-within .workspace-session-link > .status-mark { opacity: 0; }
+.workspace-session-archive:hover { color: var(--foreground); background: var(--sidebar-accent); }
+.workspace-session-archive:focus-visible, .workspace-session-pin:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+@media (hover: none) { .workspace-session-archive, .workspace-session-pin { opacity: 1; pointer-events: auto; } .workspace-session-link > .status-mark { right: 58px; } .workspace-session-link { padding-right: 76px; } }
+
+.archived-chat-row { display: flex; gap: 12px; align-items: center; padding-block: 8px; border-bottom: 1px solid var(--border); }
+.archived-chat-row > div { display: grid; gap: 4px; min-width: 0; flex: 1; }
+.archived-chat-row strong, .archived-chat-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archived-chat-row small { color: var(--muted-foreground); }
+.prospero-sidebar .workspace-session-link[data-active],
+.prospero-sidebar .workspace-session-item:hover > .workspace-session-link,
+.prospero-sidebar .workspace-session-item:focus-within > .workspace-session-link { background: color-mix(in srgb, var(--sidebar-foreground) 10%, transparent); color: var(--sidebar-foreground); box-shadow: none; }
+
+.session-action-error { position: absolute; z-index: 45; top: 12px; left: 12px; right: 12px; width: auto; max-height: 50%; overflow: auto; background: var(--popover); box-shadow: var(--shadow); }

@@ -684,7 +684,19 @@ impl Store {
                 resync_required: true,
             });
         }
-        let mut statement = transaction.prepare("SELECT seq,kind,entity_id,payload FROM change_events WHERE scope=?1 AND seq>?2 ORDER BY seq LIMIT ?3")?;
+        // The desktop polls idle streams frequently. The head read already
+        // proves there can be no rows; avoid preparing/scanning the event table.
+        if after == latest {
+            return Ok(EventPage {
+                items: vec![],
+                next_seq: latest,
+                latest_seq: latest,
+                floor_seq: floor,
+                has_more: false,
+                resync_required: false,
+            });
+        }
+        let mut statement = transaction.prepare_cached("SELECT seq,kind,entity_id,payload FROM change_events WHERE scope=?1 AND seq>?2 ORDER BY seq LIMIT ?3")?;
         let rows = statement.query_map(params![scope, after, (limit + 1) as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)?,

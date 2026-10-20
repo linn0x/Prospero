@@ -84,12 +84,22 @@ def seal(directory, manifest):
     os.chmod(target, 0o600)
 
 
-def safe_tree(directory):
+def safe_tree(directory, *, ignore_account_caches=False):
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError(f'expected real directory: {directory}')
-    for path in directory.rglob('*'):
+    pending = list(directory.iterdir())
+    while pending:
+        path = pending.pop()
         if path.is_symlink() or not (path.is_file() or path.is_dir()):
             raise ValueError(f'symlink, linked or special file in source: {path}')
+        if not path.is_dir():
+            continue
+        parts = path.relative_to(directory).parts
+        if (ignore_account_caches and parts[-2:] == ('tmp', 'arg0')
+                and any(parts[index:index + 2] in (('agent-accounts', 'codex'), ('agent-accounts', 'codex-usage'))
+                        for index in range(len(parts) - 2))):
+            continue
+        pending.extend(path.iterdir())
 
 
 def file_signature(path):
@@ -121,7 +131,7 @@ def snapshot_hosts(source, stage, stack):
     host_root = source / 'execution-hosts'
     if not host_root.exists():
         return []
-    safe_tree(host_root)
+    safe_tree(host_root, ignore_account_caches=True)
     with connection(stage / 'prospero.sqlite') as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not {'orch_host_registry', 'orch_executions', 'orch_operations_v2'} <= tables:
@@ -138,7 +148,7 @@ def snapshot_hosts(source, stage, stack):
             raise ValueError('retired Host directory is missing')
         expected.add((host_id, epoch))
         driver = directory / 'driver-state'
-        safe_tree(driver)
+        safe_tree(driver, ignore_account_caches=True)
         stack.enter_context(lock_owner(driver))
         inspect(driver / 'prospero.sqlite')
     actual = set()
@@ -191,7 +201,7 @@ def snapshot_hosts(source, stage, stack):
 def backup(source, destination, binaries):
     if source.is_symlink() or not source.is_dir() or destination.exists() or destination.is_symlink():
         raise ValueError('source must be a real directory and destination must not exist')
-    safe_tree(source)
+    safe_tree(source, ignore_account_caches=True)
     regular(source / 'prospero.sqlite')
     with lock_owner(source), ExitStack() as stack:
         inspect(source / 'prospero.sqlite')

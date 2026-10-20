@@ -384,6 +384,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   openTerminalStream(sessionId: string, requestId: string): Promise<{ supported: boolean }>;
   writeClipboard(value: string): Promise<{ ok: boolean }>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
+  forkSession(sessionId: string): Promise<SessionInfo>;
   createCrossModelChild(sessionId: string, input: { sourceId: string; routeId: string; revision: number; agent: "codex" | "claude" | "opencode"; task: string; title?: string }): Promise<JsonObject>;
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;

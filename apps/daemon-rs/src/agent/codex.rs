@@ -1759,6 +1759,44 @@ pub(super) async fn spawn_turn(
     })
 }
 
+pub(super) async fn fork_thread(
+    data: &Path,
+    workspace: &str,
+    source: &str,
+    options: &TurnOptions,
+) -> Result<String> {
+    let (environment, args) = if let Some(profile) = options.api_profile.as_ref() {
+        if profile.protocol() != "openai_responses" {
+            return Err(Error::Invalid("此账号不支持 Codex 聊天分支".into()));
+        }
+        (
+            options.environment.clone(),
+            crate::accounts::profile::codex_app_server_args(profile),
+        )
+    } else {
+        let (_, mut environment) = super::usage::native_codex_environment(data)?;
+        environment.extend(options.environment.iter().cloned());
+        (environment, Vec::new())
+    };
+    let mut rpc = StartingRpc::start(data, workspace, &environment, &args).await?;
+    let result = async {
+        rpc.request("initialize", json!({"clientInfo":{"name":"prospero","title":"Prospero","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true,"requestAttestation":false}})).await?;
+        rpc.notify("initialized", json!({})).await?;
+        let policy = execution_policy(workspace, options.policy);
+        let reply = rpc.request("thread/fork", json!({"threadId":source,"cwd":workspace,"excludeTurns":true,"approvalPolicy":policy.approval_policy,"sandbox":policy.sandbox})).await?;
+        let id = reply.get("thread").and_then(|thread| thread.get("id")).and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id != source).ok_or_else(|| Error::Invalid("Codex 未返回独立的分支线程".into()))?;
+        crate::database::validate_id(id)?;
+        rpc.cleanup.record_thread(id);
+        Ok(id.to_owned())
+    }.await;
+    let quiescence = rpc.cleanup.terminate(&mut rpc.child).await;
+    if matches!(quiescence, Quiescence::Unknown) {
+        return Err(super::lifecycle::cleanup_error(Error::Conflict, quiescence));
+    }
+    result
+}
+
 pub(super) async fn read_subagent_history_once(
     data: &Path,
     workspace: &str,

@@ -114,6 +114,33 @@ fn clone_timeline_writes(writes: &[TimelineWrite]) -> Vec<TimelineWrite> {
         .collect()
 }
 
+fn copy_fork_attachments(data: &Path, source: &str, destination: &str) -> Result<()> {
+    fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(source)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Invalid("附件路径包含符号链接，无法创建分支".into()));
+        }
+        if metadata.is_dir() {
+            std::fs::create_dir_all(destination)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+            }
+        } else if metadata.is_file() {
+            std::fs::copy(source, destination)?;
+        } else {
+            return Err(Error::Invalid("附件类型无效".into()));
+        }
+        Ok(())
+    }
+    let root = data.join("attachments").join(source);
+    match std::fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => copy_tree(&root, &data.join("attachments").join(destination)),
+    }
+}
+
 fn attachment_path(
     data: &Path,
     session_id: &str,
@@ -893,6 +920,15 @@ impl Agents {
         input: CreateAgentSession,
         id: Option<String>,
     ) -> Result<SessionHead> {
+        self.create_inner_with_history(input, id, None).await
+    }
+
+    async fn create_inner_with_history(
+        &self,
+        input: CreateAgentSession,
+        id: Option<String>,
+        history: Option<(String, i64)>,
+    ) -> Result<SessionHead> {
         crate::database::validate_text(&input.title, 512, false)?;
         if input.workspace.len() > 4096 || input.workspace.trim().is_empty() {
             return Err(Error::Invalid("invalid workspace".into()));
@@ -1102,7 +1138,7 @@ impl Agents {
                         }
                     }
                 }
-                store.create_agent_session_with_id(create, policy, id)
+                store.create_agent_session_with_history(create, policy, id, history)
             })
             .await?;
         self.0.entries.lock().await.insert(
@@ -1120,6 +1156,101 @@ impl Agents {
         );
         self.publish();
         Ok(head)
+    }
+
+    /// Fork stored chat history into a distinct native conversation and independent timeline.
+    pub async fn fork_chat(&self, source: &str) -> Result<SessionHead> {
+        crate::database::validate_id(source)?;
+        let source_id = source.to_owned();
+        let (head, run) = self
+            .0
+            .database
+            .call(move |store| Ok((store.session(&source_id)?, store.agent_run(&source_id)?)))
+            .await?;
+        if !matches!(run.agent, AgentKind::Codex | AgentKind::Claude)
+            || head.kind != SessionKind::Structured
+        {
+            return Err(Error::Invalid(
+                "当前仅 Codex 和 Claude 对话支持保留历史的聊天分支".into(),
+            ));
+        }
+        if !matches!(head.status, SessionStatus::Idle | SessionStatus::Completed) {
+            return Err(Error::Invalid("请等待当前轮次结束后创建聊天分支".into()));
+        }
+        let native_id = run
+            .native_id
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("此聊天尚无可分支的历史".into()))?;
+        let options = TurnOptions {
+            policy: run.policy,
+            mode: run.mode,
+            model: run.model.clone(),
+            effort: run.effort.clone(),
+            environment: Self::account_environment(&self.0.database, run.account_id.clone())
+                .await?,
+            api_profile: Self::account_api_profile(&self.0.database, run.account_id.clone())
+                .await?,
+            agent_preset: run.agent_preset.clone(),
+        };
+        let forked_id = if run.agent == AgentKind::Claude {
+            super::claude::fork_session(&head.workspace, native_id, &options).await?
+        } else {
+            super::codex::fork_thread(
+                self.0.database.directory(),
+                &head.workspace,
+                native_id,
+                &options,
+            )
+            .await?
+        };
+        let new_id = uuid::Uuid::new_v4().to_string();
+        // Copy attachment files before publishing the new session, never follow links.
+        let data = self.0.database.directory().to_owned();
+        let source_id = source.to_owned();
+        let destination_id = new_id.clone();
+        let copied = tokio::task::spawn_blocking(move || {
+            copy_fork_attachments(&data, &source_id, &destination_id)
+        })
+        .await
+        .map_err(|_| Error::Closed)?;
+        if let Err(error) = copied {
+            let _ = std::fs::remove_dir_all(
+                self.0
+                    .database
+                    .directory()
+                    .join("attachments")
+                    .join(&new_id),
+            );
+            return Err(error);
+        }
+        let created = self
+            .create_inner_with_history(
+                CreateAgentSession {
+                    agent: run.agent,
+                    title: head.title.chars().take(480).collect::<String>() + " · 分支",
+                    workspace: head.workspace,
+                    auto_approve: run.policy == ApprovalPolicy::Auto,
+                    mode: Some(run.mode.label().into()),
+                    model: run.model,
+                    effort: run.effort,
+                    agent_preset: run.agent_preset,
+                    account_id: run.account_id,
+                    resume: Some(super::ResumeInput {
+                        id: forked_id,
+                        title: None,
+                        fork: None,
+                    }),
+                },
+                Some(new_id.clone()),
+                Some((source.to_owned(), run.turn)),
+            )
+            .await;
+        if created.is_err() {
+            let _ = std::fs::remove_dir_all(
+                self.0.database.directory().join("attachments").join(new_id),
+            );
+        }
+        created
     }
 
     /// Start an independent child structured session against a selected model

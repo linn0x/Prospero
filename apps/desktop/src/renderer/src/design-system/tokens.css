@@ -73,11 +73,11 @@
   --overlay: #ffffff;
   --scrim: #17203366;
   --shadow: 0 18px 50px #24345117;
-  --chrome-glass: color-mix(in srgb, var(--sidebar) 30%, transparent);
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 68%, transparent);
   --chrome-highlight: #ffffff66;
   --overlay-glass: color-mix(in srgb, var(--popover) 84%, transparent);
   --glass-border: color-mix(in srgb, var(--foreground) 12%, transparent);
-  --glass-filter: blur(18px) saturate(125%);
+  --glass-filter: blur(18px) saturate(108%);
   --glass-shadow: 0 18px 48px #24345124;
   --glass-scrim: #1720332e;
   --liquid-fill: color-mix(in srgb, var(--surface-1) 76%, transparent);
@@ -176,7 +176,7 @@
   --secondary: var(--surface-2);
   --input: var(--border-strong);
   --shadow: 0 22px 64px #0000006e;
-  --chrome-glass: color-mix(in srgb, var(--sidebar) 36%, transparent);
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 72%, transparent);
   --chrome-highlight: #ffffff1f;
   --overlay-glass: color-mix(in srgb, var(--popover) 86%, transparent);
   --glass-border: color-mix(in srgb, var(--foreground) 18%, transparent);

@@ -1,8 +1,7 @@
-import { TerminalMouseToggle } from "./TerminalMouseToggle";
+import { writeTerminalMousePreference } from "./TerminalMouseToggle";
 import { sessionTabName } from "./session-tab-labels";
 import { useRef, useState } from "react";
-import { Files, GitBranch, Search } from "lucide-react";
-import { openProjectTools } from "../project-tools/tool-state";
+import { Columns2, MousePointer2 } from "lucide-react";
 import { DesktopIcon } from "../design-system/icons";
 import type { JsonObject, NativeTerminalState, SessionInfo } from "../../../shared/types";
 import { Button } from "../components/ui/button";
@@ -12,7 +11,7 @@ import { reportError, shortPath } from "../state";
 
 import { sessionLabel, StatusMark } from "./session-presentation";
 
-export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus, localSelection, onLocalSelectionChange, nativeTerminal = false, nativeTerminalState, onNativeTerminalAction }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void; localSelection: boolean; onLocalSelectionChange: (value: boolean) => void; nativeTerminal?: boolean; nativeTerminalState?: NativeTerminalState; onNativeTerminalAction?: (action: "acquire" | "takeover" | "release" | "reconnect") => void }) {
+export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus, localSelection, onLocalSelectionChange, nativeTerminal = false, nativeTerminalState, onNativeTerminalAction, onSplit }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void; localSelection: boolean; onLocalSelectionChange: (value: boolean) => void; onSplit?: (() => void) | undefined; nativeTerminal?: boolean; nativeTerminalState?: NativeTerminalState; onNativeTerminalAction?: (action: "acquire" | "takeover" | "release" | "reconnect") => void }) {
   const { t } = useLocale();
   const label = sessionTabName(session);
   const project = session.cwd.split(/[\\/]/).filter(Boolean).at(-1);
@@ -41,16 +40,13 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
     <header className="pane-toolbar session-toolbar">
       <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}><StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} /><strong>{label === project ? shortPath(session.cwd) : label}</strong>{label !== project && <small>{shortPath(session.cwd)}</small>}</div>
       <div className="pane-toolbar-actions">
-        {session.kind === "pty" && !nativeTerminal && <TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={onLocalSelectionChange} />}
-        <Button variant="ghost" size="icon-sm" aria-label={t("浏览项目文件", "Browse project files")} title={t("浏览项目文件", "Browse project files")} onClick={() => openProjectTools(session.cwd)}><Files /></Button>
-        <Button variant="ghost" size="icon-sm" aria-label={t("搜索项目内容", "Search project contents")} title={t("搜索项目内容", "Search project contents")} onClick={() => openProjectTools(session.cwd, "search")}><Search /></Button>
-        <Button variant="ghost" size="icon-sm" aria-label={t("查看 Git 变更", "Review Git changes")} title={t("查看 Git 变更", "Review Git changes")} onClick={() => openProjectTools(session.cwd, "git")}><GitBranch /></Button>
-
-        <Button variant="ghost" size="icon-sm" aria-label={isMac ? t("在系统终端打开工作区", "Open workspace in system terminal") : t("在 Windows Terminal 中打开", "Open in Windows Terminal")} title={t("外部终端", "External terminal")} disabled={busy} onClick={() => void action(() => window.prospero.openWindowsTerminal(session.cwd), t("已打开终端", "Terminal opened"))}><DesktopIcon name="terminal" /></Button>
-        <Button variant="ghost" size="icon-sm" disabled={busy || !["running", "starting", "waiting_input", "waiting_approval"].includes(session.status)} aria-label={t("停止当前轮次", "Stop current turn")} title={t("停止当前轮次", "Stop current turn")} onClick={() => void action(() => window.prospero.interruptSession(session.id))}><DesktopIcon name="stop" /></Button>
-        <Button variant="ghost" size="icon-sm" aria-label={t("切换工具栏", "Toggle tools")} title={t("文件、搜索、Git 与会话工具", "Files, search, Git and session tools")} aria-pressed={contextVisible} onClick={onToggleContext}><DesktopIcon name="sidebar" /></Button>
+        {["running", "starting", "waiting_input", "waiting_approval"].includes(session.status) && <Button variant="ghost" size="sm" disabled={busy} aria-label={t("停止当前轮次", "Stop current turn")} onClick={() => void action(() => window.prospero.interruptSession(session.id))}><DesktopIcon name="stop" />{t("停止", "Stop")}</Button>}
+        <Button variant="ghost" size="sm" aria-label={t("切换工具栏", "Toggle tools")} title={t("文件、搜索、Git 与会话工具", "Files, search, Git and session tools")} aria-pressed={contextVisible} onClick={onToggleContext}><DesktopIcon name="sidebar" />{t("工具", "Tools")}</Button>
+        <Button variant="ghost" size="sm" aria-label={t("进入专注模式", "Enter focus mode")} onClick={onToggleFocus}><DesktopIcon name="expand" />{t("专注", "Focus")}</Button>
         <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label={t("会话操作", "Session actions")} />}><DesktopIcon name="more" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>
-          <DropdownMenuItem onClick={onToggleFocus}><DesktopIcon name="expand" />{t("进入专注模式", "Enter focus mode")}<span className="ml-auto text-xs text-muted-foreground">{isMac ? "⌘⌥F" : "Ctrl+Alt+F"}</span></DropdownMenuItem>
+          {onSplit && <DropdownMenuItem onClick={onSplit}><Columns2 />{t("分屏查看会话", "Split sessions")}</DropdownMenuItem>}
+          {session.kind === "pty" && !nativeTerminal && <DropdownMenuItem onClick={() => { writeTerminalMousePreference(!localSelection, undefined, session.id); onLocalSelectionChange(!localSelection); }}><MousePointer2 />{localSelection ? t("启用应用鼠标交互", "Enable application mouse interaction") : t("恢复本地选字", "Restore local text selection")}</DropdownMenuItem>}
+          <DropdownMenuItem disabled={busy} onClick={() => void action(() => window.prospero.openWindowsTerminal(session.cwd), t("已打开终端", "Terminal opened"))}><DesktopIcon name="terminal" />{t("在外部终端打开", "Open in external terminal")}</DropdownMenuItem>
           {nativeCanRelease && <DropdownMenuItem onClick={() => onNativeTerminalAction?.("release")}><DesktopIcon name="terminal" />{t("释放终端控制", "Release terminal control")}</DropdownMenuItem>}
           {nativeCanAcquire && <>
             <DropdownMenuItem onClick={() => onNativeTerminalAction?.("acquire")}><DesktopIcon name="terminal" />{t("请求终端控制", "Request terminal control")}</DropdownMenuItem>

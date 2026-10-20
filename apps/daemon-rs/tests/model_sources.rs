@@ -37,11 +37,25 @@ timeout = True
 #[derive(Clone)]
 struct CatalogState {
     hits: Arc<AtomicUsize>,
+    auth: Arc<Mutex<Vec<String>>>,
     body: Arc<Mutex<Value>>,
 }
 
-async fn models(State(state): State<CatalogState>) -> axum::response::Response {
+async fn models(
+    State(state): State<CatalogState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     state.hits.fetch_add(1, Ordering::SeqCst);
+    let scheme = if headers.get("authorization").and_then(|v| v.to_str().ok())
+        == Some(format!("Bearer {SECRET}").as_str())
+    {
+        "bearer"
+    } else if headers.get("x-api-key").and_then(|v| v.to_str().ok()) == Some(SECRET) {
+        "anthropic"
+    } else {
+        "missing"
+    };
+    state.auth.lock().unwrap().push(scheme.into());
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -53,6 +67,7 @@ async fn models(State(state): State<CatalogState>) -> axum::response::Response {
 struct FakeServer {
     base_url: String,
     hits: Arc<AtomicUsize>,
+    auth: Arc<Mutex<Vec<String>>>,
 }
 
 fn spawn_server() -> FakeServer {
@@ -61,11 +76,13 @@ fn spawn_server() -> FakeServer {
     let port = listener.local_addr().unwrap().port();
     let state = CatalogState {
         hits: Arc::new(AtomicUsize::new(0)),
+        auth: Arc::new(Mutex::new(vec![])),
         body: Arc::new(Mutex::new(
             json!({"data":[{"id":"claude-test","display_name":"Claude Test","capabilities":{"tools":true}}]}),
         )),
     };
     let hits = state.hits.clone();
+    let auth = state.auth.clone();
     let app = axum::Router::new()
         .route("/v1/models", get(models))
         .with_state(state);
@@ -76,6 +93,7 @@ fn spawn_server() -> FakeServer {
     FakeServer {
         base_url: format!("http://127.0.0.1:{port}"),
         hits,
+        auth,
     }
 }
 
@@ -187,6 +205,7 @@ async fn source_create_list_models_bind_and_delete_flow() {
     assert_eq!(status, StatusCode::OK, "{catalog}");
     assert_eq!(catalog["models"][0]["id"], "claude-test");
     assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(*server.auth.lock().unwrap(), vec!["anthropic"]);
 
     let (status, bound) = harness
         .post(envelope(
@@ -244,6 +263,18 @@ async fn source_supports_openai_compatible_routes() {
     let source_id = source["id"].as_str().unwrap();
     let route_id = source["routes"][0]["id"].as_str().unwrap();
     let revision = source["revision"].as_i64().unwrap();
+
+    for protocol in ["openai_responses", "openai_chat_completions"] {
+        let (status, catalog) = harness
+            .post(envelope(json!({
+                "kind":"models", "sourceId":source_id, "revision":revision,
+                "protocol":protocol, "credentialId":source["credentials"][0]["id"]
+            })))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(catalog["ok"], true, "{catalog}");
+    }
+    assert_eq!(*server.auth.lock().unwrap(), vec!["bearer", "bearer"]);
 
     let (status, bound) = harness
         .post(envelope(

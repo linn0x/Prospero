@@ -338,6 +338,14 @@ pub(super) async fn quarantine_legacy_start(
         store.reliability_transaction(|tx|{
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM orch_operations_v2 WHERE operation_id=?1)",[&id],|row|row.get(0))?;
             if exists{return Ok(());}
+            let task_has_unsettled_execution: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orch_executions WHERE task_id=?1 AND state!='finalized')",
+                [&start.task_id],
+                |row| row.get(0),
+            )?;
+            if task_has_unsettled_execution {
+                return Ok(());
+            }
             let epoch:i64=tx.query_row("SELECT COALESCE(MAX(execution_epoch),0)+1 FROM orch_executions WHERE task_id=?1",[&start.task_id],|row|row.get(0))?;
             let attempt=super::start::worker_session_id(&id);
             let request=serde_json::json!({"legacyStartId":id,"taskId":start.task_id});

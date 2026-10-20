@@ -406,6 +406,7 @@ impl Api {
             .route("/ws", get(remote_ws))
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
+            .route("/v1/agent-sessions/{id}/fork", post(fork_agent_chat))
             .route(
                 "/v1/cross-model-children",
                 get(list_all_cross_model_children),
@@ -4103,6 +4104,8 @@ fn health_capabilities() -> Vec<String> {
         "chat.attachment-previews.v1",
         "agent.deepseek-harness.v1",
         "model.sources.v1",
+        "session.codex-fork.v1",
+        "session.claude-fork.v1",
         "orchestration.automation.v1",
         "scheduled-agents.v1",
         "session.workspace.summary",
@@ -4679,7 +4682,7 @@ async fn model_sources_route(
         axum::extract::rejection::JsonRejection,
     >,
 ) -> Response {
-    use crate::accounts::models::{FeatureError, fetch_models};
+    use crate::accounts::models::{FeatureError, fetch_models_with_protocol};
     use crate::accounts::sources::{BindOutcome, SourceAction, SourceResult};
 
     let Json(control) = match body {
@@ -4741,7 +4744,13 @@ async fn model_sources_route(
                 }
             };
             let headers = target.0.headers.clone().unwrap_or_else(BTreeMap::new);
-            let models = fetch_models(&target.0.base_url, &target.1, &headers).await;
+            let models = fetch_models_with_protocol(
+                &target.0.protocol,
+                &target.0.base_url,
+                &target.1,
+                &headers,
+            )
+            .await;
             match models {
                 Ok(models) => {
                     let mut result = SourceResult::success(&request_id);
@@ -5679,6 +5688,16 @@ async fn launch_models(
         .or_else(|| Some(crate::accounts::NATIVE_CLAUDE_ID.into()));
     let catalog = api.agents.launch_catalog_for(account_id.as_deref()).await?;
     Ok(Json(catalog))
+}
+
+async fn fork_agent_chat(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<SessionHead>, ApiError> {
+    let _permit = api.api_features.try_acquire().map_err(|_| Error::Busy)?;
+    let head = api.agents.fork_chat(&id).await?;
+    api.publish();
+    Ok(Json(head))
 }
 
 async fn agent_interrupt(

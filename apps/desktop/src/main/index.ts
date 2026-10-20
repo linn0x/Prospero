@@ -1343,6 +1343,11 @@ function installIpc(): void {
     if (typeof message["type"] !== "string" || !INTERACTION_TYPES.has(message["type"])) throw new Error("不支持的会话操作");
     return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/interact`, { method: "POST", body: message });
   });
+  ipcMain.handle("session:fork", async (_event, rawId: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (!RUST_BACKEND) throw new Error("聊天分支需要 Rust daemon");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/fork`, { method: "POST", timeoutMs: 180_000 });
+  });
   ipcMain.handle("session:interrupt", (_event, rawId: unknown) => runtime.request(`/_prospero/control/session/${encodeURIComponent(requireId(rawId, "会话"))}/interrupt`, { method: "POST" }));
   ipcMain.handle("session:kill", async (_event, rawId: unknown) => {
     const sessionId = requireId(rawId, "会话");

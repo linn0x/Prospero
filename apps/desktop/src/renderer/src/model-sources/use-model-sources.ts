@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ModelSource, ModelSourceAction, S2CModelSourceResult } from "../../../shared/types";
+import type { ModelSource } from "../../../shared/types";
 import { reportError } from "../state";
 
-export async function runModelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult> {
-  const result = await window.prospero.modelSourceAction(action);
-  if (!result.ok) throw new Error(result.error?.message ?? "模型源操作失败 / Model source action failed");
-  return result;
-}
+import { createSourceRequester } from "./source-requests";
+
+export const runModelSourceAction = createSourceRequester(action => window.prospero.modelSourceAction(action));
 
 export function useModelSources(supported: boolean) {
   const [sources, setSources] = useState<ModelSource[]>([]);

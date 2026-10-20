@@ -56,7 +56,7 @@ def emit(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
 
-emit({"type": "system", "subtype": "init", "session_id": "native-1"})
+emit({"type": "system", "subtype": "init", "session_id": (resume if scenario == "claudefork" and resume else "native-1")})
 
 def read_line_raw():
     # Read straight from fd 0: a BufferedReader readline can pull coalesced
@@ -115,7 +115,7 @@ elif scenario == "usageduplicate":
 elif scenario == "usage":
     text_block("usage counted")
     result(input_tokens=12, output_tokens=7, cost_usd=0.25)
-elif scenario == "resume":
+elif scenario in ("resume", "claudefork"):
     text_block("second turn" if resume else "first turn")
     result()
 elif scenario == "approval":
@@ -369,7 +369,13 @@ for line in sys.stdin:
             emit({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32001, "message": "bad model provider", "data": {"hint": "wire_api invalid"}}})
             continue
         respond(rpc_id, {"thread": {"id": next_thread}})
+    elif method == "thread/fork":
+        with open(os.path.join(os.getcwd(), "thread-fork.json"), "w") as log:
+            log.write(json.dumps(params))
+        respond(rpc_id, {"thread": {"id": "thread-forked", "forkedFromId": params.get("threadId")}})
     elif method == "thread/resume":
+        with open(os.path.join(os.getcwd(), "thread-resume.json"), "w") as log:
+            log.write(json.dumps(params))
         respond(rpc_id, {"thread": {"id": params.get("threadId", "thread-resumed")}})
     elif method == "thread/read":
         with open(os.path.join(os.getcwd(), "thread-read.json"), "w") as log:
@@ -647,6 +653,7 @@ impl Drop for Harness {
         unsafe {
             std::env::remove_var("PROSPERO_CLAUDE_BIN");
             std::env::remove_var("PROSPERO_CODEX_BIN");
+            std::env::remove_var("PROSPERO_CLAUDE_FORK_HELPER");
         }
     }
 }
@@ -3561,4 +3568,194 @@ async fn usage_keeps_missing_metrics_unknown_and_deduplicates_terminal_frames() 
         assert_eq!(usage.usage_complete, Some(complete));
         assert_eq!(usage.usage_finalized, Some(true));
     }
+}
+
+#[tokio::test]
+async fn codex_chat_fork_copies_history_and_continues_an_independent_native_thread() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let source = harness.create_codex().await;
+    assert!(
+        harness.agents.fork_chat(&source.id).await.is_err(),
+        "An empty conversation has no history to fork"
+    );
+    harness
+        .agents
+        .send(
+            &source.id,
+            "Remember the original context".into(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    harness.wait_for(&source.id, |records| records.iter().any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed"))).await;
+    for _ in 0..100 {
+        if harness.status(&source.id).await == prosperod_rs::protocol::SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let original = harness.records(&source.id).await;
+    let attachment = harness
+        ._data
+        .path()
+        .join("attachments")
+        .join(&source.id)
+        .join("turn1-user")
+        .join("image");
+    std::fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+    std::fs::write(&attachment, b"fixture image bytes").unwrap();
+    let branch = harness.agents.fork_chat(&source.id).await.unwrap();
+    assert_ne!(branch.id, source.id);
+    assert_eq!(branch.account_id, source.account_id);
+    assert_eq!(branch.model, source.model);
+    assert_eq!(branch.effort, source.effort);
+    assert_eq!(
+        serde_json::to_value(harness.records(&branch.id).await).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(
+            harness
+                ._data
+                .path()
+                .join("attachments")
+                .join(&branch.id)
+                .join("turn1-user/image")
+        )
+        .unwrap(),
+        b"fixture image bytes"
+    );
+    let request: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(harness.workspace.path().join("thread-fork.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["threadId"], "thread-created");
+    assert_eq!(request["excludeTurns"], true);
+    assert!(
+        !harness.workspace.path().join("thread-resume.json").exists(),
+        "Forking must not resume/write the source thread"
+    );
+    harness
+        .agents
+        .send(
+            &branch.id,
+            "Take a different direction".into(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    harness
+        .wait_for(&branch.id, |records| {
+            records.iter().any(|(id, body, _)| {
+                id.starts_with("turn2")
+                    && matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
+            })
+        })
+        .await;
+    let resumed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(harness.workspace.path().join("thread-resume.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resumed["threadId"], "thread-forked");
+    assert_eq!(
+        serde_json::to_value(harness.records(&source.id).await).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn codex_chat_fork_rejects_running_turn_without_creating_a_branch() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexhang").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let source = harness.create_codex().await;
+    harness
+        .agents
+        .send(&source.id, "keep running".into(), None, Vec::new())
+        .await
+        .unwrap();
+    assert!(harness.agents.fork_chat(&source.id).await.is_err());
+    assert!(!harness.workspace.path().join("thread-fork.json").exists());
+    harness.agents.close(&source.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_chat_fork_resumes_new_native_session_and_preserves_source() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("claudefork").await;
+    let helper = harness.workspace.path().join("fork-helper.cjs");
+    std::fs::write(&helper, r#"const fs=require('node:fs');fs.writeFileSync('claude-fork-call.json',JSON.stringify({source:process.argv[2],workspace:process.argv[3]}));console.log(JSON.stringify({sessionId:'22222222-2222-4222-8222-222222222222'}));"#).unwrap();
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_FORK_HELPER", &helper);
+    }
+    let source = harness.create().await;
+    harness
+        .agents
+        .send(&source.id, "original context".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness.wait_for(&source.id, |rows| rows.iter().any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed"))).await;
+    for _ in 0..100 {
+        if harness.status(&source.id).await == prosperod_rs::protocol::SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before = serde_json::to_value(harness.records(&source.id).await).unwrap();
+    let branch = harness.agents.fork_chat(&source.id).await.unwrap();
+    assert_eq!(branch.agent, prosperod_rs::protocol::AgentKind::Claude);
+    assert_ne!(branch.id, source.id);
+    assert_eq!(
+        serde_json::to_value(harness.records(&branch.id).await).unwrap(),
+        before
+    );
+    let request: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(harness.workspace.path().join("claude-fork-call.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["source"], "native-1");
+    harness
+        .agents
+        .send(&branch.id, "branch context".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&branch.id, |rows| {
+            rows.iter().any(|(id, body, _)| {
+                id.starts_with("turn2")
+                    && matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
+            })
+        })
+        .await;
+    assert_eq!(
+        serde_json::to_value(harness.records(&source.id).await).unwrap(),
+        before
+    );
+    let log = std::fs::read_to_string(harness.workspace.path().join("turns.log")).unwrap();
+    assert!(
+        log.contains("resume=22222222-2222-4222-8222-222222222222"),
+        "{log}"
+    );
 }

@@ -321,6 +321,77 @@ pub(super) struct TurnOptions {
     pub(super) api_profile: Option<crate::accounts::ApiProfile>,
 }
 
+/// Fork the persisted transcript without starting an inference turn.
+pub(super) async fn fork_session(
+    workspace: &str,
+    source: &str,
+    options: &TurnOptions,
+) -> Result<String> {
+    crate::database::validate_id(source)?;
+    let runtime = std::env::current_exe()?
+        .parent()
+        .ok_or(Error::Closed)?
+        .to_owned();
+    let helper = std::env::var_os("PROSPERO_CLAUDE_FORK_HELPER")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            [
+                runtime.join("node_modules/@prospero/daemon/dist/claude-session-fork.js"),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../daemon/dist/claude-session-fork.js"),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+        })
+        .ok_or_else(|| Error::Invalid("缺少 Claude 会话分支组件，请更新桌面 runtime".into()))?;
+    let bundled_node = runtime.join(if cfg!(windows) {
+        "node/node.exe"
+    } else {
+        "node/node"
+    });
+    let node = std::env::var_os("PROSPERO_NODE").unwrap_or_else(|| {
+        if bundled_node.is_file() {
+            bundled_node.into_os_string()
+        } else {
+            "node".into()
+        }
+    });
+    let mut command = Command::new(node);
+    command
+        .arg(helper)
+        .arg(source)
+        .arg(workspace)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    for (key, value) in &options.environment {
+        command.env(key, value);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| Error::Timeout)??;
+    let reply: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| Error::Invalid("Claude 分支组件返回了无效响应".into()))?;
+    if !output.status.success() {
+        return Err(Error::Invalid(
+            reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("无法创建 Claude 聊天分支")
+                .to_owned(),
+        ));
+    }
+    let id = reply
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| *id != source)
+        .ok_or_else(|| Error::Invalid("Claude 未返回独立的分支会话".into()))?;
+    uuid::Uuid::parse_str(id).map_err(|_| Error::Invalid("Claude 分支会话 ID 无效".into()))?;
+    Ok(id.to_owned())
+}
+
 pub(super) fn spawn_turn(
     workspace: &str,
     prompt: &str,

@@ -481,6 +481,10 @@ describe("Electron state snapshot caching", () => {
 
     expect(new StateStore(home).snapshot().archivedSessionIds).toEqual(["live"]);
 
+    store.setSessionPinned("live", true);
+    expect(store.snapshot().archivedSessionIds).toEqual([]);
+    expect(store.snapshot().pinnedSessionIds).toEqual(["live"]);
+    store.setSessionArchived("live", true);
     store.setSessionArchived("live", false);
     expect(store.snapshot().archivedSessionIds).toEqual([]);
     expect(() => store.setSessionArchived("missing", true)).toThrow();

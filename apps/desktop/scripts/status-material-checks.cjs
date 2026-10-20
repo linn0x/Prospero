@@ -63,11 +63,12 @@ module.exports = async ({ window, run, wait, click, screenshot, sessions, update
   const simulateMac = () => run("document.documentElement.dataset.platform='darwin';document.documentElement.dataset.nativeGlass='true';document.documentElement.dataset.reducedTransparency='false';document.documentElement.dataset.highContrast='false';document.querySelector('.windows-titlebar')?.style.setProperty('display','none')");
   await simulateMac(); await delay(250);
   glass.main = await style(surface);
-  assert.match(glass.main.filter, /blur\(/, JSON.stringify(await run(`({dataset:{...document.documentElement.dataset},token:getComputedStyle(document.documentElement).getPropertyValue('--glass-filter'),media:['prefers-reduced-transparency: no-preference','prefers-contrast: no-preference','forced-colors: none'].map(query=>[query,matchMedia('('+query+')').matches])})`)));
+  assert.equal(glass.main.filter, 'none', 'Tabs should not stack another blur above native vibrancy');
+  assert.equal(glass.main.shadow, 'none');
   assert.equal(glass.main.pointer, 'none');
   const hover = async selector => { await run(`(() => {const el=document.querySelector(${JSON.stringify(selector)}),r=el.getBoundingClientRect();el.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,pointerType:'mouse',clientX:r.left+r.width*.3,clientY:r.top+r.height*.5}))})()`); await delay(60); };
   await hover(surface);
-  assert.equal(await run(`document.querySelector('${surface}').style.getPropertyValue('--liquid-active')`), '1');
+  assert.equal(await run(`document.querySelector('${surface}').style.getPropertyValue('--liquid-active')`), '');
   assert.equal((await style(surface)).width, glass.main.width);
   glass.sidebar = await style('.context-dock .project-preview-tab.is-active'); assert.equal(glass.sidebar.filter, 'none');
   await hover('.context-dock [data-slot="toggle-group-item"]');
@@ -77,7 +78,7 @@ module.exports = async ({ window, run, wait, click, screenshot, sessions, update
   // Verify the shared Base UI Tabs component in a real dialog, too.
   await click('[aria-label="新增工作区"]');
   await wait("Boolean(document.querySelector('[role=dialog] [data-slot=tabs-trigger][data-active]'))");
-  glass.dialog = await style('[role=dialog] [data-slot="tabs-trigger"][data-active]'); assert.match(glass.dialog.filter, /blur\(/);
+  glass.dialog = await style('[role=dialog] [data-slot="tabs-trigger"][data-active]'); assert.equal(glass.dialog.filter, 'none');
   await click('[role="dialog"] [data-slot="dialog-close"]');
   await run("document.documentElement.dataset.reducedTransparency='true'");
   glass.reduced = await style(surface); assert.equal(glass.reduced.filter, 'none'); assert.equal(glass.reduced.border, 'none');
@@ -88,5 +89,5 @@ module.exports = async ({ window, run, wait, click, screenshot, sessions, update
   assert.equal(await run("[...document.querySelectorAll('.status-mark')].every(dot=>getComputedStyle(dot).animationName==='none')"), true);
   wc.debugger.detach();
   await run("document.documentElement.dataset.platform='win32';document.documentElement.dataset.nativeGlass='false';document.querySelector('.windows-titlebar')?.style.removeProperty('display')");
-  return { states, glass, checks: ['single-line rows and pins', 'right status dot', 'running/completed/stopped/approval/unread animations', 'background completion unread', 'opening clears unread', 'toolbar status without text', 'macOS tab material', 'conversation sidebar excluded', 'Base UI tabs', 'no hover layout shift', 'reduced transparency/high contrast/reduced motion'] };
+  return { states, glass, checks: ['single-line rows and pins', 'right status dot', 'running/completed/stopped/approval/unread animations', 'background completion unread', 'opening clears unread', 'toolbar status without text', 'flat macOS tab surfaces', 'conversation sidebar excluded', 'Base UI tabs', 'no hover layout shift', 'reduced transparency/high contrast/reduced motion'] };
 };

@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -33,6 +33,17 @@ function context(projectDir: string, platform: "darwin" | "win32", arch: number)
 }
 
 describe("runtime packaging guard", () => {
+  it("ships the entitlement files referenced by the macOS signing configuration", () => {
+    const root = join(import.meta.dirname, "..");
+    const { build } = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    for (const file of [build.mac.entitlements, build.mac.entitlementsInherit]) {
+      const source = readFileSync(join(root, file), "utf8");
+      expect(source).toContain("<plist");
+      expect(source).toContain("com.apple.security.cs.allow-jit");
+      expect(source).toContain("com.apple.security.cs.disable-library-validation");
+    }
+  });
+
   it("rejects packaged Rust backend when the Rust binary is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "prospero-runtime-"));
     mkdirSync(join(root, ".runtime", "node"), { recursive: true });
