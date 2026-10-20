@@ -1,3 +1,5 @@
+import { ArchivedChatsDialog } from "./ArchivedChatsDialog";
+import { scheduleDeferredRequest } from "./deferred-request";
 import { OverviewAttention } from "./attention/OverviewAttention";
 import { AttentionGroup, AttentionFilters, AttentionDetails } from "./attention/AttentionGroups";
 import { attentionSummary, pendingRequests, type AttentionFilter } from "./attention/attention-state";
@@ -23,6 +25,7 @@ import {
 } from "react";
 import {
   Activity,
+  GitBranch,
   Monitor,
   Archive,
   ArchiveRestore,
@@ -78,7 +81,6 @@ import {
   prefetchAccountUsage,
 } from "./account-usage-cache";
 import { isMissingSessionError, reportError, shortPath, text } from "./state";
-import { installLiquidGlass } from "./liquid-glass";
 import { useLocale, type Language } from "./locale";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
@@ -338,13 +340,13 @@ type NavItem = { id: View; label: string; icon: ComponentType };
 const primaryNav: NavItem[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "inbox", label: "Inbox", icon: Mail },
-  { id: "remote", label: "Remote computers", icon: Monitor },
-  { id: "mobile", label: "Mobile", icon: Smartphone },
   { id: "workspaces", label: "Workspaces", icon: FolderKanban },
   { id: "runs", label: "Runs", icon: Workflow },
 ];
 
 const resourceNav: NavItem[] = [
+  { id: "remote", label: "Remote computers", icon: Monitor },
+  { id: "mobile", label: "Mobile", icon: Smartphone },
   { id: "providers", label: "Agents", icon: Boxes },
   { id: "skills", label: "Skills", icon: BookOpen },
   { id: "diagnostics", label: "Diagnostics", icon: Activity },
@@ -386,7 +388,7 @@ function getViewCopy(
         ),
       },
       runs: {
-        title: t("运行", "Runs"),
+        title: t("任务编排", "Task orchestration"),
         description: t(
           "看板、依赖图与执行时间线",
           "Board, dependency graph, and execution timeline",
@@ -433,63 +435,19 @@ type SidebarSessionHandlers = {
   onTogglePin: (id: string) => void;
   onRenameSession: (id: string) => void;
   onDuplicateSession: (session: SessionInfo) => void;
+  onForkSession: (session: SessionInfo) => void;
   onSetUnread: (id: string, unread: boolean) => void;
   onToggleArchive: (id: string) => void;
 };
 
-type PinnedSessionRowProps = Pick<
-  SidebarSessionHandlers,
-  "onOpenSession" | "onTogglePin"
-> & {
+type PinnedSessionRowProps = SidebarSessionHandlers & {
   session: SessionInfo;
   active: boolean;
   unread: boolean;
 };
 
-/**
- * Pinned rows remain independently mounted from the workspace preview.  This
- * keeps a pinned session reachable even when its project has hundreds of
- * historical sessions that are no longer part of the live snapshot.
- */
-const PinnedSessionRow = memo(function PinnedSessionRow({
-  session,
-  active,
-  unread,
-  onOpenSession,
-  onTogglePin,
-}: PinnedSessionRowProps) {
-  const { t } = useLocale();
-  return (
-    <SidebarMenuItem className="workspace-session-item workspace-pinned-item">
-      <SidebarMenuButton
-        className="workspace-session-link"
-        isActive={active}
-        aria-current={active ? "page" : undefined}
-        tooltip={sessionLabel(session)}
-        onClick={() => onOpenSession(session.id, session)}
-      >
-        <SessionAgentIcon agent={session.agent} />
-        <span className="workspace-session-copy"><strong>{sessionLabel(session)}</strong></span>
-        <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} />
-      </SidebarMenuButton>
-      <SidebarMenuAction
-        showOnHover
-        className="session-pin-action is-pinned"
-        aria-pressed="true"
-        aria-label={t(
-          `取消置顶 ${sessionLabel(session)}`,
-          `Unpin ${sessionLabel(session)}`,
-        )}
-        onPointerDown={(event) => event.stopPropagation()}
-        onClick={(event) => {
-          consumeSidebarAction(event);
-          onTogglePin(session.id);
-        }}
-      >
-        <Pin className="rotate-45" fill="currentColor" />
-      </SidebarMenuAction>
-    </SidebarMenuItem>
-  );
+const PinnedSessionRow = memo(function PinnedSessionRow(props: PinnedSessionRowProps) {
+  return <WorkspaceSessionRow {...props} pinned archived={false} pinnedArea />;
 }, sidebarSessionRowEqual);
 
 type WorkspaceSessionRowProps = SidebarSessionHandlers & {
@@ -498,6 +456,7 @@ type WorkspaceSessionRowProps = SidebarSessionHandlers & {
   unread: boolean;
   pinned: boolean;
   archived: boolean;
+  pinnedArea?: boolean;
 };
 
 /**
@@ -511,16 +470,19 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
   unread,
   pinned,
   archived,
+  pinnedArea = false,
   onOpenSession,
   onTogglePin,
   onRenameSession,
   onDuplicateSession,
+  onForkSession,
   onSetUnread,
   onToggleArchive,
 }: WorkspaceSessionRowProps) {
   const { t } = useLocale();
+  const Row = pinnedArea ? SidebarMenuItem : SidebarMenuSubItem;
   return (
-    <SidebarMenuSubItem className="workspace-session-item">
+    <Row className={cn("workspace-session-item", pinnedArea && "workspace-pinned-item")}>
       <ContextMenu>
         <ContextMenuTrigger
           render={
@@ -553,9 +515,12 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
               <Pencil />
               {t("编辑名称", "Rename")}
             </ContextMenuItem>
+            <ContextMenuItem disabled={!["codex", "claude"].includes(session.agent) || session.kind !== "structured" || !["idle", "done", "completed"].includes(session.status)} title={t("Codex / Claude 对话可在当前轮次结束后创建独立历史分支", "Codex / Claude conversations can branch after the current turn completes")} onClick={() => onForkSession(session)}>
+              <GitBranch />{t("创建聊天分支", "Branch chat")}
+            </ContextMenuItem>
             <ContextMenuItem onClick={() => onDuplicateSession(session)}>
               <Copy />
-              {t("复制会话", "Duplicate session")}
+              {t("复制会话配置", "Copy session configuration")}
             </ContextMenuItem>
           </ContextMenuGroup>
           <ContextMenuSeparator />
@@ -597,7 +562,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
         type="button"
         data-slot="workspace-session-pin"
         data-testid="workspace-session-pin"
-        className={cn("workspace-session-pin", pinned && "is-pinned")}
+        className={cn("workspace-session-pin", pinnedArea && "session-pin-action", pinned && "is-pinned")}
         aria-pressed={pinned}
         aria-label={
           pinned
@@ -616,7 +581,14 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
       >
         <Pin aria-hidden="true" />
       </button>
-    </SidebarMenuSubItem>
+      <button type="button" data-slot="workspace-session-archive" className="workspace-session-archive"
+        aria-label={archived ? t(`恢复 ${sessionLabel(session)}`, `Restore ${sessionLabel(session)}`) : t(`归档 ${sessionLabel(session)}`, `Archive ${sessionLabel(session)}`)}
+        title={archived ? t("恢复聊天", "Restore chat") : t("归档聊天", "Archive chat")}
+        onPointerDown={event => event.stopPropagation()}
+        onClick={event => { consumeSidebarAction(event); onToggleArchive(session.id); }}>
+        {archived ? <ArchiveRestore aria-hidden="true" /> : <Archive aria-hidden="true" />}
+      </button>
+    </Row>
   );
 }, sidebarSessionRowEqual);
 
@@ -661,10 +633,12 @@ function sidebarSessionRowEqual(
   return (
     previous.onOpenSession === next.onOpenSession &&
     previous.onTogglePin === next.onTogglePin &&
+    previous.onToggleArchive === next.onToggleArchive &&
     (!("onRenameSession" in previous) ||
       ("onRenameSession" in next &&
         previous.onRenameSession === next.onRenameSession &&
         previous.onDuplicateSession === next.onDuplicateSession &&
+        previous.onForkSession === next.onForkSession &&
         previous.onSetUnread === next.onSetUnread &&
         previous.onToggleArchive === next.onToggleArchive))
   );
@@ -780,6 +754,7 @@ function ShellSidebar({
   onRenameProject,
   onRenameSession,
   onDuplicateSession,
+  onForkSession,
   onSetUnread,
   onAddWorkspace,
   remoteWorkspaces,
@@ -804,6 +779,7 @@ function ShellSidebar({
   onRenameProject: (path: string) => void;
   onRenameSession: (id: string) => void;
   onDuplicateSession: (session: SessionInfo) => void;
+  onForkSession: (session: SessionInfo) => void;
   onSetUnread: (id: string, unread: boolean) => void;
   onAddWorkspace: () => void;
   remoteWorkspaces: RemoteWorkspace[];
@@ -839,6 +815,7 @@ function ShellSidebar({
     closeMobileSidebar();
   }, [closeMobileSidebar, onAddWorkspace]);
   const [workspaceOpen, setWorkspaceOpen] = useState(true);
+  const [archiveOpen, setArchiveOpen] = useState(false);
   const managedLayout = useMemo(
     () => groupManagedWorkspaces(snapshot.projects, snapshot.orchestration),
     [snapshot.projects, snapshot.orchestration],
@@ -849,6 +826,8 @@ function ShellSidebar({
   const [searchPage, setSearchPage] = useState<SessionPage>();
   const [searchPageQuery, setSearchPageQuery] = useState("");
   const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState(false);
+  const [searchRetry, setSearchRetry] = useState(0);
   const searchGeneration = useRef(0);
   const [searchLimit, setSearchLimit] = useState(SIDEBAR_SEARCH_PAGE_SIZE);
   const [pinnedPage, setPinnedPage] = useState<SessionPage>();
@@ -1037,6 +1016,7 @@ function ShellSidebar({
   }, [pinnedSessionKey, pinnedSessionRequestIds, snapshot.daemon.metadataRevision]);
   useEffect(() => {
     const generation = ++searchGeneration.current;
+    setSearchError(false);
     if (!deferredSessionQuery) {
       setSearchPage(undefined);
       setSearchPageQuery("");
@@ -1044,33 +1024,26 @@ function ShellSidebar({
       setSearchLimit(SIDEBAR_SEARCH_PAGE_SIZE);
       return;
     }
-    let cancelled = false;
     setSearchLimit(SIDEBAR_SEARCH_PAGE_SIZE);
     setSearchLoading(true);
-    void window.prospero
-      .listSessions({
-        query: deferredSessionQuery,
-        limit: SIDEBAR_SEARCH_PAGE_SIZE,
-      })
-      .then((page) => {
-        if (!cancelled && searchGeneration.current === generation) {
+    return scheduleDeferredRequest(
+      () => window.prospero.listSessions({ query: deferredSessionQuery, limit: SIDEBAR_SEARCH_PAGE_SIZE }),
+      {
+        success: (page) => {
+          if (searchGeneration.current !== generation) return;
           setSearchPage(page);
           setSearchPageQuery(deferredSessionQuery);
-        }
-      })
-      .catch(() => {
-        if (!cancelled && searchGeneration.current === generation) {
+        },
+        error: () => {
+          if (searchGeneration.current !== generation) return;
           setSearchPage(undefined);
           setSearchPageQuery(deferredSessionQuery);
-        }
-      })
-      .finally(() => {
-        if (!cancelled && searchGeneration.current === generation) setSearchLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [deferredSessionQuery, snapshot.daemon.metadataRevision]);
+          setSearchError(true);
+        },
+        settled: () => { if (searchGeneration.current === generation) setSearchLoading(false); },
+      },
+    );
+  }, [deferredSessionQuery, snapshot.daemon.metadataRevision, searchRetry]);
   const pinned = useMemo(() => {
     const byId = new Map(sessionsById);
     for (const session of pinnedPage?.items ?? []) byId.set(session.id, session);
@@ -1241,6 +1214,7 @@ function ShellSidebar({
     )
       return;
     setSearchLoading(true);
+    setSearchError(false);
     const generation = searchGeneration.current;
     const query = deferredSessionQuery;
     const cursor = searchPage.nextCursor;
@@ -1261,7 +1235,9 @@ function ShellSidebar({
             : current,
         );
       })
-      .catch(() => undefined)
+      .catch(() => {
+        if (searchGeneration.current === generation) setSearchError(true);
+      })
       .finally(() => {
         if (searchGeneration.current === generation) setSearchLoading(false);
       });
@@ -1325,7 +1301,7 @@ function ShellSidebar({
       key={session.id} session={session} active={view === "workspaces" && activeId === session.id}
       unread={snapshot.unreadSessionIds.includes(session.id)} archived={snapshot.archivedSessionIds.includes(session.id)}
       onToggleArchive={onToggleArchive} pinned={snapshot.pinnedSessionIds.includes(session.id)} onOpenSession={selectSession}
-      onTogglePin={onTogglePin} onRenameSession={onRenameSession} onDuplicateSession={onDuplicateSession} onSetUnread={onSetUnread}
+      onTogglePin={onTogglePin} onRenameSession={onRenameSession} onDuplicateSession={onDuplicateSession} onForkSession={onForkSession} onSetUnread={onSetUnread}
     />;
     return (
       <Collapsible
@@ -1505,7 +1481,7 @@ function ShellSidebar({
     >
       {(isMac || focus) && <SidebarHeader className="sidebar-shell-header">
         {isMac && <>
-        <Button className="sidebar-new-session" variant="ghost" size="icon-sm" aria-label={t("新建会话", "New session")} title={t("新建会话", "New session")} onClick={() => newSession()}><Plus /></Button>
+        <Button className="sidebar-new-session" variant="ghost" size="icon-sm" aria-label={t("新建会话", "New session")} title={t("新建会话", "New session")} onClick={() => newSession()}><Plus /><span className="sidebar-new-session-label">{t("新建会话", "New session")}</span></Button>
         <SidebarTrigger
           className="sidebar-header-toggle"
           aria-label={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
@@ -1519,13 +1495,6 @@ function ShellSidebar({
           <SidebarGroup>
             <SidebarGroupContent>
               <SidebarMenu>{renderNav(primaryNav)}</SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
-          <SidebarSeparator />
-          <SidebarGroup>
-            <SidebarGroupLabel>{t("工具", "Tools")}</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
         </nav>
@@ -1551,6 +1520,11 @@ function ShellSidebar({
                     unread={snapshot.unreadSessionIds.includes(session.id)}
                     onOpenSession={selectSession}
                     onTogglePin={onTogglePin}
+                    onToggleArchive={onToggleArchive}
+                    onRenameSession={onRenameSession}
+                    onDuplicateSession={onDuplicateSession}
+                    onForkSession={onForkSession}
+                    onSetUnread={onSetUnread}
                   />
                 ))}
                 {pinned.length === 0 && pinnedLoading && (
@@ -1624,6 +1598,7 @@ function ShellSidebar({
                   <DropdownMenuLabel>
                     {t("工作区", "Workspaces")}
                   </DropdownMenuLabel>
+                  <DropdownMenuItem onClick={() => setArchiveOpen(true)}><Archive />{t("已归档聊天", "Archived chats")}</DropdownMenuItem>
                   <DropdownMenuItem
                     onClick={chooseProject}
                   >
@@ -1695,12 +1670,17 @@ function ShellSidebar({
                         <span>
                           {searchLoading
                             ? t("正在搜索会话…", "Searching sessions…")
-                            : t(
+                            : searchError ? t("搜索未完成，以下仅为已加载的会话", "Search incomplete; showing loaded sessions only") : t(
                                 `找到 ${String(searchResultTotal)} 个会话`,
                                 `Found ${String(searchResultTotal)} sessions`,
                               )}
                         </span>
                       </SidebarMenuItem>
+                      {searchError && <SidebarMenuItem>
+                        <Button variant="ghost" size="sm" onClick={() => setSearchRetry(value => value + 1)}>
+                          <RefreshCw />{t("重试搜索", "Retry search")}
+                        </Button>
+                      </SidebarMenuItem>}
                       <SidebarMenuSub>
                         {visibleSearchSessions.map((session) => {
                           const project = projectForSession(snapshot.projects, session);
@@ -1723,12 +1703,12 @@ function ShellSidebar({
                             onOpenSession={selectSession}
                             onTogglePin={onTogglePin}
                             onRenameSession={onRenameSession}
-                            onDuplicateSession={onDuplicateSession}
+                            onDuplicateSession={onDuplicateSession} onForkSession={onForkSession}
                             onSetUnread={onSetUnread}
                           />
                           </Fragment>;
                         })}
-                        {searchSessions.length === 0 && !searchLoading && (
+                        {searchSessions.length === 0 && !searchLoading && !searchError && (
                           <SidebarMenuSubItem className="workspace-search-empty">
                             {t("没有匹配的会话", "No matching sessions")}
                           </SidebarMenuSubItem>
@@ -1816,6 +1796,14 @@ function ShellSidebar({
         </div>
       </SidebarContent>
       <SidebarFooter className="sidebar-shell-footer">
+        <nav className="sidebar-resource-nav" aria-label={t("连接与工具", "Connections & tools")}>
+          <SidebarGroup>
+            <SidebarGroupLabel>{t("连接与工具", "Connections & tools")}</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        </nav>
         <SidebarMenu className="sidebar-footer-actions">
           <SidebarMenuItem>
             <HoverCard onOpenChange={handleDaemonCardOpen}>
@@ -1861,6 +1849,7 @@ function ShellSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
+      {archiveOpen && <ArchivedChatsDialog ids={snapshot.archivedSessionIds} onClose={() => setArchiveOpen(false)} onOpen={selectSession} />}
       <SidebarRail
         aria-label={t("调整侧栏宽度", "Resize sidebar")}
         title={t("拖动调整宽度 · 双击恢复默认", "Drag to resize · Double-click to reset")}
@@ -2010,7 +1999,7 @@ function OverviewPane({
             </CardContent>
             <CardFooter>
               <Button variant="ghost" size="sm" onClick={() => onOpenRuns(runId || undefined)}>
-                {t("打开运行", "Open run")}{" "}
+                {t("查看任务编排", "View orchestration")}{" "}
                 <ArrowRight data-icon="inline-end" />
               </Button>
             </CardFooter>
@@ -2428,7 +2417,7 @@ function InboxPane({
               </CardContent>
               <CardFooter className="flex-wrap">
                 <Button variant="ghost" size="sm" onClick={() => onOpenRuns(text(gate["runId"]), text(gate["taskId"]) || undefined)}>
-                  {t("打开运行", "Open run")}
+                  {t("查看任务编排", "View orchestration")}
                 </Button>
               </CardFooter>
             </Card>
@@ -2843,6 +2832,12 @@ function SessionRenameDialog({
   );
 }
 
+type SessionCreateDraft = {
+  input: SessionCreateInput;
+  useSource: boolean;
+  sourceSelection: SourceSelection | undefined;
+};
+
 function NewSessionDialog({
   snapshot,
   project,
@@ -2854,7 +2849,11 @@ function NewSessionDialog({
   onManageHosts,
   initialSource,
   initialTab,
+  initialDraft,
+  onConfigureAccounts,
 }: {
+  initialDraft: SessionCreateDraft | undefined;
+  onConfigureAccounts: (draft: SessionCreateDraft) => void;
   initialTab: "session" | "workspace";
   snapshot: DesktopSnapshot;
   project: string | undefined;
@@ -2871,11 +2870,11 @@ function NewSessionDialog({
   const independentAccounts = useMemo(() => snapshot.accounts.filter(account => !account.modelSource), [snapshot.accounts]);
   const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
   const rememberedSource = useMemo(() => rememberedSourceSelection(), []);
-  const initialAgent = initialSource?.agent ?? rememberedSource?.agent ?? rememberedLaunchAgent();
-  const [useSource, setUseSource] = useState(() => sourceSupported && Boolean(initialSource || rememberedSource));
-  const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialSource ?? (rememberedSource ? { ...rememberedSource, revision: 0 } : undefined));
+  const initialAgent = initialDraft?.input.agent ?? initialSource?.agent ?? rememberedSource?.agent ?? rememberedLaunchAgent();
+  const [useSource, setUseSource] = useState(() => initialDraft?.useSource ?? (sourceSupported && Boolean(initialSource || rememberedSource)));
+  const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialDraft?.sourceSelection ?? initialSource ?? (rememberedSource ? { ...rememberedSource, revision: 0 } : undefined));
   const sourceState = useModelSources(sourceSupported && useSource);
-  const [input, setInput] = useState<SessionCreateInput>({
+  const [input, setInput] = useState<SessionCreateInput>(initialDraft?.input ?? {
     cwd: project || snapshot.projects[0] || "",
     agent: initialAgent,
     kind: initialSource ? "structured" : rememberedLaunchKind(initialAgent),
@@ -2903,6 +2902,7 @@ function NewSessionDialog({
   const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
   const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
   const [launchModelsError, setLaunchModelsError] = useState<string>();
+  const [launchModelsRetry, setLaunchModelsRetry] = useState(0);
   const launchCatalogKey = useRef<string | undefined>(undefined);
   const workspaceSelectRef = useRef<HTMLSelectElement>(null);
   const launchWorkspaces = useMemo(
@@ -2973,9 +2973,9 @@ function NewSessionDialog({
     setInput((current) => current.kind === "structured" ? current : { ...current, kind: "structured" });
   }, [requiresStructured]);
   useEffect(() => {
-    if (!useSource) return;
+    if (!useSource || sourceState.loading || sourceState.error) return;
     setSourceSelection((current) => selectedSourceRoute(sourceState.sources, current, sourceRuntimeAgent) ? current : defaultSourceSelection(sourceState.sources, current, sourceRuntimeAgent));
-  }, [sourceRuntimeAgent, sourceState.sources, useSource]);
+  }, [sourceRuntimeAgent, sourceState.sources, sourceState.loading, sourceState.error, useSource]);
   useEffect(() => {
     if (!open || !supportsLaunchModels) {
       launchCatalogKey.current = undefined;
@@ -2985,7 +2985,7 @@ function NewSessionDialog({
       return;
     }
     if (tab !== "session") return;
-    const catalogKey = JSON.stringify([input.agent, input.accountId, input.kind]);
+    const catalogKey = JSON.stringify([input.agent, input.accountId, input.kind, launchModelsRetry]);
     if (launchCatalogKey.current === catalogKey) return;
     let cancelled = false;
     const agent = input.agent as "codex" | "claude" | "deepseek" | "opencode";
@@ -3000,21 +3000,21 @@ function NewSessionDialog({
         if (cancelled) return;
         launchCatalogKey.current = catalogKey;
         setLaunchModels(catalog.models);
-        const model =
-          catalog.models.find((candidate) => candidate.id === catalog.currentModel) ??
-          catalog.models.find((candidate) => candidate.isDefault) ??
-          catalog.models[0];
         setInput((current) => {
           if (
             current.agent !== agent ||
             current.kind !== kind ||
             current.accountId !== accountId
           ) return current;
+          const preferred = catalog.models.find(candidate => candidate.id === current.model);
+          const model = preferred ?? catalog.models.find(candidate => candidate.id === catalog.currentModel)
+            ?? catalog.models.find(candidate => candidate.isDefault) ?? catalog.models[0];
           return {
             ...current,
             model: model?.id,
             effort:
-              catalog.currentEffort ??
+              (preferred && current.effort && preferred.supportedEfforts.includes(current.effort) ? current.effort : undefined) ??
+              (catalog.currentEffort && model?.supportedEfforts.includes(catalog.currentEffort) ? catalog.currentEffort : undefined) ??
               model?.defaultEffort ??
               model?.supportedEfforts[0],
           };
@@ -3035,13 +3035,25 @@ function NewSessionDialog({
     return () => {
       cancelled = true;
     };
-  }, [input.accountId, input.agent, input.kind, open, supportsLaunchModels, tab]);
+  }, [input.accountId, input.agent, input.kind, launchModelsRetry, open, supportsLaunchModels, tab]);
+  const creationBlocker = choosingWorkspace
+    ? t("请先完成工作区选择。", "Finish choosing a workspace first.")
+    : remoteId
+      ? !remoteTarget ? t("远程工作区不可用，请重新选择。", "This remote workspace is unavailable. Choose another workspace.") : undefined
+      : !input.cwd
+        ? t("请先选择或添加一个工作区。", "Choose or add a workspace first.")
+        : !accountCanLaunch
+          ? useSource
+            ? sourceState.loading ? t("正在读取模型源…", "Loading model sources…") : t("请选择可用的模型源和模型。", "Choose an available model source and model.")
+            : t("当前账号无法创建此类会话，请检查账号配置或切换会话类型。", "Check the account configuration or choose a supported session type.")
+          : supportsLaunchModels && launchModelsLoading
+            ? t("正在读取模型列表，请稍候…", "Loading the model list…") : undefined;
   const create = async (): Promise<void> => {
     if (remoteId) {
       if (!busyRef.current && remoteTarget) { onRemoteWorkspace(remoteTarget, true); onOpenChange(false); }
       return;
     }
-    if (busyRef.current || !input.cwd || !accountCanLaunch) return;
+    if (busyRef.current || creationBlocker) return;
     busyRef.current = true;
     setBusy(true);
     setError(undefined);
@@ -3075,7 +3087,7 @@ function NewSessionDialog({
         aria-busy={busy || choosingWorkspace}
       >
         <DialogHeader>
-          <DialogTitle>{t("新建", "Create")}</DialogTitle>
+          <DialogTitle>{tab === "workspace" ? t("添加工作区", "Add workspace") : t("新建会话", "New session")}</DialogTitle>
           <DialogDescription>{tab === "workspace" ? t("添加本机或远程文件夹，继续创建会话。", "Add a local or remote folder, then start a conversation.") : t("选择工作区、Agent 和模型。", "Choose a workspace, agent, and model.")}</DialogDescription>
         </DialogHeader>
         <Tabs className="create-dialog-tabs" value={tab} onValueChange={(value) => { if (!busy && !choosingWorkspace && (value === "session" || value === "workspace")) setTab(value); }}>
@@ -3093,6 +3105,7 @@ function NewSessionDialog({
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         )}
+        <fieldset className="session-create-fields" disabled={busy || choosingWorkspace}>
         <FieldGroup>
           <Field>
             <FieldLabel htmlFor="session-project">
@@ -3147,6 +3160,9 @@ function NewSessionDialog({
             </FieldDescription>
           </Field>
           {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
+          <Button className="session-configure-accounts w-fit" variant="ghost" size="sm" onClick={() => onConfigureAccounts({ input: { ...input }, useSource, sourceSelection })}>
+            <Settings />{t("配置账号与模型", "Configure accounts & models")}
+          </Button>
           <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("本机账号 / API 配置", "Local account / API profile")}</Button></div>
           {useSource ? <><div className="grid gap-4 sm:grid-cols-2"><Field><FieldLabel htmlFor="source-runtime-agent">Agent</FieldLabel><NativeSelect id="source-runtime-agent" value={sourceRuntimeAgent} disabled={busy} onChange={event => setSourceRuntimeAgent(event.target.value as SourceRuntimeAgent)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect><FieldDescription>{t("选择负责执行代码和工具操作的 Agent。", "Choose the agent that runs code and tools.")}</FieldDescription></Field><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></div><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /></> : <>
           <div className="grid gap-4 sm:grid-cols-2">
@@ -3298,6 +3314,10 @@ function NewSessionDialog({
                     selectedLaunchModel?.description ??
                     t("目录随所选账号实时读取。", "Catalog loaded for the selected account.")}
                 </FieldDescription>
+                {!launchModelsLoading && (launchModelsError || launchModels.length === 0) && <Button
+                  className="session-retry-models w-fit" variant="ghost" size="sm"
+                  onClick={() => setLaunchModelsRetry(value => value + 1)}
+                ><RefreshCw />{launchModelsError ? t("重试读取模型", "Retry loading models") : t("刷新模型列表", "Refresh model list")}</Button>}
               </Field>
               <Field>
                 <FieldLabel htmlFor="session-effort">
@@ -3362,13 +3382,16 @@ function NewSessionDialog({
           </Field>
           </>}
         </FieldGroup>
+        </fieldset>
         <DialogFooter>
+          {(busy || creationBlocker) && <p id="session-create-status" className="session-create-status" role="status">{busy ? t("正在创建会话，请稍候…", "Creating your session…") : creationBlocker}</p>}
           <Button variant="outline" disabled={busy || choosingWorkspace} onClick={() => onOpenChange(false)}>
             {t("取消", "Cancel")}
           </Button>
           <Button
             aria-busy={busy}
-            disabled={busy || choosingWorkspace || (remoteId ? !remoteTarget : !accountCanLaunch || !input.cwd || (supportsLaunchModels && launchModelsLoading))}
+            aria-describedby={busy || creationBlocker ? "session-create-status" : undefined}
+            disabled={busy || Boolean(creationBlocker)}
             onClick={() => void create()}
           >
             {busy ? (
@@ -3649,7 +3672,6 @@ function CommandDialog({
 }
 
 export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
-  useEffect(() => installLiquidGlass(), []);
   const { t } = useLocale();
   useEffect(() => {
     if (snapshot.daemon.lastError) notify({ kind: "error", title: t("本地服务异常", "Local service error"), message: snapshot.daemon.lastError });
@@ -3670,7 +3692,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setActiveRemoteId(workspace.id);
     setView("workspaces");
   }, [activeRemoteId, remote.upsert]);
-  const openAddWorkspace = useCallback(() => { setCreateTab("workspace"); setNewSessionOpen(true); }, []);
+  const openAddWorkspace = useCallback(() => { setInitialSessionDraft(undefined); setCreateTab("workspace"); setNewSessionOpen(true); }, []);
   useEffect(() => {
     if (view !== "workspaces") { setActiveRemoteId(undefined); setRemoteSessionRequest(0); }
   }, [view]);
@@ -3708,6 +3730,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     readStoredActiveSession,
   );
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [pendingSessionDraft, setPendingSessionDraft] = useState<SessionCreateDraft>();
+  const [initialSessionDraft, setInitialSessionDraft] = useState<SessionCreateDraft>();
   const [newSessionProject, setNewSessionProject] = useState<string>();
   const [newSessionSource, setNewSessionSource] = useState<SourceSelection>();
   const [runTargetId, setRunTargetId] = useState<string>();
@@ -3892,25 +3916,6 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       localStorage.setItem(SIDEBAR_OPEN_STORAGE_KEY, String(open));
     } catch {}
   }, []);
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (matchesDesktopShortcut(event, "k", window.prospero.platform)) {
-        event.preventDefault();
-        setLauncher("command");
-      } else if (matchesDesktopShortcut(event, "p", window.prospero.platform)) {
-        event.preventDefault();
-        setLauncher("quick");
-      } else if (matchesDesktopShortcut(event, "n", window.prospero.platform)) {
-        event.preventDefault();
-        if (view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
-        setNewSessionProject(undefined);
-        setNewSessionSource(undefined);
-        setCreateTab("session"); setNewSessionOpen(true);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeRemote, view]);
   const openSession = useCallback((id: string, session?: SessionInfo, options: { openTab?: boolean } = {}): void => {
     setActiveRemoteId(undefined);
     if (session) {
@@ -3957,24 +3962,45 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, []);
   const openNewSession = useCallback((project?: string): void => {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
+    setInitialSessionDraft(undefined);
     setNewSessionProject(sessionLaunchProject(sessionSnapshot, project, activeRemoteId ? undefined : activeId));
     setNewSessionSource(undefined);
     setCreateTab("session"); setNewSessionOpen(true);
   }, [activeId, activeRemote, activeRemoteId, sessionSnapshot, view]);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (matchesDesktopShortcut(event, "k", window.prospero.platform)) {
+        event.preventDefault();
+        setLauncher("command");
+      } else if (matchesDesktopShortcut(event, "p", window.prospero.platform)) {
+        event.preventDefault();
+        setLauncher("quick");
+      } else if (matchesDesktopShortcut(event, "n", window.prospero.platform)) {
+        event.preventDefault();
+        if (!event.repeat) openNewSession();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openNewSession]);
   const toggleArchive = useCallback((id: string): void => {
-    void window.prospero
-      .setSessionArchived(id, !snapshotRef.current.archivedSessionIds.includes(id))
-      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+    const archived = !snapshotRef.current.archivedSessionIds.includes(id);
+    void window.prospero.setSessionArchived(id, archived).then(() => {
+      if (archived) {
+        setOpenIds(current => current.filter(item => item !== id));
+        setActiveId(current => current === id ? undefined : current);
+      }
+    }).catch(reason => isMissingSessionError(reason) ? forgetMissingSession(id) : setSessionActionError(reportError(reason)));
   }, [forgetMissingSession]);
   const togglePin = useCallback((id: string): void => {
     void window.prospero
       .setSessionPinned(id, !snapshotRef.current.pinnedSessionIds.includes(id))
-      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : setSessionActionError(reportError(reason)));
   }, [forgetMissingSession]);
   const setUnread = useCallback((id: string, unread: boolean): void => {
     void window.prospero
       .setSessionUnread(id, unread)
-      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : setSessionActionError(reportError(reason)));
   }, [forgetMissingSession]);
   const [focus, setFocus] = useState(() => {
     try {
@@ -3998,6 +4024,24 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [view]);
+  const branching = useRef(new Set<string>());
+  const forkSession = useCallback((session: SessionInfo): void => {
+    if (branching.current.has(session.id)) return;
+    if (!snapshotRef.current.daemon.capabilities?.includes(session.agent === "claude" ? "session.claude-fork.v1" : "session.codex-fork.v1")) {
+      setSessionActionError(t("请更新 Rust daemon 后使用聊天分支。", "Update the Rust daemon to branch chats.")); return;
+    }
+    branching.current.add(session.id);
+    setSessionActionError(undefined);
+    void window.prospero.forkSession(session.id).then(async created => {
+      openSession(created.id, created, { openTab: true });
+      try {
+        await window.prospero.renameSession(created.id, t(`${sessionLabel(session)} · 分支`, `${sessionLabel(session)} · Branch`));
+      } catch (reason) {
+        setSessionActionError(t(`分支已创建，但名称保存失败：${reportError(reason)}`, `The branch was created, but its name could not be saved: ${reportError(reason)}`));
+      }
+    }).catch(reason => setSessionActionError(reportError(reason)))
+      .finally(() => branching.current.delete(session.id));
+  }, [openSession, t]);
   const duplicateSession = useCallback((session: SessionInfo): void => {
     setSessionActionError(undefined);
     void (async () => {
@@ -4107,6 +4151,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onRenameProject={setEditingProject}
         onRenameSession={setEditingSession}
         onDuplicateSession={duplicateSession}
+        onForkSession={forkSession}
         onSetUnread={setUnread}
         onAddWorkspace={openAddWorkspace}
         remoteWorkspaces={remote.workspaces}
@@ -4122,8 +4167,20 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
 
-        <div className="main-viewport" style={{ position: "relative" }}>
-          {sessionActionError && !workspaceFocus && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
+        <div className={cn("main-viewport", pendingSessionDraft && view === "providers" && "has-session-draft")} style={{ position: "relative" }}>
+          {pendingSessionDraft && view === "providers" && <div className="session-draft-banner" role="region" aria-label={t("待继续的新建会话", "Pending session draft")}>
+            <div><strong>{t("配置完成后继续创建会话", "Continue creating your session after setup")}</strong><p title={pendingSessionDraft.input.cwd}>{pendingSessionDraft.input.cwd}</p></div>
+            <Button size="sm" onClick={() => {
+              setInitialSessionDraft(pendingSessionDraft);
+              setNewSessionProject(pendingSessionDraft.input.cwd);
+              setNewSessionSource(undefined);
+              setCreateTab("session");
+              setPendingSessionDraft(undefined);
+              setNewSessionOpen(true);
+            }}>{t("继续创建", "Continue creation")}</Button>
+            <Button variant="ghost" size="sm" onClick={() => setPendingSessionDraft(undefined)}>{t("放弃草稿", "Discard draft")}</Button>
+          </div>}
+          {sessionActionError && <Alert variant="destructive" className="session-action-error"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
           <Suspense
             fallback={
               <div className="boot-screen">
@@ -4163,7 +4220,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 initialTaskId={taskTargetId}
               />
             ) : view === "providers" ? (
-              <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} onUseModelSource={selection => { setNewSessionProject(undefined); setNewSessionSource(selection); setCreateTab("session"); setNewSessionOpen(true); }} />
+              <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} onUseModelSource={selection => { setInitialSessionDraft(undefined); setNewSessionProject(undefined); setNewSessionSource(selection); setCreateTab("session"); setNewSessionOpen(true); }} />
             ) : view === "skills" ? (
               <SkillsPane snapshot={sessionSnapshot} />
             ) : view === "diagnostics" ? (
@@ -4203,6 +4260,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           onRemoteWorkspace={openRemoteWorkspace}
           onManageHosts={() => selectView("remote")}
           initialTab={createTab}
+          initialDraft={initialSessionDraft}
+          onConfigureAccounts={(draft) => {
+            setPendingSessionDraft(draft);
+            setNewSessionOpen(false);
+            selectView("providers");
+          }}
           initialSource={newSessionSource}
         />
       )}

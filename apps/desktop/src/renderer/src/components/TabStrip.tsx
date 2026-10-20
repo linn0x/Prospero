@@ -93,11 +93,13 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
       }
     };
     const paint = () => {
+      frame = 0;
       const current = drag.current;
       if (!current?.started) return;
       const outer = host.getBoundingClientRect();
       const edge = Math.min(36, outer.width / 4);
       const speed = current.x < outer.left + edge ? -Math.min(12, (outer.left + edge - current.x) / 3) : current.x > outer.right - edge ? Math.min(12, (current.x - outer.right + edge) / 3) : 0;
+      const previousScroll = host.scrollLeft;
       host.scrollLeft += speed;
       current.element.style.transform = `translateX(${current.x - current.startX + host.scrollLeft - current.scroll}px)`;
       const others = tabElements().filter(element => element !== current.element).sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
@@ -105,7 +107,8 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
       current.before = target?.dataset.tabId ?? null;
       const marker = target?.getBoundingClientRect().left ?? others.at(-1)?.getBoundingClientRect().right ?? outer.left;
       host.style.setProperty("--tab-drop-x", `${Math.max(1, Math.min(outer.width - 2, marker - outer.left)) + host.scrollLeft}px`);
-      frame = requestAnimationFrame(paint);
+      // Keep animating only while edge scrolling actually moves the viewport.
+      if (host.scrollLeft !== previousScroll) frame = requestAnimationFrame(paint);
     };
     const move = (event: PointerEvent) => {
       const current = drag.current;
@@ -116,20 +119,25 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
         host.setPointerCapture(event.pointerId);
         current.element.dataset.dragging = "true";
         host.dataset.sorting = "true";
-        frame = requestAnimationFrame(paint);
       }
-      if (current.started) event.preventDefault();
+      if (current.started) {
+        if (!frame) frame = requestAnimationFrame(paint);
+        event.preventDefault();
+      }
     };
     const up = (event: PointerEvent) => { if (event.pointerId === drag.current?.pointer) { drag.current.x = event.clientX; finish(event.type !== "pointerup"); } };
     const escape = (event: KeyboardEvent) => { if (event.key === "Escape" && drag.current) { event.preventDefault(); event.stopPropagation(); finish(true); } };
     const blur = () => finish(true);
+    const scroll = () => { if (drag.current?.started && !frame) frame = requestAnimationFrame(paint); };
     window.addEventListener("pointermove", move, { passive: false });
     window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
     window.addEventListener("keydown", escape, true); window.addEventListener("blur", blur);
     host.addEventListener("lostpointercapture", blur);
+    host.addEventListener("scroll", scroll, { passive: true });
     return () => {
       finish(true); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up);
       window.removeEventListener("keydown", escape, true); window.removeEventListener("blur", blur); host.removeEventListener("lostpointercapture", blur);
+      host.removeEventListener("scroll", scroll);
     };
   }, []);
 
@@ -144,10 +152,11 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
         const handle = (event.target as HTMLElement).closest("[data-tab-handle]");
         const element = handle?.closest<HTMLElement>("[data-tab-id]");
         if (!element?.dataset.tabId) return;
-        drag.current = { id: element.dataset.tabId, pointer: event.pointerId, startX: event.clientX, x: event.clientX, scroll: host.scrollLeft, started: false, before: null, keys, element };
+        drag.current = { id: element.dataset.tabId, pointer: event.pointerId, startX: event.clientX, x: event.clientX, scroll: host.scrollLeft, started: false, before: null, keys: JSON.stringify(latest.current.items.map(item => item.id)), element };
     };
     const click = (event: MouseEvent) => { if (performance.now() < suppressClick.current) { suppressClick.current = 0; event.preventDefault(); event.stopPropagation(); } };
     const keydown = (event: KeyboardEvent) => {
+        const { items, onReorder } = latest.current;
         const handle = (event.target as HTMLElement).closest("[role=tab]");
         const id = handle?.closest<HTMLElement>("[data-tab-id]")?.dataset.tabId;
         const index = items.findIndex(item => item.id === id);
@@ -169,7 +178,7 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
     };
     host.addEventListener("pointerdown", down, true); host.addEventListener("click", click, true); host.addEventListener("keydown", keydown, true);
     return () => { host.removeEventListener("pointerdown", down, true); host.removeEventListener("click", click, true); host.removeEventListener("keydown", keydown, true); };
-  }, [items, keys, onReorder]);
+  }, []);
 
   return <div className={cn("tab-strip", className)} data-overflow={edges.overflow || undefined}>
     <div ref={viewport} className={cn("tab-strip-viewport", listClassName)} role="tablist" aria-label={label} aria-describedby={description}>

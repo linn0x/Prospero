@@ -5,7 +5,7 @@ import { SidebarMenuSubItem } from "./components/ui/sidebar";
 import { Spinner } from "./components/ui/spinner";
 import { useLocale } from "./locale";
 import { WORKSPACE_PAGE_SIZE, WORKSPACE_PREVIEW_SIZE, WorkspaceSessionPager } from "./workspace-session-pager";
-import { filterSessionsByQuery, sidebarProjectSessions, sortSidebarSessions } from "./workspace-sidebar-state";
+import { sidebarProjectSessions, sortSidebarSessions } from "./workspace-sidebar-state";
 
 export function WorkspaceHistory({ workspace, name, enabled, revision, preview, activeId, pinned, unread, archived, query, onTotal, renderRow }: {
   workspace: string; name: string; enabled: boolean; revision: string | undefined; preview: SessionInfo[]; activeId: string | undefined;
@@ -19,7 +19,7 @@ export function WorkspaceHistory({ workspace, name, enabled, revision, preview, 
   const total = state.page?.total;
   useEffect(() => { if (total !== undefined) onTotal(workspace, total); }, [onTotal, total, workspace]);
   const items = state.expanded ? state.page?.items ?? [] : [...new Map([...preview, ...(state.page?.items ?? [])].map(item => [item.id, item])).values()];
-  const candidate = state.expanded ? filterSessionsByQuery(items, query) : sidebarProjectSessions(items, archived, query);
+  const candidate = sidebarProjectSessions(items, archived, query);
   const visible = sortSidebarSessions(candidate, activeId, pinned, unread).slice(0, state.expanded ? WORKSPACE_PAGE_SIZE : WORKSPACE_PREVIEW_SIZE);
   return <>
     {visible.map(renderRow)}

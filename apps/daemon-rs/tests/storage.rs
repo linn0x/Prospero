@@ -348,3 +348,23 @@ fn database_symlinks_are_rejected_and_files_are_private() {
         0o600
     );
 }
+
+#[test]
+fn idle_event_poll_retains_cursor_and_observes_the_next_write() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    assert!(store.events("sessions", 0, 100).unwrap().items.is_empty());
+    create(&mut store);
+    for _ in 0..100 {
+        let page = store.events("sessions", 1, 100).unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_seq, 1);
+        assert_eq!(page.latest_seq, 1);
+        assert!(!page.has_more && !page.resync_required);
+    }
+    let next = create(&mut store);
+    let page = store.events("sessions", 1, 100).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].entity_id, next.id);
+    assert_eq!(page.next_seq, 2);
+}

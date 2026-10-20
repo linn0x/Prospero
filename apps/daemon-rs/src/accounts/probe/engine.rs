@@ -325,9 +325,9 @@ async fn gateway_inner(c: &Context, request: Request) -> ProbeResult<Response> {
             .min(1024)
     );
     let suffix = match protocol {
-        "anthropic" => "v1/messages",
-        "openai_responses" => "responses",
-        _ => "chat/completions",
+        "anthropic" => "/v1/messages",
+        "openai_responses" => "/responses",
+        _ => "/chat/completions",
     };
     let url =
         endpoint(&c.profile, suffix).map_err(|_| ("invalid_profile", "API Profile 地址无效。"))?;
@@ -954,9 +954,18 @@ mod tests {
     }
     async fn upstream(
         State(f): State<Fake>,
+        uri: axum::http::Uri,
         headers: axum::http::HeaderMap,
         axum::Json(body): axum::Json<Value>,
     ) -> Response {
+        assert_eq!(
+            uri.path(),
+            match f.protocol {
+                "anthropic" => "/v1/messages",
+                "openai_responses" => "/v1/responses",
+                _ => "/v1/chat/completions",
+            }
+        );
         f.requests.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             headers

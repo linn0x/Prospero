@@ -154,6 +154,9 @@ export class RustClient {
     if (typeof result.supported !== "boolean") throw new Error("Invalid daemon response");
     return { supported: result.supported };
   }
+  forkAgentSession(value: string, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
+    return this.json(`/v1/agent-sessions/${id(value)}/fork`, { method: "POST", signal, timeoutMs });
+  }
   createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
     return this.json("/v1/agent-sessions", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }

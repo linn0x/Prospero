@@ -1031,6 +1031,16 @@ impl Store {
         policy: ApprovalPolicy,
         id: Option<String>,
     ) -> Result<SessionHead> {
+        self.create_agent_session_with_history(input, policy, id, None)
+    }
+
+    pub(crate) fn create_agent_session_with_history(
+        &mut self,
+        input: CreateAgentSession,
+        policy: ApprovalPolicy,
+        id: Option<String>,
+        history: Option<(String, i64)>,
+    ) -> Result<SessionHead> {
         let mode = match input.mode.as_deref() {
             Some(value) => PermissionMode::from_wire(value)?,
             None => PermissionMode::Default,
@@ -1082,6 +1092,21 @@ impl Store {
                      VALUES(?1,?2,1,?3,?4,0,?5,?6,?7,?8,?9)",
                     params![head.id, crate::database::label(agent)?, policy.label(), mode.label(), native_id, model, effort, account_id, agent_preset],
                 )?;
+                if let Some((source, turn)) = history {
+                    let (current_turn, status): (i64, String) = tx.query_row(
+                        "SELECT a.turn,json_extract(s.payload,'$.status') FROM agent_runs a JOIN session_heads s ON s.id=a.session_id WHERE a.session_id=?1", [&source], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    if current_turn != turn || !matches!(status.as_str(), "idle" | "completed") { return Err(Error::Conflict); }
+                    tx.execute("INSERT INTO content_heads(session_id,id,bytes) SELECT ?1,id,bytes FROM content_heads WHERE session_id=?2", params![head.id, source])?;
+                    tx.execute("INSERT INTO content_chunks(session_id,content_id,offset,body) SELECT ?1,content_id,offset,body FROM content_chunks WHERE session_id=?2", params![head.id, source])?;
+                    tx.execute("INSERT INTO timeline_heads(session_id,position) SELECT ?1,position FROM timeline_heads WHERE session_id=?2", params![head.id, source])?;
+                    tx.execute("INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview,subagent_id) SELECT ?1,id,turn_id,position,revision,generation,body,preview,subagent_id FROM timeline_records WHERE session_id=?2", params![head.id, source])?;
+                    tx.execute("INSERT INTO agent_subagents(session_id,subagent_id,name,role,task,status,can_message,summary,created_at,updated_at) SELECT ?1,subagent_id,name,role,task,status,0,summary,created_at,updated_at FROM agent_subagents WHERE session_id=?2", params![head.id, source])?;
+                    let old_scope = format!("timeline:{source}");
+                    let new_scope = format!("timeline:{}", head.id);
+                    tx.execute("INSERT INTO stream_heads(scope,last_seq,floor_seq) SELECT ?1,last_seq,floor_seq FROM stream_heads WHERE scope=?2", params![new_scope, old_scope])?;
+                    tx.execute("INSERT INTO change_events(scope,seq,kind,entity_id,payload) SELECT ?1,seq,kind,entity_id,payload FROM change_events WHERE scope=?2", params![new_scope, old_scope])?;
+                    tx.execute("UPDATE agent_runs SET turn=?2 WHERE session_id=?1", params![head.id, turn])?;
+                }
                 Ok(())
             },
         )

@@ -87,7 +87,7 @@ app.on("browser-window-created", (_event, window) => {
       await wait("Boolean(document.querySelector('.session-toolbar'))");
       await wait("document.querySelector('.workspace-primary')?.textContent.includes('项目结构很清晰')");
       await run("window.__originalCenter=document.querySelector('.workspace-primary');window.__originalChat=document.querySelector('.chat-pane')");
-      await click('[aria-label="浏览项目文件"]');
+      await click('[aria-label="切换工具栏"]');
       await wait("Boolean(document.querySelector('.workspace-dock-aside .project-tools-shell'))");
       const assertSplit = async () => {
         const bounds = await run("(() => {const center=document.querySelector('.workspace-primary').getBoundingClientRect();const dock=document.querySelector('.workspace-dock-aside').getBoundingClientRect();return {centerWidth:center.width,dockWidth:dock.width,gap:dock.left-center.right,route:localStorage.getItem('prospero.activeView'),sameCenter:window.__originalCenter===document.querySelector('.workspace-primary')}})()");
@@ -111,7 +111,7 @@ app.on("browser-window-created", (_event, window) => {
       await run("window.__editor=document.querySelector('.project-code-editor')");
       await click('[aria-label="隐藏工具栏"]');
       await wait("!document.querySelector('.workspace-dock-aside')");
-      await click('[aria-label="浏览项目文件"]');
+      await click('[aria-label="切换工具栏"]');
       await wait("Boolean(document.querySelector('.project-code-editor'))");
       assert.equal(await run("window.__editor===document.querySelector('.project-code-editor') && window.__editor.value.includes('Prospero edited')"), true, "Hiding the dock preserves the editor and draft");
       window.setSize(700, 740); await wait("Boolean(document.querySelector('.workspace-dock-sheet .project-code-editor'))");
@@ -119,7 +119,7 @@ app.on("browser-window-created", (_event, window) => {
       await screenshot("files-overlay");
       window.setSize(1380, 900); await wait("Boolean(document.querySelector('.workspace-dock-aside .project-code-editor'))");
       await click('#workspace-tab-ui-second-session');
-      await click('[aria-label="浏览项目文件"]');
+      await click('[aria-label="切换工具栏"]');
       await click('[title="README.md"].project-tree-row');
       await wait("document.querySelector('.project-tools-instance:not([hidden]) .project-markdown-preview h1')?.textContent==='Another workspace'");
       await click('#workspace-tab-ui-project-session');

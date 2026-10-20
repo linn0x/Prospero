@@ -25,6 +25,29 @@ class ReleaseTest(unittest.TestCase):
         self.db.commit()
         self.snapshot = self.root / 'backup'
 
+    def test_codex_ephemeral_links_are_ignored_but_never_backed_up(self):
+        cache = self.source / 'agent-accounts/codex-usage/native-codex/home/tmp/arg0'
+        cache.mkdir(parents=True)
+        (cache / 'applypatch').symlink_to('/does-not-exist')
+        manifest = release.backup(self.source, self.snapshot, [])
+        self.assertFalse(any('agent-accounts' in path for path in manifest['files']))
+        restored = self.root / 'restored'
+        self.assertFalse(release.restore(self.snapshot, restored)['admissionAllowed'])
+
+    def test_codex_cache_root_link_is_rejected(self):
+        cache = self.source / 'agent-accounts/codex/account/tmp/arg0'
+        cache.parent.mkdir(parents=True)
+        cache.symlink_to(self.root)
+        with self.assertRaisesRegex(ValueError, 'linked or special'):
+            release.backup(self.source, self.snapshot, [])
+
+    def test_other_account_links_still_rejected(self):
+        cache = self.source / 'agent-accounts/claude/account/tmp/arg0'
+        cache.mkdir(parents=True)
+        (cache / 'unknown').symlink_to('/does-not-exist')
+        with self.assertRaisesRegex(ValueError, 'linked or special'):
+            release.backup(self.source, self.snapshot, [])
+
     def test_wal_snapshot_restore_and_pin(self):
         binary = self.root / 'prosperod'
         binary.write_bytes(b'pinned-runtime')

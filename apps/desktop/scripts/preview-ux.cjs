@@ -1,6 +1,7 @@
 // Isolated interactive UX preview. Uses synthetic data; never starts a daemon.
 // Run: npm run preview:ux -w @prospero/desktop
 const {app}=require('electron');
+const previewSessionView=require('./preview-session-view.cjs');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {pathToFileURL}=require('node:url');const {createServer}=require('node:http');
 const repo=path.resolve(__dirname,'../../..');
@@ -14,14 +15,33 @@ if(process.argv.includes('--attention')) {
  for(let i=0;i<11;i++)sessions.push({id:'preview-shell-'+i,agent:'claude',kind:'pty',title:i%2?'claude · Current project':'Claude',cwd:i%2?current:other,status:'running',createdAt:i+2});
  fs.writeFileSync(path.join(home,'orchestration-desktop.json'),JSON.stringify({version:1,runs:[{id:'preview-run',status:'active',objective:'改进长标题任务的审批展示与完整上下文阅读',cwd:current}],tasks:[{id:'preview-task',runId:'preview-run',status:'failed',title:'检查多个项目同时运行时，审批请求、待回答问题和失败任务是否都能被清晰识别并完成处理',spec:'完整任务说明。\n包含上下文、验证步骤和恢复操作。',cwd:current}],gates:[{id:'preview-gate',taskId:'preview-task',runId:'preview-run',status:'pending',question:'完整审批请求：是否继续处理当前任务？\n请先阅读这一段完整上下文，再选择。',reason:'这是隔离预览数据，不会执行真实操作。',options:['继续','暂停']}],worktreeAssets:[]}));
 }
-const accounts=['codex','claude'].map(agent=>({id:'native-'+agent,agent,name:agent==='codex'?'Codex':'Claude Code',status:'signed_in',isDefault:true,engine:agent,capabilities:{sessionKinds:['structured','pty'],modelSelection:false,reasoningEffort:false,plan:true,resume:true}}));
+const accounts=['codex','claude'].map(agent=>({id:'native-'+agent,agent,name:agent==='codex'?'Codex':'Claude Code',status:'signed_in',isDefault:true,engine:agent,capabilities:{sessionKinds:['structured','pty'],modelSelection:process.argv.includes('--model-retry'),reasoningEffort:false,plan:true,resume:true}}));
 const sources=[{id:'preview-source',name:'示例模型源',revision:1,enabled:true,endpoints:[{protocol:'openai_responses',baseUrl:'https://models.invalid/v1'},{protocol:'anthropic',baseUrl:'https://models.invalid'}],credentials:[{id:'preview-key',name:'示例凭据',revision:1}],routes:[{id:'demo-codex',name:'示例模型 · Codex',model:'demo-codex',protocol:'openai_responses',credentialId:'preview-key',enabled:true},{id:'demo-claude',name:'示例模型 · Claude',model:'demo-claude',protocol:'anthropic',credentialId:'preview-key',enabled:true}],defaultRouteId:'demo-codex',createdAt:1,updatedAt:1}];
 const server=createServer((req,res)=>{let raw='';req.on('data',b=>raw+=b);req.on('end',()=>{let body={};try{body=JSON.parse(raw||'{}');}catch{}const url=new URL(req.url,'http://127.0.0.1');res.setHeader('content-type','application/json');let result={ok:true,items:[],models:[],modes:[]};
  if(url.pathname.endsWith('/accounts'))result={type:'agent.accounts',requestId:body.requestId,ok:true,accounts};
- else if(url.pathname.endsWith('/model-sources'))result=body.action?.kind==='list'?{type:'model.source.result',requestId:body.requestId,ok:true,sources}:{type:'model.source.result',requestId:body.requestId,ok:false,error:{code:'unsupported',message:'预览模式不会修改配置或创建会话。'}};
+ else if(url.pathname.endsWith('/model-sources')) {
+  if(body.action?.kind==='list')result={type:'model.source.result',requestId:body.requestId,ok:true,sources};
+  else if(body.action?.kind==='models' && process.argv.includes('--catalog-preview'))result={type:'model.source.result',requestId:body.requestId,ok:true,models:Array.from({length:130},(_,i)=>({id:'catalog-model-'+i,label:'Catalog model '+i}))};
+  else result={type:'model.source.result',requestId:body.requestId,ok:false,error:{code:'unsupported',message:'预览模式不会修改配置或创建会话。'}};
+ }
+ else if(url.pathname.endsWith('/launch/models') && process.argv.includes('--model-retry')) {
+  if(!process.env.PROSPERO_PREVIEW_MODEL_READY_FILE || !fs.existsSync(process.env.PROSPERO_PREVIEW_MODEL_READY_FILE)){res.statusCode=503;result={error:'模拟模型目录暂时不可用'};}
+  else result={models:[{id:'preview-model',label:'Preview model',supportedEfforts:[],isDefault:true}],currentModel:'preview-model'};
+ }
  else if(url.pathname.endsWith('/sessions'))result={items:sessions,hasMore:false};
- else if(url.pathname.endsWith('/view'))result=process.argv.includes('--attention')?{kind:'pty',mode:url.searchParams.has('outputAfterSeq')?'delta':'snapshot',ansi:'Prospero isolated terminal preview\r\n$ ',output:'',seq:1,cols:120,rows:40,caughtUp:true}:{mode:'snapshot',events:[],evSeq:0};
- else if(url.pathname.endsWith('/resize'))result={ok:true};
+ else if(url.pathname.endsWith('/view')) {
+  const id=decodeURIComponent(url.pathname.match(/\/session\/([^/]+)\/view$/)?.[1]??'');
+  const session=sessions.find(item=>item.id===id);
+  if(!session){res.statusCode=404;result={error:'Preview session not found'};}
+  else {
+   result=previewSessionView(session,url.searchParams.get('outputAfterSeq'));
+   if(result===null){
+    const timer=setTimeout(()=>{if(!res.destroyed){res.statusCode=204;res.end();}},500);
+    res.once('close',()=>clearTimeout(timer));return;
+   }
+  }
+ }
+ else if(url.pathname.endsWith('/resize') || (url.pathname.endsWith('/interact') && body.type==='term.resize'))result={ok:true};
  else if(req.method !== 'GET' && !url.pathname.endsWith('/view')){res.statusCode=400;result={error:'预览不会执行真实操作'};}
  else if(url.pathname.endsWith('/session/create')){res.statusCode=400;result={error:'预览不会创建真实会话'};}
  res.end(JSON.stringify(result));});});

@@ -23,6 +23,7 @@
     "check:project-tools": "npm run build && electron scripts/check-project-tools.cjs",
     "check:packaged-rust": "node scripts/smoke-packaged-runtime.cjs",
     "pack": "npm run build && electron-builder --dir",
+    "pack:local:mac": "npm run build && electron-builder --dir --mac -c.mac.identity=- && node scripts/finalize-local-mac.mjs",
     "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
     "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1",
     "prepare:runtime:mac": "node scripts/prepare-runtime.mjs",
@@ -181,8 +182,8 @@
       "artifactName": "Prospero-${version}-mac-${arch}.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist",
+      "entitlements": "assets/entitlements.mac.plist",
+      "entitlementsInherit": "assets/entitlements.mac.plist",
       "extendInfo": {
         "NSLocalNetworkUsageDescription": "Prospero \u5728\u672c\u5730\u7f51\u7edc\u4e0a\u5e7f\u64ad\u4e0e\u63a5\u53d7\u6765\u81ea\u4f60\u624b\u673a\u7684\u76f4\u8fde,\u7528\u4e8e\u8fdc\u7a0b\u63a7\u5236 code agent \u4f1a\u8bdd\u3002",
         "NSBonjourServices": [

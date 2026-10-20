@@ -323,6 +323,11 @@ export class RustRuntime {
   private refreshing: Promise<void> | undefined;
   private sequence = 0;
   private orchestrationSequence = 0;
+  private orchestrationWindow: JsonObject = {};
+  private orchestrationReadAt = 0;
+  private orchestrationReady = false;
+  private orchestrationRetryPending = false;
+  private orchestrationConnection: string | undefined;
   private nextDevicesPollAt = 0;
   private ready = false;
   private readonly terminalRecovery: TerminalRecovery;
@@ -405,6 +410,12 @@ export class RustRuntime {
   }
 
   private clearState(): void {
+    this.sequence = 0;
+    this.orchestrationSequence = 0;
+    this.orchestrationWindow = {};
+    this.orchestrationReady = false;
+    this.orchestrationRetryPending = false;
+    this.orchestrationConnection = undefined;
     this.nextDevicesPollAt = 0;
     this.store.setApiState({ running: false, config: { bind: "127.0.0.1", port: 0 }, status: {}, devices: {}, orchestration: {}, projects: [] });
   }
@@ -415,15 +426,28 @@ export class RustRuntime {
   }
 
   private refresh(force = false): Promise<void> {
-    if (this.refreshing) return force ? this.refreshing.then(() => this.refresh()) : this.refreshing;
-    this.refreshing = this.readWindow().finally(() => { this.refreshing = undefined; });
+    if (this.refreshing) return force ? this.refreshing.then(() => this.refresh(true)) : this.refreshing;
+    this.refreshing = this.readWindow(force).finally(() => { this.refreshing = undefined; });
     return this.refreshing;
   }
 
-  private async readWindow(): Promise<void> {
+  private async readWindow(force = false): Promise<void> {
     const { client, pid, baseUrl } = this.current();
+    const connection = `${pid}:${baseUrl}`;
+    if (this.orchestrationConnection !== connection) {
+      this.orchestrationSequence = 0;
+      this.orchestrationWindow = {};
+      this.orchestrationReady = false;
+      this.orchestrationRetryPending = false;
+      this.orchestrationConnection = connection;
+    }
     const signal = this.controller.signal;
     const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
+    // Runtime observations can change without a graph event, so even identical
+    // revisions are reused for at most two seconds during active refreshes.
+    const refreshOrchestration = Boolean(orchCursor && (force || !this.orchestrationReady
+      || this.orchestrationRetryPending || orchCursor.resyncRequired
+      || orchCursor.latestSeq !== this.orchestrationSequence || Date.now() - this.orchestrationReadAt >= 2_000));
     const [summary, active, recent, workspaces, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
@@ -451,7 +475,7 @@ export class RustRuntime {
         this.store.appendLog(`[rust] agent controls read failed: ${error instanceof Error ? error.message : String(error)}\n`);
         return { controls: [] };
       }),
-      orchCursor
+      refreshOrchestration && orchCursor
         ? readOrchestrationWindow(client, signal, orchCursor.latestSeq).catch((error: unknown) => {
           // Orchestration is additive; a failure here must not blank the session list.
           this.store.appendLog(`[rust] orchestration read failed: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -460,13 +484,21 @@ export class RustRuntime {
         : Promise.resolve(null),
     ]);
     signal.throwIfAborted();
-    if (orchCursor) this.orchestrationSequence = orchCursor.latestSeq;
+    if (orchestration && orchCursor) {
+      this.orchestrationWindow = orchestration;
+      this.orchestrationSequence = orchCursor.latestSeq;
+      this.orchestrationReadAt = Date.now();
+      this.orchestrationReady = true;
+      this.orchestrationRetryPending = false;
+    } else if (refreshOrchestration || !orchCursor) {
+      this.orchestrationRetryPending = true;
+    }
     this.nextDevicesPollAt = Date.now() + 2_000;
     const queueById = new Map(queues.queues.map(queue => [queue.sessionId, queue.items]));
     const controlsById = new Map(controls.controls.map(item => [item.sessionId, item]));
     const sessions = [...active.items, ...recent.items].map(head => rustSessionInfo(head, queueById.get(head.id), controlsById.get(head.id)));
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
-    this.store.setApiState({ running: true, config: {}, devices: devices as unknown as JsonObject, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
+    this.store.setApiState({ running: true, config: {}, devices: devices as unknown as JsonObject, orchestration: this.orchestrationWindow, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
       persistence: health.persistence,
       daemonVersion: health.daemonVersion,
@@ -514,9 +546,10 @@ export class RustRuntime {
         shouldPollDevices ? client.devices(this.controller.signal).catch(() => null) : Promise.resolve(null),
       ]);
       if (devices) this.store.setApiDevices(devices as unknown as JsonObject);
-      if (sessions.resyncRequired || sessions.latestSeq !== this.sequence
+      if (this.orchestrationRetryPending || !this.orchestrationReady || sessions.resyncRequired || sessions.latestSeq !== this.sequence
         || orchestration.resyncRequired || orchestration.latestSeq !== this.orchestrationSequence) {
         await this.refresh();
+        if (this.orchestrationRetryPending) delay = 2000;
       }
     } catch { delay = 2000; }
     finally { this.schedule(delay); }
@@ -993,6 +1026,12 @@ export class RustRuntime {
     if (subagentEventsRoute && (!init?.method || init.method === "GET")) {
       const snapshot = await this.current().client.subagentEvents(subagentEventsRoute[1]!, subagentEventsRoute[2]!, signal);
       return snapshot as unknown as JsonObject;
+    }
+    const forkRoute = /^\/_prospero\/control\/session\/([^/]+)\/fork$/.exec(path);
+    if (forkRoute && init?.method === "POST") {
+      const head = await this.current().client.forkAgentSession(forkRoute[1]!, signal, init.timeoutMs ?? 180_000);
+      await this.refresh(true);
+      return rustSessionInfo(head);
     }
     const launchModelsRoute = /^\/_prospero\/control\/launch\/models(?:\?(.*))?$/.exec(path);
     if (launchModelsRoute && (!init?.method || init.method === "GET")) {

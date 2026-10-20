@@ -260,14 +260,6 @@ fn client() -> std::result::Result<reqwest::Client, FeatureError> {
 }
 
 /// Fetches the catalog. All failure modes are stable `FeatureError`s.
-pub(crate) async fn fetch_models(
-    base_url: &str,
-    api_key: &str,
-    headers: &std::collections::BTreeMap<String, String>,
-) -> std::result::Result<Vec<CatalogModel>, FeatureError> {
-    fetch_models_with_protocol("anthropic", base_url, api_key, headers).await
-}
-
 pub(crate) async fn fetch_models_with_protocol(
     protocol: &str,
     base_url: &str,

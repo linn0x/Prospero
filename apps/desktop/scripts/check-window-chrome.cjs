@@ -83,7 +83,12 @@ app.on("browser-window-created", (_event, window) => {
       window.setMinimumSize(700, 600);
       window.setSize(1280, 860);
       window.show(); window.focus();
-      await delay(1000);
+      // did-finish-load can precede the lazy React shell and initial snapshot.
+      const shellDeadline = Date.now() + 30_000;
+      while (!await run(`Boolean(document.querySelector('.prospero-main'))`)) {
+        if (Date.now() > shellDeadline) throw new Error("Desktop shell did not become ready");
+        await delay(100);
+      }
       if (!(await measure()).expanded) await toggle();
       await run(`window.widthSaves=0;const originalSetItem=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){if(key==='prospero.sidebarWidth')window.widthSaves++;return originalSetItem.call(this,key,value)};void 0;`);
       const initial = await assertHeader();

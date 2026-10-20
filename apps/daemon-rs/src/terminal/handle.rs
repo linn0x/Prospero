@@ -79,9 +79,9 @@ impl Handle {
                 // Hosts from an older app version deserialize without the new
                 // marker. Do not call an endpoint they do not implement.
                 let activity: TerminalActivity = h.get("activity").await?;
-                if !activity
+                if activity
                     .idle_prompt_since
-                    .is_some_and(|since| since < before)
+                    .is_none_or(|since| since >= before)
                 {
                     return Ok(false);
                 }
