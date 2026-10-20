@@ -847,6 +847,118 @@ fn stale_idle_worker_is_archived_only_while_its_dispatch_is_still_unreported() {
 }
 
 #[test]
+fn pty_idle_worker_is_eligible_for_reclaim_and_can_launch_again() {
+    // A pty-kind worker previously lived outside the stale idle worker
+    // watchdog (the query only matched 'structured' payloads), so idle ptys
+    // piled up and crowded out new session creation. Now both kinds are
+    // self-maintained: reclaim parks the worker (releasing its terminal slot)
+    // while it stays relaunchable by the user.
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let pty = store
+        .create_session(CreateSession {
+            agent: AgentKind::Codex,
+            kind: SessionKind::Pty,
+            title: "worker".into(),
+            workspace: "/w".into(),
+        })
+        .unwrap();
+    raw(&directory)
+        .execute(
+            "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id) \
+             VALUES(?1,'codex',1,'manual','plan',1,NULL)",
+            [&pty.id],
+        )
+        .unwrap();
+    let (run_id, ids) = make_run(&mut store, "op-pty-idle", chain(1));
+    let dispatch = store
+        .dispatch_task(&ids["n0"], &pty.id, None, None)
+        .unwrap();
+    store.set_dispatch_running(&dispatch.dispatch.id).unwrap();
+    store
+        .update_session(
+            &pty.id,
+            UpdateSession {
+                revision: pty.revision,
+                title: None,
+                lifecycle: None,
+                status: Some(SessionStatus::Idle),
+            },
+        )
+        .unwrap();
+    let stale_before = dispatch.dispatch.started_at - 60_000;
+    raw(&directory)
+        .execute(
+            "INSERT INTO timeline_checkpoints(session_id,last_progress_at) VALUES(?1,?2)",
+            params![pty.id, stale_before - 1],
+        )
+        .unwrap();
+    // Without the worker-start ledger this is just a manual dispatch and must
+    // not be reclaimed, exactly like the structured watchdog.
+    assert!(
+        store
+            .stale_idle_worker_sessions(stale_before, 4)
+            .unwrap()
+            .is_empty()
+    );
+    raw(&directory)
+        .execute(
+            "INSERT INTO orch_worker_starts(operation_id,fingerprint,request,phase,task_id,run_id,agent,account_scope,plugin_scope,profile_scope,ticket,session_id,dispatch_id,created_at,updated_at) \
+             VALUES('pty-owned-op','test','{}','running',?1,?2,'codex','native','none','none',1,?3,?4,?5,?5)",
+            params![ids["n0"], run_id, pty.id, dispatch.dispatch.id, dispatch.dispatch.started_at],
+        )
+        .unwrap();
+
+    // A pty idle worker is now returned by the stale idle watchdog.
+    assert_eq!(
+        store.stale_idle_worker_sessions(stale_before, 4).unwrap(),
+        vec![pty.id.clone()]
+    );
+    // Reclaim parks the session (releases the terminal slot).
+    let run_ids = store
+        .archive_stale_idle_worker_session(&pty.id, stale_before)
+        .unwrap();
+    assert!(run_ids.is_some());
+    assert_eq!(
+        store.session(&pty.id).unwrap().lifecycle,
+        SessionLifecycle::Archived
+    );
+    let active: i64 = raw(&directory)
+        .query_row(
+            "SELECT active FROM agent_runs WHERE session_id=?1",
+            [&pty.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    // Reconciling the parked worker settles its dispatch.
+    assert_eq!(
+        store
+            .reconcile_stale_idle_worker_session(&pty.id)
+            .unwrap()
+            .settled
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.dispatch(&dispatch.dispatch.id).unwrap().state,
+        DispatchState::Abandoned
+    );
+
+    // The user can still pull up a session in the same workspace afterwards.
+    let relaunch = store
+        .create_session(CreateSession {
+            agent: AgentKind::Codex,
+            kind: SessionKind::Pty,
+            title: "worker".into(),
+            workspace: "/w".into(),
+        })
+        .unwrap();
+    assert_eq!(relaunch.lifecycle, SessionLifecycle::Active);
+    assert_eq!(relaunch.workspace, "/w");
+}
+
+#[test]
 fn archived_structured_session_fails_dispatch_and_preserves_explicit_delivery() {
     let directory = TempDir::new().unwrap();
     let mut store = Store::open(directory.path()).unwrap();

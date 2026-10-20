@@ -93,6 +93,30 @@ impl Store {
         }
         Ok(ids)
     }
+    /// Manual Agent PTYs are intentionally separate from orchestration worker
+    /// reclamation. Runtime prompt detection performs the final safety check.
+    pub(crate) fn manual_terminal_reclaim_candidates(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT h.id FROM session_heads h \
+             JOIN terminal_runs t ON t.session_id=h.id \
+             WHERE h.lifecycle='active' AND t.active=1 \
+               AND json_extract(h.payload,'$.kind')='pty' \
+               AND json_extract(h.payload,'$.status')='running' \
+               AND json_extract(h.payload,'$.agent') IN ('codex','claude') \
+               AND json_extract(h.payload,'$.updatedAt')<?1 \
+               AND NOT EXISTS(SELECT 1 FROM orch_worker_starts w WHERE w.session_id=h.id) \
+             ORDER BY json_extract(h.payload,'$.updatedAt'),h.id LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(rusqlite::params![before, limit.min(16) as i64], |row| {
+                row.get(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
     pub fn recover_terminals(&mut self) -> Result<usize> {
         self.recover_terminals_except(&[])
     }

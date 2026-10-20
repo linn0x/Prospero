@@ -3679,7 +3679,7 @@ impl Store {
              JOIN agent_runs a ON a.session_id=d.session_id \
              LEFT JOIN timeline_checkpoints c ON c.session_id=d.session_id \
              WHERE d.state IN ('starting','running') AND h.lifecycle='active' \
-               AND json_extract(h.payload,'$.kind')='structured' \
+               AND json_extract(h.payload,'$.kind') IN ('structured','pty') \
                AND json_extract(h.payload,'$.status')='idle' AND a.active=1 \
                AND coalesce(c.last_progress_at,d.started_at)<?1 \
                AND EXISTS (SELECT 1 FROM orch_worker_starts w \
@@ -3715,7 +3715,7 @@ impl Store {
              JOIN agent_runs a ON a.session_id=d.session_id \
              LEFT JOIN timeline_checkpoints c ON c.session_id=d.session_id \
              WHERE d.session_id=?1 AND d.state IN ('starting','running') \
-               AND h.lifecycle='active' AND json_extract(h.payload,'$.kind')='structured' \
+               AND h.lifecycle='active' AND json_extract(h.payload,'$.kind') IN ('structured','pty') \
                AND json_extract(h.payload,'$.status')='idle' AND a.active=1 \
                AND coalesce(c.last_progress_at,d.started_at)<?2 \
                AND EXISTS (SELECT 1 FROM orch_worker_starts w \
@@ -3759,7 +3759,7 @@ impl Store {
                    AND (?1 IS NULL OR d.session_id=?1) \
                    AND NOT EXISTS(SELECT 1 FROM orch_executions e WHERE e.dispatch_id=d.id AND e.state!='finalized') \
                    AND (h.id IS NULL OR h.lifecycle='archived' OR ( \
-                     json_extract(h.payload,'$.kind')='structured' AND (a.session_id IS NULL OR a.active=0) \
+                     json_extract(h.payload,'$.kind') IN ('structured','pty') AND (a.session_id IS NULL OR a.active=0) \
                    )) \
                  ORDER BY d.started_at,d.id",
             )?;

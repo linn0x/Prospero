@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -371,6 +371,93 @@ async fn terminal_busy_since_tracks_live_activity() {
         .await
         .unwrap();
     assert_eq!(finished.busy_since, None);
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_agent_reclaim_requires_a_recognized_idle_prompt() {
+    let _lock = ENV_LOCK.lock().await;
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let runtime = Terminals::new(database.clone());
+    let idle_cli = directory.path().join("idle-codex.py");
+    let busy_cli = directory.path().join("busy-codex.py");
+    executable_script(
+        &idle_cli,
+        "#!/usr/bin/env python3\nimport time\nprint('\\n' * 24 + 'Ask Codex to do anything', flush=True)\ntime.sleep(60)\n",
+    );
+    executable_script(
+        &busy_cli,
+        "#!/usr/bin/env python3\nimport time\nprint('working without a prompt', flush=True)\ntime.sleep(60)\n",
+    );
+    let _env = EnvGuard::new(vec!["PROSPERO_CODEX_BIN"]);
+    unsafe { std::env::set_var("PROSPERO_CODEX_BIN", &idle_cli) };
+    let mut idle_input = input(&workspace);
+    idle_input.agent = Some(prosperod_rs::protocol::AgentKind::Codex);
+    let idle = runtime.create(idle_input).await.unwrap();
+    unsafe { std::env::set_var("PROSPERO_CODEX_BIN", &busy_cli) };
+    let mut busy_input = input(&workspace);
+    busy_input.agent = Some(prosperod_rs::protocol::AgentKind::Codex);
+    let busy = runtime.create(busy_input).await.unwrap();
+
+    for id in [&idle.id, &busy.id] {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let page = runtime
+                    .read(id.clone(), TerminalQuery::default())
+                    .await
+                    .unwrap();
+                if page.latest_seq > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        runtime
+            .reclaim_idle_manual(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64
+                    + 1,
+                2,
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.count() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let idle_head = database
+        .call({
+            let id = idle.id.clone();
+            move |store| store.session(&id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(idle_head.lifecycle, SessionLifecycle::Archived);
+    let busy_head = database
+        .call({
+            let id = busy.id.clone();
+            move |store| store.session(&id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(busy_head.lifecycle, SessionLifecycle::Active);
+    runtime.close(&busy.id).await.unwrap();
+    settled(&runtime).await;
     runtime.shutdown().await.unwrap();
     database.shutdown().await.unwrap();
 }

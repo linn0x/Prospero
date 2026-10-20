@@ -44,6 +44,7 @@ pub struct Output {
     exit_code: Option<u32>,
     busy_since: Option<i64>,
     last_activity_at: Option<i64>,
+    idle_prompt_since: Option<i64>,
     activity_version: u64,
 }
 
@@ -74,6 +75,7 @@ impl Output {
             exit_code: None,
             busy_since: None,
             last_activity_at: None,
+            idle_prompt_since: None,
             activity_version: 0,
         })
     }
@@ -114,9 +116,12 @@ impl Output {
         if self.exited {
             return;
         }
-        let changed = self.busy_since.is_none() || self.last_activity_at != Some(now);
+        let changed = self.busy_since.is_none()
+            || self.last_activity_at != Some(now)
+            || self.idle_prompt_since.is_some();
         self.busy_since.get_or_insert(now);
         self.last_activity_at = Some(now);
+        self.idle_prompt_since = None;
         if changed {
             self.activity_version = self.activity_version.wrapping_add(1);
         }
@@ -134,6 +139,7 @@ impl Output {
             version: self.activity_version,
             busy_since: self.busy_since,
             last_activity_at: self.last_activity_at,
+            idle_prompt_since: self.idle_prompt_since,
             exited: self.exited,
         }
     }
@@ -145,39 +151,45 @@ impl Output {
     }
 
     fn update_output_activity(&mut self, bytes: &[u8]) {
-        if output_looks_idle(bytes) || self.screen_looks_idle() {
+        if self.screen_looks_idle() {
+            self.mark_idle_prompt(crate::database::now());
+        } else if output_looks_idle(bytes) {
+            // Preserve the existing busy-indicator behavior for split prompt
+            // output, but only a prompt confirmed on the rendered screen is
+            // safe enough to become an automatic-reclamation marker.
             self.clear_activity();
         } else {
             self.mark_activity(crate::database::now());
         }
     }
 
+    fn mark_idle_prompt(&mut self, now: i64) {
+        let changed = self.busy_since.is_some()
+            || self.last_activity_at.is_some()
+            || self.idle_prompt_since.is_none();
+        self.busy_since = None;
+        self.last_activity_at = None;
+        self.idle_prompt_since.get_or_insert(now);
+        if changed {
+            self.activity_version = self.activity_version.wrapping_add(1);
+        }
+    }
+
     fn clear_activity(&mut self) {
-        if self.busy_since.is_some() || self.last_activity_at.is_some() {
+        if self.busy_since.is_some()
+            || self.last_activity_at.is_some()
+            || self.idle_prompt_since.is_some()
+        {
             self.busy_since = None;
             self.last_activity_at = None;
+            self.idle_prompt_since = None;
             self.activity_version = self.activity_version.wrapping_add(1);
         }
     }
 
     fn screen_looks_idle(&self) -> bool {
         let text = self.screen.visible_tail_text(ACTIVITY_TAIL_LINES);
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return false;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.contains("esc to interrupt")
-            || lower.contains("ctrl-c to quit")
-            || lower.contains("background terminal running")
-        {
-            return false;
-        }
-        lower.contains("ask codex to do anything")
-            || lower.contains("new task? /clear")
-            || text
-                .lines()
-                .any(|line| matches!(line.trim(), "\u{276f}" | "\u{203a}"))
+        text_looks_idle(&text)
     }
 
     fn terminal_query_responses(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -308,16 +320,35 @@ pub(crate) struct TerminalActivity {
     version: u64,
     pub busy_since: Option<i64>,
     pub last_activity_at: Option<i64>,
+    /// Set only when the rendered screen contains a recognized Agent prompt.
+    /// A generic lack of output is deliberately not considered reclaimable.
+    #[serde(default)]
+    pub idle_prompt_since: Option<i64>,
     pub exited: bool,
+}
+
+fn text_looks_idle(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("esc to interrupt")
+        || lower.contains("ctrl-c to quit")
+        || lower.contains("background terminal running")
+    {
+        return false;
+    }
+    lower.contains("ask codex to do anything")
+        || lower.contains("new task? /clear")
+        || text
+            .lines()
+            .any(|line| matches!(line.trim(), "\u{276f}" | "\u{203a}"))
 }
 
 fn output_looks_idle(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
-    let lower = text.to_ascii_lowercase();
-    text.lines()
-        .any(|line| matches!(line.trim(), "\u{276f}" | "\u{203a}"))
-        || lower.contains("ask codex to do anything")
-        || lower.contains("new task? /clear")
+    text_looks_idle(&text)
 }
 
 enum Control {
@@ -494,6 +525,23 @@ impl Terminal {
             .lock()
             .map_err(|_| Error::Closed)?
             .activity(crate::database::now()))
+    }
+
+    /// Stops an Agent PTY only if it is still sitting at a recognized idle
+    /// prompt. Silent commands never acquire this marker.
+    pub(crate) fn reclaim_if_idle_prompt(&self, before: i64) -> Result<bool> {
+        let reclaim = self
+            .0
+            .output
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .activity(crate::database::now())
+            .idle_prompt_since
+            .is_some_and(|since| since < before);
+        if reclaim {
+            self.stop();
+        }
+        Ok(reclaim)
     }
 
     pub(crate) async fn wait_activity(&self, version: u64, timeout: Duration) {
@@ -688,10 +736,18 @@ mod tests {
     #[test]
     fn output_activity_clears_when_prompt_returns() {
         let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
+        output.write(&b"\r\n".repeat(24));
         output.write(b"running");
         assert!(output.activity(crate::database::now()).busy_since.is_some());
         output.write("\r\n\u{276f}\r\n".as_bytes());
-        assert_eq!(output.activity(crate::database::now()).busy_since, None);
+        let idle = output.activity(crate::database::now());
+        assert_eq!(idle.busy_since, None);
+        assert!(idle.idle_prompt_since.is_some());
+        output.mark_activity(crate::database::now());
+        assert_eq!(
+            output.activity(crate::database::now()).idle_prompt_since,
+            None
+        );
     }
 
     #[test]

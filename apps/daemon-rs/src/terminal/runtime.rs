@@ -68,6 +68,35 @@ impl Terminals {
         16 - self.0.slots.available_permits()
     }
 
+    /// Reclaims old manual Agent PTYs only when their live terminal host still
+    /// reports a recognized idle prompt. Managed orchestration workers have a
+    /// separate dispatch-aware watchdog.
+    pub async fn reclaim_idle_manual(&self, before: i64, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let candidates = self
+            .0
+            .database
+            .call(move |store| store.manual_terminal_reclaim_candidates(before, 16))
+            .await?;
+        let mut reclaimed = 0;
+        for id in candidates {
+            if reclaimed >= limit {
+                break;
+            }
+            let terminal = match self.terminal(&id) {
+                Ok(terminal) => terminal,
+                Err(Error::NotFound) => continue,
+                Err(error) => return Err(error),
+            };
+            if terminal.reclaim_if_idle_prompt(before).await? {
+                reclaimed += 1;
+            }
+        }
+        Ok(reclaimed)
+    }
+
     /// Spawns the managed-Claude login flow (`claude setup-token`) in a PTY
     /// rooted at the account's isolated config directory. The returned head is
     /// a normal pty session; its run is bound to the account for accounting.
