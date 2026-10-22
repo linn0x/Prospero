@@ -4106,6 +4106,7 @@ fn health_capabilities() -> Vec<String> {
         "model.sources.v1",
         "session.codex-fork.v1",
         "session.claude-fork.v1",
+        "session.terminal-fork-picker.v1",
         "orchestration.automation.v1",
         "scheduled-agents.v1",
         "session.workspace.summary",
@@ -5695,7 +5696,16 @@ async fn fork_agent_chat(
     Path(id): Path<String>,
 ) -> std::result::Result<Json<SessionHead>, ApiError> {
     let _permit = api.api_features.try_acquire().map_err(|_| Error::Busy)?;
-    let head = api.agents.fork_chat(&id).await?;
+    let source_id = id.clone();
+    let source = api
+        .database
+        .call(move |store| store.session(&source_id))
+        .await?;
+    let head = if source.kind == SessionKind::Pty {
+        api.terminals.fork_chat(&id).await?
+    } else {
+        api.agents.fork_chat(&id).await?
+    };
     api.publish();
     Ok(Json(head))
 }

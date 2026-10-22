@@ -10,6 +10,12 @@ const home=path.join(root,'home'),other=path.join(root,'Other project'),current=
 for(const p of [home,other,current])fs.mkdirSync(p,{recursive:true});
 fs.writeFileSync(path.join(home,'desktop.json'),JSON.stringify({projects:[other,current],settings:{startDaemonOnLaunch:false,minimizeToTray:false,theme:'dark',daemonBackend:'legacy'}}));
 const sessions=[{id:'preview-session',agent:'codex',kind:'structured',title:'当前项目会话',cwd:current,status:'idle',createdAt:1}];
+if(process.argv.includes('--branch-preview')) {
+ sessions.push(
+  {id:'branch-pty',agent:'claude',kind:'pty',title:'Terminal branch preview',cwd:current,status:'running',createdAt:2},
+  {id:'branch-busy',agent:'codex',kind:'structured',title:'Busy branch preview',cwd:current,status:'running',createdAt:3},
+ );
+}
 if(process.argv.includes('--attention')) {
  sessions[0].pendingPermissions=2; sessions[0].pendingQuestions=1;
  for(let i=0;i<11;i++)sessions.push({id:'preview-shell-'+i,agent:'claude',kind:'pty',title:i%2?'claude · Current project':'Claude',cwd:i%2?current:other,status:'running',createdAt:i+2});

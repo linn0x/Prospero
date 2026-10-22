@@ -23,6 +23,89 @@ use tower::ServiceExt;
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[tokio::test]
+async fn terminal_fork_route_opens_native_picker_without_mutating_source() {
+    let _lock = ENV_LOCK.lock().await;
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let api = Api::new(database.clone(), Token::parse("1".repeat(64)).unwrap());
+    let cli = directory.path().join("fork-picker.py");
+    let capture = directory.path().join("fork.json");
+    executable_script(
+        &cli,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CAPTURE"], "w") as f:
+    json.dump({"args": sys.argv[1:], "cwd": os.getcwd(),
+               "model": os.getenv("ANTHROPIC_MODEL"),
+               "effort": os.getenv("CLAUDE_CODE_EFFORT_LEVEL")}, f)
+"#,
+    );
+    let _env = EnvGuard::new(vec!["PROSPERO_CODEX_BIN", "PROSPERO_CLAUDE_BIN", "CAPTURE"]);
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+        std::env::set_var("CAPTURE", &capture);
+    }
+    for agent in [
+        prosperod_rs::protocol::AgentKind::Codex,
+        prosperod_rs::protocol::AgentKind::Claude,
+    ] {
+        let mut launch = input(&workspace);
+        launch.agent = Some(agent);
+        launch.model = Some("test-model".into());
+        launch.effort = Some("high".into());
+        let source = database
+            .call(move |store| store.create_terminal(launch))
+            .await
+            .unwrap();
+        let (status, branch) = request(
+            &api,
+            &"1".repeat(64),
+            "POST",
+            &format!("/v1/agent-sessions/{}/fork", source.id),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{branch}");
+        settled(&api.terminals).await;
+        let captured = wait_for_json(&capture).await;
+        assert_ne!(branch["id"], source.id);
+        assert_eq!(branch["kind"], "pty");
+        assert_eq!(branch["model"], "test-model");
+        assert_eq!(branch["effort"], "high");
+        assert_eq!(
+            captured["cwd"],
+            std::fs::canonicalize(workspace.path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let args = captured["args"].as_array().unwrap();
+        assert!(!args.contains(&json!("--last")));
+        assert!(!args.contains(&json!("--continue")));
+        if agent == prosperod_rs::protocol::AgentKind::Codex {
+            assert_eq!(args[0], "fork");
+            assert!(args.contains(&json!("model=\"test-model\"")));
+        } else {
+            assert!(args.contains(&json!("--fork-session")));
+            assert_eq!(args.last().unwrap(), "--resume");
+            assert_eq!(captured["model"], "test-model");
+        }
+        let source_id = source.id.clone();
+        let unchanged = database
+            .call(move |store| store.session(&source_id))
+            .await
+            .unwrap();
+        assert_eq!(unchanged.revision, source.revision);
+        assert_eq!(unchanged.status, source.status);
+        std::fs::remove_file(&capture).unwrap();
+    }
+    api.terminals.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
 struct EnvGuard {
     keys: Vec<&'static str>,
 }
