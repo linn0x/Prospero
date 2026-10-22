@@ -175,6 +175,49 @@ impl Terminals {
         self.create_with(input, spec).await
     }
 
+    /// Existing PTYs do not record a native conversation ID. Let the native
+    /// picker identify the source explicitly; never guess using "last" or cwd.
+    /// Both commands create an independent native history after selection.
+    pub async fn fork_chat(&self, source: &str) -> Result<SessionHead> {
+        crate::database::validate_id(source)?;
+        let id = source.to_owned();
+        let head = self
+            .0
+            .database
+            .call(move |store| store.session(&id))
+            .await?;
+        if head.kind != crate::protocol::SessionKind::Pty
+            || !matches!(
+                head.agent,
+                crate::protocol::AgentKind::Codex | crate::protocol::AgentKind::Claude
+            )
+        {
+            return Err(Error::Invalid(
+                "仅 Codex 和 Claude 终端支持原生聊天分支".into(),
+            ));
+        }
+        let mut input = CreateTerminal {
+            title: head.title.chars().take(470).collect::<String>() + " · 分支",
+            workspace: head.workspace,
+            size: TerminalSize {
+                cols: 120,
+                rows: 36,
+            },
+            agent: Some(head.agent),
+            command: None,
+            account_id: head.account_id,
+            model: head.model,
+            effort: head.effort,
+            approval_policy: head.approval_policy,
+        };
+        let mut spec = self
+            .pty_program_for(&mut input)
+            .await?
+            .ok_or(Error::Invalid("此终端没有可用的原生 Agent".into()))?;
+        configure_fork_picker(head.agent, &mut spec.args)?;
+        self.create_with(input, Some(spec)).await
+    }
+
     /// A non-shell PTY (the managed-account login flow): runs an explicit
     /// program with private environment overrides and is bound to the account
     /// for active-session accounting.
@@ -905,6 +948,17 @@ fn shell_command(command: &str) -> Result<ProgramSpec> {
         environment: Vec::new(),
         account_id: None,
     })
+}
+
+fn configure_fork_picker(agent: crate::protocol::AgentKind, args: &mut Vec<String>) -> Result<()> {
+    match agent {
+        crate::protocol::AgentKind::Codex => args.insert(0, "fork".into()),
+        crate::protocol::AgentKind::Claude => {
+            args.extend(["--fork-session".into(), "--resume".into()]);
+        }
+        _ => return Err(Error::Invalid("此 Agent 不支持原生聊天分支".into())),
+    }
+    Ok(())
 }
 
 fn retryable_database_pressure(error: &Error) -> bool {

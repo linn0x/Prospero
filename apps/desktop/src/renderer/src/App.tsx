@@ -1,4 +1,5 @@
 import { ArchivedChatsDialog } from "./ArchivedChatsDialog";
+import { chatBranchDisabledReason } from "./workspace/chat-branch";
 import { scheduleDeferredRequest } from "./deferred-request";
 import { OverviewAttention } from "./attention/OverviewAttention";
 import { AttentionGroup, AttentionFilters, AttentionDetails } from "./attention/AttentionGroups";
@@ -481,6 +482,13 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
 }: WorkspaceSessionRowProps) {
   const { t } = useLocale();
   const Row = pinnedArea ? SidebarMenuItem : SidebarMenuSubItem;
+  const branchReason = chatBranchDisabledReason(session);
+  const branchExplanation = branchReason === "agent" ? t("仅支持 Codex 和 Claude", "Only Codex and Claude are supported")
+    : branchReason === "kind" ? t("此会话类型暂不支持分支", "This session type cannot be branched")
+    : branchReason === "workspace" ? t("会话缺少工作目录", "The session has no working directory")
+    : branchReason === "turn" ? t("请等待当前轮次结束", "Wait for the current turn to finish")
+    : session.kind === "pty" ? t("在新终端选择原生聊天，创建独立历史分支", "Select a native chat in a new terminal to fork its history")
+    : undefined;
   return (
     <Row className={cn("workspace-session-item", pinnedArea && "workspace-pinned-item")}>
       <ContextMenu>
@@ -515,9 +523,10 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
               <Pencil />
               {t("编辑名称", "Rename")}
             </ContextMenuItem>
-            <ContextMenuItem disabled={!["codex", "claude"].includes(session.agent) || session.kind !== "structured" || !["idle", "done", "completed"].includes(session.status)} title={t("Codex / Claude 对话可在当前轮次结束后创建独立历史分支", "Codex / Claude conversations can branch after the current turn completes")} onClick={() => onForkSession(session)}>
-              <GitBranch />{t("创建聊天分支", "Branch chat")}
+            <ContextMenuItem disabled={Boolean(branchReason)} title={branchExplanation} onClick={() => onForkSession(session)}>
+              <GitBranch />{session.kind === "pty" ? t("选择聊天并创建分支…", "Select chat to branch…") : t("创建聊天分支", "Branch chat")}
             </ContextMenuItem>
+            {branchExplanation && <p className="max-w-72 px-2 pb-2 text-xs text-muted-foreground">{branchExplanation}</p>}
             <ContextMenuItem onClick={() => onDuplicateSession(session)}>
               <Copy />
               {t("复制会话配置", "Copy session configuration")}
@@ -4027,7 +4036,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const branching = useRef(new Set<string>());
   const forkSession = useCallback((session: SessionInfo): void => {
     if (branching.current.has(session.id)) return;
-    if (!snapshotRef.current.daemon.capabilities?.includes(session.agent === "claude" ? "session.claude-fork.v1" : "session.codex-fork.v1")) {
+    if (!snapshotRef.current.daemon.capabilities?.includes(session.kind === "pty" ? "session.terminal-fork-picker.v1" : session.agent === "claude" ? "session.claude-fork.v1" : "session.codex-fork.v1")) {
       setSessionActionError(t("请更新 Rust daemon 后使用聊天分支。", "Update the Rust daemon to branch chats.")); return;
     }
     branching.current.add(session.id);
