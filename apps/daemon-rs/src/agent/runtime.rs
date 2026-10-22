@@ -839,6 +839,7 @@ impl Agents {
         );
         fan_in_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut fan_in_cursor = None;
+        let mut archived_cursor = None;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -848,6 +849,10 @@ impl Agents {
                     if let Ok(next) = self.retry_durable_cross_model_fan_in_batch(fan_in_cursor.clone(), 8).await {
                         fan_in_cursor = next;
                     }
+                    let (next, _) = self
+                        .reap_confirmed_archived_idle_batch(archived_cursor.as_deref(), 64)
+                        .await;
+                    archived_cursor = next;
                 }
                 changed = stopping.changed() => {
                     if changed.is_err() || *stopping.borrow() {
@@ -2399,6 +2404,33 @@ impl Agents {
                 entry.execution_unknown.store(false, Ordering::Release);
                 handle.quiescence_unknown.store(false, Ordering::Release);
                 *guard = None;
+                // A worker can deliver its task while its agent turn is still
+                // unwinding. The dispatch close archives the session, but
+                // cannot release its permit until this process exits. Once
+                // exit and the durable stop claim are both confirmed, finish
+                // that close here; otherwise the archived session keeps a
+                // runtime slot for the daemon's entire lifetime.
+                let archived_id = id.clone();
+                let archived_and_stopped = runtime
+                    .0
+                    .database
+                    .call_control("agent.quiesced_archive", move |store| {
+                        store.agent_execution_stopped(&archived_id)
+                    })
+                    .await
+                    .unwrap_or(false);
+                if archived_and_stopped {
+                    drop(guard);
+                    drop(_drain);
+                    if let Err(error) = runtime.release_confirmed_archived_idle(&id).await {
+                        runtime.0.database.record_recent_error(
+                            "agent.quiesced_archive",
+                            "agent_sessions",
+                            &error.to_string(),
+                        );
+                    }
+                    break;
+                }
                 runtime.publish();
                 let queued = {
                     let id = id.clone();
@@ -4598,6 +4630,69 @@ impl Agents {
         Ok(())
     }
 
+    /// Reclaim a quiesced archived session only after durable stop proof.
+    /// This also covers a close whose first attempt timed out while the turn
+    /// was still unwinding.
+    async fn release_confirmed_archived_idle(&self, id: &str) -> Result<bool> {
+        let session_id = id.to_owned();
+        let stopped = self
+            .0
+            .database
+            .call_control("agent.quiesced_archive", move |store| {
+                store.agent_execution_stopped(&session_id)
+            })
+            .await?;
+        if !stopped {
+            return Ok(false);
+        }
+        if let Ok(entry) = self.session_entry(id).await {
+            if entry.handle.lock().await.is_some() {
+                return Ok(false);
+            }
+        }
+        self.finish_close(id, false, true).await?;
+        Ok(true)
+    }
+
+    async fn reap_confirmed_archived_idle_batch(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> (Option<String>, usize) {
+        let mut ids = self
+            .0
+            .entries
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        let start = after
+            .map(|cursor| ids.partition_point(|id| id.as_str() <= cursor))
+            .unwrap_or(0);
+        let scan = ids[start..]
+            .iter()
+            .chain(ids[..start].iter())
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next = scan.last().cloned();
+        let mut reclaimed = 0;
+        for id in scan {
+            match self.release_confirmed_archived_idle(&id).await {
+                Ok(true) => reclaimed += 1,
+                Ok(false) => {}
+                Err(error) => self.0.database.record_recent_error(
+                    "agent.quiesced_archive",
+                    "agent_sessions",
+                    &error.to_string(),
+                ),
+            }
+        }
+        (next, reclaimed)
+    }
+
     /// Archive runs left active by a previous daemon process. The provider
     /// process is gone with that daemon, so turns are never replayed.
     pub async fn recover(&self) -> Result<usize> {
@@ -4866,6 +4961,62 @@ fn bounded_text(mut text: String) -> String {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quiesced_archived_session_releases_runtime_capacity_after_stop_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let head = agents
+            .create(CreateAgentSession {
+                agent: AgentKind::Claude,
+                title: "completed worker".into(),
+                workspace: root.path().to_string_lossy().into_owned(),
+                auto_approve: false,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id: None,
+                resume: None,
+            })
+            .await
+            .unwrap();
+        let session_id = head.id.clone();
+        database
+            .call_control("test.archive_during_turn", move |store| {
+                store.archive_agent_session_for_stop(&session_id, true)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(agents.count(), 1);
+        assert!(
+            !agents
+                .release_confirmed_archived_idle(&head.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(agents.count(), 1);
+
+        let session_id = head.id.clone();
+        database
+            .call_control("test.exit_confirmed", move |store| {
+                store.clear_agent_execution_unknown(&session_id)
+            })
+            .await
+            .unwrap();
+        let (_, reclaimed) = agents.reap_confirmed_archived_idle_batch(None, 8).await;
+        assert_eq!(reclaimed, 1);
+        assert_eq!(agents.count(), 0);
+        assert!(
+            agents
+                .release_confirmed_archived_idle(&head.id)
+                .await
+                .unwrap()
+        );
+        database.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn late_status_update_does_not_change_an_archived_session() {
