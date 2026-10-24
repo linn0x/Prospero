@@ -10,7 +10,7 @@ import { toast } from "@/components/Toast";
 import { Icon } from "@/components/Icon";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { DismissedModalAction } from "@/lib/host-screen-flow";
-import { supportsMacTerminal, MAC_TERMINAL_ONLY } from "@/lib/terminal-session";
+import { supportsRemoteTerminal, REMOTE_TERMINAL_UNAVAILABLE } from "@/lib/terminal-session";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { dropConnection, getConnection, peekConnection, wireAppStateReconnect } from "@/lib/connection";
 import { selectedEdgeHosts, useEdgePreferences } from "@/lib/edge-preferences";
@@ -89,7 +89,7 @@ export default function HostsScreen() {
   const effectiveSelectedHostId = resolveHomeHostSelection(hosts, selectedHostId);
   const terminalHosts = useMemo(() => {
     const candidates = mode === "edge" ? edgeHosts : hosts.filter((host) => host.id === effectiveSelectedHostId);
-    return candidates.filter((host) => supportsMacTerminal(runtimes[host.id]?.hostInfo));
+    return candidates.filter((host) => supportsRemoteTerminal(runtimes[host.id]?.hostInfo));
   }, [mode, edgeHosts, hosts, effectiveSelectedHostId, runtimes]);
   const selectedConnection = mode === "normal" && effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
   const orchestration = useOrchestrationSnapshot(
@@ -151,7 +151,7 @@ export default function HostsScreen() {
     } else if (terminalHosts.length > 1) {
       setTerminalPickerOpen(true);
     } else {
-      toast(MAC_TERMINAL_ONLY);
+      toast(REMOTE_TERMINAL_UNAVAILABLE);
     }
   };
 

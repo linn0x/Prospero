@@ -62,7 +62,7 @@ import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import type { DeliveryResult } from "@/lib/outbound-queue";
 import { SessionCreateError, type HostConnection } from "@/lib/connection";
 import { DismissedModalAction, PendingSessionCreation } from "@/lib/host-screen-flow";
-import { supportsMacTerminal, MAC_TERMINAL_ONLY } from "@/lib/terminal-session";
+import { supportsRemoteTerminal, REMOTE_TERMINAL_UNAVAILABLE } from "@/lib/terminal-session";
 import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
@@ -145,7 +145,7 @@ export default function HostScreen() {
     cwd?: string;
   }>();
   const { host, conn, runtime } = useHostConnection(hostId);
-  const supportsTerminal = supportsMacTerminal(runtime.hostInfo);
+  const supportsTerminal = supportsRemoteTerminal(runtime.hostInfo);
   const isFocused = useIsFocused();
   const supportsDeepseekHarness =
     runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
@@ -668,7 +668,7 @@ export default function HostScreen() {
 
   const submitCreate = (): void => {
     if (!conn || runtime.status !== "connected" || pendingCreate.pending) return;
-    if (agent === "shell" && !supportsTerminal) { setBanner(MAC_TERMINAL_ONLY); return; }
+    if (agent === "shell" && !supportsTerminal) { setBanner(REMOTE_TERMINAL_UNAVAILABLE); return; }
     if (!accountCanLaunch) { setBanner(selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"); return; }
     const projectPath = cwd.trim();
     if (projectPath.length === 0) {

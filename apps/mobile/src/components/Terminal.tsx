@@ -138,7 +138,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
     if (readyRef.current) rx({ kind: "activity", active: true, metrics: metricsRef.current });
     const cleanup = subscribeFocusedTerminal({
       conn, sid, cursor: lastSeqRef,
-      snapshot: (message) => rx({ kind: "snapshot", ansi: message.ansi, cols: message.cols, rows: message.rows }),
+      snapshot: (message) => rx({ kind: "snapshot", ansi: message.ansi, dataB64: message.dataB64, cols: message.cols, rows: message.rows }),
       output: (message) => rx({ kind: "output", dataB64: message.dataB64 }),
       flush,
       attach: tryAttach,

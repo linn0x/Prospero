@@ -150,9 +150,9 @@ describe("ended terminal actions", () => {
     expect(() => connection.restartTerminal(session.id)).toThrow("请先关闭终端");
     await expect(connection.deleteTerminal(session.id)).rejects.toThrow("请先关闭终端");
     useApp.getState().upsertSession(host.id, session);
-    useApp.getState().patchRuntime(host.id, { hostInfo: { name: "MacBook", platform: "Linux", daemonVersion: "test", protocolVersion: 13 } });
-    expect(() => connection.restartTerminal(session.id)).toThrow("只支持 macOS");
-    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("只支持 macOS");
+    useApp.getState().patchRuntime(host.id, { hostInfo: { name: "MacBook", platform: "android", daemonVersion: "test", protocolVersion: 13 } });
+    expect(() => connection.restartTerminal(session.id)).toThrow("尚未确认");
+    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("尚未确认");
     expect(socket.sent).toHaveLength(0);
     connection.stop();
   });
@@ -197,10 +197,10 @@ describe("HostConnection WebSocket candidates", () => {
     const host = { ...makeHost("direct"), id: "terminal-close-disconnected" };
     const connection = new HostConnection(host, generateKeyPairB64());
     const shell: SessionInfo = { id: "shell", agent: "shell", kind: "pty", cwd: "/Users/test", title: "Terminal", cols: 80, rows: 24, status: "running", createdAt: 1 };
-    const hostInfo = { name: "MacBook", platform: "Windows", daemonVersion: "test", protocolVersion: 13 };
+    const hostInfo = { name: "Unknown", platform: "android", daemonVersion: "test", protocolVersion: 13 };
     useApp.getState().patchRuntime(host.id, { hostInfo });
     useApp.getState().setSessions(host.id, [shell]);
-    await expect(connection.closeTerminal(shell.id)).rejects.toThrow("只支持 macOS");
+    await expect(connection.closeTerminal(shell.id)).rejects.toThrow("尚未确认");
     useApp.getState().patchRuntime(host.id, { hostInfo: { ...hostInfo, platform: "macOS" } });
     await expect(connection.closeTerminal(shell.id)).rejects.toThrow("主机未连接");
     expect(connection.queuedCount).toBe(0);
@@ -698,6 +698,43 @@ describe("runtime reliability control", () => {
     expect(connection.queuedCount).toBe(1);
     const queued = (connection as unknown as { queue: { take(): { operationId: string } } }).queue.take();
     expect(queued.operationId).toBe("first-operation");
+    connection.stop();
+  });
+});
+
+
+describe("session branch delivery", () => {
+  it("gates old hosts, deduplicates taps and opens only the correlated independent branch", async () => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    const source = { ...session, agent: "codex" as const, kind: "structured" as const, status: "idle" as const };
+    useApp.getState().setSessions(host.id, [source]);
+    await expect(connection.forkSession(source.id)).rejects.toThrow("升级");
+    Object.assign(internals, { advertisedCapabilities: new Set(["session.fork.v1"]) });
+    const pending = connection.forkSession(source.id);
+    expect(connection.forkSession(source.id)).toBe(pending);
+    expect(socket.sent).toHaveLength(1);
+    expect(connection.queuedCount).toBe(0);
+    const request = JSON.parse(socket.sent[0]!);
+    const branch = { ...source, id: "independent-branch" };
+    internals.onMessage(JSON.stringify({ type: "session.fork.result", sid: source.id, requestId: request.requestId, ok: true, session: branch }));
+    await expect(pending).resolves.toEqual(branch);
+    expect(useApp.getState().runtimes[host.id]?.sessions[branch.id]).toEqual(branch);
+    connection.stop();
+  });
+
+  it("reports server failure and never queues a disconnected branch request", async () => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    const source = { ...session, agent: "claude" as const, status: "running" as const };
+    useApp.getState().setSessions(host.id, [source]);
+    Object.assign(internals, { advertisedCapabilities: new Set(["session.fork.v1"]) });
+    const pending = connection.forkSession(source.id);
+    const request = JSON.parse(socket.sent[0]!);
+    internals.onMessage(JSON.stringify({ type: "session.fork.result", sid: source.id, requestId: request.requestId, ok: false, error: "shell access denied" }));
+    await expect(pending).rejects.toThrow("shell access denied");
+    socket.readyState = 3;
+    await expect(connection.forkSession(source.id)).rejects.toThrow("未连接");
+    expect(socket.sent).toHaveLength(1);
+    expect(connection.queuedCount).toBe(0);
     connection.stop();
   });
 });

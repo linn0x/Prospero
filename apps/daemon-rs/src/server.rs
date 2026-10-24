@@ -395,6 +395,12 @@ impl Api {
         self
     }
 
+    pub fn remote_router(&self) -> Router {
+        Router::new()
+            .route("/ws", get(remote_ws))
+            .with_state(self.clone())
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/health", get(health))
@@ -1112,13 +1118,25 @@ async fn handle_remote_ws(
         }
     };
     let mut channel = accepted.channel;
-    if send_hello_ok(&api, &mut socket, &mut channel, accepted.protocol_version)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let mut state = RemoteWsState::default();
+    let initial_sessions =
+        match send_hello_ok(&api, &mut socket, &mut channel, accepted.protocol_version).await {
+            Ok(sessions) => sessions,
+            Err(_) => return,
+        };
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(8);
+    let mut state = RemoteWsState {
+        response_tx: Some(response_tx),
+        session_revisions: initial_sessions
+            .into_iter()
+            .filter_map(|session| {
+                Some((
+                    session.get("id")?.as_str()?.to_owned(),
+                    serde_json::to_string(&session).ok()?,
+                ))
+            })
+            .collect(),
+        ..RemoteWsState::default()
+    };
     let mut changes = api.changes.subscribe();
     let mut revoke_check = tokio::time::interval(Duration::from_millis(500));
     revoke_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1172,6 +1190,11 @@ async fn handle_remote_ws(
                     return;
                 }
             }
+            Some(response) = response_rx.recv() => {
+                if send_remote_json(&mut socket, &mut channel, &response).await.is_err() {
+                    return;
+                }
+            }
             changed = changes.changed() => {
                 if changed.is_err() {
                     return;
@@ -1194,7 +1217,9 @@ async fn handle_remote_ws(
 struct RemoteWsState {
     pty_attachments: HashMap<String, RemotePtyAttachment>,
     chat_attachments: HashMap<String, RemoteChatAttachment>,
-    session_revisions: HashMap<String, i64>,
+    session_revisions: HashMap<String, String>,
+    response_tx: Option<tokio::sync::mpsc::Sender<JsonValue>>,
+    fork_requests: HashSet<String>,
     orchestration_snapshot: Option<String>,
 }
 
@@ -1263,31 +1288,48 @@ async fn send_hello_ok(
     socket: &mut WebSocket,
     channel: &mut SecureChannel,
     protocol_version: u8,
-) -> Result<()> {
-    let page = api
-        .call(|store| {
-            store.sessions(SessionQuery {
-                limit: Some(100),
-                lifecycle: Some(SessionLifecycle::Active),
-                ..SessionQuery::default()
-            })
-        })
-        .await?;
+) -> Result<Vec<JsonValue>> {
+    let sessions = remote_session_infos(api, load_remote_sessions(api).await?).await?;
     send_remote_json(
         socket,
         channel,
         &json!({
             "type": "hello.ok",
             "host": remote_host_info(protocol_version),
-            "sessions": page.items.into_iter().map(remote_session_info).collect::<Vec<_>>(),
+            "sessions": sessions,
         }),
     )
-    .await
+    .await?;
+    Ok(sessions)
 }
 
 fn remote_host_info(protocol_version: u8) -> JsonValue {
     let mut capabilities = vec![
         "session.create-result.v1",
+        "session.create-model.v1",
+        "session.fork.v1",
+        "session.codex-fork.v1",
+        "session.claude-fork.v1",
+        "session.terminal-fork-picker.v1",
+        "terminal.remote.v1",
+        "terminal.snapshot-base64.v1",
+        "agent.accounts.v1",
+        "agent.api-profiles.v1",
+        "agent.api-protocols.v1",
+        "agent.api-validation.v1",
+        "agent.api-engine-validation.v1",
+        "agent.account.api.models",
+        "agent.account.config",
+        "subagent.history.v1",
+        "workspace.summary.v1",
+        "fs.put-ack.v1",
+        "orchestration.snapshot.v1",
+        "orchestration.manual.v1",
+        "orchestration.graph.v1",
+        "orchestration.management.v1",
+        "orchestration.lifecycle.v1",
+        "orchestration.run-lifecycle.v1",
+        "orchestration.worktrees.v1",
         "conversation.search.v1",
         "chat.attachment-previews.v1",
         "agent.deepseek-harness.v1",
@@ -1324,15 +1366,128 @@ fn remote_session_info(head: SessionHead) -> JsonValue {
         "kind": head.kind,
         "title": head.title,
         "cwd": head.workspace,
-        "status": head.status,
+        "status": match head.status {
+            SessionStatus::WaitingPermission => "waiting_approval",
+            SessionStatus::Failed => "died",
+            SessionStatus::Completed if head.kind == SessionKind::Pty => "done",
+            SessionStatus::Completed => "completed",
+            SessionStatus::Idle => "idle",
+            SessionStatus::Starting => "starting",
+            SessionStatus::Running => "running",
+            SessionStatus::WaitingInput => "waiting_input",
+        },
+        "pendingPermissions": usize::from(head.status == SessionStatus::WaitingPermission),
+        "pendingQuestions": usize::from(head.status == SessionStatus::WaitingInput),
         "createdAt": head.created_at,
         "cols": 80,
         "rows": 24,
     });
+    for (key, field) in [
+        ("accountId", head.account_id),
+        ("model", head.model),
+        ("effort", head.effort),
+    ] {
+        if let Some(field) = field {
+            value[key] = field.into();
+        }
+    }
+    if let Some(policy) = head.approval_policy {
+        value["approvalPolicy"] = json!(policy);
+    }
     if let Some(busy_since) = head.busy_since {
         value["busySince"] = busy_since.into();
     }
     value
+}
+
+async fn load_remote_sessions(api: &Api) -> Result<Vec<SessionHead>> {
+    api.call(|store| {
+        let mut sessions = store
+            .sessions(SessionQuery {
+                limit: Some(100),
+                lifecycle: Some(SessionLifecycle::Active),
+                ..SessionQuery::default()
+            })?
+            .items;
+        sessions.extend(
+            store
+                .sessions(SessionQuery {
+                    limit: Some(20),
+                    lifecycle: Some(SessionLifecycle::Archived),
+                    ..SessionQuery::default()
+                })?
+                .items,
+        );
+        Ok(sessions)
+    })
+    .await
+}
+
+fn remote_approval_policy(policy: &str) -> &str {
+    match policy {
+        "auto" | "yolo" => "yolo",
+        "standard" => "standard",
+        _ => "strict",
+    }
+}
+
+async fn remote_session_infos(api: &Api, heads: Vec<SessionHead>) -> Result<Vec<JsonValue>> {
+    let controls = api.agents.controls().await?.controls;
+    heads
+        .into_iter()
+        .map(|head| {
+            let control = controls
+                .iter()
+                .find(|control| control.session_id == head.id);
+            let mut value = remote_session_info(head);
+            if let Some(control) = control {
+                value["agentControls"] = serde_json::to_value(control)?;
+                value["approvalPolicy"] = remote_approval_policy(&control.approval_policy).into();
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+fn remote_session_fork(
+    api: &Api,
+    state: &mut RemoteWsState,
+    device: &DeviceRecord,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let request_id = require_str(&message, "requestId")?.to_owned();
+    crate::database::validate_id(&sid)?;
+    crate::database::validate_text(&request_id, 100, false)?;
+    if state.fork_requests.contains(&request_id) {
+        return Ok(());
+    }
+    if state.fork_requests.len() >= 128 {
+        return Err(Error::Busy);
+    }
+    let sender = state.response_tx.clone().ok_or(Error::Closed)?;
+    let permit = api
+        .api_features
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::Busy)?;
+    state.fork_requests.insert(request_id.clone());
+    let api = api.clone();
+    let allow_shell = device.allow_shell;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = fork_session(&api, &sid, allow_shell).await;
+        let response = match result {
+            Ok(head) => {
+                json!({"type":"session.fork.result","sid":sid,"requestId":request_id,"ok":true,"session":remote_session_info(head)})
+            }
+            Err(error) => {
+                json!({"type":"session.fork.result","sid":sid,"requestId":request_id,"ok":false,"error":error.to_string(),"code":remote_error_code(&error)})
+            }
+        };
+        let _ = sender.send(response).await;
+    });
+    Ok(())
 }
 
 async fn route_remote_ws_message(
@@ -1354,6 +1509,14 @@ async fn route_remote_ws_message(
             send_remote_json(socket, channel, &json!({"type":"connection.pong","id":id})).await
         }
         "session.create" => remote_session_create(api, socket, channel, device, message).await,
+        "session.fork" => {
+            let sid = require_str(&message, "sid")?.to_owned();
+            let request_id = require_str(&message, "requestId")?.to_owned();
+            match remote_session_fork(api, state, device, message) {
+                Ok(()) => Ok(()),
+                Err(error) => send_remote_json(socket, channel, &json!({"type":"session.fork.result","sid":sid,"requestId":request_id,"ok":false,"error":error.to_string(),"code":remote_error_code(&error)})).await,
+            }
+        },
         "session.attach" => remote_session_attach(api, socket, channel, state, message).await,
         "session.detach" => {
             let sid = require_str(&message, "sid")?;
@@ -3158,7 +3321,7 @@ async fn send_terminal_snapshot(
             &json!({
                 "type":"term.snapshot",
                 "sid":sid,
-                "ansi":"",
+                "ansi": String::from_utf8_lossy(&BASE64_STANDARD.decode(&snapshot.data_b64).map_err(|_| Error::Invalid("invalid terminal snapshot".into()))?).into_owned(),
                 "dataB64": snapshot.data_b64,
                 "seq":snapshot.seq,
                 "cols":snapshot.size.cols,
@@ -3198,7 +3361,7 @@ async fn send_terminal_snapshot(
             &json!({
                 "type":"term.snapshot",
                 "sid":sid,
-                "ansi":"",
+                "ansi": String::from_utf8_lossy(&BASE64_STANDARD.decode(&data_b64).map_err(|_| Error::Invalid("invalid terminal snapshot".into()))?).into_owned(),
                 "dataB64": data_b64,
                 "seq":page.latest_seq,
                 "cols":page.initial_size.cols,
@@ -3476,29 +3639,18 @@ async fn flush_remote_session_states(
     channel: &mut SecureChannel,
     state: &mut RemoteWsState,
 ) -> Result<()> {
-    let page = api
-        .call(|store| {
-            store.sessions(SessionQuery {
-                limit: Some(100),
-                lifecycle: Some(SessionLifecycle::Active),
-                ..SessionQuery::default()
-            })
-        })
-        .await?;
+    let sessions = remote_session_infos(api, load_remote_sessions(api).await?).await?;
     let mut seen = HashSet::new();
-    for head in page.items {
-        seen.insert(head.id.clone());
-        let revision = head.revision;
-        if state
-            .session_revisions
-            .get(&head.id)
-            .is_none_or(|previous| *previous != revision)
-        {
-            state.session_revisions.insert(head.id.clone(), revision);
+    for session in sessions {
+        let sid = require_str(&session, "id")?.to_owned();
+        seen.insert(sid.clone());
+        let revision = serde_json::to_string(&session)?;
+        if state.session_revisions.get(&sid) != Some(&revision) {
+            state.session_revisions.insert(sid, revision);
             send_remote_json(
                 socket,
                 channel,
-                &json!({"type":"session.state","session":remote_session_info(head)}),
+                &json!({"type":"session.state","session":session}),
             )
             .await?;
         }
@@ -5696,18 +5848,28 @@ async fn fork_agent_chat(
     Path(id): Path<String>,
 ) -> std::result::Result<Json<SessionHead>, ApiError> {
     let _permit = api.api_features.try_acquire().map_err(|_| Error::Busy)?;
-    let source_id = id.clone();
+    Ok(Json(fork_session(&api, &id, true).await?))
+}
+
+async fn fork_session(api: &Api, id: &str, allow_shell: bool) -> Result<SessionHead> {
+    let source_id = id.to_owned();
     let source = api
         .database
         .call(move |store| store.session(&source_id))
         .await?;
     let head = if source.kind == SessionKind::Pty {
-        api.terminals.fork_chat(&id).await?
+        if !allow_shell {
+            return Err(Error::Feature(
+                "shell_not_allowed".into(),
+                "shell access is not allowed".into(),
+            ));
+        }
+        api.terminals.fork_chat(id).await?
     } else {
-        api.agents.fork_chat(&id).await?
+        api.agents.fork_chat(id).await?
     };
     api.publish();
-    Ok(Json(head))
+    Ok(head)
 }
 
 async fn agent_interrupt(
@@ -8007,6 +8169,31 @@ async fn mark_message_answered(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mobile_session_states_and_approval_policies_use_the_public_vocabulary() {
+        use super::*;
+        let head: SessionHead = serde_json::from_value(json!({
+            "id":"mobile-state", "agent":"codex", "kind":"structured", "title":"test",
+            "workspace":"/test", "lifecycle":"active", "status":"waiting_permission",
+            "createdAt":1, "updatedAt":1, "revision":1, "model":"fixture-model", "accountId":"fixture-account"
+        })).unwrap();
+        let value = remote_session_info(head.clone());
+        assert_eq!(value["status"], "waiting_approval");
+        assert_eq!(value["pendingPermissions"], 1);
+        assert_eq!(value["model"], "fixture-model");
+        assert_eq!(value["accountId"], "fixture-account");
+        let mut failed = head.clone();
+        failed.status = SessionStatus::Failed;
+        assert_eq!(remote_session_info(failed)["status"], "died");
+        let mut terminal = head;
+        terminal.kind = SessionKind::Pty;
+        terminal.status = SessionStatus::Completed;
+        assert_eq!(remote_session_info(terminal)["status"], "done");
+        assert_eq!(remote_approval_policy("manual"), "strict");
+        assert_eq!(remote_approval_policy("auto"), "yolo");
+        assert_eq!(remote_approval_policy("standard"), "standard");
+    }
+
     #[test]
     fn idle_worker_timeout_is_independent_of_stale_health_threshold() {
         use super::*;

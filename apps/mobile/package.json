@@ -77,7 +77,8 @@
     "prebuild:android": "npm run build:protocol",
     "build:android": "./scripts/build-apk.sh",
     "pretest": "npm run build:protocol",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:desktop": "node scripts/check-desktop-compatibility.mjs"
   },
   "private": true
 }

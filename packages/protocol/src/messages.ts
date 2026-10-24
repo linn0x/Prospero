@@ -68,6 +68,8 @@ export const CAPABILITY_CHAT_ATTACHMENT_PREVIEWS = "chat.attachment-previews.v1"
 export const CAPABILITY_WORKSPACE_ROOTS = "workspace.roots-mkdir.v1";
 /** Read-only per-session workspace branch and bounded directory size summary. */
 export const CAPABILITY_WORKSPACE_SUMMARY = "workspace.summary.v1";
+export const CAPABILITY_SESSION_FORK = "session.fork.v1";
+export const CAPABILITY_REMOTE_TERMINAL = "terminal.remote.v1";
 export const CAPABILITY_FS_PUT_ACK = "fs.put-ack.v1";
 
 export type {

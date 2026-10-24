@@ -10,6 +10,8 @@
  * - 发送排队:断线瞬间的用户操作不丢,重连后按序补发。
  */
 import type { OperationView, ExecutionRecord } from "@prospero/protocol/rust-daemon";
+import { deliveryFailureText } from "./outbound-queue";
+import { sessionBranchUnavailable } from "./session-branch";
 import { waitForOperation } from "./runtime-operation-wait";
 import { AppState, Platform } from "react-native";
 import { randomUUID } from "expo-crypto";
@@ -33,6 +35,7 @@ import {
   CAPABILITY_ORCHESTRATION_WORKTREES,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SESSION_CREATE_RESULT,
+  CAPABILITY_SESSION_FORK,
   CAPABILITY_SUBAGENT_HISTORY,
   CAPABILITY_WORKSPACE_ROOTS,
   CAPABILITY_WORKSPACE_SUMMARY,
@@ -111,7 +114,7 @@ import {
 import { flushSessionUpdates, useApp } from "./store";
 import { SessionCreateTracker, type SessionCreateTask } from "./session-create";
 import { TerminalCloseTracker } from "./terminal-close";
-import { isShellTerminal, isTerminalEnded, supportsMacTerminal, MAC_TERMINAL_ONLY } from "./terminal-session";
+import { isShellTerminal, isTerminalEnded, supportsRemoteTerminal, REMOTE_TERMINAL_UNAVAILABLE } from "./terminal-session";
 export { SessionCreateError } from "./session-create";
 export type { SessionCreateTask } from "./session-create";
 
@@ -177,6 +180,7 @@ export class HostConnection {
   private queue = new BoundedQueue<C2SMessage>(MAX_OFFLINE_QUEUE);
   private racingAttempts: ManagedAttempt<Won>[] | null = null;
   private readonly sessionCreates = new SessionCreateTracker();
+  private readonly sessionForks = new Map<string, Promise<SessionInfo>>();
   private readonly terminalCloses = new TerminalCloseTracker();
   private readonly deletedTerminalIds = new Set<string>();
   private readonly orchestrationOperationIds = new Map<string, { fingerprint: string; id: string }>();
@@ -829,6 +833,13 @@ export class HostConnection {
         }
         this.sessionCreates.result(msg);
         return;
+      case "session.fork.result":
+        if (msg.ok && msg.session) {
+          flushSessionUpdates();
+          if (!useApp.getState().runtimes[this.host.id]?.sessions[msg.session.id]) useApp.getState().upsertSession(this.host.id, msg.session);
+        }
+        this.resolveFs(msg);
+        return;
       case "term.snapshot": {
         this.sessionCreates.snapshot(msg.sid);
         // A1 验收:attach → 快照到达。真机上没有别的办法拿到这个数,
@@ -932,7 +943,9 @@ export class HostConnection {
               ? "#model-sources"
           : (msg.sid ?? "#account");
     const responsePath =
-      msg.type === "orchestration.operation.result"
+      msg.type === "session.fork.result"
+        ? `#session.fork:${msg.requestId}`
+        : msg.type === "orchestration.operation.result"
         ? `#orchestration.operation:${msg.requestId}`
         : msg.type === "orchestration.execution.result"
           ? `#orchestration.execution:${msg.requestId}`
@@ -1003,7 +1016,12 @@ export class HostConnection {
           reject(e);
         },
       });
-      this.send(msg, queueable);
+      const delivery = this.send(msg, queueable);
+      if (!delivery.accepted) {
+        const waiter = this.fsWaiters.get(key);
+        this.fsWaiters.delete(key);
+        waiter?.reject(new Error(deliveryFailureText(delivery)));
+      }
     });
   }
 
@@ -1472,6 +1490,25 @@ export class HostConnection {
     this.attachedChatSessions.set(sid, requested);
     this.attachStartedAt.set(sid, Date.now());
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
+  }
+
+  forkSession(sid: string): Promise<SessionInfo> {
+    const pending = this.sessionForks.get(sid);
+    if (pending) return pending;
+    if (!this.supportsCapability(CAPABILITY_SESSION_FORK)) return Promise.reject(new Error("请先升级电脑端以创建会话分支"));
+    const unavailable = sessionBranchUnavailable(useApp.getState().runtimes[this.host.id]?.sessions[sid]);
+    if (unavailable) return Promise.reject(new Error(unavailable));
+    const requestId = this.agentRequestId();
+    const task = this.fsRequest<Extract<S2CMessage, { type: "session.fork.result" }>>(
+      sid, `#session.fork:${requestId}`, { type: "session.fork", sid, requestId }, 180_000, false,
+    ).then((result) => {
+      if (result.sid !== sid || !result.ok || !result.session || result.session.id === sid) throw new Error(result.error ?? "电脑未返回独立的会话分支");
+      return result.session;
+    }).catch((error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}。若请求已发出，请先查看会话列表，避免重复创建。`);
+    }).finally(() => { this.sessionForks.delete(sid); });
+    this.sessionForks.set(sid, task);
+    return task;
   }
 
   async operation(operationId: string): Promise<OperationView> {
@@ -1953,7 +1990,7 @@ export class HostConnection {
 
   closeTerminal(sid: string): Promise<void> {
     const runtime = useApp.getState().runtimes[this.host.id];
-    if (!supportsMacTerminal(runtime?.hostInfo)) return Promise.reject(new Error(MAC_TERMINAL_ONLY));
+    if (!supportsRemoteTerminal(runtime?.hostInfo)) return Promise.reject(new Error(REMOTE_TERMINAL_UNAVAILABLE));
     const session = runtime?.sessions[sid];
     if (!isShellTerminal(session)) return Promise.reject(new Error("找不到此 Shell 终端，请刷新设备列表。"));
     if (isTerminalEnded(session)) return Promise.resolve();
@@ -1963,7 +2000,7 @@ export class HostConnection {
 
   private endedTerminal(sid: string): SessionInfo {
     const runtime = useApp.getState().runtimes[this.host.id];
-    if (!supportsMacTerminal(runtime?.hostInfo)) throw new Error(MAC_TERMINAL_ONLY);
+    if (!supportsRemoteTerminal(runtime?.hostInfo)) throw new Error(REMOTE_TERMINAL_UNAVAILABLE);
     const session = runtime?.sessions[sid];
     if (!session || !isShellTerminal(session)) throw new Error("找不到此 Shell 终端，请刷新设备列表。");
     if (!isTerminalEnded(session)) throw new Error("请先关闭终端，再重启或删除。");

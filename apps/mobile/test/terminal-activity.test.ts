@@ -25,7 +25,7 @@ function terminalActivity() {
     document: { fonts: { load: vi.fn(() => new Promise<void>((resolve) => { fontLoads.push(resolve); })) } },
     fontStack: (family: string) => family,
     quotedCSSFontFamily: (family: string) => JSON.stringify(family),
-    b64ToBytes: () => new Uint8Array([65]),
+    b64ToBytes: (data: string) => new Uint8Array(Buffer.from(data, "base64")),
     handle: undefined as unknown as (message: object) => void,
   };
   runInNewContext(`${html.slice(start, end)}\nglobalThis.handle = handle;`, context);
@@ -35,6 +35,15 @@ function terminalActivity() {
 afterEach(() => vi.useRealTimers());
 
 describe("terminal activity bridge", () => {
+  it("restores binary UTF-8 snapshots and retains the legacy ANSI fallback", () => {
+    const terminal = terminalActivity();
+    const bytes = Buffer.from("\x1b[31m中文\x1b[0m\r\n");
+    terminal.handle({ kind: "snapshot", ansi: "", dataB64: bytes.toString("base64"), cols: 80, rows: 24 });
+    expect(terminal.write.mock.calls[0]?.[0]).toEqual(new Uint8Array(bytes));
+    terminal.handle({ kind: "snapshot", ansi: "old server", cols: 80, rows: 24 });
+    expect(terminal.write.mock.calls[1]?.[0]).toBe("old server");
+  });
+
   it("waits for the selected font before publishing terminal dimensions, including rapid font changes", async () => {
     vi.useFakeTimers();
     const terminal = terminalActivity();

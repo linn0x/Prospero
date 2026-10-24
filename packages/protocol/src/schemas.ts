@@ -800,6 +800,22 @@ export const C2SChatAttachmentGetSchema = z.object({
   requestId: z.string().min(1).max(100),
 });
 
+export const C2SSessionForkSchema = z.object({
+  type: z.literal("session.fork"),
+  sid,
+  requestId: z.string().min(1).max(100),
+});
+
+export const S2CSessionForkResultSchema = z.object({
+  type: z.literal("session.fork.result"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  ok: z.boolean(),
+  session: SessionInfoSchema.optional(),
+  error: z.string().optional(),
+  code: z.string().optional(),
+});
+
 export const C2SSessionAttachSchema = z.object({
   type: z.literal("session.attach"),
   sid,
@@ -1456,6 +1472,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SConnectionPingSchema,
   C2SSessionCreateSchema,
+  C2SSessionForkSchema,
   C2SConversationSearchSchema,
   C2SAgentAccountsListSchema,
   C2SAgentAccountCreateSchema,
@@ -1560,6 +1577,7 @@ export const S2CTermSnapshotSchema = z.object({
   sid,
   /** @xterm/addon-serialize 输出的 ANSI 串(含颜色/光标/scrollback) */
   ansi: z.string(),
+  dataB64: z.string().optional(),
   seq,
   cols,
   rows,
@@ -2158,6 +2176,7 @@ export const S2COrchestrationSnapshotSchema = z.object({
 
 export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CSessionCreateResultSchema,
+  S2CSessionForkResultSchema,
   S2CHelloOkSchema,
   S2CConnectionPongSchema,
   S2CSessionStateSchema,

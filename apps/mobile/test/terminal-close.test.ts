@@ -1,22 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionInfo } from "@prospero/protocol";
 import { TerminalCloseTracker } from "../src/lib/terminal-close";
-import { supportsMacTerminal } from "../src/lib/terminal-session";
+import { supportsRemoteTerminal } from "../src/lib/terminal-session";
 
 const session = (id: string, status: SessionInfo["status"]): SessionInfo => ({
   id, status, kind: "pty", agent: "shell", cwd: "/Users/test", title: "test", createdAt: 1, cols: 80, rows: 24,
 });
 afterEach(() => vi.useRealTimers());
 
-describe("remote Mac terminal support", () => {
-  it.each(["macOS", "darwin", " MACOS "])("allows the remote host platform %s", (platform) => {
-    expect(supportsMacTerminal({ platform })).toBe(true);
+describe("remote terminal support", () => {
+  it.each(["macOS", "darwin", " MACOS ", "Windows", "win32", "Linux", "linux"])("allows the remote host platform %s", (platform) => {
+    expect(supportsRemoteTerminal({ platform })).toBe(true);
   });
-  it.each(["Windows", "win32", "Linux", "linux", "android", "ios", "MacBook", undefined])("rejects unsupported or unconfirmed remote platform %s", (platform) => {
-    expect(supportsMacTerminal({ platform })).toBe(false);
+  it.each(["android", "ios", "MacBook", undefined])("rejects unsupported or unconfirmed remote platform %s", (platform) => {
+    expect(supportsRemoteTerminal({ platform })).toBe(false);
   });
   it("does not infer a Mac from a missing handshake", () => {
-    expect(supportsMacTerminal(null)).toBe(false);
+    expect(supportsRemoteTerminal(null)).toBe(false);
   });
 });
 
