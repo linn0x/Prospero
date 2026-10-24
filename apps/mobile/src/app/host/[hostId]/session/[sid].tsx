@@ -48,7 +48,8 @@ import { useSettingsPreferences } from "@/lib/use-settings-preferences";
 import { useTerminalKeyboard } from "@/lib/use-terminal-keyboard";
 import { useTerminalClose } from "@/lib/use-terminal-close";
 import { useTerminalActions } from "@/lib/use-terminal-actions";
-import { isShellTerminal, isTerminalEnded, supportsMacTerminal, MAC_TERMINAL_ONLY } from "@/lib/terminal-session";
+import { sessionBranchUnavailable } from "@/lib/session-branch";
+import { isShellTerminal, isTerminalEnded, supportsRemoteTerminal, REMOTE_TERMINAL_UNAVAILABLE } from "@/lib/terminal-session";
 import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
@@ -521,7 +522,7 @@ export default function SessionScreen() {
   const isChat = isStructured;
   const shellTerminal = isShellTerminal(session);
   const terminalEnded = isTerminalEnded(session);
-  const terminalSupported = !shellTerminal || supportsMacTerminal(runtime.hostInfo);
+  const terminalSupported = !shellTerminal || supportsRemoteTerminal(runtime.hostInfo);
   const terminalClose = useTerminalClose(conn, sid);
   const terminalActions = useTerminalActions(conn, sid);
   const terminalInputEnabled = runtime.status === "connected" && !terminalEnded && terminalSupported && !terminalClose.closing;
@@ -539,6 +540,30 @@ export default function SessionScreen() {
   const [usageError, setUsageError] = useState<string | null>(null);
   const [controlsOpen, setControlsOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [branchingSid, setBranchingSid] = useState<string | null>(null);
+  const branching = branchingSid === sid;
+  const branchScope = useRef({ active: false });
+  useFocusEffect(useCallback(() => {
+    const scope = { active: true, sid };
+    branchScope.current = scope;
+    return () => { scope.active = false; };
+  }, [sid]));
+  const branchUnavailable = sessionBranchUnavailable(session);
+  const branchSession = async (): Promise<void> => {
+    if (!conn || branching || branchUnavailable) return;
+    const scope = branchScope.current;
+    setBranchingSid(sid);
+    try {
+      const branch = await conn.forkSession(sid);
+      if (!scope.active) return;
+      setMenuOpen(false);
+      router.push(`/host/${hostId}/session/${branch.id}`);
+    } catch (error) {
+      if (scope.active) toast(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBranchingSid(current => current === sid ? null : current);
+    }
+  };
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [yoloConfirmOpen, setYoloConfirmOpen] = useState(false);
@@ -1194,7 +1219,7 @@ export default function SessionScreen() {
 
   if (!terminalSupported) return <View style={styles.loadState}>
     <Stack.Screen options={{ title: "远程终端" }} />
-    <Text style={styles.loadTitle}>{runtime.hostInfo ? MAC_TERMINAL_ONLY : "正在确认设备类型…"}</Text>
+    <Text style={styles.loadTitle}>{runtime.hostInfo ? REMOTE_TERMINAL_UNAVAILABLE : "正在确认设备类型…"}</Text>
     <Pressable onPress={returnToHost} style={styles.loadBack}><Text style={styles.loadBackText}>返回</Text></Pressable>
   </View>;
 
@@ -1912,6 +1937,15 @@ export default function SessionScreen() {
       />
 
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
+        {!isSubagent && ["claude", "codex"].includes(session.agent) && <SheetAction
+          label={branching ? "正在创建分支…" : session.kind === "pty" ? "选择原生对话并创建分支" : "创建会话分支"}
+          detail={branchUnavailable ?? (conn?.supportsCapability("session.fork.v1")
+            ? session.kind === "pty" ? "在独立终端中选择历史对话，原会话继续保留" : "复制当前对话历史，在独立会话继续"
+            : "需要更新电脑端才能使用会话分支")}
+          symbol="doc.on.doc"
+          disabled={branching || runtime.status !== "connected" || Boolean(branchUnavailable) || !conn?.supportsCapability("session.fork.v1")}
+          onPress={() => { void branchSession(); }}
+        />}
         {isChat && <ConversationFontControl value={settings.conversationFontSize}
           onChange={(conversationFontSize) => updateSettings({ conversationFontSize })} />}
         {coordinatorRun && !isSubagent ? (

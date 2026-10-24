@@ -60,6 +60,8 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:0")]
         listen: SocketAddr,
+        #[arg(long)]
+        remote_ws: bool,
     },
     Pair {
         #[arg(long, default_value = "iphone")]
@@ -366,12 +368,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(prosperod_rs::terminal::guard::run(parent, shell, args)?);
         }
         Command::TerminalHost { directory } => prosperod_rs::terminal::host::run(directory)?,
-        Command::Serve { data_dir, listen } => {
+        Command::Serve {
+            data_dir,
+            listen,
+            remote_ws,
+        } => {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
                 .build()?
-                .block_on(serve(data_dir, listen, true, false))?;
+                .block_on(serve(data_dir, listen, true, false, remote_ws))?;
         }
         Command::Pair {
             name,
@@ -488,7 +494,7 @@ fn run_start(
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(serve(home, SocketAddr::new(ip, port), false, dev))?;
+        .block_on(serve(home, SocketAddr::new(ip, port), false, dev, false))?;
     Ok(())
 }
 
@@ -1404,11 +1410,23 @@ async fn serve(
     address: SocketAddr,
     local_only: bool,
     dev_mode: bool,
+    remote_ws: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use prosperod_rs::{auth::Token, server::Api, transport::LimitedListener, worker::Database};
     if local_only && !address.ip().is_loopback() {
         return Err("the local API must bind to loopback".into());
     }
+    let remote_listener = if remote_ws {
+        let config = load_config_value(&directory)?;
+        let bind = config_bind(&config);
+        let ip = match bind.as_deref() {
+            Some(spec) => resolve_bind_addr(spec)?,
+            None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        };
+        Some(tokio::net::TcpListener::bind(SocketAddr::new(ip, config_port(&config)?)).await?)
+    } else {
+        None
+    };
     let database = Database::open(directory.clone()).await?;
     let token = Token::load(&directory)?;
     // Keep inherited HTTP endpoints and direct-device reconnects usable when
@@ -1545,6 +1563,15 @@ async fn serve(
             changes.publish();
         });
     }
+    let remote_server = remote_listener.map(|listener| {
+        let remote_api = api.clone();
+        tokio::spawn(async move {
+            let stopping = remote_api.clone();
+            axum::serve(LimitedListener::new(listener), remote_api.remote_router())
+                .with_graceful_shutdown(async move { stopping.wait_stopped().await })
+                .await
+        })
+    });
     let shutdown_api = api.clone();
     let (stopping, mut stopped) = tokio::sync::watch::channel(false);
     let check_agents = api.agents.clone();
@@ -1601,6 +1628,10 @@ async fn serve(
         _ = stopped.changed() => { let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await; }
     }
     api.stop();
+    if let Some(remote_server) = remote_server {
+        remote_server.abort();
+        let _ = remote_server.await;
+    }
     api.plugin_services.stop_all().await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), projection_task).await;

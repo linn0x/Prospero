@@ -25,7 +25,7 @@
     },
     "android": {
       "package": "com.linn0x.prospero",
-      "versionCode": 23,
+      "versionCode": 24,
       "backgroundColor": "#0B0B0E",
       "userInterfaceStyle": "automatic",
       "softwareKeyboardLayoutMode": "resize",

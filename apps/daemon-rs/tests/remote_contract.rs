@@ -857,7 +857,13 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
             .iter()
             .any(|capability| capability == "agent.deepseek-harness.v1")
     );
-    assert!(hello_ok["sessions"].as_array().unwrap().is_empty());
+    assert!(
+        hello_ok["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["id"] == seeded.id)
+    );
 
     ws.send(Message::Text(
         seal(

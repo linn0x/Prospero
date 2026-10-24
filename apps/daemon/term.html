@@ -398,8 +398,9 @@
         term.resize(m.cols, m.rows);
       }
       // 回调里放开:xterm 的应答是异步发出的,同步清标志会漏掉
-      term.write(m.ansi, () => { replaying = false; });
-      perfBytes += m.ansi.length;
+      const screen = typeof m.dataB64 === "string" ? b64ToBytes(m.dataB64) : m.ansi;
+      term.write(screen, () => { replaying = false; });
+      perfBytes += screen.length;
     } else if (m.kind === "output") {
       const bytes = b64ToBytes(m.dataB64);
       term.write(bytes);

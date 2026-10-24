@@ -98,7 +98,7 @@ export class RustProcess {
       ...(this.env ?? {}),
       PATH: suppliedPath.split(delimiter).includes(binaryDir) ? suppliedPath : [binaryDir, suppliedPath].filter(Boolean).join(delimiter),
     };
-    const child = spawn(this.binary, ["serve", "--data-dir", this.directory], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: childEnv });
+    const child = spawn(this.binary, ["serve", "--data-dir", this.directory, "--remote-ws"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: childEnv });
     this.child = child;
     child.on("error", () => {});
     this.exited = new Promise(done => child.once("close", () => {

@@ -125,12 +125,14 @@ export function SheetAction({
   detail,
   symbol,
   destructive = false,
+  disabled = false,
   onPress,
 }: {
   label: string;
   detail?: string;
   symbol: IconName;
   destructive?: boolean;
+  disabled?: boolean;
   onPress: () => void;
 }) {
   const styles = useStyles();
@@ -141,7 +143,9 @@ export function SheetAction({
       accessibilityRole="button"
       accessibilityLabel={label}
       accessibilityHint={detail}
-      style={({ pressed }) => [styles.sheetAction, pressed && styles.sheetActionPressed]}
+      disabled={disabled}
+      accessibilityState={{ disabled }}
+      style={({ pressed }) => [styles.sheetAction, disabled && { opacity: 0.45 }, pressed && styles.sheetActionPressed]}
       onPress={onPress}
     >
       <View style={[styles.sheetActionIcon, { backgroundColor: destructive ? color.dangerBg : color.accentBg }]}>

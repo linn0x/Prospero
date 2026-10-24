@@ -10,7 +10,7 @@ import { SessionCreateError } from "@/lib/connection";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { sortSessions } from "@/lib/store";
 import { useMobileTheme, type ThemePalette } from "@/lib/theme";
-import { isTerminalEnded, supportsMacTerminal, MAC_TERMINAL_ONLY } from "@/lib/terminal-session";
+import { isTerminalEnded, supportsRemoteTerminal, REMOTE_TERMINAL_UNAVAILABLE } from "@/lib/terminal-session";
 import { useTerminalClose } from "@/lib/use-terminal-close";
 import { useTerminalActions } from "@/lib/use-terminal-actions";
 
@@ -29,7 +29,7 @@ export default function TerminalsScreen() {
   const terminalClose = useTerminalClose(conn, closeTarget ?? "");
   const terminalActions = useTerminalActions(conn);
   const [pending] = useState(() => new PendingSessionCreation());
-  const supported = supportsMacTerminal(runtime.hostInfo);
+  const supported = supportsRemoteTerminal(runtime.hostInfo);
   const connected = runtime.status === "connected" && conn?.host.id === hostId;
   const working = creating || terminalActions.busy !== null;
   const sessions = useMemo(() => sortSessions(runtime.sessions).filter((session) => session.agent === "shell" && session.kind === "pty"), [runtime.sessions]);
@@ -54,8 +54,8 @@ export default function TerminalsScreen() {
   if (!supported) return <View style={styles.screen}>
     <Stack.Screen options={{ title: "远程终端" }} />
     <View style={styles.content}>
-      <Text style={styles.label}>{runtime.hostInfo ? MAC_TERMINAL_ONLY : "正在确认设备类型…"}</Text>
-      <Text style={styles.detail}>连接 Mac 后可新建和管理终端。</Text>
+      <Text style={styles.label}>{runtime.hostInfo ? REMOTE_TERMINAL_UNAVAILABLE : "正在确认设备类型…"}</Text>
+      <Text style={styles.detail}>连接支持终端的电脑后可新建和管理终端。</Text>
       {!connected && <Pressable onPress={() => conn?.kick()} style={styles.smallButton} accessibilityRole="button">
         <Text style={styles.link}>重连设备</Text>
       </Pressable>}
@@ -66,7 +66,7 @@ export default function TerminalsScreen() {
     <FlatList data={sessions} keyExtractor={(session) => session.id} keyboardShouldPersistTaps="handled"
       contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 24 }]}
       ListHeaderComponent={<View style={styles.header}>
-        <Text style={styles.detail}>使用 Mac 的登录 Shell。支持 Tab 补全、历史记录和 Ctrl / Option 组合键；返回会保留终端，关闭会结束终端进程。</Text>
+        <Text style={styles.detail}>使用电脑的默认 Shell。支持 Tab 补全、历史记录和 Ctrl / Option 组合键；返回会保留终端，关闭会结束终端进程。</Text>
         {!connected && <View style={styles.connection}>
           <Text style={[styles.detail, { flex: 1 }]}>{runtime.lastError ?? "正在连接设备，连接后可新建终端。"}</Text>
           <Pressable accessibilityRole="button" onPress={() => conn?.kick()} style={styles.smallButton}><Text style={styles.link}>重连</Text></Pressable>
