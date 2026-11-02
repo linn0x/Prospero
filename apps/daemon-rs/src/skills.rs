@@ -701,3 +701,10 @@ pub fn expand_prompt(cwd: &str, text: &str) -> String {
     let prepared = prepare_composer_prompt(cwd, text);
     inject_portable_skills(&prepared.text, &prepared.skills)
 }
+
+/// Codex app-server resolves `$skill` mentions as native skill inputs. Keep
+/// the mention in the text and let Codex load each SKILL.md once; also retain
+/// the shared, bounded `@file` expansion.
+pub fn expand_prompt_for_codex(cwd: &str, text: &str) -> String {
+    prepare_composer_prompt(cwd, text).text
+}

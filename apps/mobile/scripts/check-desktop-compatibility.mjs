@@ -36,7 +36,7 @@ async function request(route, body) {
   const response = await fetch(connection.baseUrl + route, {
     method: body === undefined ? "GET" : "POST",
     headers: { authorization: `Bearer ${connection.token}`, "content-type": "application/json" },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10_000),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(60_000),
   });
   assert(response.ok, `${route}: ${response.status} ${await response.clone().text()}`);
   return response.json();
@@ -140,6 +140,38 @@ try {
   const reopened = await connect("fixture-mobile-parity");
   assert(reopened.hello.sessions.some(session => session.id === source.id && ["done", "died"].includes(session.status)));
   checks.push("terminal completion and recent history survive reconnect");
+  const burst = path.join(fixture, "replay-fixture.py");
+  await writeFile(burst, `import sys,time
+print("\\x1b]9;notification\\x07REPLAY_START", flush=True)
+for line in sys.stdin:
+ for i in range(150):
+  print(str(i)+":"+"x"*8192, flush=True)
+  time.sleep(0.004)
+ print("REPLAY_END_中文", flush=True)
+`);
+  const raw = await request("/v1/terminals", { agent: "shell", command: `python3 -u '${burst}'`, title: "Replay fixture", workspace: fixture, size: { cols: 96, rows: 32 } });
+  sessions.add(raw.id);
+  await delay(400);
+  await request(`/v1/terminals/${raw.id}/resize`, { cols: 100, rows: 34 });
+  await request(`/v1/terminals/${raw.id}/input`, { dataB64: Buffer.from("burst\n").toString("base64") });
+  await delay(1500);
+  assert.equal(await request(`/v1/terminals/${raw.id}/snapshot`), null);
+  mobile.send({ type: "session.attach", sid: raw.id });
+  const reset = await mobile.receive(message => message.type === "term.snapshot" && message.sid === raw.id);
+  assert.equal(reset.dataB64, "");
+  let restored = "", pages = 0, sawResize = false, cursor = reset.seq;
+  await until(async () => {
+    const page = await mobile.receive(message => message.type === "term.output" && message.sid === raw.id);
+    assert(page.seq > cursor); cursor = page.seq; pages++;
+    assert.equal(page.replay, true);
+    sawResize ||= page.events.some(event => event.type === "resize" && event.size.cols === 100);
+    restored += Buffer.from(page.dataB64, "base64").toString();
+    mobile.send({ type: "term.ack", sid: raw.id, seq: page.seq });
+    return restored.includes("REPLAY_END_中文");
+  });
+  assert(pages > 4); assert(sawResize); assert(restored.includes("REPLAY_START"));
+  for (let i=0; i<150; i++) assert(restored.includes(`${i}:` + "x".repeat(8192)));
+  checks.push("cold replay without snapshots preserves all pages, resize order and replay suppression");
   console.log(JSON.stringify({ ok: true, isolated: true, checks }, null, 2));
 } finally {
   for (const client of clients) client.close();

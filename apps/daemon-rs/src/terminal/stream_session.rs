@@ -108,11 +108,14 @@ pub(crate) async fn serve(socket: WebSocket, terminal: Terminal) -> Result<()> {
         let _lease = Lease { terminal: terminal.clone(), client: client.clone() };
         let mut lease_changes = terminal.controller_changes();
         let mut cursor = attach.after_seq.unwrap_or(0);
-        let snapshot = if attach.after_seq.is_none() {
+        let mut snapshot = if attach.after_seq.is_none() {
             let term = terminal.clone();
             tokio::task::spawn_blocking(move || term.snapshot()).await.map_err(|_| Error::Closed)??
         } else { None };
         let initial = terminal.read(TerminalQuery { after_seq: Some(snapshot.as_ref().map(|snapshot| snapshot.seq).unwrap_or(cursor as i64)), wait_ms: Some(0) }).await?;
+        if attach.after_seq.is_none() && snapshot.is_none() && initial.resync_required && initial.instance_start_seq == Some(initial.floor_seq) {
+            snapshot = Some(super::TerminalSnapshot { seq: initial.floor_seq, size: initial.initial_size, data_b64: String::new() });
+        }
         if (initial.resync_required && snapshot.is_none()) || cursor > initial.latest_seq as u64 {
             send_error(&mut sink, "history_gap", "The retained output cannot reconstruct this terminal").await?;
             return Ok(());

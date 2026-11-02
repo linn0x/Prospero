@@ -1005,10 +1005,18 @@ function installIpc(): void {
     if (runtime instanceof RustRuntime) return runtime.rename(sessionId, rawTitle);
     return store.renameSession(sessionId, rawTitle);
   });
-  ipcMain.handle("session:archive", (_event, rawId: unknown, archived: unknown) => {
+  ipcMain.handle("session:archive", (_event, rawId: unknown, archived: unknown, nativeId: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof archived !== "boolean") throw new Error("归档状态无效");
-    return store.setSessionArchived(sessionId, archived);
+    if (nativeId !== undefined && (typeof nativeId !== "string" || nativeId.length > 256)) throw new Error("原生对话 ID 无效");
+    if (runtime instanceof RustRuntime) return runtime.setSessionArchived(sessionId, archived, nativeId as string | undefined);
+    throw new Error("请更新电脑端以归档并释放会话");
+  });
+  ipcMain.handle("session:native-candidates", (_event, rawId: unknown, query: unknown) => {
+    const id = requireId(rawId, "会话");
+    if (typeof query !== "string" || query.length > 300) throw new Error("查询无效");
+    if (runtime instanceof RustRuntime) return runtime.nativeConversationCandidates(id, query);
+    throw new Error("请更新电脑端以绑定原生对话");
   });
   ipcMain.handle("session:pin", (_event, rawId: unknown, pinned: unknown) => {
     const sessionId = requireId(rawId, "会话");

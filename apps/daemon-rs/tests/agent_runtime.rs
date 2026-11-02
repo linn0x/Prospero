@@ -898,6 +898,50 @@ async fn codex_structured_turn_streams_into_timeline() {
 }
 
 #[tokio::test]
+async fn codex_skill_mention_is_not_inlined_before_app_server() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let skill_dir = harness.workspace.path().join(".agents/skills/review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: review\ndescription: Review files\n---\nUnique review instructions",
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "请 $review 一下".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
+            })
+        })
+        .await;
+    let start: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(harness.workspace.path().join("turn-start.json")).unwrap(),
+    )
+    .unwrap();
+    let text = start["input"][0]["text"].as_str().unwrap();
+    assert!(text.contains("$review"));
+    assert!(!text.contains("[Prospero selected Agent Skills]"));
+    assert!(!text.contains("Unique review instructions"));
+}
+
+#[tokio::test]
 async fn codex_close_kills_app_server_group_and_cleans_thread_lock() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("codexhang").await;
@@ -3758,4 +3802,86 @@ async fn claude_chat_fork_resumes_new_native_session_and_preserves_source() {
         log.contains("resume=22222222-2222-4222-8222-222222222222"),
         "{log}"
     );
+}
+
+#[tokio::test]
+async fn archive_resume_keeps_structured_identity_history_and_waits_for_new_input() {
+    let _guard = SERIAL.lock().await;
+    for codex in [false, true] {
+        let harness = Harness::new("resume").await;
+        let cli = harness.workspace.path().join("fake-codex.py");
+        std::fs::write(&cli, FAKE_CODEX).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe {
+            std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+        }
+        let source = if codex {
+            harness.create_codex().await
+        } else {
+            harness.create().await
+        };
+        harness.agents.archive(&source.id).await.unwrap();
+        let empty = harness.agents.resume(&source.id).await.unwrap();
+        assert_eq!(empty.id, source.id);
+        assert!(harness.records(&source.id).await.is_empty());
+        harness
+            .agents
+            .send(&source.id, "Retain this context".into(), None, Vec::new())
+            .await
+            .unwrap();
+        harness.wait_for(&source.id, |records| records.iter().any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed"))).await;
+        for _ in 0..100 {
+            if harness.status(&source.id).await == prosperod_rs::protocol::SessionStatus::Idle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let archived = harness.agents.archive(&source.id).await.unwrap();
+        assert_eq!(harness.agents.count(), 0);
+        let native = archived.native_session.unwrap();
+        assert!(native.native_id.is_some());
+        assert_eq!(native.state, "archived");
+        let history = serde_json::to_value(harness.records(&source.id).await).unwrap();
+        let restored = harness.agents.resume(&source.id).await.unwrap();
+        assert_eq!(restored.id, source.id);
+        assert_eq!(
+            restored.native_session.as_ref().unwrap().native_id,
+            native.native_id
+        );
+        assert_ne!(
+            restored.native_session.unwrap().runtime_id,
+            native.runtime_id
+        );
+        assert!(harness.agents.resume(&source.id).await.is_err());
+        assert_eq!(
+            serde_json::to_value(harness.records(&source.id).await).unwrap(),
+            history
+        );
+        harness
+            .agents
+            .send(
+                &source.id,
+                "Continue after archive".into(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        harness.wait_for(&source.id, |records| records.iter().any(|(id, body, _)| id.starts_with("turn2") && matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed"))).await;
+        if codex {
+            let request: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(harness.workspace.path().join("thread-resume.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(request["threadId"].as_str(), native.native_id.as_deref());
+        } else {
+            assert!(
+                std::fs::read_to_string(harness.workspace.path().join("turns.log"))
+                    .unwrap()
+                    .contains("resume=native-1")
+            );
+        }
+        harness.agents.close(&source.id).await.unwrap();
+    }
 }

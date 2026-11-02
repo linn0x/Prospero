@@ -1,3 +1,4 @@
+import { NativeSessionBindingDialog, needsNativeBinding } from "./NativeSessionBindingDialog";
 import { ArchivedChatsDialog } from "./ArchivedChatsDialog";
 import { chatBranchDisabledReason } from "./workspace/chat-branch";
 import { scheduleDeferredRequest } from "./deferred-request";
@@ -2890,6 +2891,11 @@ function NewSessionDialog({
     approvalPolicy: "standard",
     accountId: initialAgent === "opencode" && rememberedLaunchKind(initialAgent) === "pty" ? undefined : defaultSessionLaunchAccountId(independentAccounts, initialAgent),
   });
+  const [terminalApprovalPolicy, setTerminalApprovalPolicy] = useState<SessionCreateInput["approvalPolicy"]>(
+    initialDraft?.input.kind === "pty" && (initialDraft.input.agent === "codex" || initialDraft.input.agent === "claude")
+      ? initialDraft.input.approvalPolicy
+      : "yolo",
+  );
   const sourceRuntimeAgent: SourceRuntimeAgent = input.agent === "claude" || input.agent === "opencode" ? input.agent : "codex";
   const sourceChoice = selectedSourceRoute(sourceState.sources, sourceSelection, sourceRuntimeAgent);
   const setSourceRuntimeAgent = (agent: SourceRuntimeAgent): void => {
@@ -2927,6 +2933,8 @@ function NewSessionDialog({
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
   const selectedKind: SessionCreateInput["kind"] = useSource ? sourceChoice?.route.protocol === "openai_chat_completions" ? "structured" : input.kind : requiresStructured ? "structured" : input.kind;
+  const managedAgentTerminal = selectedKind === "pty" && (input.agent === "codex" || input.agent === "claude");
+  const selectedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : input.approvalPolicy;
   const supportsApprovalPolicy = selectedKind === "structured" || input.agent === "codex" || input.agent === "claude";
   const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? (input.agent !== "opencode" || selectedKind === "pty"));
   const selectedWorkspace = launchWorkspaces.find(
@@ -3071,10 +3079,10 @@ function NewSessionDialog({
         if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
         const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceSelection.sourceId, routeId: sourceSelection.routeId, revision: sourceSelection.revision, agent: sourceRuntimeAgent });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
-        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: input.approvalPolicy }));
+        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy }));
         rememberSourceSelection({ ...sourceSelection, agent: sourceRuntimeAgent });
       } else {
-        onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
+        onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
         rememberSourceSelection(undefined);
       }
       rememberLaunch(input.agent, selectedKind);
@@ -3169,7 +3177,7 @@ function NewSessionDialog({
             </FieldDescription>
           </Field>
           {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
-          <Button className="session-configure-accounts w-fit" variant="ghost" size="sm" onClick={() => onConfigureAccounts({ input: { ...input }, useSource, sourceSelection })}>
+          <Button className="session-configure-accounts w-fit" variant="ghost" size="sm" onClick={() => onConfigureAccounts({ input: { ...input, approvalPolicy: selectedApprovalPolicy }, useSource, sourceSelection })}>
             <Settings />{t("配置账号与模型", "Configure accounts & models")}
           </Button>
           <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("本机账号 / API 配置", "Local account / API profile")}</Button></div>
@@ -3367,25 +3375,23 @@ function NewSessionDialog({
             </FieldLabel>
             <NativeSelect
               id="session-approval"
-              value={input.approvalPolicy}
+              value={selectedApprovalPolicy}
               disabled={!supportsApprovalPolicy}
-              onChange={(event) =>
-                setInput({
-                  ...input,
-                  approvalPolicy: event.target
-                    .value as SessionCreateInput["approvalPolicy"],
-                })
-              }
+              onChange={(event) => {
+                const policy = event.target.value as SessionCreateInput["approvalPolicy"];
+                if (managedAgentTerminal) setTerminalApprovalPolicy(policy);
+                else setInput({ ...input, approvalPolicy: policy });
+              }}
             >
               <NativeSelectOption value="strict">{t("严格确认", "Strict")}</NativeSelectOption>
               <NativeSelectOption value="standard">{t("标准确认", "Standard")}</NativeSelectOption>
               <NativeSelectOption value="yolo">{t("自动批准（高风险）", "Auto-approve (high risk)")}</NativeSelectOption>
             </NativeSelect>
             <FieldDescription>
-              {!supportsApprovalPolicy ? t("此终端的操作确认由 CLI 自身配置管理。", "This terminal uses the CLI's own approval configuration.") : input.approvalPolicy === "strict"
+              {!supportsApprovalPolicy ? t("此终端的操作确认由 CLI 自身配置管理。", "This terminal uses the CLI's own approval configuration.") : selectedApprovalPolicy === "strict"
                 ? t("严格确认所有可能修改系统或文件的操作。", "Ask before operations that may modify files or the system.")
-                : input.approvalPolicy === "yolo"
-                  ? t("高风险：自动批准操作，仅用于可信工作区。", "High risk: approve operations automatically; use only in trusted workspaces.")
+                : selectedApprovalPolicy === "yolo"
+                  ? managedAgentTerminal ? t("终端默认免审批；Codex 同时关闭沙箱。", "Terminal sessions bypass approvals by default; Codex also disables its sandbox.") : t("高风险：自动批准操作，仅用于可信工作区。", "High risk: approve operations automatically; use only in trusted workspaces.")
                   : t("在高风险操作前请求确认。", "Ask for confirmation before high-risk actions.")}
             </FieldDescription>
           </Field>
@@ -3992,8 +3998,11 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [openNewSession]);
+  const [archiveBinding, setArchiveBinding] = useState<{ session: SessionInfo; archived: boolean }>();
   const toggleArchive = useCallback((id: string): void => {
     const archived = !snapshotRef.current.archivedSessionIds.includes(id);
+    const session = snapshotRef.current.daemon.sessions.find(session => session.id === id);
+    if (session && needsNativeBinding(session)) { setArchiveBinding({ session, archived }); return; }
     void window.prospero.setSessionArchived(id, archived).then(() => {
       if (archived) {
         setOpenIds(current => current.filter(item => item !== id));
@@ -4258,6 +4267,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               /></div></Suspense>}
         </div>
       </SidebarInset>
+      {archiveBinding && <NativeSessionBindingDialog session={archiveBinding.session} archived={archiveBinding.archived} onClose={() => setArchiveBinding(undefined)} onDone={() => {
+        if (archiveBinding.archived) { setOpenIds(current => current.filter(id => id !== archiveBinding.session.id)); setActiveId(current => current === archiveBinding.session.id ? undefined : current); }
+        setArchiveBinding(undefined);
+      }} />}
       {newSessionOpen && (
         <NewSessionDialog
           snapshot={sessionSnapshot}

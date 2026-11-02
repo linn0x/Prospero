@@ -4,6 +4,7 @@ import type { AgentKind, HostInfo, S2CMessage, UsageAccount } from "@prospero/pr
 import { AgentIcon } from "@/components/AgentIcon";
 import type { HostConnection } from "@/lib/connection";
 import { bytes, duration, untilLabel } from "@/lib/format";
+import { homeUsageAccounts } from "@/lib/home-usage";
 import { Row, Sheet } from "@/components/Sheet";
 import { color, font, quotaRemainingColor, quotaRemainingPct, radius, space, utilizationColor } from "@/lib/theme";
 
@@ -96,7 +97,7 @@ export function HostSummary({
       : null;
 
   // 紧的排前面 —— 快满的那个订阅是唯一会改变今天怎么干活的信息
-  const accounts = [...(usage?.accounts ?? [])].sort((a, b) => tightest(b) - tightest(a));
+  const accounts = homeUsageAccounts(usage?.accounts ?? []).sort((a, b) => tightest(b) - tightest(a));
   const showDeepseekHarness =
     connected &&
     conn?.supportsDeepseekHarness === true &&
@@ -157,7 +158,7 @@ export function HostSummary({
           const w = topWindow(a);
           return (
             <Gauge
-              key={a.agent}
+              key={a.accountId ?? `${a.agent}:${a.source ?? "unknown"}`}
               label={a.agent}
               agent={a.agent}
               badge={accountSourceLabel(a)}
@@ -237,7 +238,7 @@ export function HostSummary({
         ) : (
           <>
             {accounts.map((a) => (
-            <View key={a.agent} style={styles.account}>
+            <View key={a.accountId ?? `${a.agent}:${a.source ?? "unknown"}`} style={styles.account}>
               <View style={styles.accountHead}>
                 <AgentIcon agent={a.agent} size={17} badge />
                 <Text style={font.body}>{a.agent}</Text>

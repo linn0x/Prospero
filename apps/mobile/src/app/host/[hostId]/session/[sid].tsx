@@ -1,3 +1,4 @@
+import { SessionLifecycleSheet } from "@/components/SessionLifecycleSheet";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -15,6 +16,8 @@ import {
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import * as Linking from "expo-linking";
+import { StatusBar } from "expo-status-bar";
+import { NavigationBar } from "expo-navigation-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import ReanimatedDrawerLayout, {
@@ -76,7 +79,6 @@ import {
   setPerfHudEnabled,
   type TerminalPerf,
 } from "@/lib/perf-hud";
-import { setSessionArchived } from "@/lib/session-preferences";
 import { sortSessions } from "@/lib/store";
 import { recentSessions } from "@/lib/recent-sessions";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -469,6 +471,19 @@ export default function SessionScreen() {
     setDraft((current) => appendVoiceTranscript(current, text));
   }, []);
   const [focused, setFocused] = useState(false);
+  const [screenFocused, setScreenFocused] = useState(false);
+  const [terminalFullscreen, setTerminalFullscreen] = useState(true);
+  const [terminalToolsVisible, setTerminalToolsVisible] = useState(false);
+  const [terminalKeyboardVisible, setTerminalKeyboardVisible] = useState(Keyboard.isVisible());
+  useFocusEffect(useCallback(() => {
+    setScreenFocused(true);
+    return () => setScreenFocused(false);
+  }, []));
+  useEffect(() => {
+    const show = Keyboard.addListener("keyboardDidShow", () => setTerminalKeyboardVisible(true));
+    const hide = Keyboard.addListener("keyboardDidHide", () => setTerminalKeyboardVisible(false));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
   const [pending, setPending] = useState(0);
   const [search, setSearch] = useState<string | null>(null);
   const [deepseekView, setDeepseekView] = useState<"chat" | "trajectory">("chat");
@@ -507,9 +522,10 @@ export default function SessionScreen() {
     () => sortSessions(runtime.sessions),
     [runtime.sessions],
   );
-  const showSessionRail =
+  const immersiveTerminal = session?.kind === "pty" && terminalFullscreen;
+  const showSessionRail = !immersiveTerminal && (
     adaptiveLayout.verticalPanes !== null ||
-    (adaptiveLayout.width >= 960 && adaptiveLayout.height >= 560);
+    (adaptiveLayout.width >= 960 && adaptiveLayout.height >= 560));
   const sessionRailWidth =
     adaptiveLayout.verticalPanes?.start ??
     Math.min(360, Math.max(288, adaptiveLayout.width * 0.32));
@@ -521,7 +537,7 @@ export default function SessionScreen() {
   const isStructured = session?.kind === "structured";
   const isChat = isStructured;
   const shellTerminal = isShellTerminal(session);
-  const terminalEnded = isTerminalEnded(session);
+  const terminalEnded = isTerminalEnded(session) || session?.archived === true;
   const terminalSupported = !shellTerminal || supportsRemoteTerminal(runtime.hostInfo);
   const terminalClose = useTerminalClose(conn, sid);
   const terminalActions = useTerminalActions(conn, sid);
@@ -540,6 +556,7 @@ export default function SessionScreen() {
   const [usageError, setUsageError] = useState<string | null>(null);
   const [controlsOpen, setControlsOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [lifecycleTarget, setLifecycleTarget] = useState<boolean | null>(null);
   const [branchingSid, setBranchingSid] = useState<string | null>(null);
   const branching = branchingSid === sid;
   const branchScope = useRef({ active: false });
@@ -987,6 +1004,7 @@ export default function SessionScreen() {
 
   const send = useCallback(
     (text: string, deliveryOverride?: ChatDelivery): void => {
+      if (session?.archived) { setLifecycleTarget(false); return; }
       const t = text.trim();
       // 只带图不带字是合理的:一张报错截图本身就是问题
       if (!conn || !sid || (t.length === 0 && (!isChat || images.length === 0))) return;
@@ -1084,6 +1102,7 @@ export default function SessionScreen() {
       conn,
       hostId,
       sid,
+      session?.archived,
       isChat,
       images,
       busy,
@@ -1295,7 +1314,7 @@ export default function SessionScreen() {
       ? matchCommands(session.agent, draft.trim())
       : [];
   const canSend =
-    Boolean(conn && sid) &&
+    !session?.archived && Boolean(conn && sid) &&
     draftHydrated &&
     (draft.trim().length > 0 || (isChat && !isSubagent && images.length > 0)) &&
     (isChat || terminalInputEnabled);
@@ -1405,7 +1424,7 @@ export default function SessionScreen() {
           width={sessionRailWidth}
         />
       )}
-      {adaptiveLayout.verticalPanes && (
+      {!immersiveTerminal && adaptiveLayout.verticalPanes && (
         <View
           style={[
             styles.sessionFoldGutter,
@@ -1418,7 +1437,7 @@ export default function SessionScreen() {
         style={[
           styles.container,
           showSessionRail && styles.sessionDetail,
-          adaptiveLayout.verticalPanes && {
+          !immersiveTerminal && adaptiveLayout.verticalPanes && {
             flex: 0,
             width: adaptiveLayout.verticalPanes.end,
           },
@@ -1426,10 +1445,12 @@ export default function SessionScreen() {
         // 显式使用 native-stack 已知的头部高度，首轮布局就能同步算出 IME 重叠量。
         // automaticOffset 需要异步测量窗口坐标，快速首次点按时可能晚于键盘动画。
         behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={headerHeight}
+        keyboardVerticalOffset={immersiveTerminal ? 0 : headerHeight}
       >
+        {screenFocused && immersiveTerminal && <><StatusBar hidden /><NavigationBar hidden /></>}
         <Stack.Screen
         options={{
+          headerShown: !immersiveTerminal,
           headerTitleAlign: "left",
           headerBackVisible: false,
           headerLeft: () => (
@@ -1485,6 +1506,10 @@ export default function SessionScreen() {
               >
                 <Icon name={settings.sessionActionsHidden ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"}
                   size={19} color={color.accent} />
+              </Pressable>}
+              {!isChat && <Pressable style={styles.headerAction} onPress={() => setTerminalFullscreen(true)}
+                accessibilityRole="button" accessibilityLabel="终端全屏">
+                <Icon name="arrow.up.left.and.arrow.down.right" size={19} color={color.accent} />
               </Pressable>}
               <Pressable
                 style={styles.headerAction}
@@ -1678,7 +1703,20 @@ export default function SessionScreen() {
           </Pressable>
         </View>
       )}
+      {!isChat && search !== null && <View style={styles.terminalSearchBar}>
+        <Icon name="magnifyingglass" size={16} color="#9aa5ce" />
+        <TextInput style={styles.terminalSearchInput} placeholder="查找终端内容" placeholderTextColor="#737aa2"
+          value={search} autoFocus autoCapitalize="none" autoCorrect={false} returnKeyType="search"
+          onChangeText={(value) => { setSearch(value); termRef.current?.search(value, false, true); }}
+          onSubmitEditing={() => termRef.current?.search(search)} />
+        <Pressable accessibilityRole="button" accessibilityLabel="上一个匹配" onPress={() => termRef.current?.search(search, true)} style={styles.terminalSearchAction}><Text style={styles.terminalSearchActionText}>↑</Text></Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="下一个匹配" onPress={() => termRef.current?.search(search)} style={styles.terminalSearchAction}><Text style={styles.terminalSearchActionText}>↓</Text></Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="关闭终端搜索" onPress={() => { termRef.current?.search(""); setSearch(null); }} style={styles.terminalSearchAction}><Text style={styles.terminalSearchActionText}>×</Text></Pressable>
+      </View>}
 
+      {session.archived && <Pressable accessibilityRole="button" disabled={!isChat && !["claude", "codex"].includes(session.agent)} onPress={() => setLifecycleTarget(false)} style={{ padding: 12, backgroundColor: color.surface }}>
+        <Text style={{ color: color.accent }}>{isChat || ["claude", "codex"].includes(session.agent) ? "已归档 · 查看历史不会运行任务 · 点击继续对话" : "已归档 · 终端历史只读"}</Text>
+      </Pressable>}
       {isChat ? (
         <ConversationFontScale value={settings.conversationFontSize / DEFAULT_CONVERSATION_FONT_SIZE}>
         <ChatView
@@ -1701,8 +1739,8 @@ export default function SessionScreen() {
       ) : (
         terminalFontPreferenceHydrated ? (
           <>
-            <View style={styles.terminalStack}>
-              <Terminal
+            <View style={[styles.terminalStack, immersiveTerminal && Platform.OS === "ios" && { paddingTop: insets.top }]}>
+              <Terminal key={`${sid}:${session.nativeSession?.runtimeId ?? "legacy"}`}
                 ref={termRef}
                 conn={conn}
                 sid={sid}
@@ -1710,34 +1748,51 @@ export default function SessionScreen() {
                 onFontSize={setCustomTerminalFontSize}
                 inputEnabled={terminalInputEnabled}
                 sessionEnded={terminalEnded}
-                endedActions={shellTerminal ? <>
-                  {terminalActions.error && <Text accessibilityRole="alert" style={styles.terminalActionError}>{terminalActions.error}</Text>}
+                endedActions={<>
+                  {shellTerminal && terminalActions.error && <Text accessibilityRole="alert" style={styles.terminalActionError}>{terminalActions.error}</Text>}
                   <View style={styles.terminalEndedActions}>
-                    <Pressable accessibilityRole="button" accessibilityLabel="重启终端" onPress={restartShellTerminal}
+                    <Pressable accessibilityRole="button" accessibilityLabel="复制终端全部内容" onPress={() => termRef.current?.copyAll()} style={styles.terminalEndedButton}>
+                      <Text style={styles.terminalEndedButtonText}>复制全部</Text>
+                    </Pressable>
+                    <Pressable accessibilityRole="button" accessibilityLabel="搜索终端内容" onPress={() => setSearch("")} style={styles.terminalEndedButton}>
+                      <Text style={styles.terminalEndedButtonText}>查找</Text>
+                    </Pressable>
+                    {shellTerminal && <Pressable accessibilityRole="button" accessibilityLabel="重启终端" onPress={restartShellTerminal}
                       disabled={runtime.status !== "connected" || terminalActions.busy !== null}
                       style={[styles.terminalEndedButton, (runtime.status !== "connected" || terminalActions.busy !== null) && { opacity: 0.5 }]}>
                       {terminalActions.busy?.kind === "restart" ? <ActivityIndicator color="#fff" /> : <Icon name="arrow.clockwise" size={18} color="#fff" />}
                       <Text style={styles.terminalEndedButtonText}>{terminalActions.busy?.kind === "restart" ? "正在重启…" : "重启终端"}</Text>
-                    </Pressable>
-                    <Pressable accessibilityRole="button" accessibilityLabel="删除终端" onPress={() => setDeleteTerminalOpen(true)}
+                    </Pressable>}
+                    {shellTerminal && <Pressable accessibilityRole="button" accessibilityLabel="删除终端" onPress={() => setDeleteTerminalOpen(true)}
                       disabled={terminalActions.busy !== null} style={styles.terminalEndedButton}>
                       <Icon name="trash" size={18} color="#fff" /><Text style={styles.terminalEndedButtonText}>删除</Text>
-                    </Pressable>
+                    </Pressable>}
                   </View>
                   {runtime.status !== "connected" && <Pressable accessibilityRole="button" onPress={() => conn.kick()} style={styles.terminalEndedButton}>
                     <Text style={styles.terminalEndedButtonText}>重连设备</Text>
                   </Pressable>}
-                </> : undefined}
+                </>}
                 onInputB64={terminalKeyboard.inputB64}
+                onPasteB64={terminalKeyboard.pasteB64}
                 disconnectedMessage={terminalEnded ? "终端已结束。" : terminalClose.closing ? "正在关闭终端…" : "主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"}
                 onRetryConnection={terminalEnded || terminalClose.closing ? undefined : retryTerminalConnection}
                 {...(perfHud ? { onPerf: setTerminalPerf } : {})}
               />
               {perfHud && <PerfHud perf={terminalPerf} />}
+              {immersiveTerminal && <View style={[styles.terminalFullscreenControls, { top: Platform.OS === "ios" ? Math.max(0, insets.top - 44) : Math.max(8, insets.top) }]}>
+                <Pressable accessibilityRole="button" accessibilityLabel={terminalToolsVisible ? "隐藏终端工具" : "显示终端工具"}
+                  accessibilityState={{ expanded: terminalToolsVisible }} onPress={() => setTerminalToolsVisible((value) => !value)} style={styles.terminalFullscreenButton}>
+                  <Icon name="ellipsis.circle" size={18} color="#c0caf5" />
+                </Pressable>
+                <Pressable accessibilityRole="button" accessibilityLabel="退出终端全屏" onPress={() => setTerminalFullscreen(false)} style={styles.terminalFullscreenButton}>
+                  <Icon name="arrow.down.right.and.arrow.up.left" size={17} color="#c0caf5" />
+                </Pressable>
+              </View>}
             </View>
-            {!terminalEnded && <View style={{ paddingBottom: insets.bottom, backgroundColor: "#141419" }}><KeyBar
+            {!terminalEnded && (!immersiveTerminal || terminalKeyboardVisible || terminalToolsVisible) && <View style={{ paddingBottom: terminalKeyboardVisible || immersiveTerminal ? 0 : insets.bottom, backgroundColor: "#1a1b26" }}><KeyBar
               onKey={terminalKeyboard.sendKey}
-              onPaste={terminalKeyboard.paste}
+              onShortcut={terminalKeyboard.paste}
+              onPaste={(text) => termRef.current?.paste(text) ?? Promise.resolve({ accepted: false, reason: "offline" })}
               modifiers={terminalKeyboard.modifiers}
               onToggleModifier={terminalKeyboard.toggleModifier}
               enabled={terminalInputEnabled}
@@ -1747,6 +1802,9 @@ export default function SessionScreen() {
               onResetFontSize={followSystemTerminalFontSize}
               fontSizeMode={terminalFontPreference.mode}
               onScrollBottom={() => termRef.current?.scrollToBottom()}
+              onCopyAll={() => termRef.current?.copyAll()}
+              onSearch={() => setSearch("")}
+              newlineSequence={session.agent === "codex" ? "\x1b[13;2u" : ["claude", "shell"].includes(session.agent) ? "\x1b\r" : undefined}
               onDismissKeyboard={Platform.OS === "android" ? undefined : () => termRef.current?.blur()}
             /></View>}
           </>
@@ -1936,6 +1994,8 @@ export default function SessionScreen() {
         onClose={() => setSwitcherOpen(false)}
       />
 
+      {lifecycleTarget !== null && conn && <SessionLifecycleSheet conn={conn} session={session} archived={lifecycleTarget}
+        onClose={() => setLifecycleTarget(null)} onDone={() => { const archived = lifecycleTarget; setLifecycleTarget(null); if (archived) returnToHost(); }} />}
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
         {!isSubagent && ["claude", "codex"].includes(session.agent) && <SheetAction
           label={branching ? "正在创建分支…" : session.kind === "pty" ? "选择原生对话并创建分支" : "创建会话分支"}
@@ -2005,19 +2065,15 @@ export default function SessionScreen() {
           />
         ) : null}
         {/* 文件与改动已提到标题栏,这里不再重复。 */}
-        <SheetAction
-          label="归档会话"
-          detail="仅从手机当前列表移入归档，电脑端保持运行"
+        {(!session.archived || isStructured || ["claude", "codex"].includes(session.agent)) && <SheetAction
+          label={session.archived ? "继续对话" : "停止并归档"}
+          detail={session.archived ? "恢复原生对话上下文" : "停止执行、释放资源并保留历史"}
           symbol="archivebox"
           onPress={() => {
             setMenuOpen(false);
-            void setSessionArchived(hostId, sid, true)
-              .then(returnToHost)
-              .catch((error: unknown) => {
-                toast(error instanceof Error ? error.message : String(error));
-              });
+            setLifecycleTarget(session.archived ? false : true);
           }}
-        />
+        />}
         {!(shellTerminal && terminalEnded) && <SheetAction
           label={shellTerminal ? "关闭终端" : "结束会话"}
           detail="终止电脑端会话进程"
@@ -2372,7 +2428,7 @@ export default function SessionScreen() {
               autoCapitalize="none"
               autoCorrect={false}
               multiline={isChat}
-              editable={isChat || terminalInputEnabled}
+              editable={!session.archived && (isChat || terminalInputEnabled)}
               accessibilityHint={
                 !isChat && !terminalInputEnabled
                   ? terminalEnded
@@ -2685,7 +2741,13 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     justifyContent: "center",
     backgroundColor: "#09090b",
   },
-  terminalStack: { flex: 1 },
+  terminalStack: { flex: 1, backgroundColor: "#1a1b26" },
+  terminalFullscreenControls: { position: "absolute", right: 8, flexDirection: "row", borderRadius: 10, backgroundColor: "rgba(35, 40, 58, 0.86)", overflow: "hidden" },
+  terminalFullscreenButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  terminalSearchBar: { minHeight: 48, flexDirection: "row", alignItems: "center", paddingLeft: 12, backgroundColor: "#1a1b26", borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "#343747" },
+  terminalSearchInput: { flex: 1, color: "#c0caf5", paddingHorizontal: 10, paddingVertical: 8, fontSize: 14 },
+  terminalSearchAction: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  terminalSearchActionText: { color: "#c0caf5", fontSize: 20 },
   terminalEndedActions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 10 },
   terminalEndedButton: { minHeight: 44, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 8, backgroundColor: "#3A5BA8", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
   terminalEndedButtonText: { color: "#fff", fontSize: 14, fontWeight: "600" },

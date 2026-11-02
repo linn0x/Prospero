@@ -135,12 +135,11 @@ interface Won {
   helloOk: S2CHelloOk;
   endpoint: string;
   path: ConnectionPath;
-  rttMs: number;
   protocolVersion: number;
 }
 
 export interface ConnEvents extends Record<string, unknown> {
-  connected: { addr: string; path: ConnectionPath; rttMs: number };
+  connected: { addr: string; path: ConnectionPath; rttMs: number | null };
   disconnected: { willRetry: boolean };
   snapshot: S2CTermSnapshot;
   output: S2CTermOutput;
@@ -180,6 +179,7 @@ export class HostConnection {
   private queue = new BoundedQueue<C2SMessage>(MAX_OFFLINE_QUEUE);
   private racingAttempts: ManagedAttempt<Won>[] | null = null;
   private readonly sessionCreates = new SessionCreateTracker();
+  private readonly sessionActions = new Map<string, Promise<SessionInfo>>();
   private readonly sessionForks = new Map<string, Promise<SessionInfo>>();
   private readonly terminalCloses = new TerminalCloseTracker();
   private readonly deletedTerminalIds = new Set<string>();
@@ -539,7 +539,6 @@ export class HostConnection {
 
     const promise = new Promise<Won>((resolve, reject) => {
       rejectAttempt = reject;
-      const startedAt = Date.now();
       const failAttempt = (failure: AttemptResult["failure"], detail?: string): void => {
         if (settled) return;
         settled = true;
@@ -674,7 +673,6 @@ export class HostConnection {
               helloOk: msg,
               endpoint: input.endpoint,
               path: input.path,
-              rttMs: Date.now() - startedAt,
               protocolVersion,
             });
           } catch (error) {
@@ -735,7 +733,8 @@ export class HostConnection {
     this.fatalReceiveError = null;
     this.activeAddr = won.endpoint;
     this.activePath = won.path;
-    this.lastRttMs = won.rttMs;
+    // Handshake time includes loading the initial session list; it is not RTT.
+    this.lastRttMs = null;
     this.lastRecvAt = Date.now();
     this.lastPingAt = this.lastRecvAt;
     this.pendingPingId = null;
@@ -752,7 +751,7 @@ export class HostConnection {
       activeAddr: won.endpoint,
       activePath: won.path,
       lastError: null,
-      rttMs: won.rttMs,
+      rttMs: null,
     });
 
     // 记住这个地址,下次优先试(切网后往往还是同一个)
@@ -765,8 +764,18 @@ export class HostConnection {
     };
 
     this.startHeartbeat();
+    if ((this.negotiatedProtocolVersion ?? 0) >= 13) this.sendHeartbeatPing(Date.now());
     this.flushQueue();
-    this.events.emit("connected", { addr: won.endpoint, path: won.path, rttMs: won.rttMs });
+    this.events.emit("connected", { addr: won.endpoint, path: won.path, rttMs: null });
+  }
+
+  private sendHeartbeatPing(now: number): void {
+    const id = randomUUID();
+    const result = this.send({ type: "connection.ping", id });
+    if (result.accepted) {
+      this.pendingPingId = id;
+      this.lastPingAt = now;
+    }
   }
 
   /**
@@ -790,12 +799,7 @@ export class HostConnection {
         return;
       }
       if (action !== "send_ping") return;
-      const id = randomUUID();
-      const result = this.send({ type: "connection.ping", id });
-      if (result.accepted) {
-        this.pendingPingId = id;
-        this.lastPingAt = now;
-      }
+      this.sendHeartbeatPing(now);
     }, HEARTBEAT_TICK_MS);
   }
 
@@ -814,9 +818,19 @@ export class HostConnection {
     }
     switch (msg.type) {
       case "connection.pong":
-        if (msg.id === this.pendingPingId) this.pendingPingId = null;
+        if (msg.id === this.pendingPingId) {
+          const rttMs = Math.max(0, Date.now() - this.lastPingAt);
+          this.pendingPingId = null;
+          this.lastRttMs = rttMs;
+          this.patch({ rttMs });
+        }
         return;
       case "session.state":
+        {
+          const previous = useApp.getState().runtimes[this.host.id]?.sessions[msg.session.id];
+          if ((previous?.revision ?? 0) > (msg.session.revision ?? 0)) return;
+          if (previous && previous.nativeSession?.runtimeId !== msg.session.nativeSession?.runtimeId) this.detach(msg.session.id);
+        }
         if (this.deletedTerminalIds.has(msg.session.id)) return;
         useApp.getState().queueSessionUpdate(this.host.id, msg.session);
         this.sessionCreates.state(msg.session);
@@ -832,6 +846,22 @@ export class HostConnection {
           useApp.getState().upsertSession(this.host.id, msg.session);
         }
         this.sessionCreates.result(msg);
+        return;
+      case "session.history.result":
+        flushSessionUpdates();
+        for (const session of msg.sessions) useApp.getState().upsertSession(this.host.id, session);
+        this.resolveFs(msg);
+        return;
+      case "session.lifecycle.result":
+        if (msg.ok && msg.session) {
+          flushSessionUpdates();
+          const previous = useApp.getState().runtimes[this.host.id]?.sessions[msg.session.id];
+          if ((previous?.revision ?? 0) <= (msg.session.revision ?? 0)) {
+            if (previous?.nativeSession?.runtimeId !== msg.session.nativeSession?.runtimeId) this.detach(msg.session.id);
+            useApp.getState().upsertSession(this.host.id, msg.session);
+          }
+        }
+        this.resolveFs(msg);
         return;
       case "session.fork.result":
         if (msg.ok && msg.session) {
@@ -904,6 +934,7 @@ export class HostConnection {
         // workspace.list 发生在会话创建前,协议里没有 sid。旧版 daemon 不认识
         // 这条消息时会回一个全局 bad_message,也应立刻交给目录选择器,不能让用户
         // 对着转圈等 15 秒才超时。
+        if (this.rejectFsFor("#history", msg.message)) return;
         if (this.rejectFsFor("#workspace", msg.message)) return;
         if (this.rejectFsFor("#conversations", msg.message)) return;
         if (this.rejectFsFor("#accounts", msg.message)) return;
@@ -932,7 +963,7 @@ export class HostConnection {
   private resolveFs(msg: S2CMessage & { sid?: string; path?: string }): void {
     // git.status / git.done 没有 path,用消息类型当 key 的一部分
     // 账号级应答不带 sid,用固定键配对(与 usageGet 省略 sid 时一致)
-    const owner =
+    const owner = msg.type === "session.history.result" ? "#history" :
       msg.type === "workspace.listing"
         ? "#workspace"
         : msg.type === "conversation.results"
@@ -943,7 +974,11 @@ export class HostConnection {
               ? "#model-sources"
           : (msg.sid ?? "#account");
     const responsePath =
-      msg.type === "session.fork.result"
+      msg.type === "session.history.result"
+        ? `#session.history:${msg.requestId}`
+        : msg.type === "session.lifecycle.result"
+        ? `#session.lifecycle:${msg.requestId}`
+        : msg.type === "session.fork.result"
         ? `#session.fork:${msg.requestId}`
         : msg.type === "orchestration.operation.result"
         ? `#orchestration.operation:${msg.requestId}`
@@ -1490,6 +1525,43 @@ export class HostConnection {
     this.attachedChatSessions.set(sid, requested);
     this.attachStartedAt.set(sid, Date.now());
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
+  }
+
+  detach(sid: string): void {
+    this.attachedChatSessions.delete(sid);
+    if (this.isConnected && this.supportsCapability("session.lifecycle.v1")) this.send({ type: "session.detach", sid }, false);
+  }
+
+  async sessionHistory(cursor?: string): Promise<Extract<S2CMessage, { type: "session.history.result" }>> {
+    if (!this.supportsCapability("session.lifecycle.v1")) throw new Error("请更新电脑端以读取归档历史");
+    const requestId = this.agentRequestId();
+    return this.fsRequest("#history", `#session.history:${requestId}`, { type: "session.history", requestId, ...(cursor ? { cursor } : {}) }, 15_000, false);
+  }
+
+  async nativeConversationCandidates(sid: string, query: string): Promise<ResumableConversation[]> {
+    if (!this.supportsCapability("session.lifecycle.v1")) throw new Error("请更新电脑端以绑定原生对话");
+    const requestId = this.agentRequestId();
+    const result = await this.fsRequest<Extract<S2CMessage, { type: "session.lifecycle.result" }>>(
+      sid, `#session.lifecycle:${requestId}`, { type: "session.native-candidates", sid, requestId, query }, 45_000, false,
+    );
+    if (!result.ok) throw new Error(result.error ?? "读取原生对话失败");
+    return result.conversations ?? [];
+  }
+
+  setSessionArchived(sid: string, archived: boolean, nativeId?: string): Promise<SessionInfo> {
+    const key = `${sid}:${archived}:${nativeId ?? ""}`;
+    const pending = this.sessionActions.get(key);
+    if (pending) return pending;
+    if (!this.supportsCapability("session.lifecycle.v1")) return Promise.reject(new Error("请更新电脑端以归档和恢复会话"));
+    const requestId = this.agentRequestId();
+    const task = this.fsRequest<Extract<S2CMessage, { type: "session.lifecycle.result" }>>(
+      sid, `#session.lifecycle:${requestId}`, { type: archived ? "session.archive" : "session.resume", sid, requestId, ...(nativeId ? { nativeId } : {}) }, 180_000, false,
+    ).then(result => {
+      if (!result.ok || !result.session) throw new Error(result.error ?? "会话操作未确认，请刷新状态后重试");
+      return useApp.getState().runtimes[this.host.id]?.sessions[sid] ?? result.session;
+    }).finally(() => this.sessionActions.delete(key));
+    this.sessionActions.set(key, task);
+    return task;
   }
 
   forkSession(sid: string): Promise<SessionInfo> {

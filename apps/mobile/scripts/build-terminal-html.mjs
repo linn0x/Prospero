@@ -27,6 +27,9 @@ const assets = {
 };
 
 let html = read(path.join(repoRoot, "apps/daemon/term.html"));
+// Search is a mobile-only enhancement; the shared page also runs in older shells.
+const searchAddon = read(path.join(nm, "@xterm/addon-search/lib/addon-search.js")).replace(/<\/script>/gi, "<\\/script>");
+html = html.replace('<script src="/assets/webgl.js"></script>', (tag) => `${tag}\n<script>\n${searchAddon}\n</script>`);
 const terminalFontFamily = "JetBrainsMono Nerd Font Mono";
 const font = readFileSync(path.join(here, "../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"));
 // Android has no bundled Nerd Font. Inline it so Expo refresh and offline use

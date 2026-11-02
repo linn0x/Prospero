@@ -342,6 +342,36 @@ describe("HostConnection WebSocket candidates", () => {
     connection.stop();
   });
 
+  it("reports heartbeat round-trip time and ignores unrelated pong IDs", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-14T12:00:00Z"));
+    const host = makeHost("direct");
+    const connection = new HostConnection(host, generateKeyPairB64());
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      pendingPingId: string | null;
+      lastPingAt: number;
+      sendHeartbeatPing(now: number): void;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.sendHeartbeatPing(Date.now());
+    vi.advanceTimersByTime(73);
+    internals.onMessage(JSON.stringify({ type: "connection.pong", id: "different" }));
+    expect(connection.lastRttMs).toBeNull();
+    expect(internals.pendingPingId).toBe("ping-0123456789");
+    vi.advanceTimersByTime(27);
+    internals.onMessage(JSON.stringify({ type: "connection.pong", id: "ping-0123456789" }));
+    expect(connection.lastRttMs).toBe(100);
+    expect(useApp.getState().runtimes[host.id]?.rttMs).toBe(100);
+    expect(internals.pendingPingId).toBeNull();
+    connection.stop();
+  });
+
   it("carries the selected approval policy in session.create", () => {
     const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
     const send = vi.spyOn(connection, "send").mockReturnValue({
@@ -737,4 +767,66 @@ describe("session branch delivery", () => {
     expect(connection.queuedCount).toBe(0);
     connection.stop();
   });
+});
+
+describe("durable session lifecycle", () => {
+  it("waits for confirmation, deduplicates taps and does not roll back a newer runtime revision", async () => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    Object.assign(internals, { advertisedCapabilities: new Set(["session.lifecycle.v1"]) });
+    const nativeSession = { runtimeId: "instance-one", nativeId: "d86e69bd-a3f1-4713-bfbd-cb5c2ac50390", managed: true, state: "running" as const, error: null };
+    const source = { ...session, agent: "codex" as const, status: "running" as const, revision: 1, archived: false, nativeSession };
+    useApp.getState().setSessions(host.id, [source]);
+    const pending = connection.setSessionArchived(session.id, true);
+    expect(connection.setSessionArchived(session.id, true)).toBe(pending);
+    expect(useApp.getState().runtimes[host.id]?.sessions[session.id]?.archived).toBe(false);
+    expect(connection.queuedCount).toBe(0);
+    const request = JSON.parse(socket.sent[0]!);
+    const latest = { ...source, revision: 3, nativeSession: { ...nativeSession, runtimeId: "instance-two" } };
+    internals.onMessage(JSON.stringify({ type: "session.state", session: latest }));
+    internals.onMessage(JSON.stringify({ type: "session.lifecycle.result", sid: session.id, requestId: request.requestId, ok: true, session: { ...source, revision: 2, archived: true } }));
+    await expect(pending).resolves.toMatchObject({ revision: 3, archived: false, nativeSession: { runtimeId: "instance-two" } });
+    expect(socket.sent.map(value => JSON.parse(value).type)).toEqual(["session.archive", "session.detach"]);
+    connection.stop();
+  });
+
+  it("preserves a live session when archive is rejected and never queues a resume offline", async () => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    Object.assign(internals, { advertisedCapabilities: new Set(["session.lifecycle.v1"]) });
+    const source = { ...session, status: "running" as const, archived: false };
+    useApp.getState().setSessions(host.id, [source]);
+    const pending = connection.setSessionArchived(session.id, true);
+    const request = JSON.parse(socket.sent[0]!);
+    internals.onMessage(JSON.stringify({ type: "session.lifecycle.result", sid: session.id, requestId: request.requestId, ok: false, code: "session_binding_required", error: "请绑定原生对话" }));
+    await expect(pending).rejects.toThrow("请绑定");
+    expect(useApp.getState().runtimes[host.id]?.sessions[session.id]?.archived).toBe(false);
+    socket.readyState = 3;
+    await expect(connection.setSessionArchived(session.id, false)).rejects.toThrow("未连接");
+    expect(connection.queuedCount).toBe(0);
+    connection.stop();
+  });
+});
+
+it("loads all desktop account profiles and sends the selected API and terminal mode together", async () => {
+  const { connection, socket, internals } = endedTerminalConnection();
+  Object.assign(connection, { advertisedCapabilities: new Set([CAPABILITY_AGENT_ACCOUNTS, CAPABILITY_SESSION_CREATE_RESULT]) });
+  const profiles = Array.from({ length: 48 }, (_, index) => ({
+    id: `api-${index}`, agent: "codex", engine: "codex", name: `Profile ${index}`, managed: true,
+    isDefault: index === 0, status: "signed_in", createdAt: 1, updatedAt: 1, activeSessions: 0,
+    apiProfile: { provider: "openai_compatible", protocol: "openai_responses", baseUrl: "http://127.0.0.1:8317/v1", model: `model-${index}` },
+    capabilities: { sessionKinds: ["pty", "structured"], plan: true, resume: true, modelSelection: false, reasoningEffort: false },
+  }));
+  try {
+    const listing = connection.agentAccounts();
+    const listRequest = JSON.parse(socket.sent.at(-1)!);
+    internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: listRequest.requestId, action: "list", ok: true, accounts: profiles }));
+    const accounts = await listing;
+    expect(accounts).toHaveLength(48);
+    const selected = accounts[47];
+    const task = connection.createSessionTracked("codex", "/work", undefined, "pty", 96, 32, { accountId: selected.id, approvalPolicy: "strict" });
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ type: "session.create", agent: "codex", accountId: "api-47", kind: "pty", approvalPolicy: "strict" });
+    internals.onMessage(JSON.stringify({ type: "session.create.result", requestId: task.requestId, ok: true, session: {
+      id: "api-terminal-created", agent: "codex", accountId: "api-47", kind: "pty", cwd: "/work", title: "API terminal", cols: 96, rows: 32, status: "running", createdAt: 1,
+    } }));
+    await expect(task.completion).resolves.toMatchObject({ accountId: "api-47", kind: "pty" });
+  } finally { connection.stop(); }
 });

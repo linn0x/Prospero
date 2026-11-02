@@ -157,6 +157,12 @@ export class RustClient {
   forkAgentSession(value: string, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
     return this.json(`/v1/agent-sessions/${id(value)}/fork`, { method: "POST", signal, timeoutMs });
   }
+  sessionLifecycle(value: string, archived: boolean, nativeId?: string, signal: AbortSignal | null = null): Promise<SessionHead> {
+    return this.json(`/v1/sessions/${id(value)}/${archived ? "archive" : "resume"}`, { method: "POST", signal, timeoutMs: 180_000, headers: { "content-type": "application/json" }, body: JSON.stringify({ nativeId }) });
+  }
+  nativeConversationCandidates(value: string, query: string, signal: AbortSignal | null = null): Promise<ResumableConversation[]> {
+    return this.json(`/v1/sessions/${id(value)}/native-candidates?${new URLSearchParams({query})}`, { signal, timeoutMs: 30_000 });
+  }
   createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<SessionHead> {
     return this.json("/v1/agent-sessions", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }

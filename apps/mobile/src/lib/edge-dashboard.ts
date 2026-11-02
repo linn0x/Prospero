@@ -55,7 +55,7 @@ export function buildEdgeDashboard(
       key: edgeItemKey(host.id, session.id), host, session, recent: usage[session.id],
       time: recentSessionTime(session, usage[session.id]),
     });
-    sessions.push(...Object.values(runtime?.sessions ?? {}).map(wrap));
+    sessions.push(...Object.values(runtime?.sessions ?? {}).filter(session => session.archived !== true).map(wrap));
     approvals.push(...homeApprovalSessions(runtime?.sessions).map(wrap));
     const groups = partitionHomeProjects(homeWorkspaceProjects(runtime?.sessions), managedPaths[host.id] ?? []);
     for (const [items, managed] of [[groups.projects, false], [groups.taskProjects, true]] as const) {

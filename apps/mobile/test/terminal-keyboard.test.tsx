@@ -70,4 +70,18 @@ describe("remote terminal keyboard", () => {
     input.toggleModifier("ctrl"); input.sendKey("c"); input.sendKey("c"); input.sendKey("c");
     expect(conn.inputText.mock.calls.map((call) => call[1])).toEqual(["\x03", "\x03", "c"]);
   });
+  it("sends long encoded pastes in byte-limited frames and reports partial delivery", () => {
+    const { input, conn } = keyboard();
+    const bytes = utf8Encode(`\x1b[200~${"中".repeat(6000)}\x1b[201~`);
+    expect(input.pasteB64(toB64(bytes))).toEqual({ accepted: true, disposition: "sent" });
+    const frames = conn.inputB64.mock.calls.map((call) => Buffer.from(call[1], "base64"));
+    expect(frames.every((frame) => frame.length <= 8192)).toBe(true);
+    expect(Buffer.concat(frames)).toEqual(Buffer.from(bytes));
+    conn.inputB64.mockClear();
+    expect(input.inputB64(toB64(new Uint8Array(8193)))).toEqual({ accepted: true, disposition: "sent" });
+    expect(conn.inputB64.mock.calls.map((call) => Buffer.from(call[1], "base64").length)).toEqual([8192, 1]);
+    conn.inputB64.mockReset().mockReturnValueOnce({ accepted: true, disposition: "sent" }).mockReturnValueOnce({ accepted: false, reason: "offline" });
+    expect(input.pasteB64(toB64(bytes))).toEqual({ accepted: false, reason: "partial" });
+    expect(conn.inputB64).toHaveBeenCalledTimes(2);
+  });
 });

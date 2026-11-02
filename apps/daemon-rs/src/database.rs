@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 35;
+const SCHEMA_VERSION: i64 = 36;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -181,6 +181,7 @@ impl Store {
             transaction.execute_batch(include_str!("orchestration/schema-v33.sql"))?;
             transaction.execute_batch(include_str!("agent/schema-v34.sql"))?;
             transaction.execute_batch(include_str!("orchestration/schema-v35.sql"))?;
+            transaction.execute_batch(include_str!("terminal/schema-v36.sql"))?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -278,6 +279,9 @@ impl Store {
             if version <= 34 {
                 transaction.execute_batch(include_str!("orchestration/schema-v35.sql"))?;
             }
+            if version <= 35 {
+                transaction.execute_batch(include_str!("terminal/schema-v36.sql"))?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -362,6 +366,7 @@ impl Store {
         validate_text(&input.workspace, 4096, false)?;
         let timestamp = now();
         let session = SessionHead {
+            native_session: None,
             id: id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             agent: input.agent,
             kind: input.kind,
@@ -487,11 +492,24 @@ impl Store {
         update: UpdateSession,
         extra: impl FnOnce(&Transaction<'_>) -> Result<()>,
     ) -> Result<SessionHead> {
+        self.update_session_with_native(id, update, None, extra)
+    }
+
+    pub(crate) fn update_session_with_native(
+        &mut self,
+        id: &str,
+        update: UpdateSession,
+        native: Option<NativeSession>,
+        extra: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> Result<SessionHead> {
         if update.revision <= 0 || update.revision >= MAX_SAFE_INTEGER {
             return Err(Error::Invalid("invalid revision".into()));
         }
         let mut session = self.session(id)?;
         let previous = session.clone();
+        if let Some(native) = native {
+            session.native_session = Some(native);
+        }
         if session.revision != update.revision {
             return Err(Error::Conflict);
         }
@@ -903,6 +921,7 @@ impl Store {
             Self::insert_session(
                 &transaction,
                 &SessionHead {
+                    native_session: None,
                     id: format!("session-{index:09}"),
                     agent: AgentKind::Codex,
                     kind: SessionKind::Structured,

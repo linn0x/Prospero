@@ -30,6 +30,13 @@ export class TerminalRecovery {
   private saving = Promise.resolve();
   constructor(private readonly directory: string) {}
 
+  async forget(id: string): Promise<void> {
+    if (!validId(id)) return;
+    this.entries.delete(id); this.sizes.delete(id); this.dirty.delete(id);
+    this.saving = this.saving.catch(() => {}).then(() => rm(join(this.directory, `${id}.json`), { force: true }));
+    await this.saving;
+  }
+
   async load(id: string): Promise<void> {
     if (!validId(id) || this.entries.has(id)) return;
     try {

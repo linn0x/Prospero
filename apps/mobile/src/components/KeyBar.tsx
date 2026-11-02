@@ -1,3 +1,4 @@
+import { Fragment, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
@@ -40,6 +41,7 @@ const KEYS: KeyDef[] = [
   { label: "~", seq: "~" },
   { label: "|", seq: "|" },
 ];
+const PRIMARY_KEYS = new Set(["Esc", "Tab", "↑", "↓", "←", "→", "⏎"]);
 
 /** 常用 Ctrl 组合直接给快捷键位,省掉两次点击 */
 const CTRL_SHORTCUTS: KeyDef[] = [
@@ -57,6 +59,7 @@ const CTRL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 export function KeyBar({
   onKey,
   onPaste,
+  onShortcut,
   modifiers,
   onToggleModifier,
   onFontSize,
@@ -64,12 +67,16 @@ export function KeyBar({
   fontSizeMode = "system",
   onScrollBottom,
   onDismissKeyboard,
+  onCopyAll,
+  onSearch,
+  newlineSequence,
   enabled = true,
   disabledMessage = "主机未连接；终端输入已冻结。",
   onRetry,
 }: {
   onKey: (seq: string) => DeliveryResult;
-  onPaste: (text: string) => DeliveryResult;
+  onPaste: (text: string) => Promise<DeliveryResult>;
+  onShortcut: (seq: string) => DeliveryResult;
   modifiers: TerminalModifiers;
   onToggleModifier: (key: keyof TerminalModifiers) => void;
   onFontSize?: (delta: number) => void;
@@ -78,12 +85,16 @@ export function KeyBar({
   fontSizeMode?: TerminalFontPreference["mode"];
   onScrollBottom?: () => void;
   onDismissKeyboard?: () => void;
+  onCopyAll?: () => void;
+  onSearch?: () => void;
+  newlineSequence?: string;
   /** Shell 字节不可安全重放，断线时所有会投递的按键必须冻结。 */
   enabled?: boolean;
   disabledMessage?: string;
   onRetry?: () => void;
 }) {
   const { ctrl, option } = modifiers;
+  const [expanded, setExpanded] = useState(false);
 
   const send = (seq: string): void => {
     const result = onKey(seq);
@@ -100,15 +111,14 @@ export function KeyBar({
       toast("剪贴板是空的");
       return;
     }
-    // PTY 对大块粘贴有死锁报告,daemon 侧已分片写入;这里只管发。
-    // 输入在断线期间绝不排队，重连后执行旧 shell 字节比丢弃更危险。
-    const result = onPaste(text);
+    // 终端先按当前粘贴模式编码，连接层再按宿主限制分块；断线时不重放。
+    const result = await onPaste(text);
     if (!result.accepted) {
       toast(deliveryFailureText(result));
       return;
     }
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    toast(`已粘贴 ${String(text.length)} 字`);
+    toast(`已提交 ${String(text.length)} 字到终端`);
   };
 
   return (
@@ -157,6 +167,7 @@ export function KeyBar({
           </ScrollView>
         </View>
       )}
+      <View style={styles.primaryRow}>
       <ScrollView
         horizontal
         keyboardShouldPersistTaps="always"
@@ -183,19 +194,18 @@ export function KeyBar({
           <Text style={[styles.keyText, ctrl && styles.keyTextOn]}>Ctrl</Text>
         </Pressable>
 
-        <Pressable onPress={() => { onToggleModifier("option"); void Haptics.selectionAsync(); }}
+        {expanded && <Pressable onPress={() => { onToggleModifier("option"); void Haptics.selectionAsync(); }}
           disabled={!enabled} accessibilityRole="button" accessibilityLabel="Option / Alt 组合键"
           accessibilityHint="点选后搭配下一个按键；Option 加左右方向键按词移动"
           accessibilityState={{ selected: option, disabled: !enabled }}
           style={({ pressed }) => [styles.key, styles.modifier, option && styles.modifierOn, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}>
           <Text style={[styles.keyText, option && styles.keyTextOn]}>Opt ⌥</Text>
-        </Pressable>
+        </Pressable>}
 
         <View style={styles.sep} />
 
-        {KEYS.map((k) => (
+        {KEYS.filter((k) => PRIMARY_KEYS.has(k.label) || expanded).map((k) => <Fragment key={k.label}>
           <Pressable
-            key={k.label}
             onPress={() => send(k.seq)}
             disabled={!enabled}
             style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}
@@ -204,14 +214,31 @@ export function KeyBar({
           >
             <Text style={styles.keyText}>{k.label}</Text>
           </Pressable>
-        ))}
+        {k.label === "Tab" && newlineSequence && <Pressable onPress={() => {
+          const result = onShortcut(newlineSequence);
+          if (!result.accepted) toast(deliveryFailureText(result));
+          else void Haptics.selectionAsync();
+        }} disabled={!enabled} style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}
+          accessibilityRole="keyboardkey" accessibilityLabel="在 Agent 中换行">
+          <Text style={styles.keyText}>↵ 换行</Text>
+        </Pressable>}
+        </Fragment>)}
+        <Pressable onPress={() => void paste()} disabled={!enabled} accessibilityRole="button"
+          accessibilityLabel="粘贴剪贴板内容" style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}>
+          <Text style={styles.keyText}>粘贴</Text>
+        </Pressable>
 
       </ScrollView>
-      <ScrollView horizontal keyboardShouldPersistTaps="always" showsHorizontalScrollIndicator={false}
+      <Pressable onPress={() => setExpanded((value) => !value)} style={({ pressed }) => [styles.moreKey, pressed && styles.keyPressed]}
+        accessibilityRole="button" accessibilityLabel={expanded ? "收起终端工具" : "展开终端工具"} accessibilityState={{ expanded }}>
+        <Text style={styles.moreText}>{expanded ? "−" : option ? "⌥" : "···"}</Text>
+      </Pressable>
+      </View>
+      {expanded && <ScrollView horizontal keyboardShouldPersistTaps="always" showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.content}>
         {CTRL_SHORTCUTS.map((k) => (
           <Pressable key={k.label} onPress={() => {
-            const result = onPaste(k.seq);
+            const result = onShortcut(k.seq);
             if (!result.accepted) toast(deliveryFailureText(result));
             else void Haptics.selectionAsync();
           }} disabled={!enabled} accessibilityRole="keyboardkey" accessibilityLabel={k.label}
@@ -222,15 +249,10 @@ export function KeyBar({
 
         <View style={styles.sep} />
 
-        <Pressable
-          onPress={() => void paste()}
-          disabled={!enabled}
-          style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}
-          accessibilityRole="button"
-          accessibilityLabel="粘贴剪贴板内容"
-        >
-          <Text style={styles.keyText}>粘贴</Text>
-        </Pressable>
+        {onCopyAll && <Pressable onPress={onCopyAll} style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+          accessibilityRole="button" accessibilityLabel="复制终端全部内容"><Text style={styles.keyText}>复制全部</Text></Pressable>}
+        {onSearch && <Pressable onPress={onSearch} style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+          accessibilityRole="button" accessibilityLabel="搜索终端内容"><Text style={styles.keyText}>查找</Text></Pressable>}
         {onFontSize && (
           <>
             <Pressable
@@ -292,24 +314,27 @@ export function KeyBar({
             <Text style={styles.keyText}>↧ 底部</Text>
           </Pressable>
         )}
-      </ScrollView>
+      </ScrollView>}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   bar: {
-    backgroundColor: "#141419",
+    backgroundColor: "#1a1b26",
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#26262D",
+    borderTopColor: "#343747",
   },
-  content: { paddingHorizontal: 8, paddingVertical: 7, gap: 6, alignItems: "center" },
+  primaryRow: { flexDirection: "row", alignItems: "center" },
+  content: { paddingHorizontal: 8, paddingVertical: 5, gap: 5, alignItems: "center" },
+  moreKey: { width: 46, minHeight: MIN_TOUCH_TARGET, alignItems: "center", justifyContent: "center", borderLeftWidth: StyleSheet.hairlineWidth, borderLeftColor: "#343747" },
+  moreText: { color: "#9aa5ce", fontSize: 20, fontWeight: "600" },
   key: {
     minWidth: MIN_TOUCH_TARGET,
     minHeight: MIN_TOUCH_TARGET,
-    backgroundColor: "#24242B",
-    borderRadius: 9,
-    paddingHorizontal: 12,
+    backgroundColor: "#292e42",
+    borderRadius: 8,
+    paddingHorizontal: 10,
     paddingVertical: 7,
     alignItems: "center",
     justifyContent: "center",

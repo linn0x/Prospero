@@ -150,6 +150,13 @@ fn expands_skill_mention_into_prompt_inline() {
     assert!(expanded.contains("Review checklist"));
     assert!(expanded.contains("[User request]\n请 $review 一下"));
 
+    let codex = prosperod_rs::skills::expand_prompt_for_codex(
+        dir.to_str().unwrap(), "请 $review 一下",
+    );
+    assert_eq!(codex, "请 $review 一下");
+    assert!(!codex.contains("[Prospero selected Agent Skills]"));
+    assert!(!codex.contains("Review checklist"));
+
     // Portable injection wrapper matches the legacy wording.
     let prepared = inject_portable_skills(
         "hi",

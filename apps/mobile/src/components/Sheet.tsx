@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Modal,
   Platform,
@@ -6,10 +6,12 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon, type IconName } from "@/components/Icon";
+import { ResizeHandle } from "./ResizeHandle";
 import { radius, space, createThemedStyles, useMobileTheme, fontForPalette } from "@/lib/theme";
 
 /**
@@ -23,6 +25,8 @@ export function Sheet({
   title,
   onClose,
   onDismiss,
+  presentation = "bottom",
+  contentKey,
   children,
 }: {
   visible: boolean;
@@ -30,12 +34,21 @@ export function Sheet({
   onClose: () => void;
   /** Navigation must wait until the iOS presenter has released its native modal. */
   onDismiss?: () => void;
+  /** Opt-in side panel for wide landscape workflows. */
+  presentation?: "bottom" | "side";
+  /** Reset scroll position when a sheet switches between nested lists. */
+  contentKey?: string;
   children: React.ReactNode;
 }) {
   const styles = useStyles();
   const { palette: color } = useMobileTheme();
   const font = fontForPalette(color);
   const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const [sideFraction, setSideFraction] = useState<number | null>(null);
+  const sideMin = Math.min(280, width / 2);
+  const sideMax = Math.max(sideMin, width - 280);
+  const sideWidth = Math.max(sideMin, Math.min(sideMax, sideFraction === null ? Math.min(480, Math.max(340, width * 0.48)) : width * sideFraction));
   const wasVisible = useRef(visible);
   const dismissCallback = useRef(onDismiss);
   useEffect(() => {
@@ -61,7 +74,7 @@ export function Sheet({
       onRequestClose={onClose}
       onDismiss={() => { if (!visible) onDismiss?.(); }}
     >
-      <View style={styles.modalRoot}>
+      <View style={[styles.modalRoot, presentation === "side" && styles.sideRoot]}>
         {/* Native visibility owns dismissal, including interrupted/background transitions. */}
         <View style={styles.backdropLayer}>
           <Pressable
@@ -74,19 +87,25 @@ export function Sheet({
         <View
           style={[
             styles.sheet,
-            { paddingBottom: insets.bottom + space.lg },
+            presentation === "side" && styles.sideSheet,
+            presentation === "side" && { width: sideWidth },
+            { paddingBottom: insets.bottom + space.lg, ...(presentation === "side" ? { paddingTop: insets.top } : {}) },
           ]}
         >
-          <View style={styles.grabber} />
+          {presentation !== "side" && <View style={styles.grabber} />}
           <View style={styles.head}>
             <Text style={font.title}>{title}</Text>
             <Pressable onPress={onClose} hitSlop={10}>
               <Text style={styles.close}>关闭</Text>
             </Pressable>
           </View>
-          <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
+          <ScrollView key={contentKey} style={[styles.body, presentation === "side" && styles.sideBody]} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
             {children}
           </ScrollView>
+          {presentation === "side" && <View style={styles.sideDivider}>
+            <ResizeHandle label="调整模型选择面板宽度" value={sideWidth} min={sideMin} max={sideMax}
+              onChange={(next) => setSideFraction(next / width)} />
+          </View>}
         </View>
       </View>
     </Modal>
@@ -164,6 +183,7 @@ const useStyles = createThemedStyles((color) => {
   const font = fontForPalette(color);
   return StyleSheet.create({
   modalRoot: { flex: 1, justifyContent: "flex-end" },
+  sideRoot: { alignItems: "flex-start", justifyContent: "flex-start" },
   backdropLayer: { position: "absolute", inset: 0 },
   backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)" },
   sheet: {
@@ -173,6 +193,10 @@ const useStyles = createThemedStyles((color) => {
     paddingHorizontal: space.lg,
     maxHeight: "78%",
   },
+  sideSheet: { height: "100%", maxHeight: "100%",
+    borderTopLeftRadius: 0, borderBottomRightRadius: radius.lg },
+  sideDivider: { position: "absolute", top: 0, bottom: 0, right: -12 },
+  sideBody: { flex: 1 },
   grabber: {
     width: 36,
     height: 4,

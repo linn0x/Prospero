@@ -18,6 +18,7 @@ vi.mock("react-native", async () => {
   const { createElement: el, memo } = await import("react");
   return {
     View: "View", Text: "Text", TextInput: "TextInput", Pressable: "Pressable",
+    PanResponder: { create: () => ({ panHandlers: {} }) },
     ScrollView: "ScrollView", Image: "Image", ActivityIndicator: "ActivityIndicator",
     Modal: ({ visible, children }: { visible: boolean; children: ReactNode }) => visible ? el("Modal", {}, children) : null,
     // Like the native list, unchanged props skip renderItem. A theme switch must invalidate its closures.
@@ -233,5 +234,16 @@ describe("mounted conversation theme", () => {
       expect(native(root, "View").some((node) => style(node).backgroundColor === palette.surface)).toBe(true);
       assertExplicitColors(root);
     }
+  });
+
+  it("anchors the opt-in side sheet on the left and resets nested-list scrolling", async () => {
+    const element = (contentKey: string, presentation: "side" | "bottom") => <Sheet visible title="模型源" onClose={vi.fn()} contentKey={contentKey} presentation={presentation}><Row label="模型" value="当前模型" /></Sheet>;
+    const first = await render(element("sources", "side"), "light");
+    expect(native(first, "View").some((node) => style(node).alignItems === "flex-start" && style(node).justifyContent === "flex-start")).toBe(true);
+    const scroll = native(first, "ScrollView")[0];
+    const second = await render(element("source-1", "side"), "light");
+    expect(native(second, "ScrollView")[0]).not.toBe(scroll);
+    const bottom = await render(element("source-1", "bottom"), "light");
+    expect(native(bottom, "View").some((node) => style(node).justifyContent === "flex-end")).toBe(true);
   });
 });

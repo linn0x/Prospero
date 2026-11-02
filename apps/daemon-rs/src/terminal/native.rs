@@ -97,6 +97,14 @@ fn pty_size(size: TerminalSize) -> PtySize {
 }
 
 pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
+    spawn_at(command, size, 0)
+}
+
+pub(crate) fn spawn_at(
+    command: CommandBuilder,
+    size: TerminalSize,
+    base_seq: i64,
+) -> Result<Terminal> {
     validate_size(size)?;
     let pair = native_pty_system()
         .openpty(pty_size(size))
@@ -111,7 +119,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
     // At most 1 MiB of reader chunks can await terminal parsing.
     let (output_sender, output_receiver) = std::sync::mpsc::sync_channel::<ReaderEvent>(64);
     let wake = Wake(output_sender.clone());
-    let output = Arc::new(Mutex::new(Output::new(size)?));
+    let output = Arc::new(Mutex::new(Output::new_at(size, base_seq)?));
     let stop = Arc::new(AtomicBool::new(false));
     let (changed, updates) = watch::channel(0);
     let terminal = Terminal(Arc::new(Inner {

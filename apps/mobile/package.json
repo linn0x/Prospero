@@ -54,6 +54,7 @@
     "@types/node": "^22.10.2",
     "@types/react": "~19.2.2",
     "@types/react-test-renderer": "19.1.0",
+    "@xterm/addon-search": "^0.16.0",
     "eslint": "^9.0.0",
     "eslint-config-expo": "~57.0.1",
     "react-test-renderer": "19.2.3",
@@ -78,7 +79,8 @@
     "build:android": "./scripts/build-apk.sh",
     "pretest": "npm run build:protocol",
     "test": "vitest run",
-    "test:desktop": "node scripts/check-desktop-compatibility.mjs"
+    "test:desktop": "node scripts/check-desktop-compatibility.mjs",
+    "test:lifecycle": "node scripts/check-session-lifecycle.mjs"
   },
   "private": true
 }

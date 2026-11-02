@@ -1,3 +1,9 @@
+import { SessionAccountSelect } from "@/components/SessionAccountSelect";
+import { SessionModelSourceSelect } from "@/components/SessionModelSourceSelect";
+import { ResizeHandle } from "../../../components/ResizeHandle";
+import { selectLaunchAccount } from "@/lib/session-launch-selection";
+import { agentForSourceRoute, catalogRouteInput, sourceCatalogTarget, type SourceModelChoice } from "@/lib/session-model-sources";
+import { SessionLifecycleSheet } from "@/components/SessionLifecycleSheet";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -22,6 +28,7 @@ import type {
   AgentPreset,
   ApprovalPolicy,
   CodeAgentKind,
+  ModelSource,
   OrchestrationSnapshot,
   ResumableConversation,
   SessionInfo,
@@ -41,7 +48,6 @@ import { getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/pr
 import {
   getSessionPreferences,
   setProjectCollapsed,
-  setSessionArchived,
   setSessionHidden,
 } from "@/lib/session-preferences";
 import { groupSessionsByProject } from "@/lib/session-projects";
@@ -83,7 +89,7 @@ const APPROVAL_POLICIES: readonly {
   { value: "yolo", label: "YOLO", symbol: "exclamationmark.triangle.fill" },
 ];
 const approvalPolicyHelp: Record<ApprovalPolicy, string> = {
-  strict: "每次工具操作都请求确认；新会话默认使用此策略。",
+  strict: "工具操作需要时会请求确认。",
   standard: "只读操作自动放行；修改文件、执行命令和联网仍需确认。",
   yolo: "全部操作自动批准；Codex 同时启用完整访问，操作仍会记录。",
 };
@@ -146,6 +152,7 @@ export default function HostScreen() {
   }>();
   const { host, conn, runtime } = useHostConnection(hostId);
   const supportsTerminal = supportsRemoteTerminal(runtime.hostInfo);
+  const supportsAccounts = conn?.supportsAgentAccounts === true;
   const isFocused = useIsFocused();
   const supportsDeepseekHarness =
     runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
@@ -158,12 +165,13 @@ export default function HostScreen() {
   const [launchMode, setLaunchMode] = useState<"default" | "plan">("default");
   const [launchIntent, setLaunchIntent] = useState<"conversation" | "goal">("conversation");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("strict");
+  const [terminalApprovalPolicy, setTerminalApprovalPolicy] = useState<ApprovalPolicy>("yolo");
   const [createYoloConfirmOpen, setCreateYoloConfirmOpen] = useState(false);
   const [goal, setGoal] = useState("");
   const [cwd, setCwd] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | AgentKind>("all");
-  const [composing, setComposing] = useState(false);
+  const [composing, setComposing] = useState(quickCreate === "conversation" || quickCreate === "directory");
   const [toolsOpen, setToolsOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [workspacePath, setWorkspacePath] = useState("");
@@ -174,6 +182,15 @@ export default function HostScreen() {
   const [resumeLoaded, setResumeLoaded] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>([]);
+  const [accountsLoading, setAccountsLoading] = useState(false);
+  const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [accountsReload, setAccountsReload] = useState(0);
+  const [modelSources, setModelSources] = useState<ModelSource[]>([]);
+  const [modelSourcesLoading, setModelSourcesLoading] = useState(false);
+  const [modelSourcesError, setModelSourcesError] = useState<string | null>(null);
+  const [modelSourcesReload, setModelSourcesReload] = useState(0);
+  const [sourceBinding, setSourceBinding] = useState(false);
+  const sourceBindingEpoch = useRef(0);
   const [selectedAccountIds, setSelectedAccountIds] = useState<
     Partial<Record<CodeAgentKind, string>>
   >({});
@@ -186,6 +203,20 @@ export default function HostScreen() {
   const [selectedLaunchPreset, setSelectedLaunchPreset] = useState<string | null>(null);
   const [launchModelsReload, setLaunchModelsReload] = useState(0);
   const [showArchived, setShowArchived] = useState(false);
+  const [lifecycleTarget, setLifecycleTarget] = useState<{ session: SessionInfo; archived: boolean } | null>(null);
+  const [historyCursor, setHistoryCursor] = useState<string>();
+  const [historyLoading, setHistoryLoading] = useState(false);
+  useEffect(() => {
+    if (!showArchived || !conn?.supportsCapability("session.lifecycle.v1") || runtime.status !== "connected") return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setHistoryLoading(true);
+      void conn.sessionHistory().then(page => { if (!cancelled) setHistoryCursor(page.nextCursor); })
+        .catch(error => { if (!cancelled) setBanner(error instanceof Error ? error.message : String(error)); })
+        .finally(() => { if (!cancelled) setHistoryLoading(false); });
+    }, 0);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [conn, showArchived, runtime.status]);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
   const [hiddenIds, setHiddenIds] = useState<Set<string>>(() => new Set());
   const [deleteTarget, setDeleteTarget] = useState<SessionInfo | null>(null);
@@ -203,6 +234,7 @@ export default function HostScreen() {
   const deepLinkCreateRef = useRef<string | null>(null);
   const homeQuickCreateRef = useRef<string | null>(null);
   const resetPendingCreate = useCallback((): void => {
+    sourceBindingEpoch.current++;
     pendingCreate.cancel();
     pendingResumeTitleRef.current = null;
     setCreateDelivery(null);
@@ -210,7 +242,7 @@ export default function HostScreen() {
   }, [pendingCreate]);
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
-  const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
+  const orchestration = useOrchestrationSnapshot(composing ? null : conn, runtime.status, 8_000);
   const coordinatorRuns = useMemo(
     () => coordinatorRunsBySession(orchestration?.runs ?? []),
     [orchestration],
@@ -220,9 +252,12 @@ export default function HostScreen() {
   const wideComposer =
     verticalPanes !== null || width >= 720 || (width >= 600 && width > height);
   const balancedPaneWidth = width / 2;
+  const [composerFraction, setComposerFraction] = useState(0.5);
+  const composerMinWidth = Math.min(240, balancedPaneWidth);
+  const composerStart = Math.max(composerMinWidth, Math.min(width - composerMinWidth, width * composerFraction));
   const composerPaneWidths = verticalPanes ?? {
-    start: balancedPaneWidth,
-    end: width - balancedPaneWidth,
+    start: composerStart,
+    end: width - composerStart,
   };
 
   const codeAgent = agent === "claude" || agent === "codex" || agent === "opencode" ? agent : null;
@@ -235,9 +270,12 @@ export default function HostScreen() {
       matchingAccounts.find((account) => account.isDefault) ??
       matchingAccounts[0]
     : undefined;
+  const accountReady = !codeAgent || !supportsAccounts || selectedAccount !== undefined;
   const selectedAccountCapabilities = selectedAccount ? getAgentAccountCapabilities(selectedAccount) : undefined;
   const accountRequiresStructured = selectedAccountCapabilities?.sessionKinds.length === 1 && selectedAccountCapabilities.sessionKinds[0] === "structured";
   const effectiveSessionKind: SessionKind = accountRequiresStructured ? "structured" : sessionKind;
+  const managedAgentTerminal = effectiveSessionKind === "pty" && (agent === "claude" || agent === "codex");
+  const displayedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : approvalPolicy;
   const accountCanPlan = selectedAccountCapabilities?.plan ?? true;
   const accountCanResume = selectedAccountCapabilities?.resume ?? true;
   const accountCanSelectModel = selectedAccountCapabilities?.modelSelection ?? true;
@@ -247,7 +285,7 @@ export default function HostScreen() {
     composing &&
     launchIntent === "conversation" &&
     effectiveSessionKind === "structured" &&
-    accountCanResume &&
+    accountCanResume && accountReady &&
     RESUMABLE.includes(agent) &&
     runtime.status === "connected" &&
     conn !== null;
@@ -255,19 +293,96 @@ export default function HostScreen() {
     (model) => model.id === selectedLaunchModel,
   );
 
+  // A slow bind may complete after changing hosts, agents, or dismissing the form.
+  // It must never replace the current selection in that case.
+  useEffect(() => () => { sourceBindingEpoch.current++; }, [conn, hostId, isFocused, composing, agent, selectedAccount?.id, effectiveSessionKind]);
+
+  useEffect(() => {
+    if (!isFocused || !composing || !conn?.supportsModelSources || runtime.status !== "connected") return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setModelSourcesLoading(true);
+      setModelSourcesError(null);
+      void conn.modelSourceAction({ kind: "list" }).then((result) => {
+        if (!cancelled) setModelSources(result.sources ?? []);
+      }, (failure: unknown) => {
+        if (!cancelled) setModelSourcesError(`模型源读取失败：${failure instanceof Error ? failure.message : String(failure)}`);
+      }).finally(() => { if (!cancelled) setModelSourcesLoading(false); });
+    }, 0);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [conn, runtime.status, isFocused, composing, modelSourcesReload]);
+
+  const loadSourceModels = useCallback(async (source: ModelSource) => {
+    const target = sourceCatalogTarget(source);
+    if (!conn || !target) throw new Error("模型源缺少可用端点或凭据。");
+    const result = await conn.modelSourceAction({ kind: "models", sourceId: source.id, revision: source.revision, ...target, refresh: true });
+    return result.models ?? [];
+  }, [conn]);
+
+  const selectModelSource = async (source: ModelSource, choice: SourceModelChoice): Promise<void> => {
+    if (!conn || !codeAgent || runtime.status !== "connected" || sourceBinding) throw new Error("设备未连接或正在选择模型。");
+    const epoch = ++sourceBindingEpoch.current;
+    setSourceBinding(true);
+    try {
+      let selectedSource = source;
+      let route;
+      if (choice.kind === "catalog") {
+        if (source.routes.some((item) => item.model === choice.model.id)) throw new Error("此模型的配置已变化，请刷新模型源后重试。");
+        let enabled;
+        try {
+          enabled = await conn.modelSourceAction({ kind: "routes.set", sourceId: source.id, revision: source.revision,
+            routes: [catalogRouteInput(choice.model, choice.protocol, choice.credentialId)] });
+        } catch (failure) {
+          throw new Error(`启用结果未确认，请刷新模型源后再试：${failure instanceof Error ? failure.message : String(failure)}`);
+        }
+        if (sourceBindingEpoch.current !== epoch) throw new Error("选择已取消；模型可能已经启用。");
+        const sources = enabled.sources ?? (await conn.modelSourceAction({ kind: "list" })).sources ?? [];
+        if (sourceBindingEpoch.current !== epoch) throw new Error("选择已取消；模型可能已经启用。");
+        selectedSource = sources.find((item) => item.id === source.id) ?? source;
+        route = selectedSource.routes.find((item) => item.enabled && item.model === choice.model.id && item.protocol === choice.protocol && item.credentialId === choice.credentialId);
+        setModelSources(sources);
+        if (!route) throw new Error("模型可能已经启用；请刷新模型源后重试。");
+      } else {
+        route = choice.route;
+      }
+      if (sourceBindingEpoch.current !== epoch) throw new Error("选择已取消；模型可能已经启用。");
+      const targetAgent = agentForSourceRoute(route, codeAgent);
+      const result = await conn.modelSourceAction({ kind: "bind", sourceId: selectedSource.id, revision: selectedSource.revision, routeId: route.id, agent: targetAgent });
+      if (sourceBindingEpoch.current !== epoch) throw new Error("选择已取消，请重新选择模型。");
+      const accounts = result.accounts ?? await conn.agentAccounts();
+      if (sourceBindingEpoch.current !== epoch) throw new Error("选择已取消，请重新选择模型。");
+      const account = accounts.find((item) => item.id === result.accountId);
+      if (!account) throw new Error("电脑未返回绑定的账号，请刷新后重试。");
+      const next = selectLaunchAccount(account, effectiveSessionKind);
+      if (next.agent !== targetAgent) throw new Error("模型源返回了不匹配的 Agent，请刷新后重试。");
+      setAgentAccounts(accounts);
+      if (result.sources) setModelSources(result.sources);
+      setAgent(next.agent);
+      setSessionKind(next.kind);
+      setSelectedAccountIds((current) => ({ ...current, [next.agent]: account.id }));
+      setSelectedResume(null); setResumeResults([]); setResumeLoaded(false);
+      if (!getAgentAccountCapabilities(account).plan) setLaunchMode("default");
+      if (next.kind === "pty") setLaunchIntent("conversation");
+    } finally { setSourceBinding(false); }
+  };
+
   useEffect(() => {
     const reset = setTimeout(() => setSelectedResume(null), 0);
     return () => clearTimeout(reset);
   }, [selectedAccount?.id, accountRequiresStructured]);
 
   // 账号目录属于电脑端；每次回到主机页重读，确保账号管理页的新增/默认/删除立即生效。
-  useFocusEffect(
-    useCallback(() => {
-      if (!conn || runtime.status !== "connected" || !conn.supportsAgentAccounts) {
+  useEffect(() => {
+    if (!isFocused) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (!conn || runtime.status !== "connected" || !supportsAccounts) {
         setAgentAccounts([]);
-        return undefined;
+        setAccountsLoading(false);
+        return;
       }
-      let cancelled = false;
+      setAccountsLoading(true);
+      setAccountsError(null);
       void conn
         .agentAccounts()
         .then((next) => {
@@ -285,13 +400,11 @@ export default function HostScreen() {
           });
         })
         .catch((failure: unknown) => {
-          if (!cancelled) setBanner(`账号状态读取失败: ${failure instanceof Error ? failure.message : String(failure)}`);
-        });
-      return () => {
-        cancelled = true;
-      };
-    }, [conn, runtime.status]),
-  );
+          if (!cancelled) setAccountsError(`账号读取失败：${failure instanceof Error ? failure.message : String(failure)}`);
+        }).finally(() => { if (!cancelled) setAccountsLoading(false); });
+    }, 0);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [conn, runtime.status, supportsAccounts, accountsReload, isFocused]);
 
   // 模型目录来自 Agent 自己，不能在手机里硬编码。账号切换时重新读取，保证
   // 创建请求里的 model/effort 与即将启动的隔离环境属于同一份能力目录。
@@ -301,7 +414,7 @@ export default function HostScreen() {
       effectiveSessionKind !== "structured" ||
       launchCatalogAgent === null ||
       !conn?.supportsSessionCreateModel ||
-      !accountCanSelectModel ||
+      !accountCanSelectModel || !accountReady ||
       runtime.status !== "connected"
     ) {
       const reset = setTimeout(() => {
@@ -377,6 +490,7 @@ export default function HostScreen() {
     selectedAccount?.id,
     selectedAccount?.updatedAt,
     accountCanSelectModel,
+    accountReady,
     effectiveSessionKind,
   ]);
 
@@ -443,8 +557,6 @@ export default function HostScreen() {
     }, [hostId]),
   );
 
-  // 首页快速入口复用完整创建器：指定目录时直接进入 Agent 设置，未指定目录或
-  // 选择“新建目录”时先打开 WorkspacePicker（其中包含 mkdir）。
   useEffect(() => {
     if (!isFocused || !conn || runtime.status !== "connected") return;
     if (quickCreate !== "conversation" && quickCreate !== "directory") return;
@@ -457,12 +569,13 @@ export default function HostScreen() {
       setGoal("");
       setSelectedResume(null);
       setApprovalPolicy("strict");
+      setTerminalApprovalPolicy("yolo");
       setCreateYoloConfirmOpen(false);
       setWorkspacePath("");
       setManualCwdOpen(false);
       if (requestedCwd) setCwd(requestedCwd);
       setComposing(true);
-      if (quickCreate === "directory" || !requestedCwd) setPickerOpen(true);
+      setPickerOpen(quickCreate === "directory");
     }, 0);
     return () => clearTimeout(timer);
   }, [conn, isFocused, quickCreate, quickCreateCwd, runtime.status]);
@@ -479,6 +592,7 @@ export default function HostScreen() {
       setLaunchIntent("conversation");
       setGoal("");
       setApprovalPolicy("strict");
+      setTerminalApprovalPolicy("yolo");
       setCreateYoloConfirmOpen(false);
       if (hostId) router.push(`/host/${hostId}/session/${session.id}`);
     }, (error) => {
@@ -569,11 +683,11 @@ export default function HostScreen() {
     [hiddenIds, runtime.sessions],
   );
   const currentSessions = useMemo(
-    () => all.filter((session) => !archivedIds.has(session.id)),
+    () => all.filter((session) => !(session.archived ?? archivedIds.has(session.id))),
     [all, archivedIds],
   );
   const archivedSessions = useMemo(
-    () => all.filter((session) => archivedIds.has(session.id)),
+    () => all.filter((session) => session.archived ?? archivedIds.has(session.id)),
     [all, archivedIds],
   );
   const selectedPool = showArchived ? archivedSessions : currentSessions;
@@ -654,7 +768,7 @@ export default function HostScreen() {
           : runtime.status === "failed"
             ? (runtime.lastError ?? "连接失败")
             : "未连接";
-  const createButtonLabel = createDelivery === "queued"
+  const createButtonLabel = sourceBinding ? "正在选择模型…" : createDelivery === "queued"
     ? "等待连接…"
     : createDelivery === "sent"
       ? "正在创建…"
@@ -667,8 +781,9 @@ export default function HostScreen() {
             : "新建会话";
 
   const submitCreate = (): void => {
-    if (!conn || runtime.status !== "connected" || pendingCreate.pending) return;
+    if (!conn || runtime.status !== "connected" || pendingCreate.pending || sourceBinding) return;
     if (agent === "shell" && !supportsTerminal) { setBanner(REMOTE_TERMINAL_UNAVAILABLE); return; }
+    if (codeAgent && supportsAccounts && !selectedAccount) { setAccountsError("请先读取并选择电脑上的账号或 API。"); return; }
     if (!accountCanLaunch) { setBanner(selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"); return; }
     const projectPath = cwd.trim();
     if (projectPath.length === 0) {
@@ -730,9 +845,7 @@ export default function HostScreen() {
                 ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
                 approvalPolicy,
               }
-            : selectedAccount
-              ? accountOption
-              : undefined;
+            : { ...accountOption, approvalPolicy: managedAgentTerminal ? terminalApprovalPolicy : approvalPolicy };
     const createKind = launchIntent === "goal"
       ? "structured"
       : STRUCTURED.includes(agent)
@@ -756,23 +869,9 @@ export default function HostScreen() {
   };
 
   const changeArchive = useCallback((sessionId: string, archived: boolean): void => {
-    setArchivedIds((current) => {
-      const next = new Set(current);
-      if (archived) next.add(sessionId);
-      else next.delete(sessionId);
-      return next;
-    });
-    void setSessionArchived(hostId, sessionId, archived).catch((error: unknown) => {
-      // 写盘失败时撤回乐观更新；会话本身从未被终止。
-      setArchivedIds((current) => {
-        const next = new Set(current);
-        if (archived) next.delete(sessionId);
-        else next.add(sessionId);
-        return next;
-      });
-      setBanner(`归档状态保存失败: ${error instanceof Error ? error.message : String(error)}`);
-    });
-  }, [hostId]);
+    const session = runtime.sessions[sessionId];
+    if (session) setLifecycleTarget({ session, archived });
+  }, [runtime.sessions]);
 
   const deleteSession = (session: SessionInfo): void => {
     setDeleteTarget(null);
@@ -793,15 +892,16 @@ export default function HostScreen() {
   // SessionRow 的 memo 比较会读这个引用;写成普通函数的话每次渲染都换新的,
   // 所有行都会被判定为 props 变化,memo 等于没做。
   const sessionSwipeActions = useCallback((session: SessionInfo): SwipeAction[] => {
-    const archived = archivedIds.has(session.id);
+    const archived = session.archived ?? archivedIds.has(session.id);
+    const canResume = session.kind === "structured" || ["claude", "codex"].includes(session.agent);
     return [
       {
         id: "toggle-archive",
-        label: archived ? "恢复" : "归档",
+        label: archived ? canResume ? "继续" : "历史" : "归档",
         symbol: "archivebox",
         color: color.warn,
         foregroundColor: color.onAccent,
-        onPress: () => changeArchive(session.id, !archived),
+        onPress: () => archived && !canResume ? router.push(`/host/${hostId}/session/${session.id}`) : changeArchive(session.id, !archived),
       },
       {
         id: "open-files",
@@ -895,6 +995,7 @@ export default function HostScreen() {
                     setGoal("");
                     setSelectedResume(null);
                     setApprovalPolicy("strict");
+                    setTerminalApprovalPolicy("yolo");
                     setCreateYoloConfirmOpen(false);
                     setCwd((current) => current.trim() || currentSessions[0]?.cwd || "");
                     setComposing(true);
@@ -1059,11 +1160,7 @@ export default function HostScreen() {
                   <Icon name="chevron.right" size={11} color={color.textFaint} />
                 </Pressable>
               ))}
-              <Text style={[styles.projectPaneHelp, !wideComposer && styles.projectPaneHelpCompact]}>
-                {workspacePath === ""
-                  ? "目录决定会话归属；这里始终显示本次会话对应的项目。"
-                  : `已从目录浏览器选择：~/${workspacePath}`}
-              </Text>
+
             </View>
 
             {verticalPanes && (
@@ -1072,6 +1169,11 @@ export default function HostScreen() {
                 pointerEvents="none"
               />
             )}
+
+            {wideComposer && !verticalPanes && <View style={[styles.composerDivider, { left: composerPaneWidths.start - 12 }]}>
+              <ResizeHandle label="调整项目与会话设置栏宽度" value={composerPaneWidths.start} min={composerMinWidth} max={width - composerMinWidth}
+                onChange={(next) => setComposerFraction(next / width)} />
+            </View>}
 
             <ScrollView
               style={[
@@ -1091,6 +1193,7 @@ export default function HostScreen() {
               <Pressable
                 key={a}
                 onPress={() => {
+                  sourceBindingEpoch.current++;
                   setAgent(a);
                   setSessionKind(STRUCTURED.includes(a) ? "structured" : "pty");
                   if (!STRUCTURED.includes(a)) setApprovalPolicy("strict");
@@ -1119,79 +1222,15 @@ export default function HostScreen() {
               </Pressable>
             ))}
           </View>
-          {codeAgent && conn?.supportsAgentAccounts && (
-            <>
-              <View style={[styles.accountLabelRow, styles.kindLabel]}>
-                <Text style={styles.formLabel}>账号环境</Text>
-                <Pressable
-                  onPress={() => { resetPendingCreate(); router.push(`/host/${hostId}/accounts`); }}
-                  hitSlop={8}
-                  accessibilityLabel="管理 Code Agent 账号"
-                >
-                  <Text style={styles.accountManage}>管理</Text>
-                </Pressable>
-              </View>
-              <View style={styles.chips}>
-                {matchingAccounts.map((account) => {
-                  const active = selectedAccount?.id === account.id;
-                  return (
-                    <Pressable
-                      key={account.id}
-                      style={[styles.chip, active && styles.chipActive]}
-                      onPress={() => {
-                        setSelectedAccountIds((current) => ({
-                          ...current,
-                          [codeAgent]: account.id,
-                        }));
-                        setSelectedResume(null);
-                        setResumeResults([]);
-                        setResumeLoaded(false);
-                      }}
-                      accessibilityRole="button"
-                      accessibilityState={{ selected: active }}
-                    >
-                      <View
-                        style={[
-                          styles.accountDot,
-                          {
-                            backgroundColor:
-                              account.status === "signed_in"
-                                ? color.success
-                                : account.status === "unavailable"
-                                  ? color.warn
-                                  : color.textFaint,
-                          },
-                        ]}
-                      />
-                      <Text style={[styles.chipText, active && styles.chipTextActive]} numberOfLines={1}>
-                        {account.name}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-                <Pressable
-                  style={styles.chip}
-                  onPress={() => { resetPendingCreate(); router.push(`/host/${hostId}/accounts`); }}
-                >
-                  <Icon name="plus" size={12} color={color.accent} />
-                  <Text style={[styles.chipText, { color: color.accent }]}>新增</Text>
-                </Pressable>
-              </View>
-              <Text style={styles.kindHelp}>
-                {selectedAccount ? `${getAgentAccountEngine(selectedAccount)} 引擎${selectedAccount.apiProfile ? ` · Profile 模型：${selectedAccount.apiProfile.model}` : ""}` : "配置和凭据彼此隔离；项目目录仍使用左侧所选路径。"}
-              </Text>
-              {!accountCanLaunch && <Text style={styles.resumeError}>{selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"}</Text>}
-            </>
-          )}
           {STRUCTURED.includes(agent) && (
             <>
               {agent !== "deepseek" && (
                 <>
-                  <Text style={[styles.formLabel, styles.kindLabel]}>界面</Text>
+                  <Text style={[styles.formLabel, styles.kindLabel]}>会话模式</Text>
                   <View style={styles.kindSwitch} accessibilityRole="tablist">
                 <Pressable
                   style={[styles.kindOption, effectiveSessionKind === "structured" && styles.kindOptionActive]}
-                  onPress={() => setSessionKind("structured")}
+                  onPress={() => { sourceBindingEpoch.current++; setSessionKind("structured"); }}
                   disabled={selectedAccountCapabilities?.sessionKinds.includes("structured") === false}
                   accessibilityRole="tab"
                   accessibilityState={{ selected: effectiveSessionKind === "structured" }}
@@ -1214,6 +1253,7 @@ export default function HostScreen() {
                 <Pressable
                   style={[styles.kindOption, effectiveSessionKind === "pty" && styles.kindOptionActive]}
                   onPress={() => {
+                    sourceBindingEpoch.current++;
                     setSessionKind("pty");
                     setApprovalPolicy("strict");
                     setLaunchIntent("conversation");
@@ -1241,13 +1281,33 @@ export default function HostScreen() {
                   </View>
                   <Text style={styles.kindHelp}>
                     {accountRequiresStructured
-                      ? "当前账号仅支持对话界面"
+                      ? "当前账号只支持对话；使用终端请选择 Claude 或 Codex 账号 / API"
                       : effectiveSessionKind === "structured"
                         ? "消息、工具调用和审批以卡片展示"
                       : `启动 ${agent} TUI，可直接操作完整终端`}
                   </Text>
                 </>
               )}
+              {codeAgent && <SessionAccountSelect accounts={conn?.supportsModelSources && !modelSourcesLoading && !modelSourcesError
+                  ? agentAccounts.filter((account) => !account.modelSource || !modelSources.some((source) => source.enabled && source.id === account.modelSource?.sourceId && source.routes.some((route) => route.enabled && route.modelCapabilities?.tools !== false && route.id === account.modelSource?.routeId)))
+                  : agentAccounts} selected={selectedAccount} loading={accountsLoading} error={accountsError}
+                supported={supportsAccounts} disabled={runtime.status !== "connected" || createDelivery !== null || sourceBinding}
+                onRetry={() => setAccountsReload(value => value + 1)}
+                onManage={() => { resetPendingCreate(); router.push(`/host/${hostId}/accounts`); }}
+                onSelect={account => {
+                  sourceBindingEpoch.current++;
+                  const next = selectLaunchAccount(account, effectiveSessionKind);
+                  setAgent(next.agent);
+                  setSessionKind(next.kind);
+                  setSelectedAccountIds(current => ({ ...current, [next.agent]: account.id }));
+                  setSelectedResume(null); setResumeResults([]); setResumeLoaded(false);
+                  if (!getAgentAccountCapabilities(account).plan) setLaunchMode("default");
+                  if (next.kind === "pty") setLaunchIntent("conversation");
+                }} />}
+              {codeAgent && conn?.supportsModelSources && <SessionModelSourceSelect agent={codeAgent} sources={modelSources}
+                loading={modelSourcesLoading} error={modelSourcesError} disabled={runtime.status !== "connected" || createDelivery !== null || sourceBinding}
+                onRetry={() => setModelSourcesReload((value) => value + 1)} onLoadModels={loadSourceModels} onSelect={selectModelSource} />}
+              {!accountCanLaunch && <Text style={styles.resumeError}>{selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"}</Text>}
               {effectiveSessionKind === "structured" && launchCatalogAgent && accountCanSelectModel && conn?.supportsSessionCreateModel && (
                 <>
                   <View style={[styles.accountLabelRow, styles.kindLabel]}>
@@ -1420,12 +1480,12 @@ export default function HostScreen() {
                   </Text>
                 </>
               )}
-              {effectiveSessionKind === "structured" && (
+              {(effectiveSessionKind === "structured" || managedAgentTerminal) && (
                 <>
                   <Text style={[styles.formLabel, styles.kindLabel]}>审批策略</Text>
                   <View style={styles.kindSwitch} accessibilityRole="radiogroup">
                     {APPROVAL_POLICIES.map((option) => {
-                      const active = approvalPolicy === option.value;
+                      const active = displayedApprovalPolicy === option.value;
                       const danger = option.value === "yolo";
                       return (
                         <Pressable
@@ -1437,7 +1497,8 @@ export default function HostScreen() {
                           ]}
                           disabled={createDelivery !== null}
                           onPress={() => {
-                            if (danger) setCreateYoloConfirmOpen(true);
+                            if (managedAgentTerminal) setTerminalApprovalPolicy(option.value);
+                            else if (danger) setCreateYoloConfirmOpen(true);
                             else setApprovalPolicy(option.value);
                           }}
                           accessibilityRole="radio"
@@ -1466,10 +1527,10 @@ export default function HostScreen() {
                   <Text
                     style={[
                       styles.kindHelp,
-                      approvalPolicy === "yolo" && styles.policyDangerHelp,
+                      displayedApprovalPolicy === "yolo" && styles.policyDangerHelp,
                     ]}
                   >
-                    {approvalPolicyHelp[approvalPolicy]}
+                    {managedAgentTerminal && displayedApprovalPolicy === "yolo" ? "终端默认免审批；Codex 同时关闭沙箱。" : approvalPolicyHelp[displayedApprovalPolicy]}
                   </Text>
                 </>
               )}
@@ -1635,12 +1696,12 @@ export default function HostScreen() {
           <Pressable
             style={({ pressed }) => [
               styles.createBtn,
-              (runtime.status !== "connected" || createDelivery !== null) && styles.btnDisabled,
+              (runtime.status !== "connected" || createDelivery !== null || sourceBinding) && styles.btnDisabled,
               pressed && styles.createBtnPressed,
             ]}
-            disabled={runtime.status !== "connected" || createDelivery !== null}
+            disabled={runtime.status !== "connected" || createDelivery !== null || sourceBinding}
             onPress={submitCreate}
-            accessibilityState={{ disabled: runtime.status !== "connected" || createDelivery !== null, busy: createDelivery !== null }}
+            accessibilityState={{ disabled: runtime.status !== "connected" || createDelivery !== null || sourceBinding, busy: createDelivery !== null || sourceBinding }}
           >
             <View style={styles.createBtnContent}>
               {createDelivery !== null && <ActivityIndicator size="small" color={color.onAccent} />}
@@ -1738,13 +1799,15 @@ export default function HostScreen() {
                 : "当前项目与筛选下没有会话。"}
           </Text>
         }
-        ListFooterComponent={
-          projects.length > 0 ? (
-            <Text style={styles.swipeHint}>
-              左滑：项目可新建 · 会话可{showArchived ? "恢复" : "归档"}或删除
-            </Text>
-          ) : null
-        }
+        ListFooterComponent={<View>
+          {projects.length > 0 && <Text style={styles.swipeHint}>左滑：项目可新建 · 会话可{showArchived ? "继续或查看历史" : "停止并归档"}</Text>}
+          {showArchived && (historyCursor || historyLoading) && <Pressable accessibilityRole="button" disabled={historyLoading} onPress={() => {
+            if (!conn || !historyCursor) return;
+            setHistoryLoading(true);
+            void conn.sessionHistory(historyCursor).then(page => setHistoryCursor(page.nextCursor))
+              .catch(error => setBanner(error instanceof Error ? error.message : String(error))).finally(() => setHistoryLoading(false));
+          }}><Text style={styles.swipeHint}>{historyLoading ? "正在读取…" : "显示更多归档"}</Text></Pressable>}
+        </View>}
         renderItem={({ item }) => {
           if (item.kind === "session") {
             const session = item.session;
@@ -1799,6 +1862,7 @@ export default function HostScreen() {
                       setGoal("");
                       setSelectedResume(null);
                       setApprovalPolicy("strict");
+                      setTerminalApprovalPolicy("yolo");
                       setCreateYoloConfirmOpen(false);
                       setComposing(true);
                     },
@@ -1862,7 +1926,7 @@ export default function HostScreen() {
         onClose={() => { toolsNavigation.cancel(); setToolsOpen(false); }}
         onDismiss={() => toolsNavigation.dismiss()}
       >
-        {supportsTerminal && <SheetAction label="远程终端" detail="新建或返回 Mac 终端，支持 Ctrl、Option 和方向键" symbol="terminal"
+        {supportsTerminal && <SheetAction label="远程终端" detail="新建或返回电脑终端，支持 Ctrl、Option 和方向键" symbol="terminal"
           onPress={() => {
             resetPendingCreate();
             toolsNavigation.defer(() => router.push(`/host/${hostId}/terminals`));
@@ -1916,6 +1980,8 @@ export default function HostScreen() {
           }}
         />
       </Sheet>
+      {lifecycleTarget && conn && <SessionLifecycleSheet conn={conn} session={lifecycleTarget.session} archived={lifecycleTarget.archived}
+        onClose={() => setLifecycleTarget(null)} onDone={session => { const archived = lifecycleTarget.archived; setLifecycleTarget(null); if (!archived) router.push(`/host/${hostId}/session/${session.id}`); }} />}
       <Sheet
         visible={resumeConflictTitle !== null}
         title="电脑正在使用这条对话"
@@ -2368,6 +2434,7 @@ const styles = StyleSheet.create({
   launcher: { flex: 1, minHeight: 0 },
   launcherSplit: { flex: 1, minHeight: 0, flexDirection: "column" },
   launcherSplitWide: { flexDirection: "row" },
+  composerDivider: { position: "absolute", top: 0, bottom: 0, zIndex: 2 },
   foldGutter: { flexShrink: 0, backgroundColor: color.bg },
   projectPane: {
     flexGrow: 0,
@@ -2458,7 +2525,7 @@ const styles = StyleSheet.create({
   },
   kindOption: {
     flex: 1,
-    minHeight: 36,
+    minHeight: 48,
     borderRadius: 9,
     flexDirection: "row",
     alignItems: "center",

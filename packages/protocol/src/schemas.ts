@@ -294,7 +294,19 @@ export const QueuedChatMessageSchema = z.object({
   attachmentCount: z.number().int().nonnegative(),
 });
 
+export const NativeSessionSchema = z.object({
+  outputStartSeq: z.number().int().nonnegative().optional(),
+  runtimeId: z.string().min(1).max(256),
+  nativeId: z.string().min(1).max(256).nullable(),
+  managed: z.boolean(),
+  state: z.enum(["binding", "running", "archiving", "archived", "resuming", "failed"]),
+  error: z.string().nullable(),
+});
+
 export const SessionInfoSchema = z.object({
+  revision: z.number().int().nonnegative().optional(),
+  archived: z.boolean().optional(),
+  nativeSession: NativeSessionSchema.optional(),
   id: sid,
   agent: AgentKindSchema,
   kind: SessionKindSchema,
@@ -800,6 +812,28 @@ export const C2SChatAttachmentGetSchema = z.object({
   requestId: z.string().min(1).max(100),
 });
 
+export const C2SSessionHistorySchema = z.object({ type: z.literal("session.history"), requestId: z.string().min(1).max(100), cursor: z.string().max(4096).optional() });
+export const S2CSessionHistorySchema = z.object({ type: z.literal("session.history.result"), requestId: z.string().min(1).max(100), sessions: z.array(SessionInfoSchema).max(100), nextCursor: z.string().optional() });
+
+export const C2SSessionLifecycleSchema = z.object({
+  type: z.enum(["session.archive", "session.resume", "session.native-candidates"]),
+  sid,
+  requestId: z.string().min(1).max(100),
+  nativeId: z.string().uuid().optional(),
+  query: z.string().max(300).optional(),
+});
+
+export const S2CSessionLifecycleResultSchema = z.object({
+  type: z.literal("session.lifecycle.result"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  ok: z.boolean(),
+  session: SessionInfoSchema.optional(),
+  conversations: z.array(ResumableConversationSchema).optional(),
+  error: z.string().optional(),
+  code: z.string().optional(),
+});
+
 export const C2SSessionForkSchema = z.object({
   type: z.literal("session.fork"),
   sid,
@@ -815,6 +849,8 @@ export const S2CSessionForkResultSchema = z.object({
   error: z.string().optional(),
   code: z.string().optional(),
 });
+
+export const C2SSessionDetachSchema = z.object({ type: z.literal("session.detach"), sid });
 
 export const C2SSessionAttachSchema = z.object({
   type: z.literal("session.attach"),
@@ -1473,6 +1509,8 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SConnectionPingSchema,
   C2SSessionCreateSchema,
   C2SSessionForkSchema,
+  C2SSessionLifecycleSchema,
+  C2SSessionHistorySchema,
   C2SConversationSearchSchema,
   C2SAgentAccountsListSchema,
   C2SAgentAccountCreateSchema,
@@ -1490,6 +1528,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SAgentAccountLogoutSchema,
   C2SAgentAccountDeleteSchema,
   C2SSessionAttachSchema,
+  C2SSessionDetachSchema,
   C2SChatSendSchema,
   C2SChatQueueRemoveSchema,
   C2SChatQueueGuideSchema,
@@ -1584,7 +1623,12 @@ export const S2CTermSnapshotSchema = z.object({
 });
 
 export const S2CTermOutputSchema = z.object({
+  events: z.array(z.discriminatedUnion("type", [
+    z.object({ type: z.literal("output"), dataB64: z.string() }),
+    z.object({ type: z.literal("resize"), size: z.object({ cols, rows }) }),
+  ])).max(64).optional(),
   type: z.literal("term.output"),
+  replay: z.boolean().optional(),
   sid,
   dataB64: z.string(),
   seq,
@@ -1634,6 +1678,10 @@ export const FileDiffSchema = z.object({
   truncated: z.boolean().optional(),
 });
 
+// Older Rust daemons serialize an absent tool diff as null. Normalize it to
+// undefined so existing renderers keep the same optional-field contract.
+const OptionalFileDiffSchema = z.preprocess((value) => value === null ? undefined : value, FileDiffSchema.optional());
+
 export const AgentToolStartSchema = z.object({
   kind: z.literal("tool.start"),
   msgId: z.string(),
@@ -1642,7 +1690,7 @@ export const AgentToolStartSchema = z.object({
   /** 参数摘要(适配器裁剪过,避免大 payload 过网) */
   summary: z.string(),
   /** 文件类工具:改动内容 */
-  diff: FileDiffSchema.optional(),
+  diff: OptionalFileDiffSchema,
   agentId: z.string().min(1).max(500).optional(),
 });
 
@@ -1654,7 +1702,7 @@ export const AgentToolEndSchema = z.object({
   summary: z.string(),
   /** 完整输出比摘要长,可用 tool.output.get 按需拉取 */
   hasMore: z.boolean().optional(),
-  diff: FileDiffSchema.optional(),
+  diff: OptionalFileDiffSchema,
   agentId: z.string().min(1).max(500).optional(),
 });
 
@@ -1667,7 +1715,7 @@ export const AgentPermissionRequestSchema = z.object({
   resources: z.array(z.string()),
   summary: z.string(),
   /** 改文件类审批:待应用的改动,让用户看清再决定 */
-  diff: FileDiffSchema.optional(),
+  diff: OptionalFileDiffSchema,
   agentId: z.string().min(1).max(500).optional(),
 });
 
@@ -1860,8 +1908,8 @@ export const S2CAgentModelsSchema = z.object({
   sid,
   requestId: z.string().min(1).max(100),
   models: z.array(AgentModelSchema).max(100),
-  currentModel: z.string().min(1).max(300).optional(),
-  currentEffort: z.string().min(1).max(100).optional(),
+  currentModel: z.string().min(1).max(300).nullish().transform(value => value ?? undefined),
+  currentEffort: z.string().min(1).max(100).nullish().transform(value => value ?? undefined),
 });
 
 /** 创建器的模型目录应答；失败也按 requestId 原路返回，不让界面等到超时。 */
@@ -1871,9 +1919,9 @@ export const S2CLaunchModelsSchema = z.object({
   agent: z.enum(["claude", "codex", "deepseek", "opencode"]),
   models: z.array(AgentModelSchema).max(100),
   presets: z.array(AgentPresetSchema).max(100).optional(),
-  currentPreset: z.string().min(1).max(300).optional(),
-  currentModel: z.string().min(1).max(300).optional(),
-  currentEffort: z.string().min(1).max(100).optional(),
+  currentPreset: z.string().min(1).max(300).nullish().transform(value => value ?? undefined),
+  currentModel: z.string().min(1).max(300).nullish().transform(value => value ?? undefined),
+  currentEffort: z.string().min(1).max(100).nullish().transform(value => value ?? undefined),
   error: z.string().max(2000).optional(),
 });
 
@@ -1882,7 +1930,7 @@ export const S2CAgentModesSchema = z.object({
   sid,
   requestId: z.string().min(1).max(100),
   modes: z.array(AgentModeSchema).max(20),
-  currentMode: z.string().min(1).max(100).optional(),
+  currentMode: z.string().min(1).max(100).nullish().transform(value => value ?? undefined),
 });
 
 export const S2CAgentControlResultSchema = z.object({
@@ -1892,9 +1940,9 @@ export const S2CAgentControlResultSchema = z.object({
   action: z.enum(["model.set", "mode.set", "compact"]),
   ok: z.boolean(),
   message: z.string().max(2000).optional(),
-  currentModel: z.string().min(1).max(300).optional(),
-  currentEffort: z.string().min(1).max(100).optional(),
-  currentMode: z.string().min(1).max(100).optional(),
+  currentModel: z.string().min(1).max(300).nullish().transform(value => value ?? undefined),
+  currentEffort: z.string().min(1).max(100).nullish().transform(value => value ?? undefined),
+  currentMode: z.string().min(1).max(100).nullish().transform(value => value ?? undefined),
 });
 
 export const S2CPermissionRequestSchema = z.object({
@@ -2177,6 +2225,8 @@ export const S2COrchestrationSnapshotSchema = z.object({
 export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CSessionCreateResultSchema,
   S2CSessionForkResultSchema,
+  S2CSessionLifecycleResultSchema,
+  S2CSessionHistorySchema,
   S2CHelloOkSchema,
   S2CConnectionPongSchema,
   S2CSessionStateSchema,

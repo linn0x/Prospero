@@ -562,6 +562,19 @@ describe("结构化轨协议", () => {
     expect((snap as { events: unknown[] }).events).toHaveLength(3);
   });
 
+  it("accepts a legacy Rust snapshot with absent tool diffs serialized as null", () => {
+    const snapshot = parseS2C({ type: "chat.snapshot", sid: "s1", evSeq: 2, events: [
+      { kind: "tool.start", msgId: "m", callId: "c", tool: "Read", summary: "read", diff: null },
+      { kind: "tool.end", callId: "c", state: "success", summary: "done", hasMore: false, diff: null },
+    ] });
+    expect(snapshot).toMatchObject({ type: "chat.snapshot", events: [
+      { kind: "tool.start", diff: undefined }, { kind: "tool.end", diff: undefined },
+    ] });
+    expect(() => parseS2C({ type: "chat.snapshot", sid: "s1", evSeq: 1, events: [
+      { kind: "tool.start", msgId: "m", callId: "c", tool: "Read", summary: "read", diff: { path: 7 } },
+    ] })).toThrow();
+  });
+
   it("chat.complete 与 chat.suggestions 校验输入框候选", () => {
     expect(
       parseC2S({
