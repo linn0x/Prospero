@@ -43,7 +43,7 @@ impl Store {
 
     pub(crate) fn finish_terminal(&mut self, id: &str, archive: Archive) -> Result<SessionHead> {
         let head = self.session(id)?;
-        self.update_session_with(
+        let updated = self.update_session_with(
             id,
             UpdateSession {
                 revision: head.revision,
@@ -59,7 +59,17 @@ impl Store {
                 persist(tx, id, archive, false)?;
                 Ok(())
             },
-        )
+        )?;
+        if let Some(native) = &updated.native_session {
+            let state = if native.native_id.is_some() {
+                "archived"
+            } else {
+                "failed"
+            };
+            self.set_native_state(id, state, native.error.clone())
+        } else {
+            Ok(updated)
+        }
     }
 
     pub(crate) fn checkpoint_terminal(&mut self, id: &str, archive: Archive) -> Result<()> {
@@ -107,6 +117,7 @@ impl Store {
                AND json_extract(h.payload,'$.kind')='pty' \
                AND json_extract(h.payload,'$.status')='running' \
                AND json_extract(h.payload,'$.agent') IN ('codex','claude') \
+               AND json_extract(h.payload,'$.nativeSession.nativeId') IS NOT NULL \
                AND json_extract(h.payload,'$.updatedAt')<?1 \
                AND NOT EXISTS(SELECT 1 FROM orch_worker_starts w WHERE w.session_id=h.id) \
              ORDER BY json_extract(h.payload,'$.updatedAt'),h.id LIMIT ?2",
@@ -181,6 +192,12 @@ impl Store {
             }
         }
         Ok(TerminalPage {
+            instance_start_seq: Some(
+                self.session(id)?
+                    .native_session
+                    .and_then(|native| native.output_start_seq)
+                    .unwrap_or(0),
+            ),
             initial_size: TerminalSize { cols, rows },
             base_seq: after,
             next_seq: after + events.len() as i64,

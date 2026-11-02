@@ -19,7 +19,7 @@ export function resolveHomeHostSelection(
 export function homeWorkspaceProjects(
   sessions: Record<string, SessionInfo> | undefined,
 ): SessionProject[] {
-  return groupSessionsByProject(sortSessions(sessions ?? {}));
+  return groupSessionsByProject(sortSessions(sessions ?? {}).filter(session => session.archived !== true));
 }
 
 interface WorkspacePath {
@@ -90,7 +90,7 @@ export function homeRecentSessions(
   limit: number,
   recent: Readonly<Record<string, RecentSession>> = {},
 ): SessionInfo[] {
-  return Object.values(sessions ?? {})
+  return Object.values(sessions ?? {}).filter(session => session.archived !== true)
     .sort((a, b) => recentSessionTime(b, recent[b.id]) - recentSessionTime(a, recent[a.id])
       || b.createdAt - a.createdAt || b.id.localeCompare(a.id))
     .slice(0, Math.max(0, limit));
@@ -100,7 +100,7 @@ export function homeRecentSessions(
 export function homeApprovalSessions(
   sessions: Record<string, SessionInfo> | undefined,
 ): SessionInfo[] {
-  return Object.values(sessions ?? {})
+  return Object.values(sessions ?? {}).filter(session => session.archived !== true)
     .filter((session) =>
       session.status === "waiting_approval" || (session.pendingPermissions ?? 0) > 0
     )

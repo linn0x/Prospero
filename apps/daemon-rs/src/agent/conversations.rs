@@ -147,9 +147,14 @@ fn parse_claude_file(
     );
     let preview = (!first_prompt.trim().is_empty()).then(|| trim_chars(&first_prompt, 4_000));
     if !needle.is_empty() {
-        let matches = [&display_title, first_prompt.trim(), cwd.trim()]
-            .iter()
-            .any(|value| value.to_lowercase().contains(needle));
+        let matches = [
+            &display_title,
+            first_prompt.trim(),
+            cwd.trim(),
+            session_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.to_lowercase().contains(needle));
         if !matches {
             return None;
         }

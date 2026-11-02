@@ -451,7 +451,9 @@ export class StateStore extends EventEmitter {
     const projectAliases = previous && previousInputs?.projectAliases === this.projectAliases ? previous.projectAliases : reuseEquivalent(previous?.projectAliases, { ...this.projectAliases });
     const pinnedProjectPaths = previous && previousInputs?.pinnedProjectPaths === this.pinnedProjectPaths ? previous.pinnedProjectPaths : reuseEquivalent(previous?.pinnedProjectPaths, [...this.pinnedProjectPaths]);
     const pinnedSessionIds = previous && previousInputs?.pinnedSessionIds === this.pinnedSessionIds ? previous.pinnedSessionIds : reuseEquivalent(previous?.pinnedSessionIds, [...this.pinnedSessionIds]);
-    const archivedSessionIds = previous && previousInputs?.archivedSessionIds === this.archivedSessionIds ? previous.archivedSessionIds : reuseEquivalent(previous?.archivedSessionIds, [...this.archivedSessionIds]);
+    const archivedSessionIds = this.backend === "api" && daemon.capabilities?.includes("session.lifecycle.v1")
+      ? reuseEquivalent(previous?.archivedSessionIds, daemon.sessions.filter(session => session.archived === true).map(session => session.id))
+      : previous && previousInputs?.archivedSessionIds === this.archivedSessionIds ? previous.archivedSessionIds : reuseEquivalent(previous?.archivedSessionIds, [...this.archivedSessionIds]);
     const unreadSessionIds = previous && previousInputs?.unreadSessionIds === this.unreadSessionIds ? previous.unreadSessionIds : reuseEquivalent(previous?.unreadSessionIds, [...this.unreadSessionIds]);
     const workflowTemplates = previous && previousInputs?.workflowTemplates === this.workflowTemplates
       ? previous.workflowTemplates

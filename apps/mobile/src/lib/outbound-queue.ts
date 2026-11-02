@@ -6,7 +6,7 @@
  */
 export type DeliveryResult =
   | { accepted: true; disposition: "sent" | "queued" }
-  | { accepted: false; reason: "offline" | "queue_full" | "transport_error" };
+  | { accepted: false; reason: "offline" | "queue_full" | "transport_error" | "partial" };
 
 export const acceptedDelivery = (disposition: "sent" | "queued"): DeliveryResult => ({
   accepted: true,
@@ -14,12 +14,14 @@ export const acceptedDelivery = (disposition: "sent" | "queued"): DeliveryResult
 });
 
 export const rejectedDelivery = (
-  reason: "offline" | "queue_full" | "transport_error",
+  reason: "offline" | "queue_full" | "transport_error" | "partial",
 ): DeliveryResult => ({ accepted: false, reason });
 
 export function deliveryFailureText(result: DeliveryResult): string {
   if (result.accepted) return "";
   switch (result.reason) {
+    case "partial":
+      return "粘贴过程中连接中断，部分内容可能已送达；请检查终端后再操作。";
     case "queue_full":
       return "本机离线队列已满；草稿和附件已保留，请恢复连接后重试。";
     case "transport_error":

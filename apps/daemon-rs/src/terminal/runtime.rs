@@ -21,6 +21,7 @@ struct State {
     failed: AtomicBool,
     changed: watch::Sender<u64>,
     checkpoints: Arc<Semaphore>,
+    lifecycle: tokio::sync::Mutex<()>,
     control_environment: std::sync::Mutex<Option<crate::control_cli::ControlEnvironment>>,
 }
 
@@ -56,6 +57,7 @@ impl Terminals {
             failed: AtomicBool::new(false),
             changed: watch::channel(0).0,
             checkpoints: Arc::new(Semaphore::new(2)),
+            lifecycle: tokio::sync::Mutex::new(()),
             control_environment: std::sync::Mutex::new(None),
         }))
     }
@@ -254,7 +256,7 @@ impl Terminals {
             let created = if reply.is_closed() {
                 Err(Error::Closed)
             } else {
-                runtime.start(input, spec).await
+                runtime.start(input, spec, None).await
             };
             match created {
                 Ok((head, terminal)) => {
@@ -337,8 +339,10 @@ impl Terminals {
                 .send_modify(|seq| *seq = seq.wrapping_add(1));
             return;
         }
+        let _ = runtime.sync_native_binding(&head.id).await;
         let finalized = runtime.finish_handle(&head.id, &terminal).await;
         if finalized.is_ok() {
+            let _ = runtime.sync_native_binding(&head.id).await;
             let _ = terminal.release().await;
         }
         if finalized.is_err() {
@@ -367,7 +371,23 @@ impl Terminals {
         let mut retained = Vec::new();
         if self.0.guard.is_some() {
             for id in &ids {
-                let directory = self.0.database.directory().join("terminal-hosts").join(id);
+                let stored_id = id.clone();
+                let head = self
+                    .0
+                    .database
+                    .call(move |store| store.session(&stored_id))
+                    .await?;
+                let instance = head
+                    .native_session
+                    .as_ref()
+                    .map(|native| native.runtime_id.as_str())
+                    .unwrap_or(id);
+                let directory = self
+                    .0
+                    .database
+                    .directory()
+                    .join("terminal-hosts")
+                    .join(instance);
                 match host::Host::attach(directory.clone()).await {
                     Ok(host) => {
                         let permit = self
@@ -415,12 +435,48 @@ impl Terminals {
                 }
             }
         }
+        let pending = retained.clone();
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            for sid in pending {
+                let query_id = sid.clone();
+                if runtime
+                    .0
+                    .database
+                    .call(move |store| store.session(&query_id))
+                    .await
+                    .is_ok_and(|head| {
+                        head.native_session
+                            .is_some_and(|native| native.state == "archiving")
+                    })
+                {
+                    let _ = runtime.archive(&sid, None).await;
+                }
+            }
+        });
         let count = retained.len();
         self.0
             .database
             .call(move |store| store.recover_terminals_except(&retained))
             .await?;
-        host::reap_exited(self.0.database.directory().join("terminal-hosts"), &ids).await?;
+        let mut instances = Vec::new();
+        for id in ids {
+            let head = self
+                .0
+                .database
+                .call(move |store| store.session(&id))
+                .await?;
+            instances.push(
+                head.native_session
+                    .map(|native| native.runtime_id)
+                    .unwrap_or(head.id),
+            );
+        }
+        host::reap_exited(
+            self.0.database.directory().join("terminal-hosts"),
+            &instances,
+        )
+        .await?;
         Ok(count)
     }
 
@@ -561,6 +617,14 @@ impl Terminals {
             if terminal.hosted() && self.0.closed.load(Ordering::Acquire) {
                 return Ok(());
             }
+            match self.sync_native_binding(id).await {
+                Ok(_) => {}
+                Err(error) if retryable_database_pressure(&error) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             let activity = terminal.activity().await?;
             if published != Some(activity.busy_since) {
                 let id = id.to_owned();
@@ -686,6 +750,7 @@ impl Terminals {
         &self,
         mut input: CreateTerminal,
         spec: Option<ProgramSpec>,
+        restored: Option<SessionHead>,
     ) -> Result<(SessionHead, Handle)> {
         let workspace = input.workspace.clone();
         let directory = tokio::task::spawn_blocking(move || std::fs::canonicalize(workspace))
@@ -712,20 +777,106 @@ impl Terminals {
             .lock()
             .ok()
             .and_then(|environment| environment.clone());
+        let managed = self.0.guard.is_some()
+            && input.command.is_none()
+            && matches!(
+                input.agent,
+                Some(crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex)
+            )
+            && spec
+                .as_ref()
+                .is_some_and(|spec| !spec.args.iter().any(|arg| arg == "setup-token"));
+        let mut native = managed.then(|| crate::protocol::NativeSession {
+            output_start_seq: None,
+            runtime_id: uuid::Uuid::new_v4().to_string(),
+            native_id: restored
+                .as_ref()
+                .and_then(|head| head.native_session.as_ref())
+                .and_then(|native| native.native_id.clone()),
+            managed: true,
+            state: if restored.is_some() {
+                "resuming"
+            } else {
+                "binding"
+            }
+            .into(),
+            error: None,
+        });
+        let base_seq = if let Some(head) = &restored {
+            let id = head.id.clone();
+            self.0
+                .database
+                .call(move |store| {
+                    Ok(store
+                        .terminal_output(&id, TerminalQuery::default())?
+                        .latest_seq
+                        + 1)
+                })
+                .await?
+        } else {
+            0
+        };
+        if let Some(native) = &mut native {
+            native.output_start_seq = Some(base_seq);
+        }
+        let native_for_store = native.clone();
         let head = self
             .0
             .database
-            .call(move |store| store.create_terminal_with(input, account_id))
+            .call(move |store| {
+                if let Some(head) = restored {
+                    store
+                        .reset_terminal_instance(&head.id, native_for_store.ok_or(Error::Conflict)?)
+                } else {
+                    let head = store.create_terminal_with(input, account_id)?;
+                    match native_for_store {
+                        Some(native) => store.set_native_session(&head.id, native),
+                        None => Ok(head),
+                    }
+                }
+            })
             .await?;
         let session_id = head.id.clone();
-        let host_directory = host_directory.join(&head.id);
+        let host_directory = host_directory.join(
+            native
+                .as_ref()
+                .map(|n| n.runtime_id.as_str())
+                .unwrap_or(&head.id),
+        );
+        let binding = native
+            .as_ref()
+            .map(|n| super::session::binding_path(self.0.database.directory(), &n.runtime_id));
+        let launcher = executable.clone();
+        let agent = crate::database::label(head.agent)?;
         let command = tokio::task::spawn_blocking(move || {
             let mut command = match &spec {
                 Some(spec) => {
                     // Explicit program (managed-account login): no shell, no
                     // guard, private env overrides only.
-                    let mut command = portable_pty::CommandBuilder::new(&spec.program);
-                    command.args(&spec.args);
+                    let mut command = if let (Some(native), Some(binding), Some(launcher)) =
+                        (&native, &binding, &launcher)
+                    {
+                        let mut command = portable_pty::CommandBuilder::new(launcher);
+                        command.args([
+                            "agent-terminal",
+                            "--agent",
+                            &agent,
+                            "--cli",
+                            &spec.program,
+                            "--binding",
+                        ]);
+                        command.arg(binding);
+                        if let Some(id) = &native.native_id {
+                            command.args(["--native-id", id]);
+                        }
+                        command.arg("--");
+                        command.args(&spec.args);
+                        command
+                    } else {
+                        let mut command = portable_pty::CommandBuilder::new(&spec.program);
+                        command.args(&spec.args);
+                        command
+                    };
                     for (key, value) in &spec.environment {
                         command.env(key, value);
                     }
@@ -764,12 +915,13 @@ impl Terminals {
         .await
         .map_err(|_| Error::Closed)?;
         let child = match executable {
-            Some(exe) => host::Host::start(
+            Some(exe) => host::Host::start_at(
                 exe,
                 host_directory,
                 command,
                 size,
                 expected_hash.unwrap_or_default(),
+                base_seq,
             )
             .await
             .map(Handle::Hosted),
@@ -786,10 +938,10 @@ impl Terminals {
                     &id,
                     Archive {
                         snapshot: None,
-                        floor: 0,
-                        start: 0,
-                        seq: 0,
-                        latest_seq: 0,
+                        floor: base_seq,
+                        start: base_seq,
+                        seq: base_seq,
+                        latest_seq: base_seq,
                         events: Vec::new(),
                         exit_code: None,
                     },
@@ -879,6 +1031,301 @@ impl Terminals {
     pub(crate) fn local(&self, id: &str) -> Result<Option<Terminal>> {
         Ok(self.terminal(id)?.local())
     }
+    pub async fn sync_native_binding(&self, id: &str) -> Result<SessionHead> {
+        let sid = id.to_owned();
+        let head = self
+            .0
+            .database
+            .call(move |store| store.session(&sid))
+            .await?;
+        let Some(native) = head.native_session.as_ref().filter(|native| native.managed) else {
+            return Ok(head);
+        };
+        let path = super::session::binding_path(self.0.database.directory(), &native.runtime_id);
+        let binding = tokio::task::spawn_blocking(move || super::session::read_binding(&path))
+            .await
+            .map_err(|_| Error::Closed)??;
+        let Some(binding) = binding else {
+            return Ok(head);
+        };
+        if native.native_id.as_deref() == Some(&binding.native_id)
+            && !matches!(native.state.as_str(), "binding" | "resuming")
+        {
+            return Ok(head);
+        }
+        let instance = native.runtime_id.clone();
+        let sid = id.to_owned();
+        let updated = self
+            .0
+            .database
+            .call(move |store| {
+                let head = store.session(&sid)?;
+                let Some(mut native) = head.native_session else {
+                    return Err(Error::Conflict);
+                };
+                if native.runtime_id != instance {
+                    return Err(Error::Conflict);
+                }
+                native.native_id = Some(binding.native_id);
+                if matches!(native.state.as_str(), "binding" | "resuming") {
+                    native.state = "running".into();
+                }
+                native.error = None;
+                store.set_native_session(&sid, native)
+            })
+            .await?;
+        self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1));
+        Ok(updated)
+    }
+
+    pub async fn native_candidates(
+        &self,
+        id: &str,
+        query: String,
+    ) -> Result<Vec<crate::agent::ResumableConversation>> {
+        crate::database::validate_text(&query, 300, true)?;
+        let sid = id.to_owned();
+        let head = self
+            .0
+            .database
+            .call(move |store| store.session(&sid))
+            .await?;
+        let rows = match head.agent {
+            crate::protocol::AgentKind::Codex => {
+                let (environment, _, _) =
+                    self.resolve_codex_terminal_account(head.account_id).await?;
+                crate::agent::usage::search_codex_conversations_in(
+                    self.0.database.directory(),
+                    PathBuf::from(&head.workspace),
+                    environment,
+                    &query,
+                    50,
+                )
+                .await?
+            }
+            crate::protocol::AgentKind::Claude => {
+                let (environment, _, _, _) = self
+                    .resolve_claude_terminal_account(head.account_id)
+                    .await?;
+                let config = environment
+                    .iter()
+                    .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                    .map(|(_, value)| PathBuf::from(value))
+                    .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))
+                    .unwrap_or_else(|| {
+                        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
+                    });
+                tokio::task::spawn_blocking(move || {
+                    crate::agent::conversations::search_claude_config_dir(&config, &query, Some(50))
+                })
+                .await
+                .map_err(|_| Error::Closed)??
+            }
+            _ => return Err(Error::Invalid("此终端不支持原生会话绑定".into())),
+        };
+        let workspace = std::fs::canonicalize(&head.workspace)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| std::fs::canonicalize(&row.cwd).is_ok_and(|path| path == workspace))
+            .collect())
+    }
+
+    pub async fn validate_binding(&self, id: &str, native_id: &str) -> Result<()> {
+        super::session::validate_native_id(native_id)?;
+        if !self
+            .native_candidates(id, native_id.into())
+            .await?
+            .iter()
+            .any(|row| row.id == native_id)
+        {
+            return Err(Error::Invalid("所选原生对话不属于此账号和工作目录".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn archive(&self, id: &str, native_id: Option<String>) -> Result<SessionHead> {
+        let _guard = self.0.lifecycle.try_lock().map_err(|_| Error::Busy)?;
+        let mut head = self.sync_native_binding(id).await?;
+        if head.lifecycle == crate::protocol::SessionLifecycle::Archived
+            && self.terminal(id).is_err()
+        {
+            let sid = id.to_owned();
+            return self
+                .0
+                .database
+                .call(move |store| store.set_native_state(&sid, "archived", None))
+                .await;
+        }
+        if let Some(native_id) = native_id {
+            self.validate_binding(id, &native_id).await?;
+            if head.native_session.as_ref().is_some_and(|n| n.managed) {
+                return Err(Error::Conflict);
+            }
+            let native = crate::protocol::NativeSession {
+                output_start_seq: None,
+                runtime_id: head.id.clone(),
+                native_id: Some(native_id),
+                managed: false,
+                state: "running".into(),
+                error: None,
+            };
+            let sid = id.to_owned();
+            head = self
+                .0
+                .database
+                .call(move |store| store.set_native_session(&sid, native))
+                .await?;
+        }
+        if matches!(
+            head.agent,
+            crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
+        ) && head.native_session.as_ref().is_none_or(|native| {
+            native.native_id.is_none()
+                && !(native.managed && head.agent == crate::protocol::AgentKind::Codex)
+        }) {
+            return Err(Error::Feature(
+                "session_binding_required".into(),
+                "此终端尚未绑定原生对话；请先确认要恢复的对话".into(),
+            ));
+        }
+        let sid = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.set_native_state(&sid, "archiving", None))
+            .await?;
+        let result: Result<()> = async {
+            self.terminal(id)?.stop().await?;
+            let mut changes = self.0.changed.subscribe();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    changes.borrow_and_update();
+                    if self.terminal(id).is_err() {
+                        return Ok(());
+                    }
+                    changes.changed().await.map_err(|_| Error::Closed)?;
+                }
+            })
+            .await
+            .map_err(|_| Error::Timeout)?
+        }
+        .await;
+        let sid = id.to_owned();
+        match result {
+            Ok(()) => {
+                self.0
+                    .database
+                    .call(move |store| store.set_native_state(&sid, "archived", None))
+                    .await
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.0
+                    .database
+                    .call(move |store| store.set_native_state(&sid, "failed", Some(detail)))
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn resume(&self, id: &str) -> Result<SessionHead> {
+        let _guard = self.0.lifecycle.try_lock().map_err(|_| Error::Busy)?;
+        if self.terminal(id).is_ok() {
+            return Err(Error::Conflict);
+        }
+        let sid = id.to_owned();
+        let head = self
+            .0
+            .database
+            .call(move |store| store.session(&sid))
+            .await?;
+        let native = head
+            .native_session
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("此终端没有可恢复的原生对话".into()))?;
+        if head.lifecycle != crate::protocol::SessionLifecycle::Archived
+            || (native.native_id.is_none()
+                && !(native.managed && head.agent == crate::protocol::AgentKind::Codex))
+            || self.0.guard.is_none()
+        {
+            return Err(Error::Conflict);
+        }
+        let old_directory = self
+            .0
+            .database
+            .directory()
+            .join("terminal-hosts")
+            .join(&native.runtime_id);
+        if host::owner_alive(&old_directory)? {
+            if let Ok(host) = host::Host::attach(old_directory.clone()).await {
+                let _ = Handle::Hosted(host).release().await;
+            }
+            for _ in 0..50 {
+                if !host::owner_alive(&old_directory)? {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if host::owner_alive(&old_directory)? {
+                return Err(Error::Busy);
+            }
+        }
+        let mut input = CreateTerminal {
+            title: head.title.clone(),
+            workspace: head.workspace.clone(),
+            agent: Some(head.agent),
+            command: None,
+            size: TerminalSize {
+                cols: 120,
+                rows: 36,
+            },
+            account_id: head.account_id.clone(),
+            model: head.model.clone(),
+            effort: head.effort.clone(),
+            approval_policy: head.approval_policy,
+        };
+        let spec = self.pty_program_for(&mut input).await?;
+        let permit = self
+            .0
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        let empty = native.native_id.is_none();
+        let (head, terminal) = self.start(input, spec, Some(head)).await?;
+        let runtime = self.clone();
+        let saved = head.clone();
+        tokio::spawn(async move {
+            runtime.track(saved, terminal, permit).await;
+        });
+        if empty {
+            return Ok(head);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let current = self.sync_native_binding(id).await?;
+            if current.lifecycle == crate::protocol::SessionLifecycle::Archived {
+                return Err(Error::Invalid(
+                    "原生对话恢复失败；原历史已保留，请查看终端错误".into(),
+                ));
+            }
+            if current
+                .native_session
+                .as_ref()
+                .is_some_and(|native| native.state == "running")
+            {
+                return Ok(current);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Feature(
+                    "resume_unconfirmed".into(),
+                    "尚未确认恢复；请打开终端完成原生 CLI 的确认，不要重复新建".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn close(&self, id: &str) -> Result<()> {
         self.terminal(id)?.stop().await
     }

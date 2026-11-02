@@ -1123,6 +1123,31 @@ impl Store {
             .ok_or(Error::NotFound)
     }
 
+    pub(crate) fn resume_archived_agent(&mut self, id: &str) -> Result<SessionHead> {
+        let head = self.session(id)?;
+        let run = self.agent_run(id)?;
+        if head.lifecycle != SessionLifecycle::Archived
+            || run.active
+            || self.agent_execution_unknown(id)?
+            || !self.agent_execution_stopped(id)?
+        {
+            return Err(Error::Conflict);
+        }
+        if run.native_id.is_none() && run.turn != 0 {
+            return Err(Error::Invalid("此会话没有可恢复的原生历史".into()));
+        }
+        let native_id = run.native_id.clone();
+        if let Some(native_id) = &native_id {
+            self.ensure_native_available(id, native_id)?;
+        }
+        self.update_session_with_native(id, UpdateSession {
+            revision: head.revision, title: None, lifecycle: Some(SessionLifecycle::Active), status: Some(SessionStatus::Idle),
+        }, Some(NativeSession { output_start_seq: None, runtime_id: uuid::Uuid::new_v4().to_string(), native_id, managed: true, state: "running".into(), error: None }), |tx| {
+            if tx.execute("UPDATE agent_runs SET active=1 WHERE session_id=? AND active=0 AND execution_unknown=0", [id])? != 1 { return Err(Error::Conflict); }
+            Ok(())
+        })
+    }
+
     pub(crate) fn agent_execution_stopped(&self, id: &str) -> Result<bool> {
         self.connection.query_row("SELECT EXISTS(SELECT 1 FROM agent_runs a JOIN orch_recovery_jobs j ON j.kind='legacy_session' AND j.object_id=a.session_id AND j.state='complete' WHERE a.session_id=?1 AND a.active=0 AND a.execution_unknown=0)", [id], |row| row.get(0)).map_err(Into::into)
     }
@@ -2329,7 +2354,7 @@ mod tests {
             let store = Store::open(directory.path()).unwrap();
             store
                 .connection
-                .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA foreign_keys=ON; DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; DROP INDEX orch_worker_starts_dispatch_owner; DROP INDEX orch_dispatch_active_session; DROP INDEX cross_model_checks_parent_state; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; DROP TABLE orch_worker_starts; DROP TABLE timeline_checkpoints; PRAGMA user_version=28;")
+                .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE IF EXISTS terminal_instance_output; DROP TABLE IF EXISTS terminal_instances; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA foreign_keys=ON; DROP INDEX agent_message_queue_cross_model_claim; DROP INDEX cross_model_children_claim; DROP INDEX orch_worker_starts_dispatch_owner; DROP INDEX orch_dispatch_active_session; DROP INDEX cross_model_checks_parent_state; ALTER TABLE agent_message_queue DROP COLUMN cross_model_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claim_id; ALTER TABLE cross_model_children DROP COLUMN summary_claimed_at; ALTER TABLE cross_model_children DROP COLUMN summary_delivered_at; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged; ALTER TABLE cross_model_children DROP COLUMN summary_acknowledged_at; DROP TABLE orch_worker_starts; DROP TABLE timeline_checkpoints; PRAGMA user_version=28;")
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
@@ -2353,7 +2378,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
         assert_eq!(columns, 5);
         assert_eq!(queue_columns, 1);
     }

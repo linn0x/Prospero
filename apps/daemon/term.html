@@ -174,6 +174,8 @@
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(document.getElementById("term"));
+  const search = window.SearchAddon ? new window.SearchAddon.SearchAddon() : null;
+  if (search) term.loadAddon(search);
 
   let renderer = "dom";
   try {
@@ -299,6 +301,7 @@
   // intentionally leaves the OS integration to its embedder, so bridge writes
   // to AppKit but never answer clipboard-read queries from terminal programs.
   term.parser.registerOscHandler(52, (data) => {
+    if (replaying) return true;
     const separator = data.indexOf(";");
     if (separator < 0) return false;
     const payload = data.slice(separator + 1);
@@ -329,8 +332,10 @@
    * 重放产生的应答不是用户意图,丢掉。
    */
   let replaying = false;
+  let capturedPaste = null;
   term.onData((d) => {
     if (replaying) return;
+    if (capturedPaste !== null) { capturedPaste += d; return; }
     post({ kind: "input", data: bytesToB64(te.encode(d)) });
   });
 
@@ -381,6 +386,31 @@
   }
   perfLoop();
 
+  let terminalQueue = [];
+  let terminalWriting = false;
+  function flushTerminalQueue() {
+    if (terminalWriting) return;
+    while (terminalQueue.length) {
+      const action = terminalQueue.shift();
+      if (action.kind === "reset") { replaying = true; term.reset(); term.resize(action.cols, action.rows); continue; }
+      if (action.type === "resize") { term.resize(action.size.cols, action.size.rows); continue; }
+      if (action.kind === "encodePaste") {
+        capturedPaste = "";
+        try {
+          if (typeof action.text === "string" && action.text.length > 0) term.paste(action.text);
+          post({ kind: "pasteInput", requestId: action.requestId, data: bytesToB64(te.encode(capturedPaste)) });
+        } finally { capturedPaste = null; }
+        continue;
+      }
+      const bytes = action.text !== undefined ? action.text : b64ToBytes(action.dataB64);
+      terminalWriting = true;
+      if (action.replay) replaying = true;
+      perfBytes += bytes.length;
+      term.write(bytes, () => { terminalWriting = false; if (action.snapshot || action.replay) replaying = false; flushTerminalQueue(); });
+      return;
+    }
+  }
+
   function handle(m) {
     if (m.kind === "activity") {
       perfActive = m.active !== false;
@@ -392,19 +422,15 @@
       perfLast = performance.now();
       perfLoop();
     } else if (m.kind === "snapshot") {
-      replaying = true;
-      term.reset();
-      if (m.cols && m.rows && (m.cols !== term.cols || m.rows !== term.rows)) {
-        term.resize(m.cols, m.rows);
-      }
-      // 回调里放开:xterm 的应答是异步发出的,同步清标志会漏掉
-      const screen = typeof m.dataB64 === "string" ? b64ToBytes(m.dataB64) : m.ansi;
-      term.write(screen, () => { replaying = false; });
-      perfBytes += screen.length;
+      terminalQueue = [{ kind: "reset", cols: m.cols || term.cols, rows: m.rows || term.rows },
+        typeof m.dataB64 === "string" ? { dataB64: m.dataB64, snapshot: true } : { text: m.ansi, snapshot: true }];
+      flushTerminalQueue();
     } else if (m.kind === "output") {
-      const bytes = b64ToBytes(m.dataB64);
-      term.write(bytes);
-      perfBytes += bytes.length;
+      terminalQueue.push({ dataB64: m.dataB64 });
+      flushTerminalQueue();
+    } else if (m.kind === "events") {
+      terminalQueue.push(...m.events.map(event => ({ ...event, replay: m.replay === true })));
+      flushTerminalQueue();
     } else if (m.kind === "fit") {
       doFit();
     } else if (m.kind === "font") {
@@ -437,8 +463,23 @@
       term.scrollToBottom();
     } else if (m.kind === "paste") {
       if (typeof m.text === "string" && m.text.length > 0) term.paste(m.text);
+    } else if (m.kind === "encodePaste") {
+      // Process after preceding output, which may change bracketed-paste mode.
+      terminalQueue.push(m);
+      flushTerminalQueue();
     } else if (m.kind === "selectAll") {
       term.selectAll();
+    } else if (m.kind === "copyAll") {
+      term.selectAll();
+      const text = term.getSelection();
+      term.clearSelection();
+      if (text) post({ kind: "clipboardCopy", text });
+    } else if (m.kind === "search") {
+      if (search && typeof m.text === "string") {
+        if (!m.text) search.clearDecorations();
+        else if (m.previous) search.findPrevious(m.text);
+        else search.findNext(m.text, { incremental: m.incremental === true });
+      }
     } else if (m.kind === "clear") {
       term.clear();
     } else if (m.kind === "toast") {

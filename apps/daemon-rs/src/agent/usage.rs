@@ -639,6 +639,16 @@ pub(crate) async fn search_native_codex_conversations(
     limit: usize,
 ) -> Result<Vec<crate::agent::ResumableConversation>> {
     let (cwd, env) = native_codex_environment(data)?;
+    search_codex_conversations_in(data, cwd, env, query, limit).await
+}
+
+pub(crate) async fn search_codex_conversations_in(
+    data: &Path,
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::agent::ResumableConversation>> {
     let mut rpc = CodexRpc::start(data, cwd.clone(), &env).await?;
     let trimmed = query.trim();
     let params = if trimmed.is_empty() {
@@ -647,7 +657,15 @@ pub(crate) async fn search_native_codex_conversations(
         json!({ "searchTerm": trimmed, "limit": limit, "sortKey": "updated_at", "sortDirection": "desc", "archived": false })
     };
     let result = async {
-        let raw = if trimmed.is_empty() {
+        let raw = if uuid::Uuid::parse_str(trimmed).is_ok() {
+            let response = rpc
+                .request(
+                    "thread/read",
+                    json!({"threadId":trimmed,"includeTurns":false}),
+                )
+                .await?;
+            json!({"data":[response["thread"].clone()]})
+        } else if trimmed.is_empty() {
             rpc.request("thread/list", params).await?
         } else {
             match rpc.request("thread/search", params.clone()).await {

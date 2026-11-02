@@ -6,6 +6,7 @@
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, type ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
+import * as Clipboard from "expo-clipboard";
 import type { HostConnection } from "@/lib/connection";
 import { toast } from "@/components/Toast";
 import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
@@ -30,6 +31,7 @@ interface Props {
   sessionEnded?: boolean;
   endedActions?: ReactNode;
   onInputB64?: (data: string) => DeliveryResult;
+  onPasteB64?: (data: string) => DeliveryResult;
   disconnectedMessage?: string;
   onRetryConnection?: () => void;
 }
@@ -38,14 +40,19 @@ export interface TerminalHandle {
   scrollToBottom(): void;
   /** 收起键盘 */
   blur(): void;
+  copyAll(): void;
+  search(text: string, previous?: boolean, incremental?: boolean): void;
+  paste(text: string): Promise<DeliveryResult>;
 }
 
 interface BridgeUp {
-  kind: "ready" | "resized" | "input" | "perf" | "fontSize";
+  kind: "ready" | "resized" | "input" | "pasteInput" | "clipboardCopy" | "clipboardPaste" | "perf" | "fontSize";
+  requestId?: number;
   renderer?: string;
   cols?: number;
   rows?: number;
   data?: string;
+  text?: string;
   fps?: number;
   kb?: number;
   size?: number;
@@ -62,6 +69,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
     sessionEnded = false,
     endedActions,
     onInputB64,
+    onPasteB64,
     disconnectedMessage = "主机未连接；终端输入已冻结。",
     onRetryConnection,
   },
@@ -73,9 +81,24 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   const metricsRef = useRef(onPerf !== undefined);
   const attachedRef = useRef(false);
   const lastSeqRef = useRef(0);
+  useEffect(() => () => conn.detach(sid), [conn, sid]);
   const queueRef = useRef<object[]>([]);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const fontSizeRef = useRef(fontSize);
+  const pasteIdRef = useRef(0);
+  const focusEpochRef = useRef(0);
+  const pastesRef = useRef(new Map<number, { resolve: (result: DeliveryResult) => void; timer: ReturnType<typeof setTimeout> }>());
+  const cancelPastes = useCallback(() => {
+    focusEpochRef.current++;
+    for (const pending of pastesRef.current.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({ accepted: false, reason: "offline" });
+    }
+    pastesRef.current.clear();
+  }, []);
+  useEffect(() => { if (!inputEnabled) cancelPastes(); }, [inputEnabled, cancelPastes]);
+  useEffect(() => cancelPastes, [cancelPastes]);
+  useEffect(() => conn.events.on("disconnected", cancelPastes), [conn, cancelPastes]);
 
   const batchRef = useRef<object[]>([]);
   const flushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -110,10 +133,10 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
 
   const tryAttach = useCallback(() => {
     if (!activeRef.current || !readyRef.current || !conn.isConnected || !sizeRef.current) return;
-    conn.resize(sid, sizeRef.current.cols, sizeRef.current.rows);
+    if (!sessionEnded) conn.resize(sid, sizeRef.current.cols, sizeRef.current.rows);
     conn.attach(sid, lastSeqRef.current > 0 ? lastSeqRef.current : undefined);
     attachedRef.current = true;
-  }, [conn, sid]);
+  }, [conn, sid, sessionEnded]);
 
   // font 不走 shell 输入通道，也不影响 attach；WebView 自己在收到 font 后 fit，
   // 这样首次 resized/attach 已经使用正确字号。系统 Dynamic Type 变更则由受控 prop
@@ -129,22 +152,18 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   }, [onPerf, rx]);
 
   useFocusedSessionEffect(useCallback(() => {
-    if (sessionEnded) {
-      activeRef.current = false;
-      if (readyRef.current) { rx({ kind: "blur" }); flush(); }
-      return () => undefined;
-    }
     activeRef.current = true;
     if (readyRef.current) rx({ kind: "activity", active: true, metrics: metricsRef.current });
     const cleanup = subscribeFocusedTerminal({
       conn, sid, cursor: lastSeqRef,
       snapshot: (message) => rx({ kind: "snapshot", ansi: message.ansi, dataB64: message.dataB64, cols: message.cols, rows: message.rows }),
-      output: (message) => rx({ kind: "output", dataB64: message.dataB64 }),
+      output: (message) => rx(message.events ? { kind: "events", events: message.events, replay: message.replay } : { kind: "output", dataB64: message.dataB64 }),
       flush,
       attach: tryAttach,
     });
     return () => {
       activeRef.current = false;
+      cancelPastes();
       cleanup();
       attachedRef.current = false;
       if (readyRef.current) {
@@ -153,7 +172,22 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         flush();
       }
     };
-  }, [conn, sid, flush, rx, tryAttach, sessionEnded]));
+  }, [conn, sid, flush, rx, tryAttach, sessionEnded, cancelPastes]));
+
+  const requestPaste = useCallback((text: string): Promise<DeliveryResult> => {
+    if (!activeRef.current || !readyRef.current || !inputEnabled || !conn.isConnected) {
+      return Promise.resolve({ accepted: false, reason: "offline" });
+    }
+    const requestId = ++pasteIdRef.current;
+    return new Promise<DeliveryResult>((resolve) => {
+      const timer = setTimeout(() => {
+        pastesRef.current.delete(requestId);
+        resolve({ accepted: false, reason: "transport_error" });
+      }, 5000);
+      pastesRef.current.set(requestId, { resolve, timer });
+      rx({ kind: "encodePaste", requestId, text });
+    });
+  }, [conn, inputEnabled, rx]);
 
   const onMessage = useCallback(
     (e: WebViewMessageEvent) => {
@@ -166,6 +200,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
       switch (msg.kind) {
         case "ready":
           // 页面(重新)加载:内容为空,必须全量快照
+          cancelPastes();
           readyRef.current = true;
           attachedRef.current = false;
           lastSeqRef.current = 0;
@@ -186,7 +221,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           sizeRef.current = { cols: msg.cols, rows: msg.rows };
           if (!activeRef.current) break;
           if (!attachedRef.current) tryAttach();
-          else conn.resize(sid, msg.cols, msg.rows);
+          else if (!sessionEnded) conn.resize(sid, msg.cols, msg.rows);
           break;
         case "input":
           if (activeRef.current && typeof msg.data === "string" && inputEnabled) {
@@ -194,6 +229,34 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
             if (!result.accepted) toast(deliveryFailureText(result));
           }
           break;
+        case "clipboardCopy":
+          if (activeRef.current && typeof msg.text === "string" && msg.text.length > 0) {
+            void Clipboard.setStringAsync(msg.text).then(() => toast("已复制终端内容"), () => toast("无法复制终端内容"));
+          }
+          break;
+        case "clipboardPaste":
+          // A hardware keyboard shortcut uses the same checked paste path as the toolbar.
+          if (activeRef.current && inputEnabled) {
+            const epoch = focusEpochRef.current;
+            void Clipboard.getStringAsync().then((text) => {
+              if (focusEpochRef.current !== epoch) return;
+              if (!text) { toast("剪贴板是空的"); return; }
+              void requestPaste(text).then((result) => { if (!result.accepted) toast(deliveryFailureText(result)); });
+            }, () => toast("无法读取剪贴板"));
+          }
+          break;
+        case "pasteInput": {
+          if (typeof msg.requestId !== "number") break;
+          const pending = pastesRef.current.get(msg.requestId);
+          if (!pending) break;
+          pastesRef.current.delete(msg.requestId);
+          clearTimeout(pending.timer);
+          const result = activeRef.current && inputEnabled && conn.isConnected && typeof msg.data === "string" && msg.data.length > 0
+            ? (onPasteB64 ? onPasteB64(msg.data) : conn.inputB64(sid, msg.data))
+            : { accepted: false as const, reason: "offline" as const };
+          pending.resolve(result);
+          break;
+        }
         case "fontSize":
           if (activeRef.current && typeof msg.size === "number") onFontSize?.(msg.size);
           break;
@@ -205,13 +268,16 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           break;
       }
     },
-    [conn, sid, tryAttach, rx, onFontSize, onPerf, inputEnabled, onInputB64],
+    [conn, sid, tryAttach, rx, onFontSize, onPerf, inputEnabled, onInputB64, onPasteB64, cancelPastes, sessionEnded, requestPaste],
   );
 
   useImperativeHandle(ref, () => ({
     scrollToBottom: () => rx({ kind: "scrollBottom" }),
     blur: () => rx({ kind: "blur" }),
-  }), [rx]);
+    copyAll: () => rx({ kind: "copyAll" }),
+    search: (text, previous = false, incremental = false) => rx({ kind: "search", text, previous, incremental }),
+    paste: requestPaste,
+  }), [rx, requestPaste]);
 
   return (
     <View style={styles.wrap}>
@@ -233,7 +299,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         automaticallyAdjustContentInsets={false}
       />
       {!inputEnabled && (
-        <View style={styles.inputFrozen} pointerEvents="auto">
+        <View style={[styles.inputFrozen, sessionEnded && styles.endedNotice]} pointerEvents={sessionEnded ? "box-none" : "auto"}>
           <View
             style={styles.inputFrozenCard}
             accessible={!sessionEnded}
@@ -286,6 +352,7 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: "#6b5524",
   },
+  endedNotice: { justifyContent: "flex-start", backgroundColor: "transparent", paddingTop: 12 },
   inputFrozenText: { color: "#F0D798", fontSize: 13, lineHeight: 19, textAlign: "center" },
   inputFrozenRetry: {
     alignSelf: "center",

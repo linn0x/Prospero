@@ -28,8 +28,10 @@ pub fn validate_size(size: TerminalSize) -> Result<TerminalSize> {
     Ok(size)
 }
 
+pub mod launcher;
 mod replay;
 pub mod screen;
+pub mod session;
 
 pub struct Output {
     screen: screen::Screen,
@@ -37,6 +39,7 @@ pub struct Output {
     events: VecDeque<(TerminalEvent, usize)>,
     bytes: usize,
     seq: i64,
+    base_seq: i64,
     replay: replay::Replay,
     replay_failed: bool,
     query_carry: Vec<u8>,
@@ -61,15 +64,24 @@ pub(crate) struct Archive {
 }
 
 impl Output {
+    #[cfg(test)]
     fn new(size: TerminalSize) -> Result<Self> {
+        Self::new_at(size, 0)
+    }
+
+    fn new_at(size: TerminalSize, base_seq: i64) -> Result<Self> {
+        if base_seq < 0 {
+            return Err(Error::Invalid("invalid terminal sequence".into()));
+        }
         Ok(Self {
             screen: screen::Screen::new(size),
             initial_size: size,
-            replay: replay::Replay::new()?,
+            replay: replay::Replay::new_at(base_seq)?,
             replay_failed: false,
             events: VecDeque::new(),
             bytes: 0,
-            seq: 0,
+            seq: base_seq,
+            base_seq,
             query_carry: Vec::new(),
             exited: false,
             exit_code: None,
@@ -270,7 +282,9 @@ impl Output {
             return Err(Error::Invalid("terminal cursor is ahead of output".into()));
         }
         let ring_floor = self.seq - self.events.len() as i64;
-        let (floor, events) = if after < ring_floor {
+        let (floor, events) = if after < self.base_seq {
+            (self.base_seq, Vec::new())
+        } else if after < ring_floor {
             if self.replay_failed {
                 return Err(Error::Feature(
                     "terminal_replay_unavailable".into(),
@@ -302,16 +316,43 @@ impl Output {
             ));
         }
         Ok(TerminalPage {
+            instance_start_seq: Some(self.base_seq),
             initial_size: self.initial_size,
             base_seq: after,
             next_seq: after + events.len() as i64,
             latest_seq: self.seq,
-            floor_seq: if self.replay_failed { floor } else { 0 },
+            floor_seq: if self.replay_failed {
+                floor
+            } else {
+                self.base_seq
+            },
             resync_required: after < floor || after > self.seq,
             events,
             exited: self.exited,
             exit_code: self.exit_code,
         })
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    #[test]
+    fn new_instances_preserve_sequence_order_and_reject_old_cursors() {
+        let mut output = Output::new_at(TerminalSize { cols: 80, rows: 24 }, 500).unwrap();
+        output.write(b"new instance\r\n");
+        let old = output.page(499).unwrap();
+        assert!(old.resync_required);
+        assert!(old.events.is_empty());
+        assert_eq!(old.floor_seq, 500);
+        for _ in 0..RETAINED_EVENTS + 5 {
+            output.write(b"line\r\n");
+        }
+        let replay = output.page(500).unwrap();
+        assert!(!replay.resync_required);
+        assert_eq!(replay.floor_seq, 500);
+        assert!(!replay.events.is_empty());
     }
 }
 

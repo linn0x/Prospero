@@ -33,6 +33,8 @@ export type QueuedChatMessage = {
 };
 
 export type SessionInfo = {
+  archived?: boolean;
+  nativeSession?: import("@prospero/protocol/rust-daemon").NativeSession;
   terminalMode?: "events";
   historyMode?: "paged";
   id: string;
@@ -364,7 +366,8 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   renameProject(path: string, name: string): Promise<DesktopSnapshot>;
   setProjectPinned(path: string, pinned: boolean): Promise<DesktopSnapshot>;
   setSessionPinned(sessionId: string, pinned: boolean): Promise<DesktopSnapshot>;
-  setSessionArchived(sessionId: string, archived: boolean): Promise<DesktopSnapshot>;
+  setSessionArchived(sessionId: string, archived: boolean, nativeId?: string): Promise<DesktopSnapshot>;
+  nativeConversationCandidates(sessionId: string, query: string): Promise<import("@prospero/protocol/rust-daemon").ResumableConversation[]>;
   setSessionUnread(sessionId: string, unread: boolean): Promise<DesktopSnapshot>;
   forgetMissingSession(sessionId: string): Promise<DesktopSnapshot>;
   renameSession(sessionId: string, title: string): Promise<DesktopSnapshot>;

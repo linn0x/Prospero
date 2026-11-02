@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 
 pub(crate) struct Replay {
     connection: Connection,
+    base: i64,
     _directory: TempDir,
 }
 
@@ -20,7 +21,12 @@ fn unavailable() -> Error {
 }
 
 impl Replay {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self> {
+        Self::new_at(0)
+    }
+
+    pub(crate) fn new_at(base: i64) -> Result<Self> {
         let directory = tempfile::Builder::new()
             .prefix("prospero-terminal-replay-")
             .tempdir()
@@ -52,6 +58,7 @@ impl Replay {
             .execute_batch("CREATE TABLE events(seq INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
             .map_err(|_| unavailable())?;
         Ok(Self {
+            base,
             connection,
             _directory: directory,
         })
@@ -83,7 +90,7 @@ impl Replay {
             .map_err(|_| unavailable())?
             .map(|seq| seq - 1)
             .unwrap_or(0);
-        if floor != 0 {
+        if floor != self.base || after < self.base {
             return Err(unavailable());
         }
         let mut statement = self

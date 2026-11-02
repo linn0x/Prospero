@@ -502,6 +502,13 @@ async fn manual_agent_reclaim_requires_a_recognized_idle_prompt() {
         .unwrap();
     }
 
+    assert_eq!(runtime.reclaim_idle_manual(i64::MAX, 2).await.unwrap(), 0);
+    let connection = rusqlite::Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    for id in [&idle.id, &busy.id] {
+        let native = serde_json::json!({"runtimeId":id,"nativeId":uuid::Uuid::new_v4().to_string(),"managed":false,"state":"running","error":null});
+        connection.execute("UPDATE session_heads SET payload=json_set(payload,'$.nativeSession',json(?1)) WHERE id=?2", rusqlite::params![native.to_string(), id]).unwrap();
+    }
+    drop(connection);
     assert_eq!(
         runtime
             .reclaim_idle_manual(

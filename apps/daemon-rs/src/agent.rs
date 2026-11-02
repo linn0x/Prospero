@@ -6,7 +6,7 @@ pub(crate) mod lifecycle;
 mod opencode;
 mod runtime;
 mod store;
-mod usage;
+pub(crate) mod usage;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};

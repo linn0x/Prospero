@@ -166,7 +166,7 @@ export function sidebarProjectSessions(
   query: string,
 ): SessionInfo[] {
   return filterSessionsByQuery(
-    query ? sessions : sessions.filter((session) => !archivedSessionIds.includes(session.id)),
+    query ? sessions : sessions.filter((session) => !(session.archived ?? archivedSessionIds.includes(session.id))),
     query,
   );
 }

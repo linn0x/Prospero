@@ -860,7 +860,7 @@ enum Message {
     SessionResumeLoaded(Box<ConversationLoadResult>),
     SessionResumeSelected(String),
     SessionCreateSubmit,
-    SessionCreated(Result<SessionHead, String>),
+    SessionCreated(Box<Result<SessionHead, String>>),
     SessionClose,
     SessionCloseConfirm,
     SessionCloseCancel,
@@ -2851,10 +2851,12 @@ impl Desktop {
             }
             Message::SessionCreateSubmit => {
                 if let Some(state) = self.create_session.clone() {
-                    return Task::perform(create_session(state), Message::SessionCreated);
+                    return Task::perform(create_session(state), |result| {
+                        Message::SessionCreated(Box::new(result))
+                    });
                 }
             }
-            Message::SessionCreated(result) => match result {
+            Message::SessionCreated(result) => match *result {
                 Ok(session) => {
                     self.create_session = None;
                     let id = session.id.clone();

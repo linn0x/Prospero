@@ -1054,6 +1054,12 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     ))
     .await
     .unwrap();
+    let metadata = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected session metadata frame: {other:?}"),
+    };
+    assert_eq!(metadata["type"], "session.state");
+    assert_eq!(metadata["session"]["id"], seeded.id);
     let chat = match ws.next().await.unwrap().unwrap() {
         Message::Text(text) => open(&cipher, &mut recv_count, &text),
         other => panic!("unexpected chat snapshot frame: {other:?}"),

@@ -309,3 +309,11 @@ it("restores a persisted complete prefix after desktop restart even when daemon 
     expect(await rustTerminalView(client, "session", 0, 0, AbortSignal.timeout(1000), restarted)).toMatchObject({ mode: "events", baseSeq: 0, seq: 2, events, caughtUp: true });
   } finally { await recovery.flush(); await restarted.flush(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+it("starts replay at a new runtime boundary without treating pruned history as complete", async () => {
+  const output = vi.fn().mockResolvedValue(terminalPage({ baseSeq: 0, nextSeq: 0, latestSeq: 104, floorSeq: 100, instanceStartSeq: 100, resyncRequired: true }));
+  const client = { terminalOutput: output, terminalSnapshot: vi.fn().mockResolvedValue(null) };
+  await expect(rustTerminalView(client, "session", undefined, 0, AbortSignal.timeout(1000))).resolves.toMatchObject({ mode: "snapshot", seq: 100, dataB64: "" });
+  output.mockResolvedValue(terminalPage({ baseSeq: 0, nextSeq: 0, latestSeq: 104, floorSeq: 102, instanceStartSeq: 100, resyncRequired: true }));
+  await expect(rustTerminalView(client, "session", undefined, 0, AbortSignal.timeout(1000))).rejects.toThrow("无法可靠恢复画面");
+});

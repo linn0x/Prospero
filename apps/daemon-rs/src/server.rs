@@ -90,6 +90,7 @@ pub struct Api {
     api_tests: Arc<Semaphore>,
     api_testing: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     api_features: Arc<Semaphore>,
+    session_actions: Arc<tokio::sync::Mutex<()>>,
     remote_config: Arc<tokio::sync::Mutex<()>>,
     dev_mode: bool,
     remote_ws_handshake_timeout: Duration,
@@ -199,6 +200,7 @@ impl Api {
             api_tests: Arc::new(Semaphore::new(4)),
             api_testing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             api_features: Arc::new(Semaphore::new(4)),
+            session_actions: Arc::new(tokio::sync::Mutex::new(())),
             remote_config: Arc::new(tokio::sync::Mutex::new(())),
             dev_mode: false,
             remote_ws_handshake_timeout: REMOTE_WS_HANDSHAKE_TIMEOUT,
@@ -537,6 +539,12 @@ impl Api {
             .route(
                 "/v1/terminals/{id}/stream-capabilities",
                 get(terminal_stream_capabilities),
+            )
+            .route("/v1/sessions/{id}/archive", post(archive_session))
+            .route("/v1/sessions/{id}/resume", post(resume_session))
+            .route(
+                "/v1/sessions/{id}/native-candidates",
+                get(native_candidates),
             )
             .route("/v1/sessions", get(sessions))
             .route("/v1/sessions/sidebar", get(sidebar_sessions))
@@ -929,6 +937,8 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
     let request_timeout = if request.method() == axum::http::Method::POST
         && (matches!(path, "/v1/terminals" | "/v1/agent-sessions")
             || path.starts_with("/v1/agent-sessions/")
+            || path.ends_with("/archive")
+            || path.ends_with("/resume")
             || path == "/v1/workers/start"
             || (path.starts_with("/v1/schedules/") && path.ends_with("/run")))
     {
@@ -1138,6 +1148,8 @@ async fn handle_remote_ws(
         ..RemoteWsState::default()
     };
     let mut changes = api.changes.subscribe();
+    let mut output_tick = tokio::time::interval(Duration::from_millis(25));
+    output_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut revoke_check = tokio::time::interval(Duration::from_millis(500));
     revoke_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1203,6 +1215,9 @@ async fn handle_remote_ws(
                     return;
                 }
             }
+            _ = output_tick.tick(), if state.pty_attachments.values().any(|attachment| attachment.pending) => {
+                if flush_remote_terminal_events(&api, &mut socket, &mut channel, &mut state).await.is_err() { return; }
+            }
             _ = revoke_check.tick() => {
                 if remote_device_revoked(&home, &device.token) {
                     close_ws(&mut socket, CLOSE_REVOKED, "revoked").await;
@@ -1227,6 +1242,8 @@ struct RemoteWsState {
 struct RemotePtyAttachment {
     last_sent_seq: i64,
     last_ack_seq: i64,
+    pending: bool,
+    replay_until: i64,
 }
 
 #[derive(Debug)]
@@ -1308,6 +1325,7 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
         "session.create-result.v1",
         "session.create-model.v1",
         "session.fork.v1",
+        "session.lifecycle.v1",
         "session.codex-fork.v1",
         "session.claude-fork.v1",
         "session.terminal-fork-picker.v1",
@@ -1360,8 +1378,15 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
 }
 
 fn remote_session_info(head: SessionHead) -> JsonValue {
+    let archived = head.lifecycle == SessionLifecycle::Archived
+        && head
+            .native_session
+            .as_ref()
+            .is_none_or(|native| !matches!(native.state.as_str(), "archiving" | "failed"));
     let mut value = json!({
         "id": head.id,
+        "archived": archived,
+        "revision": head.revision,
         "agent": head.agent,
         "kind": head.kind,
         "title": head.title,
@@ -1390,6 +1415,9 @@ fn remote_session_info(head: SessionHead) -> JsonValue {
         if let Some(field) = field {
             value[key] = field.into();
         }
+    }
+    if let Some(native) = head.native_session {
+        value["nativeSession"] = json!(native);
     }
     if let Some(policy) = head.approval_policy {
         value["approvalPolicy"] = json!(policy);
@@ -1490,6 +1518,73 @@ fn remote_session_fork(
     Ok(())
 }
 
+fn remote_session_lifecycle(
+    api: &Api,
+    state: &mut RemoteWsState,
+    device: &DeviceRecord,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let request_id = require_str(&message, "requestId")?.to_owned();
+    let kind = require_str(&message, "type")?.to_owned();
+    crate::database::validate_id(&sid)?;
+    crate::database::validate_text(&request_id, 100, false)?;
+    let key = format!("{kind}:{request_id}");
+    if state.fork_requests.contains(&key) {
+        return Ok(());
+    }
+    if state.fork_requests.len() >= 128 {
+        return Err(Error::Busy);
+    }
+    let sender = state.response_tx.clone().ok_or(Error::Closed)?;
+    let permit = api
+        .api_features
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::Busy)?;
+    if kind != "session.native-candidates" {
+        state.fork_requests.insert(key);
+    }
+    let api = api.clone();
+    let allow_shell = device.allow_shell;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result: Result<JsonValue> = async {
+            if kind == "session.native-candidates" {
+                let rows = api
+                    .terminals
+                    .native_candidates(&sid, message["query"].as_str().unwrap_or_default().into())
+                    .await?;
+                Ok(json!({"conversations":rows}))
+            } else {
+                let native = message["nativeId"].as_str().map(str::to_owned);
+                let head =
+                    session_lifecycle(&api, &sid, kind == "session.archive", native, allow_shell)
+                        .await?;
+                Ok(json!({"session":remote_session_info(head)}))
+            }
+        }
+        .await;
+        let mut response = json!({"type":"session.lifecycle.result","sid":sid,"requestId":request_id,"ok":result.is_ok()});
+        match result {
+            Ok(fields) => response
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone()),
+            Err(error) => {
+                response["error"] = error.to_string().into();
+                response["code"] = match &error {
+                    Error::Feature(code, _) => code.as_str(),
+                    _ => remote_error_code(&error),
+                }
+                .into();
+            }
+        }
+        let _ = sender.send(response).await;
+    });
+    Ok(())
+}
+
 async fn route_remote_ws_message(
     api: &Api,
     socket: &mut WebSocket,
@@ -1509,6 +1604,23 @@ async fn route_remote_ws_message(
             send_remote_json(socket, channel, &json!({"type":"connection.pong","id":id})).await
         }
         "session.create" => remote_session_create(api, socket, channel, device, message).await,
+        "session.history" => {
+            let request_id = require_str(&message, "requestId")?;
+            let cursor = message["cursor"].as_str().map(str::to_owned);
+            let page = api.call(move |store| store.sessions(SessionQuery { cursor, limit: Some(50), lifecycle: Some(SessionLifecycle::Archived), ..SessionQuery::default() })).await?;
+            let sessions = remote_session_infos(api, page.items).await?;
+            let mut response = json!({"type":"session.history.result","requestId":request_id,"sessions":sessions});
+            if let Some(cursor) = page.next_cursor { response["nextCursor"] = cursor.into(); }
+            send_remote_json(socket, channel, &response).await
+        },
+        "session.archive" | "session.resume" | "session.native-candidates" => {
+            let sid = require_str(&message, "sid")?.to_owned();
+            let request_id = require_str(&message, "requestId")?.to_owned();
+            match remote_session_lifecycle(api, state, device, message) {
+                Ok(()) => Ok(()),
+                Err(error) => send_remote_json(socket, channel, &json!({"type":"session.lifecycle.result","sid":sid,"requestId":request_id,"ok":false,"error":error.to_string(),"code":remote_error_code(&error)})).await,
+            }
+        },
         "session.fork" => {
             let sid = require_str(&message, "sid")?.to_owned();
             let request_id = require_str(&message, "requestId")?.to_owned();
@@ -1687,7 +1799,8 @@ async fn route_remote_ws_message(
         "term.ack" => {
             let sid = require_str(&message, "sid")?;
             let seq = message.get("seq").and_then(JsonValue::as_i64).unwrap_or(0);
-            if let Some(att) = state.pty_attachments.get_mut(sid) {
+            if let Some(att) = state.pty_attachments.get_mut(sid)
+                && seq >= att.last_ack_seq && seq <= att.last_sent_seq {
                 att.last_ack_seq = seq;
             }
             Ok(())
@@ -3260,6 +3373,14 @@ async fn remote_session_attach(
 ) -> Result<()> {
     let sid = require_str(&message, "sid")?.to_owned();
     let last_seq = message.get("lastSeq").and_then(JsonValue::as_i64);
+    let source = sid.clone();
+    let head = api.call(move |store| store.session(&source)).await?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"session.state","session":remote_session_info(head)}),
+    )
+    .await?;
     if remote_try_pty_attach(api, socket, channel, state, &sid, last_seq).await? {
         return Ok(());
     }
@@ -3294,12 +3415,25 @@ async fn remote_try_pty_attach(
         RemotePtyAttachment {
             last_sent_seq: last_seq.unwrap_or(0),
             last_ack_seq: last_seq.unwrap_or(0),
+            pending: false,
+            replay_until: page.latest_seq,
         },
     );
     if last_seq.is_some() && !page.resync_required {
-        send_terminal_page(socket, channel, sid, &page).await?;
+        send_terminal_page(
+            socket,
+            channel,
+            sid,
+            &page,
+            state
+                .pty_attachments
+                .get(sid)
+                .is_some_and(|att| page.base_seq < att.replay_until),
+        )
+        .await?;
         if let Some(att) = state.pty_attachments.get_mut(sid) {
-            att.last_sent_seq = page.next_seq.max(page.latest_seq);
+            att.last_sent_seq = page.next_seq;
+            att.pending = page.next_seq < page.latest_seq;
         }
         return Ok(true);
     }
@@ -3331,6 +3465,7 @@ async fn send_terminal_snapshot(
         .await?;
         if let Some(att) = state.pty_attachments.get_mut(sid) {
             att.last_sent_seq = snapshot.seq;
+            att.last_ack_seq = snapshot.seq;
         }
         if let Ok(page) = api
             .terminals
@@ -3344,9 +3479,20 @@ async fn send_terminal_snapshot(
             .await
             && !page.resync_required
         {
-            send_terminal_page(socket, channel, sid, &page).await?;
+            send_terminal_page(
+                socket,
+                channel,
+                sid,
+                &page,
+                state
+                    .pty_attachments
+                    .get(sid)
+                    .is_some_and(|att| page.base_seq < att.replay_until),
+            )
+            .await?;
             if let Some(att) = state.pty_attachments.get_mut(sid) {
-                att.last_sent_seq = page.next_seq.max(page.latest_seq);
+                att.last_sent_seq = page.next_seq;
+                att.pending = page.next_seq < page.latest_seq;
             }
         }
     } else {
@@ -3354,23 +3500,19 @@ async fn send_terminal_snapshot(
             .terminals
             .read(sid.to_owned(), TerminalQuery::default())
             .await?;
-        let data_b64 = terminal_page_output_b64(&page)?;
-        send_remote_json(
-            socket,
-            channel,
-            &json!({
-                "type":"term.snapshot",
-                "sid":sid,
-                "ansi": String::from_utf8_lossy(&BASE64_STANDARD.decode(&data_b64).map_err(|_| Error::Invalid("invalid terminal snapshot".into()))?).into_owned(),
-                "dataB64": data_b64,
-                "seq":page.latest_seq,
-                "cols":page.initial_size.cols,
-                "rows":page.initial_size.rows,
-            }),
-        )
-        .await?;
+        let base = page.floor_seq;
+        if base > 0 && page.instance_start_seq != Some(base) {
+            return Err(Error::Feature(
+                "terminal_history_gap".into(),
+                "终端历史存在缺口，无法完整恢复画面".into(),
+            ));
+        }
+        send_remote_json(socket, channel, &json!({"type":"term.snapshot","sid":sid,"ansi":"","dataB64":"","seq":base,"cols":page.initial_size.cols,"rows":page.initial_size.rows})).await?;
         if let Some(att) = state.pty_attachments.get_mut(sid) {
-            att.last_sent_seq = page.latest_seq;
+            att.last_sent_seq = base;
+            att.last_ack_seq = base;
+            att.replay_until = page.latest_seq;
+            att.pending = base < page.latest_seq;
         }
     }
     Ok(())
@@ -3381,13 +3523,14 @@ async fn send_terminal_page(
     channel: &mut SecureChannel,
     sid: &str,
     page: &TerminalPage,
+    replay: bool,
 ) -> Result<()> {
     let data_b64 = terminal_page_output_b64(page)?;
-    if !data_b64.is_empty() {
+    if !page.events.is_empty() {
         send_remote_json(
             socket,
             channel,
-            &json!({"type":"term.output","sid":sid,"dataB64":data_b64,"seq":page.next_seq}),
+            &json!({"type":"term.output","sid":sid,"dataB64":data_b64,"events":page.events,"seq":page.next_seq,"replay":replay}),
         )
         .await?;
     }
@@ -3475,6 +3618,13 @@ fn timeline_record_events(store: &mut Store, sid: &str, record: &TimelineRecord)
                     "hasMore":has_more,
                     "diff":diff,
                 }));
+            }
+            if diff.is_none() {
+                for event in &mut events {
+                    if let Some(object) = event.as_object_mut() {
+                        object.remove("diff");
+                    }
+                }
             }
             events
         }
@@ -3750,6 +3900,14 @@ async fn flush_remote_terminal_events(
         .map(|(sid, att)| (sid.clone(), att.last_sent_seq))
         .collect();
     for (sid, last_seq) in attached {
+        if state
+            .pty_attachments
+            .get(&sid)
+            .is_some_and(|att| att.last_sent_seq.saturating_sub(att.last_ack_seq) >= 256)
+        {
+            continue;
+        }
+
         let page = match api
             .terminals
             .read(
@@ -3772,9 +3930,20 @@ async fn flush_remote_terminal_events(
             send_terminal_snapshot(api, socket, channel, state, &sid).await?;
             continue;
         }
-        send_terminal_page(socket, channel, &sid, &page).await?;
+        send_terminal_page(
+            socket,
+            channel,
+            &sid,
+            &page,
+            state
+                .pty_attachments
+                .get(&sid)
+                .is_some_and(|att| page.base_seq < att.replay_until),
+        )
+        .await?;
         if let Some(att) = state.pty_attachments.get_mut(&sid) {
-            att.last_sent_seq = page.next_seq.max(page.latest_seq);
+            att.last_sent_seq = page.next_seq;
+            att.pending = page.next_seq < page.latest_seq;
         }
     }
     Ok(())
@@ -4220,6 +4389,7 @@ fn valid_remote_id(value: &str) -> bool {
 
 fn health_capabilities() -> Vec<String> {
     [
+        "session.lifecycle.v1",
         "session.metadata",
         "session.search",
         "session.summary",
@@ -5841,6 +6011,117 @@ async fn launch_models(
         .or_else(|| Some(crate::accounts::NATIVE_CLAUDE_ID.into()));
     let catalog = api.agents.launch_catalog_for(account_id.as_deref()).await?;
     Ok(Json(catalog))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionLifecycleInput {
+    native_id: Option<String>,
+}
+
+async fn native_candidates(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> std::result::Result<Json<Vec<crate::agent::ResumableConversation>>, ApiError> {
+    Ok(Json(
+        api.terminals
+            .native_candidates(&id, query.get("query").cloned().unwrap_or_default())
+            .await?,
+    ))
+}
+
+async fn archive_session(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Json(input): Json<SessionLifecycleInput>,
+) -> std::result::Result<Json<SessionHead>, ApiError> {
+    Ok(Json(
+        session_lifecycle(&api, &id, true, input.native_id, true).await?,
+    ))
+}
+
+async fn resume_session(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Json(input): Json<SessionLifecycleInput>,
+) -> std::result::Result<Json<SessionHead>, ApiError> {
+    Ok(Json(
+        session_lifecycle(&api, &id, false, input.native_id, true).await?,
+    ))
+}
+
+async fn session_lifecycle(
+    api: &Api,
+    id: &str,
+    archived: bool,
+    native_id: Option<String>,
+    allow_shell: bool,
+) -> Result<SessionHead> {
+    let api = api.clone();
+    let id = id.to_owned();
+    tokio::spawn(async move {
+        perform_session_lifecycle(&api, &id, archived, native_id, allow_shell).await
+    })
+    .await
+    .map_err(|_| Error::Closed)?
+}
+
+async fn perform_session_lifecycle(
+    api: &Api,
+    id: &str,
+    archived: bool,
+    native_id: Option<String>,
+    allow_shell: bool,
+) -> Result<SessionHead> {
+    let _guard = api.session_actions.try_lock().map_err(|_| Error::Busy)?;
+    let sid = id.to_owned();
+    let head = api.database.call(move |store| store.session(&sid)).await?;
+    let result = if head.kind == SessionKind::Pty {
+        if !allow_shell {
+            return Err(Error::Feature(
+                "shell_not_allowed".into(),
+                "此设备没有终端权限".into(),
+            ));
+        }
+        if archived {
+            api.terminals.archive(id, native_id).await
+        } else {
+            if let Some(native_id) = native_id {
+                if head
+                    .native_session
+                    .as_ref()
+                    .is_some_and(|native| native.managed)
+                {
+                    return Err(Error::Conflict);
+                }
+                api.terminals.validate_binding(id, &native_id).await?;
+                let sid = id.to_owned();
+                api.database
+                    .call(move |store| {
+                        store.set_native_session(
+                            &sid,
+                            NativeSession {
+                                output_start_seq: None,
+                                runtime_id: sid.clone(),
+                                native_id: Some(native_id),
+                                managed: false,
+                                state: "archived".into(),
+                                error: None,
+                            },
+                        )
+                    })
+                    .await?;
+            }
+            api.terminals.resume(id).await
+        }
+    } else if archived {
+        api.agents.archive(id).await
+    } else {
+        api.agents.resume(id).await
+    };
+    api.publish();
+    result
 }
 
 async fn fork_agent_chat(
@@ -8863,6 +9144,7 @@ mod tests {
     #[test]
     fn terminal_page_output_reencodes_each_event() {
         let page = TerminalPage {
+            instance_start_seq: Some(0),
             initial_size: TerminalSize { cols: 80, rows: 24 },
             base_seq: 0,
             next_seq: 2,
@@ -8893,6 +9175,7 @@ mod tests {
     #[test]
     fn terminal_page_output_rejects_invalid_event_data() {
         let page = TerminalPage {
+            instance_start_seq: Some(0),
             initial_size: TerminalSize { cols: 80, rows: 24 },
             base_seq: 0,
             next_seq: 1,

@@ -56,7 +56,22 @@ pub enum SessionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    pub output_start_seq: Option<i64>,
+    pub runtime_id: String,
+    pub native_id: Option<String>,
+    pub managed: bool,
+    pub state: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionHead {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session: Option<NativeSession>,
     pub id: String,
     pub agent: AgentKind,
     pub kind: SessionKind,
@@ -830,6 +845,9 @@ pub struct TerminalQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    pub instance_start_seq: Option<i64>,
     pub initial_size: TerminalSize,
     #[ts(type = "number")]
     pub base_seq: i64,

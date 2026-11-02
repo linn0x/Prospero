@@ -425,19 +425,36 @@ fn recovery_abandons_orphans_without_promoting_live_starts_and_is_idempotent() {
         })
         .unwrap();
     let live_session = store
+        .create_agent_session(
+            CreateAgentSession {
+                agent: AgentKind::Codex,
+                title: "live".into(),
+                workspace: "/w".into(),
+                auto_approve: false,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id: None,
+                resume: None,
+            },
+            ApprovalPolicy::Manual,
+        )
+        .unwrap();
+
+    let completed_session = store
         .create_session(CreateSession {
             agent: AgentKind::Shell,
             kind: SessionKind::Pty,
-            title: "live".into(),
+            title: "completed".into(),
             workspace: "/w".into(),
         })
         .unwrap();
-
     // Run A: n0 settles on the live session; n1 is mid-flight on a session
     // that becomes archived before the daemon crashed.
     let (run_a, a) = make_run(&mut store, "op-graph-recover-a", chain(2));
     let d0 = store
-        .dispatch_task(&a["n0"], &live_session.id, None, None)
+        .dispatch_task(&a["n0"], &completed_session.id, None, None)
         .unwrap();
     store.set_dispatch_running(&d0.dispatch.id).unwrap();
     store
@@ -1423,7 +1440,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -1677,7 +1694,7 @@ fn v8_database_is_migrated_forward_to_current_schema() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
@@ -1689,7 +1706,7 @@ fn v32_database_adds_monitor_lookup_indexes() {
     let connection = raw(&directory);
     connection
         .execute_batch(
-            "PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA foreign_keys=ON; DROP INDEX orch_worker_starts_dispatch_owner; \
+            "PRAGMA foreign_keys=OFF; DROP TABLE IF EXISTS terminal_instance_output; DROP TABLE IF EXISTS terminal_instances; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA foreign_keys=ON; DROP INDEX orch_worker_starts_dispatch_owner; \
              DROP INDEX orch_dispatch_active_session; \
              DROP INDEX cross_model_checks_parent_state; \
              PRAGMA user_version=32;",
@@ -1702,7 +1719,7 @@ fn v32_database_adds_monitor_lookup_indexes() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     let count: i64 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ( \
@@ -1728,7 +1745,7 @@ fn v35_migration_is_atomic_repeatable_and_preserves_legacy_start_rows() {
         .unwrap();
     connection
         .execute_batch(
-            "PRAGMA foreign_keys=OFF; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA user_version=34;",
+            "PRAGMA foreign_keys=OFF; DROP TABLE IF EXISTS terminal_instance_output; DROP TABLE IF EXISTS terminal_instances; DROP TABLE orch_host_event_cursors; DROP TABLE orch_host_events; DROP TABLE orch_recovery_jobs; DROP TABLE orch_resource_reservations; DROP TABLE orch_result_receipts; DROP TABLE orch_host_commands; DROP TABLE orch_operations_v2; DROP TABLE orch_executions; DROP TABLE orch_host_registry; DROP TABLE orch_exit_proofs; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert; DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update; ALTER TABLE agent_runs DROP COLUMN execution_unknown; PRAGMA user_version=34;",
         )
         .unwrap();
     drop(connection);
@@ -1760,7 +1777,7 @@ fn v35_migration_is_atomic_repeatable_and_preserves_legacy_start_rows() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     let legacy: (String, String, String) = connection
         .query_row(
             "SELECT phase,session_id,error FROM orch_worker_starts WHERE operation_id='legacy-operation'",
@@ -1787,7 +1804,7 @@ fn unknown_schema_version_is_rejected() {
     let directory = TempDir::new().unwrap();
     drop(Store::open(directory.path()).unwrap());
     raw(&directory)
-        .pragma_update(None, "user_version", 36)
+        .pragma_update(None, "user_version", 37)
         .unwrap();
     assert!(matches!(Store::open(directory.path()), Err(Error::Schema)));
 }
@@ -1928,7 +1945,7 @@ fn v9_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        35
+        36
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -1987,7 +2004,7 @@ fn v10_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        35
+        36
     );
     let mode: String = connection
         .query_row(
@@ -2047,7 +2064,7 @@ fn v11_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        35
+        36
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -2144,7 +2161,7 @@ fn v12_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        35
+        36
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -2242,7 +2259,7 @@ fn v13_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        35
+        36
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -2330,7 +2347,7 @@ fn v14_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        35
+        36
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -2438,7 +2455,7 @@ fn v15_database_is_migrated_forward_to_current_schema() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        35
+        36
     );
     let has_engine_validation_column: i64 = connection
         .query_row(

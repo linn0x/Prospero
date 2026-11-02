@@ -182,7 +182,9 @@ export default function EditHostScreen(): React.ReactElement {
         </Text>
 
         {host.addrs.length === 0 && (
-          <Text style={styles.warn}>一条地址都没有 —— 现在无法连接。</Text>
+          host.connectionMode !== "direct" && host.relay && host.relayToken
+            ? <Text style={styles.note}>未设置直连地址；可通过中继连接。</Text>
+            : <Text style={styles.warn}>没有可用的直连地址，请添加电脑地址或选择已配置的中继。</Text>
         )}
 
         {host.addrs.map((addr) => (

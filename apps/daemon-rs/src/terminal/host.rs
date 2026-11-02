@@ -31,6 +31,8 @@ struct Launch {
     cwd: Option<std::ffi::OsString>,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     size: TerminalSize,
+    #[serde(default)]
+    base_seq: i64,
 }
 #[derive(Clone, Deserialize)]
 struct Connection {
@@ -116,12 +118,13 @@ impl Host {
     pub(crate) async fn input(&self, input: TerminalInput) -> Result<()> {
         self.post("input", &input).await
     }
-    pub async fn start(
+    pub async fn start_at(
         exe: PathBuf,
         directory: PathBuf,
         command: portable_pty::CommandBuilder,
         size: TerminalSize,
         expected_hash: String,
+        base_seq: i64,
     ) -> Result<Self> {
         std::fs::create_dir_all(&directory)?;
         #[cfg(unix)]
@@ -139,16 +142,13 @@ impl Host {
                 environment.insert(key, value.to_owned());
             }
         }
-        let launch = Launch {
+        let mut launch = Launch {
             argv: command.get_argv().clone(),
             cwd: command.get_cwd().cloned(),
             environment: environment.into_iter().collect(),
             size,
+            base_seq,
         };
-        let bytes = serde_json::to_vec(&launch)?;
-        if bytes.len() > 1024 * 1024 {
-            return Err(Error::Invalid("terminal environment exceeds limit".into()));
-        }
         let dir = directory.clone();
         let mut child = tokio::task::spawn_blocking(move || -> Result<std::process::Child> {
             let cache = dir
@@ -157,6 +157,17 @@ impl Host {
                 .ok_or(Error::Closed)?
                 .join("terminal-host-runtime");
             let executable = pin_executable(&exe, &cache, &expected_hash)?;
+            if launch
+                .argv
+                .first()
+                .is_some_and(|arg| arg == exe.as_os_str())
+            {
+                launch.argv[0] = executable.clone().into_os_string();
+            }
+            let bytes = serde_json::to_vec(&launch)?;
+            if bytes.len() > 1024 * 1024 {
+                return Err(Error::Invalid("terminal environment exceeds limit".into()));
+            }
             let mut command = std::process::Command::new(executable);
             command
                 .args(["terminal-host", "--directory"])
@@ -192,7 +203,7 @@ impl Host {
         })
         .await
         .map_err(|_| Error::Closed)??;
-        for _ in 0..100 {
+        for _ in 0..600 {
             if let Ok(host) = Self::attach(directory.clone()).await {
                 std::thread::spawn(move || {
                     let _ = child.wait();
@@ -355,7 +366,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
         command.cwd(cwd);
     }
     let token = Token::load(&directory)?;
-    let terminal = spawn(command, launch.size)?;
+    let terminal = super::native::spawn_at(command, launch.size, launch.base_seq)?;
     let id = directory
         .file_name()
         .and_then(|s| s.to_str())

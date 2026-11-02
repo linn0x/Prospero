@@ -98,7 +98,9 @@ export const useApp = create<AppState>()((set, get) => ({
     }),
   upsertSession: (hostId, session) => {
     const runtime = get().runtimes[hostId];
-    if (runtime?.status === "connected" && sessionActivityChanged(runtime.sessions[session.id], session)) {
+    const previous = runtime?.sessions[session.id];
+    if (previous?.revision !== undefined && session.revision !== undefined && previous.revision > session.revision) return;
+    if (!session.archived && runtime?.status === "connected" && sessionActivityChanged(runtime.sessions[session.id], session)) {
       recentSessions.activity(hostId, session.id, session.preview);
     }
     set((s) => {
@@ -125,7 +127,10 @@ export const useApp = create<AppState>()((set, get) => ({
     });
   },
   queueSessionUpdate: (hostId, session) => {
-    pendingSessionUpdates.set(`${hostId}\u0000${session.id}`, session);
+    const key = `${hostId}\u0000${session.id}`;
+    const previous = pendingSessionUpdates.get(key);
+    if (previous?.revision !== undefined && session.revision !== undefined && previous.revision > session.revision) return;
+    pendingSessionUpdates.set(key, session);
     if (sessionUpdateTimer === undefined) {
       sessionUpdateTimer = setTimeout(flushSessionUpdates, SESSION_UPDATE_FRAME_MS);
     }

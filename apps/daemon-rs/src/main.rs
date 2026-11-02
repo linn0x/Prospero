@@ -55,6 +55,21 @@ enum Command {
         #[arg(long)]
         directory: PathBuf,
     },
+    #[command(hide = true)]
+    AgentTerminal {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        cli: String,
+        #[arg(long)]
+        binding: PathBuf,
+        #[arg(long)]
+        native_id: Option<String>,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    TerminalBind,
     Serve {
         #[arg(long)]
         data_dir: PathBuf,
@@ -368,6 +383,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(prosperod_rs::terminal::guard::run(parent, shell, args)?);
         }
         Command::TerminalHost { directory } => prosperod_rs::terminal::host::run(directory)?,
+        Command::AgentTerminal {
+            agent,
+            cli,
+            binding,
+            native_id,
+            args,
+        } => {
+            let code = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?
+                .block_on(prosperod_rs::terminal::launcher::run(
+                    agent, cli, binding, native_id, args,
+                ))?;
+            std::process::exit(code);
+        }
+        Command::TerminalBind => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(prosperod_rs::terminal::launcher::notify())?;
+        }
         Command::Serve {
             data_dir,
             listen,

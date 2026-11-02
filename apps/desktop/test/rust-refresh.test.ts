@@ -15,7 +15,7 @@ function fixture() {
     devices: vi.fn(async () => ({ items: [] })), schedules: vi.fn(async () => []),
     agentQueues: vi.fn(async () => ({ queues: [] })), agentControls: vi.fn(async () => ({ controls: [] })),
   };
-  const store = { backend: 'api', setApiState: vi.fn(), appendLog: vi.fn() };
+  const store = { snapshot: () => ({ daemon: { sessions: [] } }), backend: 'api', setApiState: vi.fn(), appendLog: vi.fn() };
   const runtime = new RustRuntime(store as unknown as StateStore, '/synthetic/binary', '/synthetic/directory');
   const connection = { client, pid: 1, baseUrl: 'http://127.0.0.1:1234' };
   Object.assign(runtime, { connection });

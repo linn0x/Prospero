@@ -1622,15 +1622,7 @@ pub(super) async fn spawn_turn(
         let started = if let Some(thread_id) = native_id {
             let mut params = base.clone();
             params.insert("threadId".into(), json!(thread_id));
-            match rpc.request("thread/resume", Value::Object(params)).await {
-                Ok(value) => value,
-                Err(Error::Invalid(message))
-                    if message.to_ascii_lowercase().contains("no rollout found") =>
-                {
-                    rpc.request("thread/start", Value::Object(base)).await?
-                }
-                Err(error) => return Err(error),
-            }
+            rpc.request("thread/resume", Value::Object(params)).await?
         } else {
             rpc.request("thread/start", Value::Object(base)).await?
         };

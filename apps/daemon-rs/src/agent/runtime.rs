@@ -734,12 +734,13 @@ impl Agents {
                 .await
             }
             SessionKind::Pty => {
-                let directory = self
-                    .0
-                    .database
-                    .directory()
-                    .join("terminal-hosts")
-                    .join(parent_session_id);
+                let directory = self.0.database.directory().join("terminal-hosts").join(
+                    parent
+                        .native_session
+                        .as_ref()
+                        .map(|native| native.runtime_id.as_str())
+                        .unwrap_or(parent_session_id),
+                );
                 let host = crate::terminal::host::Host::attach(directory).await?;
                 let chunks = crate::cross_model_tool::terminal_fan_in_chunks(
                     &report,
@@ -1698,7 +1699,8 @@ impl Agents {
                 .call(move |store| Ok(store.session(&child_id)?.workspace))
                 .await?
         };
-        let expanded = self.expand_prompt(&workspace, &input.text).await?;
+        let codex_native_skills = matches!(&*handle.driver.lock().await, Driver::Codex(_));
+        let expanded = self.expand_prompt(&workspace, &input.text, codex_native_skills).await?;
         handle.driver.lock().await.steer(&expanded, &[]).await?;
         drop(guard);
         self.record_steer(child_session_id, &input.text, &[])
@@ -1931,7 +1933,8 @@ impl Agents {
                     .call(move |store| Ok(store.session(&id)?.workspace))
                     .await?
             };
-            let expanded = self.expand_prompt(&workspace, &text).await?;
+            let codex_native_skills = matches!(&*handle.driver.lock().await, Driver::Codex(_));
+            let expanded = self.expand_prompt(&workspace, &text, codex_native_skills).await?;
             if handle
                 .driver
                 .lock()
@@ -2062,10 +2065,23 @@ impl Agents {
         result
     }
 
-    async fn expand_prompt(&self, workspace: &str, prompt: &str) -> Result<String> {
+    async fn expand_prompt(
+        &self,
+        workspace: &str,
+        prompt: &str,
+        codex_native_skills: bool,
+    ) -> Result<String> {
         let workspace = workspace.to_owned();
         let prompt = prompt.to_owned();
-        tokio::task::spawn_blocking(move || crate::skills::expand_prompt(&workspace, &prompt))
+        tokio::task::spawn_blocking(move || {
+            if codex_native_skills {
+                // Codex resolves explicit $skill mentions itself. Inlining the
+                // same SKILL.md here makes the first provider turn pay twice.
+                crate::skills::expand_prompt_for_codex(&workspace, &prompt)
+            } else {
+                crate::skills::expand_prompt(&workspace, &prompt)
+            }
+        })
             .await
             .map_err(|_| Error::Closed)
     }
@@ -2136,7 +2152,12 @@ impl Agents {
         };
         // Expand @file/$skill mentions for the CLI while the stored user
         // record keeps the original text (mirrors legacy structured-session).
-        let expanded = self.expand_prompt(&workspace, &text).await?;
+        let api_profile =
+            Self::account_api_profile(&self.0.database, run.account_id.clone()).await?;
+        let engine = engine_agent(run.agent, api_profile.as_ref());
+        let expanded = self
+            .expand_prompt(&workspace, &text, engine == AgentKind::Codex)
+            .await?;
         self.set_status(id, SessionStatus::Running).await?;
         // Persist the user's original message before invoking the provider.
         let refs = attachment_refs(&attachments);
@@ -2171,8 +2192,6 @@ impl Agents {
             }
             return Err(error);
         }
-        let api_profile =
-            Self::account_api_profile(&self.0.database, run.account_id.clone()).await?;
         let mut environment =
             Self::account_environment(&self.0.database, run.account_id.clone()).await?;
         if let Ok(control) = self.0.control_environment.lock()
@@ -2192,7 +2211,6 @@ impl Agents {
             api_profile,
             agent_preset: run.agent_preset.clone(),
         };
-        let engine = engine_agent(run.agent, options.api_profile.as_ref());
         if let Some(claim_id) = cross_model_claim_id {
             self.mark_cross_model_fan_in_delivered(id, claim_id).await?;
         }
@@ -3577,7 +3595,8 @@ impl Agents {
                     .call(move |store| Ok(store.session(&id)?.workspace))
                     .await?
             };
-            let expanded = self.expand_prompt(&workspace, &row.text).await?;
+            let codex_native_skills = matches!(&*handle.driver.lock().await, Driver::Codex(_));
+            let expanded = self.expand_prompt(&workspace, &row.text, codex_native_skills).await?;
             if handle
                 .driver
                 .lock()
@@ -4430,6 +4449,86 @@ impl Agents {
         Ok(())
     }
 
+    pub async fn archive(&self, id: &str) -> Result<SessionHead> {
+        let sid = id.to_owned();
+        self.0
+            .database
+            .call(move |store| {
+                let head = store.session(&sid)?;
+                let run = store.agent_run(&sid)?;
+                store.set_native_session(
+                    &sid,
+                    NativeSession {
+                        output_start_seq: None,
+                        runtime_id: head
+                            .native_session
+                            .map(|n| n.runtime_id)
+                            .unwrap_or_else(|| sid.clone()),
+                        native_id: run.native_id,
+                        managed: true,
+                        state: "archiving".into(),
+                        error: None,
+                    },
+                )
+            })
+            .await?;
+        let result = self.close(id).await;
+        let sid = id.to_owned();
+        match result {
+            Ok(()) => {
+                self.0
+                    .database
+                    .call(move |store| store.set_native_state(&sid, "archived", None))
+                    .await
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.0
+                    .database
+                    .call(move |store| store.set_native_state(&sid, "failed", Some(detail)))
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn resume(&self, id: &str) -> Result<SessionHead> {
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        let mut entries = self.0.entries.lock().await;
+        if entries.contains_key(id) {
+            return Err(Error::Conflict);
+        }
+        let permit = self
+            .0
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        let sid = id.to_owned();
+        let head = self
+            .0
+            .database
+            .call(move |store| store.resume_archived_agent(&sid))
+            .await?;
+        entries.insert(
+            id.to_owned(),
+            Arc::new(Session {
+                execution_unknown: AtomicBool::new(false),
+                handle: Mutex::new(None),
+                usage: Mutex::new(UsageReport {
+                    windows: Vec::new(),
+                    ..Default::default()
+                }),
+                draining: Mutex::new(()),
+                permit: Mutex::new(Some(permit)),
+            }),
+        );
+        self.publish();
+        Ok(head)
+    }
+
     pub async fn close(&self, id: &str) -> Result<()> {
         let entry = self.session_entry(id).await.ok();
         let _drain = match entry.as_ref() {
@@ -4624,6 +4723,23 @@ impl Agents {
                 } else {
                     store.reconcile_dispatch_session(&archived)
                 }
+            })
+            .await?;
+        let sid = id.to_owned();
+        self.0
+            .database
+            .call(move |store| {
+                let head = store.session(&sid)?;
+                if let Some(mut native) = head
+                    .native_session
+                    .filter(|native| native.state == "archiving")
+                {
+                    native.native_id = store.agent_run(&sid)?.native_id;
+                    native.state = "archived".into();
+                    native.error = None;
+                    store.set_native_session(&sid, native)?;
+                }
+                Ok(())
             })
             .await?;
         self.publish();

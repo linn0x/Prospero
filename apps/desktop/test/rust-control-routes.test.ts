@@ -125,6 +125,7 @@ describe("Rust desktop control routes", () => {
     const calls: unknown[] = [];
     const store = {
       backend: "api",
+      snapshot: () => ({ daemon: { sessions: [] } }),
       setManagedState: () => undefined,
       appendLog: () => undefined,
       setApiState: (state: unknown) => calls.push(state),

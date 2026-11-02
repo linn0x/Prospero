@@ -21,6 +21,7 @@ export default function TerminalsScreen() {
   const styles = useMemo(() => createStyles(palette), [palette]);
   const insets = useSafeAreaInsets();
   const [cwd, setCwd] = useState("");
+  const [homeCwd, setHomeCwd] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -37,17 +38,28 @@ export default function TerminalsScreen() {
     setCreating(false);
     return () => { pending.cancel(); };
   }, [pending]));
+  useFocusEffect(useCallback(() => {
+    if (!conn || !connected || !supported) return;
+    let cancelled = false;
+    void conn.workspaceList("", "home").then(listing => { if (!cancelled) setHomeCwd(listing.cwd); })
+      .catch(failure => { if (!cancelled) setError(failure instanceof Error ? failure.message : "无法读取电脑主目录，请选择起始目录。"); });
+    return () => { cancelled = true; };
+  }, [conn, connected, supported]));
   const create = (): void => {
     if (!conn || !connected || !supported || pending.pending || working) return;
+    const directory = cwd.trim() || homeCwd;
+    if (!directory) { setError("请先选择终端起始目录。"); setPickerOpen(true); return; }
     setError(null); setCreating(true);
     // A tracked create is never queued or retried across reconnects. Returning to
     // the list reuses the existing PTY instead of starting a duplicate shell.
-    pending.track(conn.createSessionTracked("shell", cwd.trim() || undefined, undefined, "pty"),
+    pending.track(conn.createSessionTracked("shell", directory, undefined, "pty"),
       (session) => { setCreating(false); router.push(`/host/${hostId}/session/${session.id}`); },
       (failure) => {
         setCreating(false);
         setError(failure instanceof SessionCreateError && failure.reason === "shell_not_allowed"
           ? "此设备尚未获得终端权限，请在电脑端为该设备允许 Shell 后重试。"
+          : failure instanceof SessionCreateError && failure.message === "runtime worker is unavailable"
+            ? "电脑端终端服务不可用。请检查电脑端运行状态，恢复后再创建终端。"
           : failure instanceof Error ? failure.message : "创建终端失败，请重试。");
       });
   };

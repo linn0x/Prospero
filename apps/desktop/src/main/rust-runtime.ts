@@ -284,7 +284,7 @@ export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[
     ...(controls.currentEffort !== null ? { currentEffort: controls.currentEffort } : {}),
     ...(controls.currentMode !== null ? { currentMode: controls.currentMode } : {}),
   } : undefined;
-  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.accountId ? { accountId: head.accountId } : {}), ...(head.model ? { model: head.model } : {}), ...(head.effort ? { effort: head.effort } : {}), ...(head.approvalPolicy ? { approvalPolicy: head.approvalPolicy } : {}), ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
+  return { id: head.id, archived: head.lifecycle === "archived" && !["archiving", "failed"].includes(head.nativeSession?.state ?? ""), ...(head.nativeSession ? { nativeSession: head.nativeSession } : {}), agent: head.agent, kind: head.kind, ...(head.accountId ? { accountId: head.accountId } : {}), ...(head.model ? { model: head.model } : {}), ...(head.effort ? { effort: head.effort } : {}), ...(head.approvalPolicy ? { approvalPolicy: head.approvalPolicy } : {}), ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
 }
 
 type TerminalReader = Pick<RustConnection["client"], "terminalOutput" | "terminalSnapshot">;
@@ -299,6 +299,11 @@ export async function rustTerminalView(client: TerminalReader, id: string, curso
   const cached = recovery?.replay(id, cursor, page.floorSeq, page.latestSeq);
   if (cached) return cached;
   if (page.resyncRequired) {
+    if (cursor === undefined && page.instanceStartSeq === page.floorSeq) {
+      const snapshot = { seq: page.floorSeq, size: page.initialSize, dataB64: "" };
+      recovery?.snapshot(id, snapshot);
+      return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: "" };
+    }
     const snapshot = await client.terminalSnapshot(id, signal);
     if (snapshot) { recovery?.snapshot(id, snapshot); return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 }; }
     // Retained bytes alone cannot reconstruct cursor, modes or screen contents.
@@ -497,6 +502,11 @@ export class RustRuntime {
     const queueById = new Map(queues.queues.map(queue => [queue.sessionId, queue.items]));
     const controlsById = new Map(controls.controls.map(item => [item.sessionId, item]));
     const sessions = [...active.items, ...recent.items].map(head => rustSessionInfo(head, queueById.get(head.id), controlsById.get(head.id)));
+    const previousSessions = new Map(this.store.snapshot().daemon.sessions.map(session => [session.id, session]));
+    for (const session of sessions) {
+      const previous = previousSessions.get(session.id);
+      if (previous && previous.nativeSession?.runtimeId !== session.nativeSession?.runtimeId) await this.terminalRecovery.forget(session.id);
+    }
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
     this.store.setApiState({ running: true, config: {}, devices: devices as unknown as JsonObject, orchestration: this.orchestrationWindow, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
@@ -1260,6 +1270,16 @@ export class RustRuntime {
     return head.kind;
   }
 
+
+  async setSessionArchived(id: string, archived: boolean, nativeId?: string) {
+    await this.current().client.sessionLifecycle(id, archived, nativeId, this.controller.signal);
+    await this.refresh(true);
+    return this.store.snapshot();
+  }
+
+  nativeConversationCandidates(id: string, query: string) {
+    return this.current().client.nativeConversationCandidates(id, query, this.controller.signal);
+  }
 
   async createPairing(input: { name: string; allowShell: boolean; allowOrchestration: boolean }): Promise<{ output: string; uri?: string }> {
     const result = await this.current().client.createPairing(input, this.controller.signal);
