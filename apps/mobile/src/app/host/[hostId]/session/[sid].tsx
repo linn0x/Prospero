@@ -19,7 +19,7 @@ import * as Linking from "expo-linking";
 import { StatusBar } from "expo-status-bar";
 import { NavigationBar } from "expo-navigation-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { KeyboardAvoidingView } from "react-native-keyboard-controller";
+import { KeyboardAvoidingView, KeyboardEvents } from "react-native-keyboard-controller";
 import ReanimatedDrawerLayout, {
   DrawerKeyboardDismissMode,
   DrawerPosition,
@@ -61,7 +61,7 @@ import { QuickReplies } from "@/components/QuickReplies";
 import { SessionQuickPanel } from "@/components/SessionQuickPanel";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
-import { useAdaptiveLayout } from "@/lib/adaptive-layout";
+import { setSensorRotation, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import {
   pickFromCamera,
   pickFromLibrary,
@@ -480,8 +480,11 @@ export default function SessionScreen() {
     return () => setScreenFocused(false);
   }, []));
   useEffect(() => {
-    const show = Keyboard.addListener("keyboardDidShow", () => setTerminalKeyboardVisible(true));
-    const hide = Keyboard.addListener("keyboardDidHide", () => setTerminalKeyboardVisible(false));
+    // 用 keyboard-controller 的事件而不是 RN Keyboard:后者在 Android 上收起动画
+    // 一开始就发 keyboardDidHide,键位栏先消失、内容跳一行，键盘才往下滑。
+    // 这里出现在动画开始(willShow),消失在动画结束(didHide),键位栏全程贴着键盘。
+    const show = KeyboardEvents.addListener("keyboardWillShow", () => setTerminalKeyboardVisible(true));
+    const hide = KeyboardEvents.addListener("keyboardDidHide", () => setTerminalKeyboardVisible(false));
     return () => { show.remove(); hide.remove(); };
   }, []);
   const [pending, setPending] = useState(0);
@@ -536,6 +539,13 @@ export default function SessionScreen() {
   const isSubagent = subagentId !== undefined;
   const isStructured = session?.kind === "structured";
   const isChat = isStructured;
+  // 合上用外屏时，终端页按重力转屏，不要求用户打开系统自动旋转;离开终端页或展开后交还系统。
+  const followSensor = screenFocused && !isChat && adaptiveLayout.posture.fold === "folded";
+  useEffect(() => {
+    if (!followSensor) return;
+    setSensorRotation(true);
+    return () => setSensorRotation(false);
+  }, [followSensor]);
   const shellTerminal = isShellTerminal(session);
   const terminalEnded = isTerminalEnded(session) || session?.archived === true;
   const terminalSupported = !shellTerminal || supportsRemoteTerminal(runtime.hostInfo);
@@ -1444,7 +1454,9 @@ export default function SessionScreen() {
         ]}
         // 显式使用 native-stack 已知的头部高度，首轮布局就能同步算出 IME 重叠量。
         // automaticOffset 需要异步测量窗口坐标，快速首次点按时可能晚于键盘动画。
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        // Android 也用 padding:height 模式只在键盘判定为收起时才刷新记住的布局高度,
+        // 折叠屏展开/旋转后会把旧屏高度当显式 height 套回来，下方露出一截页面底色。
+        behavior="padding"
         keyboardVerticalOffset={immersiveTerminal ? 0 : headerHeight}
       >
         {screenFocused && immersiveTerminal && <><StatusBar hidden /><NavigationBar hidden /></>}
@@ -1746,6 +1758,7 @@ export default function SessionScreen() {
                 sid={sid}
                 fontSize={fontSize}
                 onFontSize={setCustomTerminalFontSize}
+                layoutKey={`${adaptiveLayout.posture.fold}:${adaptiveLayout.posture.orientation}`}
                 inputEnabled={terminalInputEnabled}
                 sessionEnded={terminalEnded}
                 endedActions={<>

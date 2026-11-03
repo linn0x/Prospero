@@ -303,7 +303,9 @@ export default function FilesScreen(): React.ReactElement {
     return (
       <KeyboardAvoidingView
         style={styles.screen}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        // Android 也用 padding:height 模式只在键盘判定为收起时才刷新记住的布局高度,
+        // 折叠屏展开/旋转后会把旧屏高度当显式 height 套回来，下方露出一截页面底色。
+        behavior="padding"
         keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
       >
         <Stack.Screen

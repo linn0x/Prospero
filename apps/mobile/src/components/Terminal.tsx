@@ -24,6 +24,11 @@ interface Props {
   fontSize: number;
   /** 捏合缩放后回报,让 A+/A− 的基准与终端保持一致 */
   onFontSize?: (size: number) => void;
+  /**
+   * 折叠/展开、横竖屏切换的标识。变化时主动让页面重新 fit:ResizeObserver
+   * 在显示屏切换时可能晚到，行列不变时 xterm 也不会重画。
+   */
+  layoutKey?: string;
   /** 洪峰时的渲染帧率与吞吐;Release 构建里 console 是哑的,只能走 UI */
   onPerf?: (p: { fps: number; kb: number; renderer: string }) => void;
   /** 断线后的 shell 字节不能安全补发，WebView 必须被冻结。 */
@@ -64,6 +69,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
     sid,
     fontSize,
     onFontSize,
+    layoutKey,
     onPerf,
     inputEnabled = true,
     sessionEnded = false,
@@ -81,6 +87,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   const metricsRef = useRef(onPerf !== undefined);
   const attachedRef = useRef(false);
   const lastSeqRef = useRef(0);
+  const resnapshotRef = useRef(false);
   useEffect(() => () => conn.detach(sid), [conn, sid]);
   const queueRef = useRef<object[]>([]);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
@@ -221,7 +228,11 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           sizeRef.current = { cols: msg.cols, rows: msg.rows };
           if (!activeRef.current) break;
           if (!attachedRef.current) tryAttach();
-          else if (!sessionEnded) conn.resize(sid, msg.cols, msg.rows);
+          else if (resnapshotRef.current && !sessionEnded) {
+            resnapshotRef.current = false;
+            lastSeqRef.current = 0;
+            tryAttach();
+          } else if (!sessionEnded) conn.resize(sid, msg.cols, msg.rows);
           break;
         case "input":
           if (activeRef.current && typeof msg.data === "string" && inputEnabled) {
@@ -271,6 +282,14 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
     [conn, sid, tryAttach, rx, onFontSize, onPerf, inputEnabled, onInputB64, onPasteB64, cancelPastes, sessionEnded, requestPaste],
   );
 
+  // 转屏/折叠后，快照里逐行定位的历史没有自动换行标记,xterm 只能截断、不能重排。
+  // 服务端的终端模型会按新宽度重排，所以等新尺寸报上去之后重新要一份完整快照。
+  useEffect(() => {
+    if (!readyRef.current) return;
+    resnapshotRef.current = true;
+    rx({ kind: "fit" });
+  }, [layoutKey, rx]);
+
   useImperativeHandle(ref, () => ({
     scrollToBottom: () => rx({ kind: "scrollBottom" }),
     blur: () => rx({ kind: "blur" }),
@@ -292,7 +311,9 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         setSupportMultipleWindows={false}
         allowsLinkPreview={false}
         webviewDebuggingEnabled={__DEV__}
-        androidLayerType="hardware"
+        // 不要 androidLayerType="hardware":WebView 本身已走 GPU 合成,再套一层
+        // 离屏 layer 在折叠屏展开这类大幅尺寸跳变后不会及时重建,新露出的
+        // 区域直接显示成白块。
         originWhitelist={["*"]}
         bounces={false}
         overScrollMode="never"
