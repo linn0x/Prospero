@@ -313,11 +313,11 @@ export default function HostScreen() {
   }, [conn, runtime.status, isFocused, composing, modelSourcesReload]);
 
   const loadSourceModels = useCallback(async (source: ModelSource) => {
-    const target = sourceCatalogTarget(source);
-    if (!conn || !target) throw new Error("模型源缺少可用端点或凭据。");
+    const target = codeAgent ? sourceCatalogTarget(source, codeAgent) : null;
+    if (!conn || !codeAgent || !target) throw new Error("模型源缺少当前 Agent 可用的端点或凭据。");
     const result = await conn.modelSourceAction({ kind: "models", sourceId: source.id, revision: source.revision, ...target, refresh: true });
     return result.models ?? [];
-  }, [conn]);
+  }, [conn, codeAgent]);
 
   const selectModelSource = async (source: ModelSource, choice: SourceModelChoice): Promise<void> => {
     if (!conn || !codeAgent || runtime.status !== "connected" || sourceBinding) throw new Error("设备未连接或正在选择模型。");

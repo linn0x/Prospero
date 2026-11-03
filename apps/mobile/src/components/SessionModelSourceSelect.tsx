@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import type { AgentApiCatalogModel, CodeAgentKind, ModelSource } from "@prospero/protocol";
-import { agentForSourceRoute, availableSourceRoutes, modelSourcePresentation, sourceCatalogTarget, type SourceModelChoice } from "@/lib/session-model-sources";
+import { agentForSourceRoute, availableSourceRoutes, modelSourcePresentation, sourceCatalogTarget, sourceRouteMatchesAgent, type SourceModelChoice } from "@/lib/session-model-sources";
 import { useMobileTheme } from "@/lib/theme";
 import { Icon } from "./Icon";
 import { Sheet } from "./Sheet";
@@ -29,12 +29,12 @@ export function SessionModelSourceSelect({ agent, sources, loading, error, disab
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogReload, setCatalogReload] = useState(0);
-  const available = useMemo(() => sources.filter((source) => source.enabled).map((source) => ({ source, routes: availableSourceRoutes(source, agent) })).filter((entry) => entry.routes.length > 0 || sourceCatalogTarget(entry.source) !== null), [sources, agent]);
+  const available = useMemo(() => sources.filter((source) => source.enabled).map((source) => ({ source, routes: availableSourceRoutes(source, agent), target: sourceCatalogTarget(source, agent) })).filter((entry) => entry.routes.length > 0 || entry.target !== null), [sources, agent]);
   const selected = available.find((entry) => entry.source.id === sourceId);
   const search = query.trim().toLocaleLowerCase();
   const matches = selected?.routes.filter((route) => `${route.name} ${route.model}`.toLocaleLowerCase().includes(search)) ?? [];
-  const target = selected ? sourceCatalogTarget(selected.source) : null;
-  const catalogOnly = selected && target ? catalog.filter((model) => model.modelCapabilities?.tools !== false && !selected.source.routes.some((route) => route.model === model.id) && `${model.label ?? ""} ${model.id}`.toLocaleLowerCase().includes(search)) : [];
+  const target = selected?.target ?? null;
+  const catalogOnly = selected && target ? catalog.filter((model) => model.modelCapabilities?.tools !== false && !selected.source.routes.some((route) => route.model === model.id && sourceRouteMatchesAgent(route, agent)) && `${model.label ?? ""} ${model.id}`.toLocaleLowerCase().includes(search)) : [];
   useEffect(() => {
     if (!open || !selected || !target) return;
     let cancelled = false;
@@ -45,7 +45,7 @@ export function SessionModelSourceSelect({ agent, sources, loading, error, disab
       }).finally(() => { if (!cancelled) setCatalogLoading(false); });
     }, 0);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [open, selected?.source.id, selected?.source.revision, target?.protocol, target?.credentialId, onLoadModels, catalogReload]);
+  }, [open, selected, target, onLoadModels, catalogReload]);
   const choose = (choice: SourceModelChoice, id: string): void => {
     if (!selected || busyRef.current) return;
     busyRef.current = true; setBusy(true); setBusyRouteId(id); setSelectionError(null);
@@ -86,9 +86,9 @@ export function SessionModelSourceSelect({ agent, sources, loading, error, disab
         {!catalogLoading && !matches.length && !catalogOnly.length && <Text style={{ color: palette.textDim, paddingVertical: 16 }}>没有匹配的可用模型。</Text>}
       </> : <>
         <Text style={{ color: palette.textDim, marginBottom: 10 }}>选择模型源，再选择模型；目录中的新模型会在选择后启用。</Text>
-        {available.map(({ source, routes }) => <Pressable key={source.id} accessibilityRole="button" accessibilityLabel={`模型源 ${source.name}，${routes.length} 个已启用模型`}
+        {available.map(({ source, routes, target }) => <Pressable key={source.id} accessibilityRole="button" accessibilityLabel={`模型源 ${source.name}，${routes.length} 个已启用模型`}
           onPress={() => { setSourceId(source.id); setQuery(""); }} style={[styles.row, { backgroundColor: palette.surfaceRaised }]}>
-          <View style={styles.copy}><Text style={{ color: palette.text, fontWeight: "600" }}>{source.name}</Text><Text style={{ color: palette.textDim, fontSize: 12 }}>{routes.length} 个已启用{sourceCatalogTarget(source) ? " · 可读取目录" : ""}</Text></View>
+          <View style={styles.copy}><Text style={{ color: palette.text, fontWeight: "600" }}>{source.name}</Text><Text style={{ color: palette.textDim, fontSize: 12 }}>{routes.length} 个已启用{target ? " · 可读取目录" : ""}</Text></View>
           <Icon name="chevron.right" size={16} color={palette.accent} />
         </Pressable>)}
         {!available.length && <Text style={{ color: palette.textDim, paddingVertical: 16 }}>暂无已启用模型的模型源。</Text>}

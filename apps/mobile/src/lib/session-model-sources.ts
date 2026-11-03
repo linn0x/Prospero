@@ -8,9 +8,19 @@ export function modelSourcePresentation(width: number, height: number): "side" |
   return width >= 720 && width > height ? "side" : "bottom";
 }
 
-export function sourceCatalogTarget(source: ModelSource): { protocol: ModelSourceRoute["protocol"]; credentialId: string } | null {
-  const route = source.routes.find((item) => item.id === source.defaultRouteId && item.enabled) ?? source.routes.find((item) => item.enabled);
-  const endpoint = source.endpoints.find((item) => item.protocol === route?.protocol) ?? source.endpoints[0];
+export function sourceRouteMatchesAgent(route: Pick<ModelSourceRoute, "protocol">, preferred: CodeAgentKind): boolean {
+  if (preferred === "claude") return route.protocol === "anthropic";
+  if (preferred === "opencode") return route.protocol === "openai_chat_completions";
+  return route.protocol === "openai_responses" || route.protocol === "openai_chat_completions";
+}
+
+export function sourceCatalogTarget(source: ModelSource, preferred: CodeAgentKind): { protocol: ModelSourceRoute["protocol"]; credentialId: string } | null {
+  if (!source.enabled) return null;
+  const route = source.routes.find((item) => item.id === source.defaultRouteId && item.enabled && item.modelCapabilities?.tools !== false && sourceRouteMatchesAgent(item, preferred)) ??
+    source.routes.find((item) => item.enabled && item.modelCapabilities?.tools !== false && sourceRouteMatchesAgent(item, preferred));
+  const endpoint = route
+    ? source.endpoints.find((item) => item.protocol === route.protocol)
+    : source.endpoints.find((item) => sourceRouteMatchesAgent(item, preferred));
   const credential = source.credentials.find((item) => item.id === route?.credentialId) ?? source.credentials[0];
   return endpoint && credential ? { protocol: endpoint.protocol, credentialId: credential.id } : null;
 }
@@ -35,7 +45,7 @@ export function agentForSourceRoute(route: ModelSourceRoute, preferred: CodeAgen
 /** Show each enabled model once, preferring the default or the current Agent's route. */
 export function availableSourceRoutes(source: ModelSource, preferred: CodeAgentKind): ModelSourceRoute[] {
   if (!source.enabled) return [];
-  const routes = source.routes.filter((route) => route.enabled && route.modelCapabilities?.tools !== false);
+  const routes = source.routes.filter((route) => route.enabled && route.modelCapabilities?.tools !== false && sourceRouteMatchesAgent(route, preferred));
   const byModel = new Map<string, ModelSourceRoute>();
   for (const route of routes) {
     const current = byModel.get(route.model);
