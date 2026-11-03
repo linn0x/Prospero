@@ -3,8 +3,8 @@
  * WS 保持在 RN 侧单连接,WebView 只做渲染与输入采集。
  * attach 流程:page ready → 上报 fit 尺寸 → resize → attach(带 lastSeq 续传)。
  */
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, type ReactNode } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from "react";
+import { findNodeHandle, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import * as Clipboard from "expo-clipboard";
 import type { HostConnection } from "@/lib/connection";
@@ -13,9 +13,13 @@ import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
 import { subscribeFocusedTerminal } from "@/lib/focused-session-stream";
 import { useFocusedSessionEffect } from "@/lib/use-focused-session-effect";
 import { TERMINAL_HTML, TERMINAL_FONT_FAMILY } from "./terminal-html";
+import ProsperoGhosttyModule from "../../modules/prospero-ghostty/src/ProsperoGhosttyModule";
+import ProsperoGhosttyView from "../../modules/prospero-ghostty/src/ProsperoGhosttyView";
+import type { ProsperoGhosttyEvent } from "../../modules/prospero-ghostty/src/ProsperoGhostty.types";
 
 // source 对象保持稳定,避免会话状态刷新时让原生 WebView 误判为需要重新加载。
 const TERMINAL_SOURCE = { html: TERMINAL_HTML } as const;
+const TAIL_ATTACH_EVENTS = 160;
 
 interface Props {
   conn: HostConnection;
@@ -141,7 +145,8 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   const tryAttach = useCallback(() => {
     if (!activeRef.current || !readyRef.current || !conn.isConnected || !sizeRef.current) return;
     if (!sessionEnded) conn.resize(sid, sizeRef.current.cols, sizeRef.current.rows);
-    conn.attach(sid, lastSeqRef.current > 0 ? lastSeqRef.current : undefined);
+    const lastSeq = lastSeqRef.current > 0 ? lastSeqRef.current : undefined;
+    conn.attach(sid, lastSeq, lastSeq === undefined && conn.supportsTerminalTailAttach ? { tailEvents: TAIL_ATTACH_EVENTS } : undefined);
     attachedRef.current = true;
   }, [conn, sid, sessionEnded]);
 
@@ -179,7 +184,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         flush();
       }
     };
-  }, [conn, sid, flush, rx, tryAttach, sessionEnded, cancelPastes]));
+  }, [conn, sid, flush, rx, tryAttach, cancelPastes]));
 
   const requestPaste = useCallback((text: string): Promise<DeliveryResult> => {
     if (!activeRef.current || !readyRef.current || !inputEnabled || !conn.isConnected) {
@@ -346,17 +351,250 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   );
 });
 
+const NativeGhosttyTerminalInner = forwardRef<TerminalHandle, Props>(function NativeGhosttyTerminal(
+  {
+    conn,
+    sid,
+    fontSize,
+    onFontSize,
+    layoutKey,
+    onPerf,
+    inputEnabled = true,
+    sessionEnded = false,
+    endedActions,
+    onInputB64,
+    onPasteB64,
+    disconnectedMessage = "主机未连接；终端输入已冻结。",
+    onRetryConnection,
+  },
+  ref,
+) {
+  const nativeRef = useRef<View>(null);
+  const activeRef = useRef(false);
+  const readyRef = useRef(false);
+  const attachedRef = useRef(false);
+  const lastSeqRef = useRef(0);
+  const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const resnapshotRef = useRef(false);
+  const focusEpochRef = useRef(0);
+  const tag = useCallback(() => {
+    const handle = findNodeHandle(nativeRef.current);
+    return typeof handle === "number" ? handle : null;
+  }, []);
+
+  useEffect(() => () => conn.detach(sid), [conn, sid]);
+
+  const cancelPastes = useCallback(() => {
+    focusEpochRef.current++;
+  }, []);
+  useEffect(() => { if (!inputEnabled) cancelPastes(); }, [inputEnabled, cancelPastes]);
+  useEffect(() => conn.events.on("disconnected", cancelPastes), [conn, cancelPastes]);
+
+  const tryAttach = useCallback(() => {
+    if (!activeRef.current || !readyRef.current || !conn.isConnected || !sizeRef.current) return;
+    if (!sessionEnded) conn.resize(sid, sizeRef.current.cols, sizeRef.current.rows);
+    const lastSeq = lastSeqRef.current > 0 ? lastSeqRef.current : undefined;
+    conn.attach(sid, lastSeq, lastSeq === undefined && conn.supportsTerminalTailAttach ? { tailEvents: TAIL_ATTACH_EVENTS } : undefined);
+    attachedRef.current = true;
+  }, [conn, sid, sessionEnded]);
+
+  useFocusedSessionEffect(useCallback(() => {
+    activeRef.current = true;
+    const cleanup = subscribeFocusedTerminal({
+      conn,
+      sid,
+      cursor: lastSeqRef,
+      snapshot: (message) => {
+        const viewTag = tag();
+        if (viewTag !== null) ProsperoGhosttyModule?.snapshot(viewTag, message.dataB64 ?? null, message.ansi ?? null, message.cols, message.rows);
+      },
+      output: (message) => {
+        const viewTag = tag();
+        if (viewTag === null) return;
+        if (message.events) ProsperoGhosttyModule?.events(viewTag, JSON.stringify({ events: message.events, replay: message.replay === true }));
+        else ProsperoGhosttyModule?.write(viewTag, message.dataB64);
+      },
+      flush: () => undefined,
+      attach: tryAttach,
+    });
+    return () => {
+      activeRef.current = false;
+      cancelPastes();
+      cleanup();
+      attachedRef.current = false;
+      const viewTag = tag();
+      if (viewTag !== null) ProsperoGhosttyModule?.blur(viewTag);
+    };
+  }, [conn, sid, tag, tryAttach, cancelPastes]));
+
+  const onReady = useCallback((event: { nativeEvent: ProsperoGhosttyEvent }) => {
+    readyRef.current = true;
+    attachedRef.current = false;
+    lastSeqRef.current = 0;
+    const cols = event.nativeEvent.cols;
+    const rows = event.nativeEvent.rows;
+    if (typeof cols === "number" && typeof rows === "number") sizeRef.current = { cols, rows };
+    tryAttach();
+  }, [tryAttach]);
+
+  const onResize = useCallback((event: { nativeEvent: ProsperoGhosttyEvent }) => {
+    const cols = event.nativeEvent.cols;
+    const rows = event.nativeEvent.rows;
+    if (typeof cols !== "number" || typeof rows !== "number") return;
+    sizeRef.current = { cols, rows };
+    if (!activeRef.current) return;
+    if (!attachedRef.current) tryAttach();
+    else if (resnapshotRef.current && !sessionEnded) {
+      resnapshotRef.current = false;
+      lastSeqRef.current = 0;
+      tryAttach();
+    } else if (!sessionEnded) conn.resize(sid, cols, rows);
+  }, [conn, sid, tryAttach, sessionEnded]);
+
+  const onInput = useCallback((event: { nativeEvent: ProsperoGhosttyEvent }) => {
+    const data = event.nativeEvent.data;
+    if (!activeRef.current || typeof data !== "string" || !inputEnabled) return;
+    const result = onInputB64 ? onInputB64(data) : conn.inputB64(sid, data);
+    if (!result.accepted) toast(deliveryFailureText(result));
+  }, [conn, sid, inputEnabled, onInputB64]);
+
+  const onClipboardCopy = useCallback((event: { nativeEvent: ProsperoGhosttyEvent }) => {
+    const text = event.nativeEvent.text;
+    if (activeRef.current && typeof text === "string" && text.length > 0) {
+      void Clipboard.setStringAsync(text).then(() => toast("已复制终端内容"), () => toast("无法复制终端内容"));
+    }
+  }, []);
+
+  const onClipboardPaste = useCallback(() => {
+    if (!activeRef.current || !inputEnabled) return;
+    const epoch = focusEpochRef.current;
+    void Clipboard.getStringAsync().then((text) => {
+      if (focusEpochRef.current !== epoch) return;
+      if (!text) { toast("剪贴板是空的"); return; }
+      const viewTag = tag();
+      if (viewTag !== null) ProsperoGhosttyModule?.paste(viewTag, text);
+    }, () => toast("无法读取剪贴板"));
+  }, [inputEnabled, tag]);
+
+  const onNativeFontSize = useCallback((event: { nativeEvent: ProsperoGhosttyEvent }) => {
+    const size = event.nativeEvent.size;
+    if (activeRef.current && typeof size === "number") onFontSize?.(size);
+  }, [onFontSize]);
+
+  const onNativePerf = useCallback((event: { nativeEvent: ProsperoGhosttyEvent }) => {
+    const { fps, kb, renderer } = event.nativeEvent;
+    if (activeRef.current && typeof fps === "number" && typeof kb === "number") {
+      onPerf?.({ fps, kb, renderer: renderer ?? "ghostty" });
+    }
+  }, [onPerf]);
+
+  const onUnavailable = useCallback((event: { nativeEvent: ProsperoGhosttyEvent }) => {
+    const reason = event.nativeEvent.reason;
+    if (typeof reason === "string" && reason) toast(reason);
+  }, []);
+
+  useEffect(() => {
+    if (!readyRef.current) return;
+    resnapshotRef.current = true;
+    const viewTag = tag();
+    if (viewTag !== null) ProsperoGhosttyModule?.scrollToBottom(viewTag);
+  }, [layoutKey, tag]);
+
+  useImperativeHandle(ref, () => ({
+    scrollToBottom: () => {
+      const viewTag = tag();
+      if (viewTag !== null) ProsperoGhosttyModule?.scrollToBottom(viewTag);
+    },
+    blur: () => {
+      const viewTag = tag();
+      if (viewTag !== null) ProsperoGhosttyModule?.blur(viewTag);
+    },
+    copyAll: () => {
+      const viewTag = tag();
+      if (viewTag !== null) ProsperoGhosttyModule?.copyAll(viewTag);
+    },
+    search: (text, previous = false, incremental = false) => {
+      const viewTag = tag();
+      if (viewTag !== null) ProsperoGhosttyModule?.search(viewTag, text, previous, incremental);
+    },
+    paste: (text) => {
+      const viewTag = tag();
+      if (viewTag === null) return Promise.resolve({ accepted: false, reason: "offline" });
+      ProsperoGhosttyModule?.paste(viewTag, text);
+      return Promise.resolve(inputEnabled ? { accepted: true, disposition: "sent" } : { accepted: false, reason: "offline" });
+    },
+  }), [tag, inputEnabled]);
+
+  if (!ProsperoGhosttyView) return null;
+
+  return (
+    <View style={styles.wrap}>
+      <ProsperoGhosttyView
+        ref={nativeRef}
+        style={styles.native}
+        active={activeRef.current}
+        fontSize={fontSize}
+        inputEnabled={inputEnabled}
+        onReady={onReady}
+        onUnavailable={onUnavailable}
+        onResize={onResize}
+        onInput={onInput}
+        onClipboardCopy={onClipboardCopy}
+        onClipboardPaste={onClipboardPaste}
+        onFontSize={onNativeFontSize}
+        onPerf={onNativePerf}
+      />
+      {!inputEnabled && (
+        <View style={[styles.inputFrozen, sessionEnded && styles.endedNotice]} pointerEvents={sessionEnded ? "box-none" : "auto"}>
+          <View
+            style={styles.inputFrozenCard}
+            accessible={!sessionEnded}
+            accessibilityLiveRegion="polite"
+            accessibilityLabel={disconnectedMessage}
+          >
+            <Text style={styles.inputFrozenText}>{disconnectedMessage}</Text>
+            {sessionEnded && endedActions}
+            {onRetryConnection && (
+              <Pressable
+                style={({ pressed }) => [styles.inputFrozenRetry, pressed && styles.inputFrozenRetryPressed]}
+                onPress={onRetryConnection}
+                accessibilityRole="button"
+                accessibilityLabel="重新连接主机后继续终端输入"
+              >
+                <Text style={styles.inputFrozenRetryText}>重试连接</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+      )}
+    </View>
+  );
+});
+
 /**
  * 顶部状态计时每秒都会更新;终端连接和 sid 没变时不应连带重渲染 WebView。
  * 这既避免无意义的原生属性同步,也守住正在进行的输入法组合态。
  */
 export const Terminal = memo(forwardRef<TerminalHandle, Props>(function Terminal(props, ref) {
-  return <TerminalInner key={`${props.conn.host.id}\u0000${props.sid}`} {...props} ref={ref} />;
+  const [nativeGhostty, setNativeGhostty] = useState(false);
+  useEffect(() => {
+    if (Platform.OS !== "android" || !ProsperoGhosttyModule || !ProsperoGhosttyView) {
+      setNativeGhostty(false);
+      return;
+    }
+    const availability = ProsperoGhosttyModule.availability();
+    setNativeGhostty(availability.available === true);
+  }, []);
+  const key = `${props.conn.host.id}\u0000${props.sid}`;
+  return nativeGhostty
+    ? <NativeGhosttyTerminalInner key={key} {...props} ref={ref} />
+    : <TerminalInner key={key} {...props} ref={ref} />;
 }));
 
 const styles = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: "#09090b" },
   web: { flex: 1, backgroundColor: "#09090b" },
+  native: { flex: 1, backgroundColor: "#09090b" },
   inputFrozen: {
     ...StyleSheet.absoluteFill,
     alignItems: "center",

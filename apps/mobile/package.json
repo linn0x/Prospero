@@ -74,6 +74,7 @@
     "prelint": "npm run build:protocol",
     "lint": "expo lint",
     "build:terminal": "node scripts/build-terminal-html.mjs",
+    "build:android-ghostty": "node scripts/build-android-ghostty.mjs",
     "prepare:android-voice-model": "./scripts/prepare-android-voice-model.sh",
     "prebuild:android": "npm run build:protocol",
     "build:android": "./scripts/build-apk.sh",

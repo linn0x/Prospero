@@ -857,6 +857,7 @@ export const C2SSessionAttachSchema = z.object({
   sid,
   /** 客户端已收到的最后 seq;省略表示要全量快照 */
   lastSeq: seq.optional(),
+  tailEvents: z.number().int().min(1).max(512).optional(),
 });
 
 export const C2STermInputSchema = z.object({

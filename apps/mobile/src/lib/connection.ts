@@ -37,6 +37,7 @@ import {
   CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_SESSION_FORK,
   CAPABILITY_SUBAGENT_HISTORY,
+  CAPABILITY_TERMINAL_TAIL_ATTACH,
   CAPABILITY_WORKSPACE_ROOTS,
   CAPABILITY_WORKSPACE_SUMMARY,
   CLOSE_AUTH_FAILED,
@@ -220,6 +221,7 @@ export class HostConnection {
     if (capability === CAPABILITY_CHAT_ATTACHMENT_PREVIEWS) return version >= 11;
     if (capability === CAPABILITY_SESSION_CREATE_MODEL) return version >= 11;
     if (capability === CAPABILITY_WORKSPACE_ROOTS) return false;
+    if (capability === CAPABILITY_TERMINAL_TAIL_ATTACH) return false;
     return false;
   }
 
@@ -306,6 +308,10 @@ export class HostConnection {
 
   get supportsWorkspaceSummary(): boolean {
     return this.supportsCapability(CAPABILITY_WORKSPACE_SUMMARY);
+  }
+
+  get supportsTerminalTailAttach(): boolean {
+    return this.supportsCapability(CAPABILITY_TERMINAL_TAIL_ATTACH);
   }
 
   start(): void {
@@ -1516,7 +1522,7 @@ export class HostConnection {
   private foregroundAt: number | null = null;
   private attachStartedAt = new Map<string, number>();
 
-  attach(sid: string, lastSeq?: number): void {
+  attach(sid: string, lastSeq?: number, options?: { tailEvents?: number }): void {
     const requested = lastSeq ?? null;
     const previous = this.attachedChatSessions.get(sid);
     if (previous === null || (previous !== undefined && requested !== null && requested <= previous)) {
@@ -1524,7 +1530,12 @@ export class HostConnection {
     }
     this.attachedChatSessions.set(sid, requested);
     this.attachStartedAt.set(sid, Date.now());
-    this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
+    this.send({
+      type: "session.attach",
+      sid,
+      ...(lastSeq !== undefined ? { lastSeq } : {}),
+      ...(options?.tailEvents !== undefined ? { tailEvents: options.tailEvents } : {}),
+    });
   }
 
   detach(sid: string): void {

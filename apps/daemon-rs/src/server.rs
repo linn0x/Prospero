@@ -1331,6 +1331,7 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
         "session.terminal-fork-picker.v1",
         "terminal.remote.v1",
         "terminal.snapshot-base64.v1",
+        "terminal.tail-attach.v1",
         "agent.accounts.v1",
         "agent.api-profiles.v1",
         "agent.api-protocols.v1",
@@ -3373,6 +3374,10 @@ async fn remote_session_attach(
 ) -> Result<()> {
     let sid = require_str(&message, "sid")?.to_owned();
     let last_seq = message.get("lastSeq").and_then(JsonValue::as_i64);
+    let tail_events = message
+        .get("tailEvents")
+        .and_then(JsonValue::as_u64)
+        .map(|value| value.clamp(1, 512) as i64);
     let source = sid.clone();
     let head = api.call(move |store| store.session(&source)).await?;
     send_remote_json(
@@ -3381,7 +3386,7 @@ async fn remote_session_attach(
         &json!({"type":"session.state","session":remote_session_info(head)}),
     )
     .await?;
-    if remote_try_pty_attach(api, socket, channel, state, &sid, last_seq).await? {
+    if remote_try_pty_attach(api, socket, channel, state, &sid, last_seq, tail_events).await? {
         return Ok(());
     }
     remote_chat_attach(api, socket, channel, state, message).await
@@ -3394,6 +3399,7 @@ async fn remote_try_pty_attach(
     state: &mut RemoteWsState,
     sid: &str,
     last_seq: Option<i64>,
+    tail_events: Option<i64>,
 ) -> Result<bool> {
     let page = match api
         .terminals
@@ -3410,6 +3416,12 @@ async fn remote_try_pty_attach(
         Err(Error::NotFound) => return Ok(false),
         Err(error) => return Err(error),
     };
+    if last_seq.is_none()
+        && let Some(tail_events) = tail_events
+    {
+        send_terminal_tail(api, socket, channel, state, sid, &page, tail_events).await?;
+        return Ok(true);
+    }
     state.pty_attachments.insert(
         sid.to_owned(),
         RemotePtyAttachment {
@@ -3439,6 +3451,69 @@ async fn remote_try_pty_attach(
     }
     send_terminal_snapshot(api, socket, channel, state, sid).await?;
     Ok(true)
+}
+
+async fn send_terminal_tail(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+    sid: &str,
+    bounds: &TerminalPage,
+    tail_events: i64,
+) -> Result<()> {
+    let latest = bounds.latest_seq;
+    let mut base = latest.saturating_sub(tail_events).max(bounds.floor_seq);
+    let mut page = api
+        .terminals
+        .read(
+            sid.to_owned(),
+            TerminalQuery {
+                after_seq: Some(base),
+                wait_ms: None,
+            },
+        )
+        .await?;
+    if page.resync_required {
+        base = page.floor_seq.max(0);
+        page = api
+            .terminals
+            .read(
+                sid.to_owned(),
+                TerminalQuery {
+                    after_seq: Some(base),
+                    wait_ms: None,
+                },
+            )
+            .await?;
+    }
+    let size = api
+        .terminals
+        .snapshot(sid.to_owned())
+        .await?
+        .map(|snapshot| snapshot.size)
+        .unwrap_or(page.initial_size);
+    state.pty_attachments.insert(
+        sid.to_owned(),
+        RemotePtyAttachment {
+            last_sent_seq: base,
+            last_ack_seq: base,
+            pending: false,
+            replay_until: page.latest_seq,
+        },
+    );
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"term.snapshot","sid":sid,"ansi":"","dataB64":"","seq":base,"cols":size.cols,"rows":size.rows}),
+    )
+    .await?;
+    send_terminal_page(socket, channel, sid, &page, true).await?;
+    if let Some(att) = state.pty_attachments.get_mut(sid) {
+        att.last_sent_seq = page.next_seq;
+        att.pending = page.next_seq < page.latest_seq;
+    }
+    Ok(())
 }
 
 async fn send_terminal_snapshot(
@@ -3967,6 +4042,7 @@ fn require_u16(value: &JsonValue, key: &str) -> Result<u16> {
 fn remote_error_code(error: &Error) -> &'static str {
     match error {
         Error::NotFound => "session_not_found",
+        Error::Conflict => "conflict",
         Error::Feature(code, _) if code == "shell_not_allowed" => "shell_not_allowed",
         _ => "bad_message",
     }
@@ -4415,6 +4491,7 @@ fn health_capabilities() -> Vec<String> {
         "terminal.output.page",
         "terminal.snapshot",
         "terminal.stream.v1",
+        "terminal.tail-attach.v1",
         "events.replay",
         "events.stream",
         "agent.account.api.models",
