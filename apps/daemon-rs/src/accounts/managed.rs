@@ -288,6 +288,7 @@ pub(crate) fn profile_account_environment(
     let root = profile_account_root_for_agent(data, id, agent)?;
     if agent == AgentKind::Codex {
         crate::cross_model_tool::install_codex_skill(&root)?;
+        crate::accounts::profile::install_codex_model_catalog(&root, profile)?;
     }
     let secret = profile_secret_for_agent(data, id, agent, profile)?.unwrap_or_default();
     if profile.protocol() == "openai_chat_completions" {

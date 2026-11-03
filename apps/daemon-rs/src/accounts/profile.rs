@@ -588,6 +588,104 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
 }
 
+/// File name of the per-account Codex model catalog inside `CODEX_HOME`.
+pub(crate) const CODEX_MODEL_CATALOG: &str = "prospero-models.json";
+
+/// Published model metadata for endpoints whose vendors document a Codex
+/// catalog (Zhipu GLM Coding Plan). Route capabilities take precedence.
+fn known_codex_model(model: &str) -> Option<(i64, &'static [&'static str], &'static str)> {
+    match model {
+        "glm-5.3" => Some((1_048_576, &["low", "high", "max"], "Z.ai's latest flagship model")),
+        "glm-5-turbo" => Some((204_800, &[], "Agent-optimized model")),
+        _ => None,
+    }
+}
+
+/// Codex warns "Model metadata … not found" and falls back to generic limits for
+/// any slug outside its built-in catalog. Builds the entry Codex would otherwise
+/// lack, or `None` when nothing reliable is known about the context window.
+pub(crate) fn codex_model_catalog(profile: &ApiProfile) -> Option<serde_json::Value> {
+    let caps = profile.model_capabilities.as_ref();
+    let known = known_codex_model(&profile.model);
+    let context = caps
+        .and_then(|caps| caps.context_window)
+        .or(known.map(|(context, _, _)| context))?;
+    let efforts: Vec<String> = caps
+        .and_then(|caps| caps.supported_efforts.clone())
+        .unwrap_or_else(|| {
+            known
+                .map(|(_, efforts, _)| efforts.iter().map(|effort| (*effort).to_owned()).collect())
+                .unwrap_or_default()
+        });
+    let reasoning = caps.and_then(|caps| caps.reasoning).unwrap_or(true);
+    let default_effort = efforts
+        .last()
+        .cloned()
+        .unwrap_or_else(|| if reasoning { "medium" } else { "none" }.into());
+    let input_modalities = if caps.and_then(|caps| caps.vision) == Some(true) {
+        serde_json::json!(["text", "image"])
+    } else {
+        serde_json::json!(["text"])
+    };
+    Some(serde_json::json!({
+        "models": [{
+            "slug": profile.model,
+            "display_name": profile.model,
+            "description": known.map(|(_, _, description)| description).unwrap_or("Prospero model source"),
+            "default_reasoning_level": default_effort,
+            "supported_reasoning_levels": efforts
+                .iter()
+                .map(|effort| serde_json::json!({ "effort": effort, "description": effort }))
+                .collect::<Vec<_>>(),
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 0,
+            "base_instructions": "",
+            "supports_reasoning_summaries": reasoning,
+            "default_reasoning_summary": "none",
+            "support_verbosity": false,
+            "apply_patch_tool_type": "freeform",
+            "truncation_policy": { "mode": "bytes", "limit": 10000 },
+            "context_window": context,
+            "max_context_window": context,
+            "effective_context_window_percent": 95,
+            "supports_parallel_tool_calls": caps.and_then(|caps| caps.tools).unwrap_or(true),
+            "experimental_supported_tools": [],
+            "input_modalities": input_modalities,
+        }]
+    }))
+}
+
+/// Writes the account's model catalog and points the account's own
+/// `config.toml` at it. Only `model_catalog_json` is touched so settings Codex
+/// persists there (trusted projects, notices) survive every launch; the shared
+/// `~/.codex` of the native account is never involved.
+pub(crate) fn install_codex_model_catalog(root: &std::path::Path, profile: &ApiProfile) -> Result<()> {
+    let catalog_path = root.join(CODEX_MODEL_CATALOG);
+    let config_path = root.join("config.toml");
+    let mut config = match std::fs::read_to_string(&config_path) {
+        Ok(source) => toml::from_str::<toml::Table>(&source)
+            .map_err(|_| Error::Invalid("Codex 账号 config.toml 无效".into()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(catalog) = codex_model_catalog(profile) else {
+        if config.remove("model_catalog_json").is_some() {
+            std::fs::write(&config_path, toml::to_string(&config).map_err(|_| Error::Invalid("Codex 账号 config.toml 无效".into()))?)?;
+        }
+        let _ = std::fs::remove_file(&catalog_path);
+        return Ok(());
+    };
+    std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog)?)?;
+    let path = catalog_path.to_string_lossy().into_owned();
+    if config.get("model_catalog_json").and_then(toml::Value::as_str) != Some(path.as_str()) {
+        config.insert("model_catalog_json".into(), toml::Value::String(path));
+        std::fs::write(&config_path, toml::to_string(&config).map_err(|_| Error::Invalid("Codex 账号 config.toml 无效".into()))?)?;
+    }
+    Ok(())
+}
+
 /// Ensures `<root>/.claude.json` records completed onboarding so a profile
 /// session never opens first-run flows against a third-party endpoint.
 fn prepare_claude_config(root: &std::path::Path) {
@@ -639,6 +737,74 @@ mod tests {
             model_capabilities: None,
             headers: None,
         }
+    }
+
+    fn codex_profile(model: &str, caps: Option<ModelCapabilities>) -> ApiProfile {
+        ApiProfile {
+            model: model.into(),
+            model_capabilities: caps,
+            ..profile(Some("openai_responses"))
+        }
+    }
+
+    #[test]
+    fn codex_catalog_uses_published_glm_metadata() {
+        let catalog = codex_model_catalog(&codex_profile("glm-5.3", None)).expect("known model");
+        let entry = &catalog["models"][0];
+        assert_eq!(entry["slug"], "glm-5.3");
+        assert_eq!(entry["context_window"], 1_048_576);
+        assert_eq!(entry["default_reasoning_level"], "max");
+        let efforts: Vec<_> = entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, ["low", "high", "max"]);
+    }
+
+    #[test]
+    fn codex_catalog_prefers_route_capabilities_and_skips_unknown_models() {
+        let caps = ModelCapabilities {
+            context_window: Some(64_000),
+            supported_efforts: Some(vec!["low".into(), "medium".into()]),
+            vision: Some(true),
+            max_output_tokens: None,
+            tools: None,
+            reasoning: None,
+        };
+        let catalog = codex_model_catalog(&codex_profile("glm-5.3", Some(caps))).unwrap();
+        assert_eq!(catalog["models"][0]["context_window"], 64_000);
+        assert_eq!(catalog["models"][0]["default_reasoning_level"], "medium");
+        assert_eq!(catalog["models"][0]["input_modalities"], serde_json::json!(["text", "image"]));
+        assert!(codex_model_catalog(&codex_profile("vendor-mystery", None)).is_none());
+    }
+
+    #[test]
+    fn codex_catalog_install_preserves_account_config() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config.toml"),
+            "[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap();
+        install_codex_model_catalog(root.path(), &codex_profile("glm-5-turbo", None)).unwrap();
+        let config: toml::Table =
+            toml::from_str(&std::fs::read_to_string(root.path().join("config.toml")).unwrap()).unwrap();
+        let catalog_path = root.path().join(CODEX_MODEL_CATALOG);
+        assert_eq!(config["model_catalog_json"].as_str(), catalog_path.to_str());
+        assert_eq!(config["projects"]["/work"]["trust_level"].as_str(), Some("trusted"));
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+        assert_eq!(catalog["models"][0]["context_window"], 204_800);
+
+        // A route switched to an unknown model drops the stale catalog again.
+        install_codex_model_catalog(root.path(), &codex_profile("vendor-mystery", None)).unwrap();
+        let config: toml::Table =
+            toml::from_str(&std::fs::read_to_string(root.path().join("config.toml")).unwrap()).unwrap();
+        assert!(config.get("model_catalog_json").is_none());
+        assert!(config.get("projects").is_some());
+        assert!(!catalog_path.exists());
     }
 
     #[test]
