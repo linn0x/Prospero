@@ -1,4 +1,7 @@
-import type { FoldingFeatureInfo } from "../../modules/prospero-window-layout/src/ProsperoWindowLayout.types";
+import type {
+  DeviceDisplayInfo,
+  FoldingFeatureInfo,
+} from "../../modules/prospero-window-layout/src/ProsperoWindowLayout.types";
 
 export type WindowWidthClass = "compact" | "medium" | "expanded";
 
@@ -68,4 +71,40 @@ export function primaryPaneWidth(
   panes: VerticalPaneLayout | null,
 ): number {
   return panes?.start ?? width;
+}
+
+export type FoldPosture = "folded" | "unfolded" | "half-opened" | "none";
+export type WindowOrientation = "portrait" | "landscape";
+
+export interface DevicePosture {
+  /** none = 不是折叠机(或拿不到原生信息)。 */
+  fold: FoldPosture;
+  orientation: WindowOrientation;
+}
+
+// 外屏(Fold 系列约 360–480dp)和内屏(≥ 600dp)之间的分界,沿用 Android 平板断点。
+const UNFOLDED_MIN_DISPLAY_WIDTH = 600;
+
+/**
+ * 判定「合上/展开 × 横屏/竖屏」。
+ *
+ * - 方向看窗口宽高比，不看系统 rotation:Fold 内屏的自然方向是横向,
+ *   rotation 0 在那里是横屏。
+ * - 有 FoldingFeature 一定是展开(平展或半折)。没有时不能直接当作合上:
+ *   内屏分屏/小窗同样没有,所以再看当前显示屏的最短边。
+ */
+export function devicePosture(
+  width: number,
+  height: number,
+  feature: FoldingFeatureInfo | null,
+  device: DeviceDisplayInfo | undefined,
+): DevicePosture {
+  const orientation: WindowOrientation = width > height ? "landscape" : "portrait";
+  let fold: FoldPosture = "none";
+  if (feature !== null) {
+    fold = feature.state === "half-opened" ? "half-opened" : "unfolded";
+  } else if (device?.isFoldable) {
+    fold = device.displaySmallestWidth < UNFOLDED_MIN_DISPLAY_WIDTH ? "folded" : "unfolded";
+  }
+  return { fold, orientation };
 }

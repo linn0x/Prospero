@@ -32,12 +32,21 @@
       inset 0 1px rgba(125, 207, 255, 0.06),
       inset 12px 0 28px -24px rgba(122, 162, 247, 0.4);
   }
+  /*
+   * 终端贴底:键盘弹出/收起、折叠屏展开时容器高度逐帧变化，而行数要等尺寸
+   * 稳定后才重算。底部对齐让提示符一路贴着键盘上沿走，多出/不够的高度落在
+   * 顶部(历史区),不会出现提示符被裁掉、再整屏跳一下的情况。
+   */
   #term {
     height: 100%;
     width: 100%;
     padding: 8px 3px 8px 10px;
     box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
   }
+  #term > .xterm { flex: none; }
   .xterm .xterm-viewport {
     overflow-y: auto !important;
     -webkit-overflow-scrolling: touch;
@@ -178,9 +187,19 @@
   if (search) term.loadAddon(search);
 
   let renderer = "dom";
+  function repaint() {
+    try { term.refresh(0, term.rows - 1); } catch (e) {}
+  }
   try {
     const gl = new window.WebglAddon.WebglAddon();
-    gl.onContextLoss(() => gl.dispose());
+    // 折叠屏展开/合上会把 Activity 挪到另一块显示器,GPU 上下文可能随之丢失。
+    // dispose 只是把渲染器换回 DOM,并不会重画 —— 不补 refresh 就停在半张
+    // 旧画面上,直到下一次输出才恢复。
+    gl.onContextLoss(() => {
+      gl.dispose();
+      renderer = "dom";
+      repaint();
+    });
     term.loadAddon(gl);
     renderer = "webgl";
   } catch (e) {
@@ -344,14 +363,31 @@
   let fontReady = false;
   let fontRevision = 0;
   let fitTimer = null;
+  // 快照/回放会把终端改成服务端记录的行列;那可能是本端 resize 生效前的旧值
+  // (例如折叠屏换到外屏后重连)。写完后若与容器能放下的不一致，就重新 fit
+  // 并把正确尺寸报回去。只在快照/回放后做，不跟实时流里其他端的 resize 抢。
+  function refitIfDrifted() {
+    if (!fontReady || typeof fit.proposeDimensions !== "function") return;
+    let proposed = null;
+    try { proposed = fit.proposeDimensions(); } catch (e) {}
+    if (proposed && (proposed.cols !== term.cols || proposed.rows !== term.rows)) doFit();
+  }
+
+  // 尾随防抖：动画期间 ResizeObserver 每帧都会触发，过去每 50ms fit 一次，
+  // 等于在动画中途反复改 PTY 尺寸、逼 shell/TUI 重绘好几遍。现在只在尺寸
+  // 停止变化后 fit 一次;中间帧靠上面的贴底布局保持画面连贯。
   function doFit() {
-    if (!fontReady || fitTimer) return;
+    if (!fontReady) return;
+    if (fitTimer) clearTimeout(fitTimer);
     fitTimer = setTimeout(() => {
       fitTimer = null;
       if (!fontReady) return;
       try { fit.fit(); } catch (e) {}
+      // 尺寸跳变(折叠屏展开)后 fit 若算出相同的行列,xterm 不会重画,
+      // 新露出的区域就一直是空的。
+      try { term.refresh(0, term.rows - 1); } catch (e) {}
       post({ kind: "resized", cols: term.cols, rows: term.rows });
-    }, 50);
+    }, 80);
   }
 
   // 性能打点(W4 spike):有输出流量的秒窗上报 fps 与吞吐
@@ -406,7 +442,11 @@
       terminalWriting = true;
       if (action.replay) replaying = true;
       perfBytes += bytes.length;
-      term.write(bytes, () => { terminalWriting = false; if (action.snapshot || action.replay) replaying = false; flushTerminalQueue(); });
+      term.write(bytes, () => {
+        terminalWriting = false;
+        if (action.snapshot || action.replay) { replaying = false; refitIfDrifted(); }
+        flushTerminalQueue();
+      });
       return;
     }
   }
@@ -520,10 +560,12 @@
    * 吸附是刻意的:自由缩放会停在 11.3px 这种值上,等宽字体在非整数字号下
    * 渲染发虚,而手机上本来就看得吃力。档位之间跳,每一档都清晰。
    */
+  // 双指缩放进行中时滚动让路;由 pinchZoom 写、touchScroll 读。
+  let pinchActive = false;
   (function pinchZoom() {
     const STEPS = [8, 9, 10, 11, 12, 14, 16, 18, 20];
     const el = document.getElementById("term");
-    let base = 0, startSize = 12;
+    let base = 0, startSize = 12, starts = null;
     const dist = (t) => Math.hypot(
       t[0].clientX - t[1].clientX,
       t[0].clientY - t[1].clientY,
@@ -532,10 +574,23 @@
       if (e.touches.length !== 2) return;
       base = dist(e.touches);
       startSize = term.options.fontSize;
+      starts = [...e.touches].map((t) => ({ id: t.identifier, x: t.clientX, y: t.clientY }));
+      pinchActive = false;
     }, { passive: true });
     el.addEventListener("touchmove", (e) => {
-      if (e.touches.length !== 2 || base === 0) return;
-      const target = startSize * (dist(e.touches) / base);
+      if (e.touches.length !== 2 || base === 0 || !starts) return;
+      const ratio = dist(e.touches) / base;
+      if (!pinchActive) {
+        // 横屏握持时拇指常搭在屏幕边上，另一指滑动也会改变两点距离。
+        // 只有两指都动起来、且距离变化明显，才认作捏合。
+        const bothMoved = [...e.touches].every((t) => {
+          const s0 = starts.find((s) => s.id === t.identifier);
+          return s0 && Math.hypot(t.clientX - s0.x, t.clientY - s0.y) > 12;
+        });
+        if (!bothMoved || Math.abs(ratio - 1) < 0.12) return;
+        pinchActive = true;
+      }
+      const target = startSize * ratio;
       let best = STEPS[0];
       for (const s of STEPS) {
         if (Math.abs(s - target) < Math.abs(best - target)) best = s;
@@ -546,8 +601,120 @@
         post({ kind: "fontSize", size: best });
       }
     }, { passive: true });
+    const end = (e) => {
+      if (e.touches.length < 2) { base = 0; starts = null; pinchActive = false; }
+    };
+    el.addEventListener("touchend", end, { passive: true });
+    el.addEventListener("touchcancel", end, { passive: true });
+  })();
+
+  /**
+   * 单指上下拖动滚动终端。
+   *
+   * xterm 6 换成了 VS Code 的滚动容器,只认 wheel,不再处理触摸,手机上划不动。
+   * 这里把位移按行高折算:普通缓冲区直接 scrollLines;应用开了鼠标追踪
+   * (全屏 TUI)就合成 wheel 事件交给 xterm,由它按当前协议编码成滚轮上报。
+   * 备用缓冲区且没开鼠标时什么都不发 —— xterm 会把滚轮变成方向键,
+   * 一次误划就会翻 Agent 的输入历史。
+   */
+  (function touchScroll() {
+    const el = document.getElementById("term");
+    let lastY = 0, lastT = 0, acc = 0, velocity = 0;
+    let dragging = false, inertia = null;
+    const cellHeight = () => {
+      const screen = term.element && term.element.querySelector(".xterm-screen");
+      const h = screen ? screen.getBoundingClientRect().height / term.rows : 0;
+      return h > 0 ? h : 16;
+    };
+    const stopInertia = () => {
+      if (inertia !== null) cancelAnimationFrame(inertia);
+      inertia = null;
+    };
+    function scrollLines(lines, x, y) {
+      if (lines === 0) return;
+      if (term.modes.mouseTrackingMode !== "none") {
+        const target = term.element.querySelector(".xterm-screen") || term.element;
+        const step = lines > 0 ? 1 : -1;
+        for (let i = 0; i < Math.abs(lines); i++) {
+          target.dispatchEvent(new WheelEvent("wheel", {
+            bubbles: true, cancelable: true, clientX: x, clientY: y,
+            deltaY: step, deltaMode: WheelEvent.DOM_DELTA_LINE,
+          }));
+        }
+      } else if (term.buffer.active.type === "normal") {
+        term.scrollLines(lines);
+      }
+    }
+    // 手指上移 = 内容往新的方向走 = 正向行数
+    function consume(dy, x, y) {
+      acc -= dy;
+      const h = cellHeight();
+      const lines = acc > 0 ? Math.floor(acc / h) : Math.ceil(acc / h);
+      if (lines !== 0) {
+        acc -= lines * h;
+        scrollLines(lines, x, y);
+      }
+    }
+    // 按触点跟踪：屏幕上搭着一根不动的手指(横屏握持的拇指)时，另一根手指
+    // 照样能滚。谁先在竖直方向上动起来就跟谁。
+    const starts = new Map();
+    let trackId = null;
+    el.addEventListener("touchstart", (e) => {
+      stopInertia();
+      for (const t of e.changedTouches) starts.set(t.identifier, { x: t.clientX, y: t.clientY });
+      if (!dragging) { acc = 0; velocity = 0; }
+    }, { passive: true });
+    el.addEventListener("touchmove", (e) => {
+      if (pinchActive) { dragging = false; trackId = null; return; }
+      if (!dragging) {
+        for (const t of e.touches) {
+          const s0 = starts.get(t.identifier);
+          if (!s0) continue;
+          const dx = Math.abs(t.clientX - s0.x), dy = Math.abs(t.clientY - s0.y);
+          if (dy > 10 && dy >= dx) {
+            dragging = true;
+            trackId = t.identifier;
+            lastY = t.clientY; lastT = performance.now();
+            break;
+          }
+        }
+        if (!dragging) return;
+      }
+      const t = [...e.touches].find((x) => x.identifier === trackId);
+      if (!t) return;
+      e.preventDefault();
+      const now = performance.now();
+      const dy = t.clientY - lastY;
+      const dt = Math.max(1, now - lastT);
+      velocity = 0.8 * (dy / dt) + 0.2 * velocity;
+      lastY = t.clientY; lastT = now;
+      consume(dy, t.clientX, t.clientY);
+    }, { passive: false });
     el.addEventListener("touchend", (e) => {
-      if (e.touches.length < 2) base = 0;
+      let ended = null;
+      for (const t of e.changedTouches) {
+        starts.delete(t.identifier);
+        if (t.identifier === trackId) ended = t;
+      }
+      if (!dragging || !ended) return;
+      dragging = false; trackId = null;
+      const x = ended.clientX, y = ended.clientY;
+      // 停顿后再抬手不算甩动
+      if (performance.now() - lastT > 80 || Math.abs(velocity) < 0.3) return;
+      let prev = performance.now();
+      const step = (now) => {
+        const dt = Math.min(32, now - prev);
+        prev = now;
+        velocity *= Math.pow(0.995, dt);
+        if (Math.abs(velocity) < 0.05) { inertia = null; return; }
+        consume(velocity * dt, x, y);
+        inertia = requestAnimationFrame(step);
+      };
+      inertia = requestAnimationFrame(step);
+    }, { passive: true });
+    el.addEventListener("touchcancel", (e) => {
+      for (const t of e.changedTouches) starts.delete(t.identifier);
+      dragging = false; trackId = null;
     }, { passive: true });
   })();
 

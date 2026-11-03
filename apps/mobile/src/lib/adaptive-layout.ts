@@ -6,12 +6,17 @@ import type {
   WindowLayoutInfo,
 } from "../../modules/prospero-window-layout/src/ProsperoWindowLayout.types";
 import {
+  devicePosture,
   verticalPaneLayout,
   windowWidthClass,
 } from "@/lib/adaptive-layout-math";
 
 export {
+  devicePosture,
   primaryPaneWidth,
+  type DevicePosture,
+  type FoldPosture,
+  type WindowOrientation,
   verticalPaneLayout,
   windowWidthClass,
   type VerticalPaneLayout,
@@ -28,6 +33,19 @@ function readCurrentLayout(): WindowLayoutInfo {
     return ProsperoWindowLayoutModule.getCurrent();
   } catch {
     return EMPTY_LAYOUT;
+  }
+}
+
+/**
+ * Android:让当前 Activity 按传感器转屏，即使系统锁定了自动旋转;false 交还给系统。
+ * 其它平台和没有原生模块的构建上是空操作。
+ */
+export function setSensorRotation(enabled: boolean): void {
+  if (Platform.OS !== "android") return;
+  try {
+    ProsperoWindowLayoutModule?.setSensorRotation?.(enabled);
+  } catch {
+    // 旧版原生模块没有这个函数;保持系统默认即可。
   }
 }
 
@@ -74,6 +92,8 @@ export function useAdaptiveLayout() {
       isExpanded: widthClass === "expanded",
       foldingFeature: layout.foldingFeature,
       verticalPanes: verticalPaneLayout(width, layout.foldingFeature, height),
+      // 窗口尺寸和 WindowManager 事件到达顺序不定，两者任一变化都重新判定。
+      posture: devicePosture(width, height, layout.foldingFeature, layout.device),
     };
-  }, [height, layout.foldingFeature, width]);
+  }, [height, layout.device, layout.foldingFeature, width]);
 }
