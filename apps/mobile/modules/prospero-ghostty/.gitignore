@@ -1,0 +1,3 @@
+/android/build/
+/android/src/main/jniLibs/
+/android/src/main/cpp/include/ghostty.h

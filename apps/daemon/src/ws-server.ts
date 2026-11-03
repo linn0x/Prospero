@@ -37,6 +37,7 @@ import {
   CAPABILITY_ORCHESTRATION_WORKTREES,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
+  CAPABILITY_TERMINAL_TAIL_ATTACH,
   CAPABILITY_WORKSPACE_ROOTS,
   CAPABILITY_WORKSPACE_SUMMARY,
   MIN_PROTOCOL_VERSION,
@@ -856,6 +857,7 @@ export async function createDaemonServer(
       capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG, CAPABILITY_MODEL_SOURCES);
     }
     if (conn.protocolVersion >= 15) capabilities.push(CAPABILITY_FS_PUT_ACK);
+    capabilities.push(CAPABILITY_TERMINAL_TAIL_ATTACH);
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
     if (conn.protocolVersion >= 14) capabilities.push(CAPABILITY_DEEPSEEK_TRAJECTORY);
     if (conn.protocolVersion >= 11) {
@@ -1084,6 +1086,34 @@ export async function createDaemonServer(
     } finally {
       att.snapshotInflight = false;
     }
+  }
+
+  async function sendTailSnapshot(conn: Conn, sid: string, session: PtySession | RemotePtySession | RemoteWindowsPtySession, att: AttachState, tailEvents: number): Promise<boolean> {
+    const snap = await session.snapshot();
+    const start = Math.max(0, session.ring.lastSeq - tailEvents);
+    const chunks = session.ring.since(start);
+    if (chunks === null) return false;
+    send(conn, {
+      type: "term.snapshot",
+      sid,
+      ansi: "",
+      seq: start,
+      cols: snap.cols,
+      rows: snap.rows,
+    });
+    att.lastSentSeq = start;
+    att.lastAckSeq = start;
+    if (chunks.length > 0) {
+      send(conn, {
+        type: "term.output",
+        sid,
+        dataB64: toB64(concatBytes(chunks)),
+        seq: session.ring.lastSeq,
+        replay: true,
+      });
+      att.lastSentSeq = session.ring.lastSeq;
+    }
+    return true;
   }
 
   /**
@@ -1518,6 +1548,9 @@ export async function createDaemonServer(
           paused: false,
         };
         conn.attachments.set(msg.sid, att);
+        if (msg.lastSeq === undefined && msg.tailEvents !== undefined) {
+          if (await sendTailSnapshot(conn, msg.sid, session, att, msg.tailEvents)) return;
+        }
         if (msg.lastSeq !== undefined) {
           const chunks = session.ring.since(msg.lastSeq);
           if (chunks !== null) {

@@ -172,8 +172,8 @@
     customGlyphs: true,
     drawBoldTextInBrightColors: true,
     rescaleOverlappingGlyphs: true,
-    smoothScrollDuration: 80,
-    fastScrollSensitivity: 4,
+    smoothScrollDuration: 40,
+    fastScrollSensitivity: 5,
     macOptionIsMeta: true,
     macOptionClickForcesSelection: true,
     altClickMovesCursor: false,
@@ -362,6 +362,7 @@
   // 可能先触发 attach，随后 Dynamic Type 才改变列数，造成短暂错配。
   let fontReady = false;
   let fontRevision = 0;
+  let currentFontFamily = "";
   let fitTimer = null;
   // 快照/回放会把终端改成服务端记录的行列;那可能是本端 resize 生效前的旧值
   // (例如折叠屏换到外屏后重连)。写完后若与容器能放下的不一致，就重新 fit
@@ -376,7 +377,7 @@
   // 尾随防抖：动画期间 ResizeObserver 每帧都会触发，过去每 50ms fit 一次，
   // 等于在动画中途反复改 PTY 尺寸、逼 shell/TUI 重绘好几遍。现在只在尺寸
   // 停止变化后 fit 一次;中间帧靠上面的贴底布局保持画面连贯。
-  function doFit() {
+  function doFit(delay = 80) {
     if (!fontReady) return;
     if (fitTimer) clearTimeout(fitTimer);
     fitTimer = setTimeout(() => {
@@ -387,7 +388,7 @@
       // 新露出的区域就一直是空的。
       try { term.refresh(0, term.rows - 1); } catch (e) {}
       post({ kind: "resized", cols: term.cols, rows: term.rows });
-    }, 80);
+    }, delay);
   }
 
   // 性能打点(W4 spike):有输出流量的秒窗上报 fps 与吞吐
@@ -479,6 +480,8 @@
         ? Math.min(72, Math.max(6, requestedSize))
         : 12;
       const family = typeof m.family === "string" ? m.family.trim() : "";
+      if (fontReady && size === term.options.fontSize && family === currentFontFamily) return;
+      currentFontFamily = family;
       term.options.fontFamily = fontStack(family);
       term.options.fontSize = size;
       fontReady = false;
@@ -565,15 +568,39 @@
   (function pinchZoom() {
     const STEPS = [8, 9, 10, 11, 12, 14, 16, 18, 20];
     const el = document.getElementById("term");
-    let base = 0, startSize = 12, starts = null;
+    let base = 0, startSize = 12, starts = null, pendingSize = null, activeSteps = STEPS;
     const dist = (t) => Math.hypot(
       t[0].clientX - t[1].clientX,
       t[0].clientY - t[1].clientY,
     );
+    const mid = (t) => ({
+      x: (t[0].clientX + t[1].clientX) / 2,
+      y: (t[0].clientY + t[1].clientY) / 2,
+    });
+    const previewTarget = () => term.element || el.firstElementChild;
+    const clearPreview = () => {
+      const target = previewTarget();
+      if (!target) return;
+      target.style.transform = "";
+      target.style.transformOrigin = "";
+      target.style.willChange = "";
+      target.style.backfaceVisibility = "";
+    };
+    const setPreview = (scale, point) => {
+      const target = previewTarget();
+      if (!target) return;
+      const rect = target.getBoundingClientRect();
+      target.style.transformOrigin = `${point.x - rect.left}px ${point.y - rect.top}px`;
+      target.style.transform = `scale(${scale}) translateZ(0)`;
+      target.style.willChange = "transform";
+      target.style.backfaceVisibility = "hidden";
+    };
     el.addEventListener("touchstart", (e) => {
       if (e.touches.length !== 2) return;
       base = dist(e.touches);
       startSize = term.options.fontSize;
+      activeSteps = STEPS.includes(startSize) ? STEPS : [...STEPS, startSize].sort((a, b) => a - b);
+      pendingSize = null;
       starts = [...e.touches].map((t) => ({ id: t.identifier, x: t.clientX, y: t.clientY }));
       pinchActive = false;
     }, { passive: true });
@@ -590,19 +617,28 @@
         if (!bothMoved || Math.abs(ratio - 1) < 0.12) return;
         pinchActive = true;
       }
+      e.preventDefault();
       const target = startSize * ratio;
-      let best = STEPS[0];
-      for (const s of STEPS) {
+      let best = activeSteps[0];
+      for (const s of activeSteps) {
         if (Math.abs(s - target) < Math.abs(best - target)) best = s;
       }
-      if (best !== term.options.fontSize) {
-        term.options.fontSize = best;
-        doFit();
-        post({ kind: "fontSize", size: best });
-      }
-    }, { passive: true });
+      const minScale = activeSteps[0] / startSize;
+      const maxScale = activeSteps[activeSteps.length - 1] / startSize;
+      setPreview(Math.min(maxScale, Math.max(minScale, ratio)), mid(e.touches));
+      pendingSize = best !== startSize ? best : null;
+    }, { passive: false });
     const end = (e) => {
-      if (e.touches.length < 2) { base = 0; starts = null; pinchActive = false; }
+      if (e.touches.length < 2) {
+        const committedSize = pendingSize;
+        clearPreview();
+        if (committedSize !== null && committedSize !== term.options.fontSize) {
+          term.options.fontSize = committedSize;
+          doFit(0);
+          post({ kind: "fontSize", size: committedSize });
+        }
+        base = 0; starts = null; pendingSize = null; pinchActive = false;
+      }
     };
     el.addEventListener("touchend", end, { passive: true });
     el.addEventListener("touchcancel", end, { passive: true });
@@ -635,14 +671,16 @@
       if (term.modes.mouseTrackingMode !== "none") {
         const target = term.element.querySelector(".xterm-screen") || term.element;
         const step = lines > 0 ? 1 : -1;
-        for (let i = 0; i < Math.abs(lines); i++) {
+        const count = Math.min(8, Math.abs(lines));
+        for (let i = 0; i < count; i++) {
           target.dispatchEvent(new WheelEvent("wheel", {
             bubbles: true, cancelable: true, clientX: x, clientY: y,
             deltaY: step, deltaMode: WheelEvent.DOM_DELTA_LINE,
           }));
         }
       } else if (term.buffer.active.type === "normal") {
-        term.scrollLines(lines);
+        const targetLine = Math.max(0, Math.min(term.buffer.active.baseY, term.buffer.active.viewportY + lines));
+        term.scrollToLine(targetLine);
       }
     }
     // 手指上移 = 内容往新的方向走 = 正向行数
