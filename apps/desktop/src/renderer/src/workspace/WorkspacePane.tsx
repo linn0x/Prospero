@@ -74,7 +74,14 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   widthRef.current = width;
   useEffect(() => () => { if (dockDragFrame.current !== undefined) cancelAnimationFrame(dockDragFrame.current); }, []);
   const chromeVisible = workspaceChromeVisible(focus);
-  const nativeTerminal = Boolean(session && supportsNativeTerminal(session));
+  const sessionRuntimeKey = session ? `${session.id}:${session.nativeSession?.runtimeId ?? "legacy"}` : undefined;
+  const liveNativeSessionKeyRef = useRef<string | undefined>(undefined);
+  if (session && supportsNativeTerminal(session)) {
+    liveNativeSessionKeyRef.current = sessionRuntimeKey;
+  } else if (!session || session.kind !== "pty" || session.terminalMode !== "events" || liveNativeSessionKeyRef.current !== sessionRuntimeKey) {
+    liveNativeSessionKeyRef.current = undefined;
+  }
+  const nativeTerminal = Boolean(session && (supportsNativeTerminal(session) || liveNativeSessionKeyRef.current === sessionRuntimeKey));
   useEffect(() => {
     if (!nativeTerminal) {
       setNativeAvailable(false);

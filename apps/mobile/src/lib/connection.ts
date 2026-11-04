@@ -1098,9 +1098,9 @@ export class HostConnection {
     return this.workspaceList(path, root, name);
   }
 
-  /** 搜索电脑上由 Claude Code / Codex 自己保存、可原生接回的对话。 */
+  /** 搜索电脑上由 Claude Code / Codex / Pi 自己保存、可原生接回的对话。 */
   async localConversations(
-    agent: "claude" | "codex" | "deepseek",
+    agent: "claude" | "codex" | "deepseek" | "pi",
     query: string,
     limit = 20,
     accountId?: string,
@@ -1978,7 +1978,7 @@ export class HostConnection {
   }
 
   launchModels(
-    agent: "claude" | "codex" | "deepseek" | "opencode",
+    agent: "claude" | "codex" | "deepseek" | "opencode" | "pi",
     accountId?: string,
   ): Promise<Extract<S2CMessage, { type: "launch.models" }>> {
     if (!this.supportsSessionCreateModel) {

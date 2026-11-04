@@ -270,7 +270,7 @@ export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon" | "or
 export type SessionCreateInput = {
   cwd: string;
   sourceSessionId?: string;
-  agent: "codex" | "claude" | "deepseek" | "opencode" | "grok" | "trae" | "shell" | "custom";
+  agent: "codex" | "claude" | "deepseek" | "opencode" | "pi" | "grok" | "trae" | "shell" | "custom";
   kind: "structured" | "pty";
   approvalPolicy: "strict" | "standard" | "yolo";
   mode?: "default" | "plan";
@@ -388,7 +388,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   writeClipboard(value: string): Promise<{ ok: boolean }>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   forkSession(sessionId: string): Promise<SessionInfo>;
-  createCrossModelChild(sessionId: string, input: { sourceId: string; routeId: string; revision: number; agent: "codex" | "claude" | "opencode"; task: string; title?: string }): Promise<JsonObject>;
+  createCrossModelChild(sessionId: string, input: { sourceId: string; routeId: string; revision: number; agent: "codex" | "claude" | "opencode" | "pi"; task: string; title?: string }): Promise<JsonObject>;
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
   cancelSessionPage(requestId: string): Promise<void>;
@@ -409,7 +409,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   revealSkill(path: string, cwd: string): Promise<{ ok: boolean; error?: string }>;
   getAgentModes(sessionId: string): Promise<AgentModeCatalog>;
   setAgentMode(sessionId: string, mode: string): Promise<{ currentMode: string }>;
-  getLaunchModels(agent: "codex" | "claude" | "deepseek" | "opencode", accountId?: string): Promise<AgentModelCatalog>;
+  getLaunchModels(agent: "codex" | "claude" | "deepseek" | "opencode" | "pi", accountId?: string): Promise<AgentModelCatalog>;
   getAgentModels(sessionId: string): Promise<AgentModelCatalog>;
   setAgentModel(sessionId: string, model: string, effort?: string): Promise<{ currentModel: string; currentEffort?: string }>;
   orchestrationAction(method: string, params: JsonObject): Promise<JsonObject>;

@@ -28,6 +28,7 @@ export function AccountCreateForm({ capabilities, disabled, busy, error, onCreat
   const [agent, setAgent] = useState<"codex" | "claude">("codex");
   const [name, setName] = useState("");
   const [apiName, setApiName] = useState("");
+  const [apiEngineMode, setApiEngineMode] = useState<"default" | "pi">("default");
   const [protocol, setProtocol] = useState<AccountApiProtocol>("openai_responses");
   const [baseUrl, setBaseUrl] = useState(accountApiProtocolDefaults("openai_responses").baseUrl);
   const [model, setModel] = useState(accountApiProtocolDefaults("openai_responses").model);
@@ -65,7 +66,7 @@ export function AccountCreateForm({ capabilities, disabled, busy, error, onCreat
         if (name.trim() && await onCreateManaged({ agent, name: name.trim() }) && mounted.current) setName("");
       } else {
         if (!apiName.trim() || !baseUrl.trim() || !model.trim() || !apiKey.trim()) return;
-        const saved = await onCreateApi(accountCreateApiInput({ name: apiName, protocol: effectiveProtocol, baseUrl, model, apiKey, modelCapabilities }, protocolsSupported, validationSupported));
+        const saved = await onCreateApi(accountCreateApiInput({ name: apiName, ...(apiEngineMode === "pi" ? { agent: "pi" as const } : {}), protocol: effectiveProtocol, baseUrl, model, apiKey, modelCapabilities }, protocolsSupported, validationSupported));
         if (saved && mounted.current) { setApiName(""); setApiKey(""); }
       }
     } catch (reason) { if (mounted.current) setLocalError(reportError(reason)); }
@@ -92,8 +93,14 @@ export function AccountCreateForm({ capabilities, disabled, busy, error, onCreat
           <Field><FieldLabel htmlFor={`${id}-protocol`}>{protocolsSupported ? t("API 协议", "API protocol") : t("CLI Agent", "CLI agent")}</FieldLabel>
             <NativeSelect id={`${id}-protocol`} value={effectiveProtocol} onChange={event => changeProtocol(event.target.value as AccountApiProtocol)}>
               {(protocolsSupported ? accountApiProtocols : ["openai_responses", "anthropic"] as const).map(value => <NativeSelectOption key={value} value={value}>{protocolsSupported ? accountApiProtocolLabel(value) : accountApiEngineLabel(value)}</NativeSelectOption>)}
-            </NativeSelect><FieldDescription>{accountApiEngineLabel(effectiveProtocol)} · {t("引擎", "engine")}</FieldDescription>
+            </NativeSelect><FieldDescription>{apiEngineMode === "pi" ? "Pi" : accountApiEngineLabel(effectiveProtocol)} · {t("引擎", "engine")}</FieldDescription>
           </Field>
+          {protocolsSupported && <Field><FieldLabel htmlFor={`${id}-api-engine`}>{t("执行引擎", "Execution engine")}</FieldLabel>
+            <NativeSelect id={`${id}-api-engine`} value={apiEngineMode} onChange={event => setApiEngineMode(event.target.value as "default" | "pi")}>
+              <NativeSelectOption value="default">{accountApiEngineLabel(effectiveProtocol)} ({t("协议默认", "Protocol default")})</NativeSelectOption>
+              <NativeSelectOption value="pi">Pi Coding Agent</NativeSelectOption>
+            </NativeSelect>
+          </Field>}
           <Field><FieldLabel htmlFor={`${id}-base-url`}>{t("API 地址", "Base URL")}</FieldLabel><Input id={`${id}-base-url`} type="url" inputMode="url" value={baseUrl} maxLength={2000} required spellCheck={false} onChange={event => setBaseUrl(event.target.value)} /></Field>
           <Field><FieldLabel htmlFor={`${id}-api-key`}>API Key</FieldLabel><Input id={`${id}-api-key`} type="password" value={apiKey} maxLength={8192} required autoComplete="new-password" onChange={event => setApiKey(event.target.value)} /></Field>
           <ModelCatalogPicker value={model} onChange={setModel} request={accountModelCatalogRequest({ protocol: effectiveProtocol, baseUrl, apiKey })} supported={modelsSupported} disabled={inactive} />

@@ -67,6 +67,8 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
   const notifiedClosedIds = useRef(new Set<number>());
   const lastNativeError = useRef<string | undefined>(undefined);
   const boundsFrame = useRef<number | undefined>(undefined);
+  const liveSessionSeenRef = useRef(supportsNativeTerminal(session));
+  if (supportsNativeTerminal(session)) liveSessionSeenRef.current = true;
   activeRef.current = active;
   focusedRef.current = focused;
   stateRef.current = state;
@@ -91,7 +93,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
   };
 
   useEffect(() => {
-    if (!supportsNativeTerminal(session)) { setMode("fallback"); return; }
+    if (!supportsNativeTerminal(session) && !liveSessionSeenRef.current) { setMode("fallback"); return; }
     if (!active || mode !== "pending") return;
     let cancelled = false;
     void window.prospero.nativeTerminal.available().then(result => {
@@ -179,7 +181,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
   }, [mode, session.id, fontSize, fontFamily, retry]);
 
   const pasteClipboardImage = useCallback(async (): Promise<void> => {
-    if (session.agent !== "claude" && session.agent !== "codex") {
+    if (session.agent !== "claude" && session.agent !== "codex" && session.agent !== "pi") {
       notifyNativeIssue(t("此终端暂不支持图片粘贴，请保存图片后使用文件路径", "Image paste is unavailable in this terminal; save the image and use its file path"), "warning");
       return;
     }

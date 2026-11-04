@@ -228,9 +228,10 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .provider-logo { width: 42px; height: 42px; flex: none; display: grid; place-items: center; border-radius: var(--ui-radius-window); background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
 .provider-codex .provider-logo { color: var(--text); }
 .provider-claude .provider-logo { color: #d87855; background: color-mix(in srgb, #d87855 10%, var(--surface-2)); }
+.provider-pi .provider-logo { color: #10b981; background: color-mix(in srgb, #10b981 10%, var(--surface-2)); }
 .provider-deepseek .provider-logo { color: #4d72ff; background: color-mix(in srgb, #4d72ff 10%, var(--surface-2)); }
 .provider-trae .provider-logo { color: #6f7cf7; background: color-mix(in srgb, #6f7cf7 10%, var(--surface-2)); }
-.provider-strip { display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); gap: 9px; margin-bottom: 22px; }
+.provider-strip { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 9px; margin-bottom: 22px; }
 .provider-card { min-width: 0; display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center; padding: 12px; border: 1px solid var(--border); background: linear-gradient(145deg, var(--surface-1), var(--surface-2)); border-radius: var(--ui-radius-window); }
 .provider-card > div:nth-child(2) { min-width: 0; }
 .provider-card p { color: var(--muted); font-size: var(--ui-text-caption); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 3px; }

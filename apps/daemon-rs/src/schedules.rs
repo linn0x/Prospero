@@ -842,6 +842,7 @@ fn valid_agent(agent: AgentKind) -> bool {
             | AgentKind::Codex
             | AgentKind::Deepseek
             | AgentKind::Opencode
+            | AgentKind::Pi
             | AgentKind::Grok
     )
 }
@@ -849,7 +850,7 @@ fn valid_agent(agent: AgentKind) -> bool {
 fn resumable_agent(agent: AgentKind) -> bool {
     matches!(
         agent,
-        AgentKind::Claude | AgentKind::Codex | AgentKind::Deepseek
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Deepseek | AgentKind::Pi
     )
 }
 
@@ -994,6 +995,7 @@ fn agent_kind(value: &str) -> Option<AgentKind> {
         "codex" => Some(AgentKind::Codex),
         "deepseek" => Some(AgentKind::Deepseek),
         "opencode" => Some(AgentKind::Opencode),
+        "pi" => Some(AgentKind::Pi),
         "grok" => Some(AgentKind::Grok),
         _ => None,
     }
@@ -1214,6 +1216,7 @@ fn agent_label(agent: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Codex => "codex",
         AgentKind::Opencode => "opencode",
+        AgentKind::Pi => "pi",
         AgentKind::Deepseek => "deepseek",
         AgentKind::Grok => "grok",
         AgentKind::Trae => "trae",

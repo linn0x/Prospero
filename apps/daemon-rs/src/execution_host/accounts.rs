@@ -85,7 +85,9 @@ fn validate_account_id(id: &str) -> Result<()> {
     if id.len() > 100
         || matches!(
             id,
-            crate::accounts::NATIVE_CLAUDE_ID | crate::agent::NATIVE_CODEX_ID
+            crate::accounts::NATIVE_CLAUDE_ID
+                | crate::agent::NATIVE_CODEX_ID
+                | crate::accounts::NATIVE_PI_ID
         )
     {
         return Err(invalid_snapshot());
@@ -103,7 +105,7 @@ fn validate_reference(reference: &AccountSnapshotRef) -> Result<()> {
             .all(|byte| byte.is_ascii_hexdigit())
         || !matches!(
             reference.engine,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
         )
     {
         return Err(invalid_snapshot());
@@ -291,7 +293,7 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
         || snapshot.credential.secret.contains(['\r', '\n', '\0'])
         || !matches!(
             snapshot.account_agent,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
         )
     {
         return Err(invalid_snapshot());
@@ -311,7 +313,11 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
     }
     match snapshot.profile.as_ref() {
         Some(profile) => {
-            let engine = profile::agent_kind(profile);
+            let engine = if snapshot.account_agent == AgentKind::Pi {
+                AgentKind::Pi
+            } else {
+                profile::agent_kind(profile)
+            };
             if snapshot.engine != engine
                 || (snapshot.account_agent != snapshot.requested_agent
                     && engine != snapshot.requested_agent)
@@ -325,6 +331,7 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
                 AgentKind::Claude => "claude",
                 AgentKind::Codex => "codex",
                 AgentKind::Opencode => "opencode",
+                AgentKind::Pi => "pi",
                 _ => return Err(invalid_snapshot()),
             };
             profile::clean_profile(
@@ -412,7 +419,7 @@ pub(crate) async fn capture(
     validate_account_id(account_id)?;
     if !matches!(
         agent,
-        AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
     ) {
         return Err(invalid_snapshot());
     }
@@ -470,11 +477,15 @@ pub(crate) async fn capture(
             };
             let (default_model, default_effort) =
                 crate::accounts::config::read_defaults(&data, &target)?;
-            let engine = record
-                .api_profile
-                .as_ref()
-                .map(profile::agent_kind)
-                .unwrap_or(record.agent);
+            let engine = if record.agent == AgentKind::Pi {
+                AgentKind::Pi
+            } else {
+                record
+                    .api_profile
+                    .as_ref()
+                    .map(profile::agent_kind)
+                    .unwrap_or(record.agent)
+            };
             let snapshot = FrozenAccount {
                 format_version: 1,
                 snapshot_id: snapshot_id(&operation_id),

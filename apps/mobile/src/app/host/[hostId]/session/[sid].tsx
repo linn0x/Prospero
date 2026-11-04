@@ -1728,8 +1728,8 @@ export default function SessionScreen() {
         <Pressable accessibilityRole="button" accessibilityLabel="关闭终端搜索" onPress={() => { termRef.current?.search(""); setSearch(null); }} style={styles.terminalSearchAction}><Text style={styles.terminalSearchActionText}>×</Text></Pressable>
       </View>}
 
-      {session.archived && <Pressable accessibilityRole="button" disabled={!isChat && !["claude", "codex"].includes(session.agent)} onPress={() => setLifecycleTarget(false)} style={{ padding: 12, backgroundColor: color.surface }}>
-        <Text style={{ color: color.accent }}>{isChat || ["claude", "codex"].includes(session.agent) ? "已归档 · 查看历史不会运行任务 · 点击继续对话" : "已归档 · 终端历史只读"}</Text>
+      {session.archived && <Pressable accessibilityRole="button" disabled={!isChat && !["claude", "codex", "pi"].includes(session.agent)} onPress={() => setLifecycleTarget(false)} style={{ padding: 12, backgroundColor: color.surface }}>
+        <Text style={{ color: color.accent }}>{isChat || ["claude", "codex", "pi"].includes(session.agent) ? "已归档 · 查看历史不会运行任务 · 点击继续对话" : "已归档 · 终端历史只读"}</Text>
       </Pressable>}
       {isChat ? (
         <ConversationFontScale value={settings.conversationFontSize / DEFAULT_CONVERSATION_FONT_SIZE}>
@@ -2012,7 +2012,7 @@ export default function SessionScreen() {
       {lifecycleTarget !== null && conn && <SessionLifecycleSheet conn={conn} session={session} archived={lifecycleTarget}
         onClose={() => setLifecycleTarget(null)} onDone={() => { const archived = lifecycleTarget; setLifecycleTarget(null); if (archived) returnToHost(); }} />}
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
-        {!isSubagent && ["claude", "codex"].includes(session.agent) && <SheetAction
+        {!isSubagent && ["claude", "codex", "pi"].includes(session.agent) && <SheetAction
           label={branching ? "正在创建分支…" : session.kind === "pty" ? "选择原生对话并创建分支" : "创建会话分支"}
           detail={branchUnavailable ?? (conn?.supportsCapability("session.fork.v1")
             ? session.kind === "pty" ? "在独立终端中选择历史对话，原会话继续保留" : "复制当前对话历史，在独立会话继续"
@@ -2080,7 +2080,7 @@ export default function SessionScreen() {
           />
         ) : null}
         {/* 文件与改动已提到标题栏,这里不再重复。 */}
-        {(!session.archived || isStructured || ["claude", "codex"].includes(session.agent)) && <SheetAction
+        {(!session.archived || isStructured || ["claude", "codex", "pi"].includes(session.agent)) && <SheetAction
           label={session.archived ? "继续对话" : "停止并归档"}
           detail={session.archived ? "恢复原生对话上下文" : "停止执行、释放资源并保留历史"}
           symbol="archivebox"

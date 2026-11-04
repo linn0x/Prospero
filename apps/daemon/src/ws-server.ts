@@ -251,7 +251,7 @@ export interface DaemonServerOptions {
   notify?: NotifyConfig | null;
   /** 测试可注入；生产读取 Claude/Codex 官方本机会话索引。 */
   conversationSearch?: (
-    agent: "claude" | "codex" | "deepseek",
+    agent: "claude" | "codex" | "deepseek" | "pi",
     query: string,
     limit: number,
     environment?: Record<string, string>,

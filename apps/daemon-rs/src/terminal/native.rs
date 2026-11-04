@@ -96,6 +96,95 @@ fn pty_size(size: TerminalSize) -> PtySize {
     }
 }
 
+fn is_codex_command(command: &CommandBuilder) -> bool {
+    let argv = command.get_argv();
+    argv.windows(2)
+        .any(|pair| pair[0] == "--agent" && pair[1] == "codex")
+        || argv
+            .iter()
+            .any(|arg| arg == "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexCtrlCAction {
+    Trigger,
+    Ignore,
+}
+
+fn match_codex_ctrl_c_csi(bytes: &[u8]) -> Option<(usize, CodexCtrlCAction)> {
+    if !bytes.starts_with(b"\x1b[") {
+        return None;
+    }
+    let mut index = 2;
+    while index < bytes.len() && matches!(bytes[index], b'0'..=b'9' | b':' | b';') {
+        index += 1;
+    }
+    let final_byte = *bytes.get(index)?;
+    let params = std::str::from_utf8(&bytes[2..index]).ok()?;
+    match final_byte {
+        b'u' => {
+            let mut fields = params.split(';');
+            let key_field = fields.next()?;
+            let mod_field = fields.next()?;
+            let is_c = key_field.split(':').any(|part| matches!(part, "99" | "67"));
+            if !is_c {
+                return None;
+            }
+            let mut mod_parts = mod_field.split(':');
+            let modifiers: u32 = mod_parts.next()?.parse().ok()?;
+            let mask = modifiers.checked_sub(1)? & !0xc0;
+            if mask != 4 {
+                return None;
+            }
+            let action = match mod_parts.next() {
+                None | Some("") | Some("1") => CodexCtrlCAction::Trigger,
+                Some("2") | Some("3") => CodexCtrlCAction::Ignore,
+                Some(_) => return None,
+            };
+            Some((index + 1, action))
+        }
+        b'~' => {
+            let mut fields = params.split(';');
+            if fields.next()? != "27" {
+                return None;
+            }
+            let modifiers: u32 = fields.next()?.parse().ok()?;
+            let key = fields.next()?;
+            if fields.next().is_some() || !matches!(key, "99" | "67") {
+                return None;
+            }
+            let mask = modifiers.checked_sub(1)? & !0xc0;
+            if mask != 4 {
+                return None;
+            }
+            Some((index + 1, CodexCtrlCAction::Trigger))
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_codex_ctrl_c(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x03 {
+            out.push(0x15);
+            index += 1;
+            continue;
+        }
+        if let Some((consumed, action)) = match_codex_ctrl_c_csi(&bytes[index..]) {
+            if action == CodexCtrlCAction::Trigger {
+                out.push(0x15);
+            }
+            index += consumed;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
+}
+
 pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
     spawn_at(command, size, 0)
 }
@@ -106,6 +195,7 @@ pub(crate) fn spawn_at(
     base_seq: i64,
 ) -> Result<Terminal> {
     validate_size(size)?;
+    let codex_ctrl_c_guard = is_codex_command(&command);
     let pair = native_pty_system()
         .openpty(pty_size(size))
         .map_err(|_| Error::Invalid("cannot allocate terminal".into()))?;
@@ -275,6 +365,7 @@ pub(crate) fn spawn_at(
                     &mut pending_input,
                     writer.as_mut(),
                     &stop,
+                    codex_ctrl_c_guard,
                 );
                 if !read_any
                     && pending_bytes(&pending_input) <= PENDING_WRITE_BYTES - RESPONSE_RESERVE_BYTES
@@ -357,10 +448,20 @@ fn handle_control(
     output: &Arc<Mutex<Output>>,
     changed: &watch::Sender<u64>,
     pending_input: &mut VecDeque<PendingWrite>,
+    codex_ctrl_c_guard: bool,
 ) {
     match control {
         Control::Input(bytes, reply) => {
             if !reply.is_closed() {
+                let bytes = if codex_ctrl_c_guard {
+                    rewrite_codex_ctrl_c(&bytes)
+                } else {
+                    bytes
+                };
+                if bytes.is_empty() {
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
                 let queued = pending_input
                     .iter()
                     .map(|item| item.bytes.len() - item.offset)
@@ -411,6 +512,7 @@ fn process_controls_and_drain_input(
     pending_input: &mut VecDeque<PendingWrite>,
     writer: &mut dyn Write,
     stop: &AtomicBool,
+    codex_ctrl_c_guard: bool,
 ) {
     while let Ok(control) = receiver.try_recv() {
         handle_control(
@@ -420,6 +522,7 @@ fn process_controls_and_drain_input(
             output,
             changed,
             pending_input,
+            codex_ctrl_c_guard,
         );
     }
     drain_pending_input(writer, stop, pending_input);
@@ -733,11 +836,26 @@ mod tests {
             &mut pending,
             &mut writer,
             &stop,
+            false,
         );
 
         assert_eq!(writer.into_inner(), b"wheel-report");
         assert!(response.try_recv().unwrap().is_ok());
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn codex_ctrl_c_guard_rewrites_press_and_strips_repeat_or_release() {
+        assert_eq!(rewrite_codex_ctrl_c(b"\x03"), b"\x15");
+        assert_eq!(rewrite_codex_ctrl_c(b"\x1b[99;5u"), b"\x15");
+        assert_eq!(rewrite_codex_ctrl_c(b"\x1b[99;5:1u"), b"\x15");
+        assert_eq!(rewrite_codex_ctrl_c(b"\x1b[99:67;5:1u"), b"\x15");
+        assert_eq!(rewrite_codex_ctrl_c(b"\x1b[99::99;5:1;3u"), b"\x15");
+        assert_eq!(rewrite_codex_ctrl_c(b"\x1b[99;69u"), b"\x15");
+        assert_eq!(rewrite_codex_ctrl_c(b"\x1b[27;5;99~"), b"\x15");
+        assert!(rewrite_codex_ctrl_c(b"\x1b[99;5:2u").is_empty());
+        assert!(rewrite_codex_ctrl_c(b"\x1b[99;5:3u").is_empty());
+        assert_eq!(rewrite_codex_ctrl_c(b"abc\x1b[99;1u\x04"), b"abc\x1b[99;1u\x04");
     }
 
     #[test]

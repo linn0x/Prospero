@@ -4,7 +4,8 @@ export type OrchestrationWorkerAgent =
   | "codex"
   | "claude"
   | "deepseek"
-  | "opencode";
+  | "opencode"
+  | "pi";
 
 export type OrchestrationLaunchSelection = {
   agent: OrchestrationWorkerAgent;
@@ -14,7 +15,7 @@ export type OrchestrationLaunchSelection = {
 
 function accountParams(selection: OrchestrationLaunchSelection): JsonObject {
   if (
-    (selection.agent === "codex" || selection.agent === "claude" || selection.agent === "opencode") &&
+    (selection.agent === "codex" || selection.agent === "claude" || selection.agent === "opencode" || selection.agent === "pi") &&
     selection.accountId?.trim()
   ) {
     return { accountId: selection.accountId.trim() };

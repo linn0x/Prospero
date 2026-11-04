@@ -8,7 +8,7 @@ export type AccountApiProtocol =
 export type AccountApiProvider = "openai_compatible" | "anthropic_compatible";
 
 export type AccountApiDefaults = {
-  agent: "codex" | "claude" | "opencode";
+  agent: "codex" | "claude" | "opencode" | "pi";
   baseUrl: string;
   model: string;
 };
@@ -180,6 +180,7 @@ export function accountApiProvider(protocol: AccountApiProtocol): AccountApiProv
 export function accountApiProtocolsForAgent(agent: string): AccountApiProtocol[] {
   if (agent === "claude") return ["anthropic"];
   if (agent === "opencode") return ["openai_chat_completions"];
+  if (agent === "pi") return ["anthropic", "openai_responses", "openai_chat_completions"];
   return ["openai_responses", "openai_chat_completions"];
 }
 

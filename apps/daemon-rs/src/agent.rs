@@ -4,6 +4,7 @@ pub(crate) mod conversations;
 mod deepseek;
 pub(crate) mod lifecycle;
 mod opencode;
+pub(crate) mod pi;
 mod runtime;
 mod store;
 pub(crate) mod usage;

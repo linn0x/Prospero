@@ -7,7 +7,7 @@ import { useMobileTheme } from "@/lib/theme";
 
 export function SessionLifecycleSheet({ conn, session, archived, onClose, onDone }: { conn: HostConnection; session: SessionInfo; archived: boolean; onClose(): void; onDone(session: SessionInfo): void }) {
   const { palette } = useMobileTheme();
-  const binding = session.kind === "pty" && ["claude", "codex"].includes(session.agent) && !session.nativeSession?.managed && !session.nativeSession?.nativeId;
+  const binding = session.kind === "pty" && ["claude", "codex", "pi"].includes(session.agent) && !session.nativeSession?.managed && !session.nativeSession?.nativeId;
   const [query, setQuery] = useState("");
   const [items, setItems] = useState<ResumableConversation[]>([]);
   const [selected, setSelected] = useState<string>();
@@ -28,7 +28,7 @@ export function SessionLifecycleSheet({ conn, session, archived, onClose, onDone
   return <Sheet visible title={binding ? "绑定原生对话" : archived ? "归档会话" : "继续对话"} onClose={() => { if (!busy) onClose(); }}>
     <Text style={{ color: palette.textDim, lineHeight: 22, marginBottom: 12 }}>{binding
       ? "请选择这个终端正在使用的原生对话。确认后将保存对话 ID，供以后准确恢复。"
-      : archived ? (session.kind === "structured" || ["claude", "codex"].includes(session.agent) ? "停止当前执行并释放运行资源，保留历史、工作目录和文件改动。以后可以继续原对话。" : "结束终端并保留历史。任意 Shell 程序无法恢复其进程状态，可以另建终端继续工作。")
+      : archived ? (session.kind === "structured" || ["claude", "codex", "pi"].includes(session.agent) ? "停止当前执行并释放运行资源，保留历史、工作目录和文件改动。以后可以继续原对话。" : "结束终端并保留历史。任意 Shell 程序无法恢复其进程状态，可以另建终端继续工作。")
         : "使用原来的原生对话 ID 恢复上下文。不会自动重发上次中断的指令。"}</Text>
     {binding && <>
       <TextInput accessibilityLabel="搜索原生对话" value={query} onChangeText={setQuery} editable={!busy}

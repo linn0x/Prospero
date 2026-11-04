@@ -1069,7 +1069,7 @@ function installIpc(): void {
     if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
     const id = requireId(rawId, "终端会话");
     const session = store.snapshot().daemon.sessions.find(item => item.id === id);
-    if (!session || session.kind !== "pty" || !["codex", "claude"].includes(session.agent)) throw new Error("此会话不支持图片粘贴 / Image paste is unavailable for this session");
+    if (!session || session.kind !== "pty" || !["codex", "claude", "pi"].includes(session.agent)) throw new Error("此会话不支持图片粘贴 / Image paste is unavailable for this session");
     const image = clipboard.readImage();
     if (image.isEmpty()) throw new Error("剪贴板中没有图片 / No image in clipboard");
     const bytes = image.toPNG();
@@ -1282,7 +1282,7 @@ function installIpc(): void {
       if (!source || resolve(source.cwd) !== normalized) throw new Error("原会话的工作目录不可用，请重新选择工作区 / Original session workspace is unavailable");
     }
     if (!existsSync(normalized) || !statSync(normalized).isDirectory()) throw new Error("原工作目录已不可用，请选择有效的工作区 / Workspace directory is unavailable");
-    if (!["codex", "claude", "deepseek", "opencode", "grok", "trae", "shell", "custom"].includes(input.agent)) throw new Error("Agent 无效");
+    if (!["codex", "claude", "deepseek", "opencode", "pi", "grok", "trae", "shell", "custom"].includes(input.agent)) throw new Error("Agent 无效");
     if (input.kind !== "structured" && input.kind !== "pty") throw new Error("会话类型无效");
     if (!["strict", "standard", "yolo"].includes(input.approvalPolicy)) throw new Error("审批策略无效");
     if (input.command) {
@@ -1406,7 +1406,7 @@ function installIpc(): void {
     return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/modes`, { method: "POST", body: { mode: rawMode } });
   });
   ipcMain.handle("launch:models", (_event, rawAgent: unknown, rawAccountId: unknown) => {
-    if (rawAgent !== "codex" && rawAgent !== "claude" && rawAgent !== "deepseek") throw new Error("Agent 不支持模型目录");
+    if (rawAgent !== "codex" && rawAgent !== "claude" && rawAgent !== "deepseek" && rawAgent !== "opencode" && rawAgent !== "pi") throw new Error("Agent 不支持模型目录");
     const params = new URLSearchParams({ agent: rawAgent });
     if (rawAccountId !== undefined) params.set("accountId", requireId(rawAccountId, "账号"));
     return runtime.request(`/_prospero/control/launch/models?${params}`);

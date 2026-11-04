@@ -103,6 +103,7 @@ const agentTitle: Record<CodeAgentKind, string> = {
   claude: "Claude Code",
   codex: "Codex",
   opencode: "OpenCode",
+  pi: "Pi",
 };
 
 const statusText: Record<AgentAccount["status"], string> = {
@@ -210,6 +211,7 @@ export default function AgentAccountsScreen() {
       claude: accounts.filter((account) => getAgentAccountEngine(account) === "claude"),
       codex: accounts.filter((account) => getAgentAccountEngine(account) === "codex"),
       opencode: accounts.filter((account) => getAgentAccountEngine(account) === "opencode"),
+      pi: accounts.filter((account) => getAgentAccountEngine(account) === "pi"),
     }),
     [accounts],
   );
@@ -226,11 +228,13 @@ export default function AgentAccountsScreen() {
       claude: [],
       codex: [],
       opencode: [],
+      pi: [],
     };
     for (const source of sources) {
       if (!source.enabled) continue;
       for (const route of source.routes) {
         if (!route.enabled || route.modelCapabilities?.tools === false) continue;
+        result.pi.push({ source, route });
         if (route.protocol === "anthropic") {
           result.claude.push({ source, route });
         } else {
@@ -513,7 +517,7 @@ export default function AgentAccountsScreen() {
         {error && <Text style={styles.error}>{error}</Text>}
         {loading && accounts.length === 0 && <ActivityIndicator color={color.accent} style={styles.loader} />}
 
-        {(["claude", "codex", "opencode"] as const).map((agent) => (
+        {(["claude", "codex", "opencode", "pi"] as const).map((agent) => (
           <View key={agent} style={styles.section}>
             <View style={styles.sectionHeader}>
               <View style={styles.sectionIdentity}>

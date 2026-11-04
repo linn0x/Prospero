@@ -117,10 +117,15 @@ pub(crate) fn account_root(data: &Path, id: &str) -> Result<PathBuf> {
     account_root_for_agent(data, "claude", id)
 }
 
-fn profile_account_root_for_agent(data: &Path, id: &str, agent: AgentKind) -> Result<PathBuf> {
+pub(crate) fn profile_account_root_for_agent(
+    data: &Path,
+    id: &str,
+    agent: AgentKind,
+) -> Result<PathBuf> {
     let agent = match agent {
         AgentKind::Codex => "codex",
         AgentKind::Opencode => "opencode",
+        AgentKind::Pi => "pi",
         _ => "claude",
     };
     account_root_for_agent(data, agent, id)
@@ -291,10 +296,83 @@ pub(crate) fn profile_account_environment(
         crate::accounts::profile::install_codex_model_catalog(&root, profile)?;
     }
     let secret = profile_secret_for_agent(data, id, agent, profile)?.unwrap_or_default();
+    if agent == AgentKind::Pi {
+        return pi_environment(&root, profile, &secret);
+    }
     if profile.protocol() == "openai_chat_completions" {
         return opencode_environment(&root, profile, &secret);
     }
     Ok(session_environment(&root, profile, &secret))
+}
+
+fn pi_environment(
+    root: &Path,
+    profile: &ApiProfile,
+    secret: &str,
+) -> Result<Vec<(String, String)>> {
+    let agent_dir = root.join("pi-agent");
+    ensure_private_dir(&agent_dir)?;
+    let mut headers = BTreeMap::new();
+    if let Some(profile_headers) = &profile.headers {
+        for (name, value) in profile_headers {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    let api_name = match profile.protocol() {
+        "anthropic" => "anthropic-messages",
+        "openai_responses" => "openai-responses",
+        _ => "openai-completions",
+    };
+    let caps = profile.model_capabilities.as_ref();
+    let reasoning = caps.and_then(|c| c.reasoning).unwrap_or(true);
+    let vision = caps.and_then(|c| c.vision) != Some(false);
+    let context_window = caps.and_then(|c| c.context_window).unwrap_or(128_000);
+    let max_tokens = caps.and_then(|c| c.max_output_tokens).unwrap_or(16_384);
+    let config_file = agent_dir.join("models.json");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "providers": {
+            "prospero": {
+                "baseUrl": profile.base_url,
+                "api": api_name,
+                "apiKey": "PROSPERO_PI_API_KEY",
+                "headers": headers,
+                "models": [
+                    {
+                        "id": profile.model,
+                        "name": profile.model,
+                        "reasoning": reasoning,
+                        "input": if vision { vec!["text", "image"] } else { vec!["text"] },
+                        "contextWindow": context_window,
+                        "maxTokens": max_tokens,
+                    }
+                ],
+            }
+        }
+    }))?;
+    fs::write(&config_file, body)?;
+    #[cfg(unix)]
+    fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600))?;
+    Ok(vec![
+        (
+            "PI_CODING_AGENT_DIR".into(),
+            agent_dir.to_string_lossy().into_owned(),
+        ),
+        ("PI_SKIP_VERSION_CHECK".into(), "1".into()),
+        ("PI_TELEMETRY".into(), "0".into()),
+        ("PROSPERO_PI_API_KEY".into(), secret.to_owned()),
+        (
+            "PROSPERO_API_PROFILE_CONFIG".into(),
+            config_file.to_string_lossy().into_owned(),
+        ),
+        (
+            "PROSPERO_API_PROFILE_MODEL".into(),
+            format!("prospero/{}", profile.model),
+        ),
+        (
+            "PROSPERO_API_PROFILE_VISION".into(),
+            if vision { "1" } else { "0" }.into(),
+        ),
+    ])
 }
 
 fn opencode_environment(
@@ -475,6 +553,7 @@ fn agent_from_storage(raw: Option<&str>, profile: Option<&ApiProfile>) -> AgentK
     match raw {
         Some("codex") => AgentKind::Codex,
         Some("opencode") => AgentKind::Opencode,
+        Some("pi") => AgentKind::Pi,
         Some("claude") => AgentKind::Claude,
         _ => profile
             .map(super::profile::agent_kind)
@@ -486,11 +565,15 @@ fn agent_label_value(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Codex => "codex",
         AgentKind::Opencode => "opencode",
+        AgentKind::Pi => "pi",
         _ => "claude",
     }
 }
 
 fn profile_engine_label(agent: AgentKind, profile: Option<&ApiProfile>) -> &'static str {
+    if agent == AgentKind::Pi {
+        return "pi";
+    }
     agent_label_value(profile.map(super::profile::agent_kind).unwrap_or(agent))
 }
 
@@ -499,6 +582,7 @@ fn agent_label(agent: AgentKind) -> Result<&'static str> {
         AgentKind::Claude => Ok("claude"),
         AgentKind::Codex => Ok("codex"),
         AgentKind::Opencode => Ok("opencode"),
+        AgentKind::Pi => Ok("pi"),
         _ => Err(Error::Invalid("Agent 不支持 API Profile".into())),
     }
 }
@@ -511,6 +595,10 @@ pub(crate) fn validate_profile_agent(agent: AgentKind, profile: &ApiProfile) -> 
             "openai_responses" | "openai_chat_completions"
         ),
         AgentKind::Opencode => profile.protocol() == "openai_chat_completions",
+        AgentKind::Pi => matches!(
+            profile.protocol(),
+            "anthropic" | "openai_responses" | "openai_chat_completions"
+        ),
         _ => false,
     };
     if ok {
@@ -599,6 +687,7 @@ impl crate::database::Store {
                 "claude" => AgentKind::Claude,
                 "codex" => AgentKind::Codex,
                 "opencode" => AgentKind::Opencode,
+                "pi" => AgentKind::Pi,
                 _ => continue,
             };
             if validate_profile_agent(agent, &profile).is_err() {

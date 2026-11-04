@@ -4,7 +4,7 @@ import type { AgentModelCapabilities, AgentReasoningEffort } from "@prospero/pro
 import { accountApiEngineLabel, accountReasoningEfforts, modelCapabilityDraft, parseModelCapabilities, type ModelCapabilityDraft } from "../account-profile-form";
 
 export type SourceSelection = { sourceId: string; routeId: string; revision: number; agent?: SourceRuntimeAgent };
-export type SourceRuntimeAgent = "codex" | "claude" | "opencode";
+export type SourceRuntimeAgent = "codex" | "claude" | "opencode" | "pi";
 
 export function parseSourceHeaders(value: string): Record<string, string> {
   const entries = value.split(/\r?\n/).filter(line => line.trim()).map(line => {
@@ -19,7 +19,7 @@ export function parseSourceHeaders(value: string): Record<string, string> {
 }
 
 export function sourceRouteSupportsAgent(route: ModelSourceRoute, agent?: SourceRuntimeAgent): boolean {
-  if (!agent) return true;
+  if (!agent || agent === "pi") return true;
   if (agent === "claude") return route.protocol === "anthropic";
   if (agent === "opencode") return route.protocol === "openai_chat_completions";
   return route.protocol !== "anthropic";
@@ -90,7 +90,7 @@ export function rememberedSourceSelection(): Pick<SourceSelection, "sourceId" | 
     if (!value || typeof value !== "object") return undefined;
     const row = value as Record<string, unknown>;
     if (typeof row.sourceId === "string" && typeof row.routeId === "string" && [row.sourceId, row.routeId].every(id => /^[A-Za-z0-9-]{1,100}$/.test(id))) {
-      return { sourceId: row.sourceId, routeId: row.routeId, ...(row.agent === "claude" || row.agent === "codex" || row.agent === "opencode" ? { agent: row.agent } : {}) };
+      return { sourceId: row.sourceId, routeId: row.routeId, ...(row.agent === "claude" || row.agent === "codex" || row.agent === "opencode" || row.agent === "pi" ? { agent: row.agent } : {}) };
     }
   } catch {}
   return undefined;

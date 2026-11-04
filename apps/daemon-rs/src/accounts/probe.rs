@@ -116,6 +116,10 @@ fn codex_binary() -> String {
     std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into())
 }
 
+fn pi_binary() -> String {
+    crate::agent::pi::binary()
+}
+
 async fn runtime_version() -> std::result::Result<Option<String>, ProbeFailure> {
     command_version(
         "claude",
@@ -240,6 +244,10 @@ pub(crate) async fn codex_runtime_available() -> bool {
     .await
 }
 
+pub(crate) async fn pi_runtime_available() -> bool {
+    command_available(pi_binary(), &[("PI_CODING_AGENT_DIR", "config")]).await
+}
+
 async fn engine_runtime_version(
     engine: crate::protocol::AgentKind,
 ) -> std::result::Result<Option<String>, ProbeFailure> {
@@ -256,6 +264,9 @@ async fn engine_runtime_version(
         crate::protocol::AgentKind::Opencode => {
             command_version("opencode", opencode_binary(), &[]).await
         }
+        crate::protocol::AgentKind::Pi => {
+            command_version("pi", pi_binary(), &[("PI_CODING_AGENT_DIR", "config")]).await
+        }
         _ => Err(fail("runtime_unavailable", "Agent CLI 不可用。")),
     }
 }
@@ -264,6 +275,7 @@ fn engine_label(engine: crate::protocol::AgentKind) -> &'static str {
     match engine {
         crate::protocol::AgentKind::Codex => "codex",
         crate::protocol::AgentKind::Opencode => "opencode",
+        crate::protocol::AgentKind::Pi => "pi",
         _ => "claude",
     }
 }

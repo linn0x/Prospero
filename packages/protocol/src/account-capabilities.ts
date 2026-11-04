@@ -4,13 +4,15 @@ type AccountMetadata = Pick<AgentAccount, "agent" | "apiProfile" | "apiProfileEr
 
 /** Old daemons omit metadata; derive their existing restrictions consistently across clients. */
 export function getAgentAccountEngine(account: AccountMetadata): AgentExecutionEngine {
-  return account.engine ?? (account.apiProfile?.protocol === "anthropic"
+  if (account.engine) return account.engine;
+  if (account.agent === "pi") return "pi";
+  return account.apiProfile?.protocol === "anthropic"
     ? "claude"
     : account.apiProfile?.protocol === "openai_responses"
       ? "codex"
       : account.apiProfile?.protocol === "openai_chat_completions"
         ? "opencode"
-        : account.agent);
+        : account.agent;
 }
 
 export function getAgentAccountCapabilities(account: AccountMetadata): AgentAccountCapabilities {
@@ -21,7 +23,7 @@ export function getAgentAccountCapabilities(account: AccountMetadata): AgentAcco
   const engine = getAgentAccountEngine(account);
   return {
     sessionKinds: engine === "opencode" ? ["structured"] : ["pty", "structured"],
-    plan: engine !== "opencode",
+    plan: engine !== "opencode" && engine !== "pi",
     resume: engine !== "opencode",
     modelSelection: !account.apiProfile,
     reasoningEffort: !account.apiProfile,

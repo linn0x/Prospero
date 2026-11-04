@@ -59,7 +59,7 @@ import {
 import { color, font, radius, space, statusColor } from "@/lib/theme";
 
 const WORKER_AGENTS: AgentKind[] = [
-  "claude", "codex", "deepseek", "opencode", "grok", "trae",
+  "claude", "codex", "pi", "deepseek", "opencode", "grok", "trae",
 ];
 const POLICIES: ApprovalPolicy[] = ["strict", "standard", "yolo"];
 
@@ -267,7 +267,7 @@ export default function OrchestrationScreen() {
   );
   const orphanWorktreeAssets = worktreeAssetGroups.orphaned;
   const accountsFor = (agent: AgentKind): AgentAccount[] =>
-    agent === "claude" || agent === "codex"
+    agent === "claude" || agent === "codex" || agent === "pi"
       ? agentAccounts.filter((account) => account.agent === agent)
       : [];
   const defaultAccountId = (agent: AgentKind): string | undefined =>
