@@ -101,9 +101,6 @@ fi
 step "构建 @prospero/protocol"
 (cd "$REPO_ROOT" && npx tsc --build packages/protocol)
 
-step "准备 Android 中英混合离线语音模型"
-"$MOBILE_DIR/scripts/prepare-android-voice-model.sh"
-
 # generated android/ 会被下一步整目录重建。先把已经用于真机安装的签名保存到
 # Prospero 私有目录，随后再拷回新工程；同 applicationId + 同证书才能原位升级。
 EXISTING_KEYSTORE="$MOBILE_DIR/android/app/debug.keystore"

@@ -122,10 +122,10 @@ pub fn sidebar(mode: Mode) -> impl Fn(&Theme) -> container::Style {
 
 pub fn terminal(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgb8(26, 27, 38))),
-        text_color: Some(Color::from_rgb8(192, 202, 245)),
+        background: Some(Background::Color(Color::from_rgb8(22, 23, 26))),
+        text_color: Some(Color::from_rgb8(230, 232, 238)),
         border: Border {
-            color: Color::from_rgb8(42, 44, 61),
+            color: Color::from_rgb8(44, 46, 53),
             width: 1.0,
             radius: border::Radius::new(RADIUS_PANEL),
         },

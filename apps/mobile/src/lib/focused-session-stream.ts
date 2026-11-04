@@ -58,7 +58,7 @@ export function subscribeFocusedChat(options: {
     if (!active || message.sid !== sid || message.evSeq <= receivedSeq) return;
     receivedSeq = message.evSeq;
     queued.push(message.body);
-    if (timer === null) timer = setTimeout(flush, 32);
+    if (timer === null) timer = setTimeout(flush, 16);
     options.unread();
   });
   const offOutput = conn.events.on("toolOutput", (message) => {

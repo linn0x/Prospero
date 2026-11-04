@@ -529,12 +529,13 @@ const ChatViewContent = memo(function ChatViewContent({
         onScrollEndDrag={handleScrollEndDrag}
         onMomentumScrollBegin={handleMomentumScrollBegin}
         onMomentumScrollEnd={handleMomentumScrollEnd}
-        scrollEventThrottle={32}
+        scrollEventThrottle={16}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
         removeClippedSubviews={Platform.OS === "android"}
         initialNumToRender={12}
-        maxToRenderPerBatch={8}
+        maxToRenderPerBatch={10}
+        updateCellsBatchingPeriod={16}
         // iOS 上 removeClippedSubviews 不可靠,只能靠窗口本身收窄挂载量。气泡里
         // 有 Markdown、diff 和图片,十一屏的量在长会话里就是白挂着的原生视图。
         windowSize={7}
@@ -1622,12 +1623,14 @@ const ActivityGroup = memo(function ActivityGroup({
 
 const useStyles = createThemedStyles((color) => StyleSheet.create({
   turnCapsule: { alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 7,
-    minHeight: 40, paddingHorizontal: 13, paddingVertical: 8, borderRadius: 22, backgroundColor: color.surfaceRaised },
+    minHeight: 40, paddingHorizontal: 13, paddingVertical: 8, borderRadius: 22,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: color.border, backgroundColor: color.surfaceRaised },
   turnCapsuleText: { color: color.textDim, fontSize: 12, fontWeight: "600" },
   turnCapsuleHint: { color: color.textFaint, fontSize: 11 },
   resultFiles: { gap: 6, marginTop: 10 },
   resultFile: { flexDirection: "row", alignItems: "center", gap: 8, minHeight: 42,
-    borderRadius: radius.md, backgroundColor: color.surfaceRaised, paddingHorizontal: 11 },
+    borderRadius: radius.md, borderWidth: StyleSheet.hairlineWidth, borderColor: color.border,
+    backgroundColor: color.surfaceRaised, paddingHorizontal: 11 },
   resultFileText: { flex: 1, color: color.accent, fontSize: 12 },
   root: { flex: 1 },
   list: { flex: 1, backgroundColor: color.bg },
@@ -1708,8 +1711,8 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   pendingOutgoingStatus: { marginTop: 3, color: color.textDim, fontSize: 10 },
   userBubble: {
     backgroundColor: color.accent,
-    borderRadius: radius.lg,
-    borderBottomRightRadius: 6,
+    borderRadius: 18,
+    borderBottomRightRadius: 5,
     paddingHorizontal: 14,
     paddingVertical: 10,
     maxWidth: "86%",

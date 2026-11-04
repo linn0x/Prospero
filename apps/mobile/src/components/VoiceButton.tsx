@@ -154,10 +154,12 @@ async function inspectAvailability(): Promise<Availability> {
       return { kind: "ready" };
     }
 
-    if (samsungMixedAvailable || bundledAndroidMixedAvailable) {
-      // Loading the model after the user releases push-to-talk accounts for a
-      // large part of perceived latency. Keep it warm as Samsung's guaranteed
-      // local fallback too, because vendor access can vary by firmware policy.
+    if (samsungMixedAvailable) {
+      await ProsperoMixedSpeechModule!.prepare();
+      return { kind: "ready" };
+    }
+
+    if (bundledAndroidMixedAvailable) {
       await Promise.all([
         ProsperoMixedSpeechModule!.prepare(),
         prepareAndroidOfflineSpeech(),

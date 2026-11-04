@@ -592,24 +592,24 @@ export const Terminal = memo(forwardRef<TerminalHandle, Props>(function Terminal
 }));
 
 const styles = StyleSheet.create({
-  wrap: { flex: 1, backgroundColor: "#09090b" },
-  web: { flex: 1, backgroundColor: "#09090b" },
-  native: { flex: 1, backgroundColor: "#09090b" },
+  wrap: { flex: 1, backgroundColor: "#16171a" },
+  web: { flex: 1, backgroundColor: "#16171a" },
+  native: { flex: 1, backgroundColor: "#16171a" },
   inputFrozen: {
     ...StyleSheet.absoluteFill,
     alignItems: "center",
     justifyContent: "center",
     padding: 24,
-    backgroundColor: "rgba(9, 9, 11, 0.58)",
+    backgroundColor: "rgba(15, 16, 19, 0.68)",
   },
   inputFrozenCard: {
     maxWidth: 340,
     gap: 12,
     padding: 16,
-    borderRadius: 12,
-    backgroundColor: "#211d15",
+    borderRadius: 14,
+    backgroundColor: "#1f1c16",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#6b5524",
+    borderColor: "#5c4922",
   },
   endedNotice: { justifyContent: "flex-start", backgroundColor: "transparent", paddingTop: 12 },
   inputFrozenText: { color: "#F0D798", fontSize: 13, lineHeight: 19, textAlign: "center" },
