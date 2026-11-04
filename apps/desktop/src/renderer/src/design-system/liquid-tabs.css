@@ -1,10 +1,10 @@
-/* Tabs remain opaque reading anchors, including above native vibrancy. */
+/* Tabs remain crisp capsule anchors above native vibrancy, aligned with Rex.app. */
 @media (prefers-reduced-transparency: no-preference) and (prefers-contrast: no-preference) and (forced-colors: none) {
   :root[data-platform="darwin"][data-native-glass="true"]:not([data-reduced-transparency="true"]):not([data-high-contrast="true"]) {
     [data-liquid-glass="tab"]:not([data-liquid-glass-scope="plain"] *):is(.is-active, [data-active], [aria-selected="true"], [aria-pressed="true"]) {
       color: var(--foreground);
       background: var(--surface-raised);
-      border-color: var(--border);
+      border-color: color-mix(in srgb, var(--foreground) 12%, var(--border));
       box-shadow: none;
     }
   }

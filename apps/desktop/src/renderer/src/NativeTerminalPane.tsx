@@ -11,19 +11,36 @@ export function supportsNativeTerminal(session: SessionInfo): boolean {
   return window.prospero.platform === "darwin" && session.kind === "pty" && session.terminalMode === "events" && !READ_ONLY_TERMINAL_STATUSES.has(session.status);
 }
 
+const OVERLAY_SELECTORS = [
+  '[role="dialog"]', '[role="alertdialog"]', '[role="menu"]', '[role="listbox"]', '[role="tooltip"]',
+  '[data-slot="sheet-overlay"]', '[data-slot="dialog-overlay"]', '[data-slot="popover-content"]',
+  '[data-slot="dropdown-menu-content"]', '[data-slot="tooltip-content"]', '[data-slot="sheet-content"]',
+  '[data-slot="dialog-content"]', '[data-radix-popper-content-wrapper]',
+].join(",");
+
+function nodeIntersectsOverlay(node: Node): boolean {
+  if (!(node instanceof Element)) return false;
+  return node.matches(OVERLAY_SELECTORS) || Boolean(node.closest(OVERLAY_SELECTORS) || node.querySelector(OVERLAY_SELECTORS));
+}
+
+function mutationAffectsTerminal(records: MutationRecord[], element: HTMLElement): boolean {
+  for (const record of records) {
+    const target = record.target;
+    if (target === document.body || target === document.documentElement || target.contains(element) || nodeIntersectsOverlay(target)) return true;
+    for (const added of record.addedNodes) if (nodeIntersectsOverlay(added)) return true;
+    for (const removed of record.removedNodes) if (nodeIntersectsOverlay(removed)) return true;
+  }
+  return false;
+}
+
 function overlayCovers(rect: DOMRect): boolean {
-  const selectors = [
-    '[role="dialog"]', '[role="alertdialog"]', '[role="menu"]', '[role="listbox"]', '[role="tooltip"]',
-    '[data-slot="sheet-overlay"]', '[data-slot="dialog-overlay"]', '[data-slot="popover-content"]',
-    '[data-slot="dropdown-menu-content"]', '[data-slot="tooltip-content"]', '[data-slot="sheet-content"]',
-    '[data-slot="dialog-content"]', '[data-radix-popper-content-wrapper]',
-  ].join(",");
-  for (const element of document.querySelectorAll<HTMLElement>(selectors)) {
-    if (!element.isConnected || element.getClientRects().length === 0) continue;
+  for (const element of document.querySelectorAll<HTMLElement>(OVERLAY_SELECTORS)) {
+    if (!element.isConnected) continue;
+    const box = element.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0 || box.left >= rect.right || box.right <= rect.left || box.top >= rect.bottom || box.bottom <= rect.top) continue;
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
-    const box = element.getBoundingClientRect();
-    if (box.width > 0 && box.height > 0 && box.left < rect.right && box.right > rect.left && box.top < rect.bottom && box.bottom > rect.top) return true;
+    return true;
   }
   return false;
 }
@@ -214,7 +231,13 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     if (!element) return;
     const resizeObserver = new ResizeObserver(scheduleBounds);
     resizeObserver.observe(element);
-    const mutationObserver = new MutationObserver(scheduleBounds);
+    const mainContainer = element.closest(".prospero-main");
+    const stackContainer = element.closest(".workspace-session-stack");
+    if (mainContainer) resizeObserver.observe(mainContainer);
+    if (stackContainer && stackContainer !== mainContainer) resizeObserver.observe(stackContainer);
+    const mutationObserver = new MutationObserver((records) => {
+      if (mutationAffectsTerminal(records, element)) scheduleBounds();
+    });
     mutationObserver.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["class", "style", "open", "data-state", "aria-hidden"] });
     window.addEventListener("resize", scheduleBounds);
     window.addEventListener("scroll", scheduleBounds, true);

@@ -66,9 +66,13 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
   });
   const [dockVisited, setDockVisited] = useState(false);
   const [resizing, setResizing] = useState(false);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const resizerRef = useRef<HTMLDivElement>(null);
+  const dockDragFrame = useRef<number | undefined>(undefined);
   const drag = useRef<{ pointerId: number; startX: number; width: number; autoWidth: boolean } | undefined>(undefined);
   const widthRef = useRef(width);
   widthRef.current = width;
+  useEffect(() => () => { if (dockDragFrame.current !== undefined) cancelAnimationFrame(dockDragFrame.current); }, []);
   const chromeVisible = workspaceChromeVisible(focus);
   const nativeTerminal = Boolean(session && supportsNativeTerminal(session));
   useEffect(() => {
@@ -117,6 +121,10 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
     window.addEventListener("keydown", search);
     return () => { window.removeEventListener("prospero:project-tools", open); window.removeEventListener("keydown", search); };
   }, [active, focused, dockId, focus, onToggleFocus]);
+  const applyDockDragWidth = (next: number): void => {
+    resizerRef.current?.setAttribute("aria-valuenow", String(Math.round(next)));
+    gridRef.current?.style.setProperty("--context-dock-width", `${next}px`);
+  };
   const saveWidth = (next: number): void => {
     const value = clampDockWidth(next);
     widthRef.current = value;
@@ -128,7 +136,19 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
     const start = drag.current;
     if (!start || start.pointerId !== event.pointerId) return;
     drag.current = undefined;
-    if (cancel) { setWidth(start.width); setAutoWidth(start.autoWidth); } else saveWidth(widthRef.current);
+    if (dockDragFrame.current !== undefined) {
+      cancelAnimationFrame(dockDragFrame.current);
+      dockDragFrame.current = undefined;
+    }
+    if (cancel) {
+      widthRef.current = start.width;
+      applyDockDragWidth(start.width);
+      setWidth(start.width);
+      setAutoWidth(start.autoWidth);
+    } else {
+      applyDockDragWidth(widthRef.current);
+      saveWidth(widthRef.current);
+    }
     setResizing(false);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
@@ -146,7 +166,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
     </header>}
   </>;
   return <div ref={host} className={cn("pane-workspace workspace-session-layout", focus && "is-focus")} data-dock-resizing={resizing || undefined}>
-    <div className={cn("workspace-grid", visible && !overlay && "has-dock")} style={{ "--context-dock-width": `${effectiveWidth}px` } as CSSProperties}>
+    <div ref={gridRef} className={cn("workspace-grid", visible && !overlay && "has-dock")} style={{ "--context-dock-width": `${effectiveWidth}px` } as CSSProperties}>
       <main id={active ? primary ? "workspace-session-panel" : "workspace-secondary-panel" : undefined} role="tabpanel" aria-labelledby={chromeVisible && session ? `workspace-tab-${session.id}` : undefined} aria-label={focus && session ? sessionLabel(session) : undefined} className="workspace-primary">
         {toolbar}
         {focus && session?.kind === "pty" && !nativeAvailable && <div className="workspace-focus-controls"><TerminalMouseToggle sessionId={session.id} localSelection={localSelection} onChange={setLocalSelection} /></div>}
@@ -155,7 +175,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
         </Suspense>
       </main>
       {visible && !overlay && <>
-        <div className="context-dock-resizer" role="separator" aria-orientation="vertical" aria-label={t("调整工具栏宽度", "Resize tools")} aria-valuemin={DOCK_MIN_WIDTH} aria-valuemax={maxWidth} aria-valuenow={effectiveWidth} tabIndex={0} onDoubleClick={() => saveWidth(DOCK_DEFAULT_WIDTH)} onPointerDown={(event) => {
+        <div ref={resizerRef} className="context-dock-resizer" role="separator" aria-orientation="vertical" aria-label={t("调整工具栏宽度", "Resize tools")} aria-valuemin={DOCK_MIN_WIDTH} aria-valuemax={maxWidth} aria-valuenow={effectiveWidth} tabIndex={0} onDoubleClick={() => saveWidth(DOCK_DEFAULT_WIDTH)} onPointerDown={(event) => {
           if (event.button !== 0) return;
           event.preventDefault();
           drag.current = { pointerId: event.pointerId, startX: event.clientX, width: effectiveWidth, autoWidth };
@@ -170,10 +190,29 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
           if (start?.pointerId === event.pointerId) {
             const next = Math.min(maxWidth, clampDockWidth(start.width + start.startX - event.clientX));
             widthRef.current = next;
-            setWidth(next);
+            resizerRef.current?.setAttribute("aria-valuenow", String(Math.round(next)));
+            if (dockDragFrame.current === undefined) {
+              dockDragFrame.current = requestAnimationFrame(() => {
+                dockDragFrame.current = undefined;
+                gridRef.current?.style.setProperty("--context-dock-width", `${widthRef.current}px`);
+              });
+            }
           }
         }} onPointerUp={(event) => endDrag(event, false)} onPointerCancel={(event) => endDrag(event, true)} onLostPointerCapture={(event) => { if (drag.current?.pointerId === event.pointerId) endDrag(event, true); }} onKeyDown={(event) => {
-          if (event.key === "Escape" && drag.current) { event.preventDefault(); setWidth(drag.current.width); setAutoWidth(drag.current.autoWidth); drag.current = undefined; setResizing(false); return; }
+          if (event.key === "Escape" && drag.current) {
+            event.preventDefault();
+            if (dockDragFrame.current !== undefined) {
+              cancelAnimationFrame(dockDragFrame.current);
+              dockDragFrame.current = undefined;
+            }
+            widthRef.current = drag.current.width;
+            applyDockDragWidth(drag.current.width);
+            setWidth(drag.current.width);
+            setAutoWidth(drag.current.autoWidth);
+            drag.current = undefined;
+            setResizing(false);
+            return;
+          }
           const next = event.key === "Home" ? DOCK_MIN_WIDTH : event.key === "End" ? maxWidth : event.key === "ArrowLeft" ? effectiveWidth + 20 : event.key === "ArrowRight" ? effectiveWidth - 20 : undefined;
           if (next !== undefined) { event.preventDefault(); saveWidth(Math.min(maxWidth, next)); }
         }} />
@@ -197,9 +236,15 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
   const [focusedId, setFocusedId] = useState(activeId);
   const [ratio, setRatio] = useState(50);
   const [stacked, setStacked] = useState(false);
+  const [splitResizing, setSplitResizing] = useState(false);
   const stack = useRef<HTMLDivElement>(null);
+  const splitResizerRef = useRef<HTMLDivElement>(null);
+  const splitDragFrame = useRef<number | undefined>(undefined);
+  const ratioRef = useRef(ratio);
+  ratioRef.current = ratio;
   const previousActive = useRef(activeId);
   const drag = useRef<{ pointer: number; ratio: number } | undefined>(undefined);
+  useEffect(() => () => { if (splitDragFrame.current !== undefined) cancelAnimationFrame(splitDragFrame.current); }, []);
   const candidates = openIds.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty" && id !== activeId)).filter((item): item is SessionInfo => Boolean(item));
   const peerId = splitId === activeId ? previousActive.current : splitId;
   const splitSession = session?.kind === "pty" ? candidates.find(item => item.id === peerId) : undefined;
@@ -234,15 +279,27 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
     onFocusedSessionChange?.(id);
     if (snapshot.unreadSessionIds.includes(id)) void window.prospero.setSessionUnread(id, false);
   };
+  const applySplitRatio = (next: number): void => {
+    splitResizerRef.current?.setAttribute("aria-valuenow", String(Math.round(next)));
+    stack.current?.style.setProperty(stacked ? "grid-template-rows" : "grid-template-columns", `${next}fr 6px ${100 - next}fr`);
+  };
   const closeSplit = (): void => { setSplitId(undefined); setFocusedId(activeId); };
   const endDrag = (event: PointerEvent<HTMLDivElement>, cancel: boolean): void => {
     const current = drag.current;
     if (!current || current.pointer !== event.pointerId) return;
-    if (cancel) setRatio(current.ratio);
     drag.current = undefined;
+    if (splitDragFrame.current !== undefined) {
+      cancelAnimationFrame(splitDragFrame.current);
+      splitDragFrame.current = undefined;
+    }
+    const nextRatio = cancel ? current.ratio : ratioRef.current;
+    ratioRef.current = nextRatio;
+    applySplitRatio(nextRatio);
+    setRatio(nextRatio);
+    setSplitResizing(false);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
-  return <div className="workspace-view workspace-view-single workspace-multipane">
+  return <div className="workspace-view workspace-view-single workspace-multipane" data-split-resizing={splitResizing || undefined}>
     {session?.kind === "pty" && splitSession && <div className="workspace-split-controls">
       <span className="workspace-split-label"><Columns2 />{t("分屏", "Split view")}</span>
       {splitSession && <><NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => setSplitId(event.target.value)}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect><Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button></>}
@@ -255,18 +312,40 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
           <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => setSplitId(candidates[0]?.id) : undefined} session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
         </div>;
       })}
-      {splitSession && <div className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => setRatio(50)} onPointerDown={event => {
+      {splitSession && <div ref={splitResizerRef} className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => setRatio(50)} onPointerDown={event => {
         if (event.button !== 0) return;
         event.preventDefault();
         drag.current = { pointer: event.pointerId, ratio };
+        ratioRef.current = ratio;
+        setSplitResizing(true);
         event.currentTarget.setPointerCapture(event.pointerId);
         event.currentTarget.focus();
       }} onPointerMove={event => {
         if (drag.current?.pointer !== event.pointerId || !stack.current) return;
         const rect = stack.current.getBoundingClientRect();
-        setRatio(Math.max(25, Math.min(75, 100 * (stacked ? (event.clientY - rect.top) / rect.height : (event.clientX - rect.left) / rect.width))));
+        const next = Math.max(25, Math.min(75, 100 * (stacked ? (event.clientY - rect.top) / rect.height : (event.clientX - rect.left) / rect.width)));
+        ratioRef.current = next;
+        splitResizerRef.current?.setAttribute("aria-valuenow", String(Math.round(next)));
+        if (splitDragFrame.current === undefined) {
+          splitDragFrame.current = requestAnimationFrame(() => {
+            splitDragFrame.current = undefined;
+            applySplitRatio(ratioRef.current);
+          });
+        }
       }} onPointerUp={event => endDrag(event, false)} onPointerCancel={event => endDrag(event, true)} onLostPointerCapture={event => endDrag(event, true)} onKeyDown={event => {
-        if (event.key === "Escape" && drag.current) { setRatio(drag.current.ratio); drag.current = undefined; event.preventDefault(); return; }
+        if (event.key === "Escape" && drag.current) {
+          if (splitDragFrame.current !== undefined) {
+            cancelAnimationFrame(splitDragFrame.current);
+            splitDragFrame.current = undefined;
+          }
+          ratioRef.current = drag.current.ratio;
+          applySplitRatio(drag.current.ratio);
+          setRatio(drag.current.ratio);
+          setSplitResizing(false);
+          drag.current = undefined;
+          event.preventDefault();
+          return;
+        }
         const next = event.key === "Home" ? 25 : event.key === "End" ? 75 : ["ArrowLeft", "ArrowUp"].includes(event.key) ? ratio - 5 : ["ArrowRight", "ArrowDown"].includes(event.key) ? ratio + 5 : undefined;
         if (next !== undefined) { event.preventDefault(); setRatio(Math.max(25, Math.min(75, next))); }
       }} />}

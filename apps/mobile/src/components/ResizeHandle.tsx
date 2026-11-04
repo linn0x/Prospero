@@ -7,17 +7,20 @@ export function ResizeHandle({ value, min, max, onChange, label }: {
   value: number; min: number; max: number; onChange(value: number): void; label: string;
 }) {
   const { palette } = useMobileTheme();
+  const [dragging, setDragging] = useState(false);
   const current = useRef({ value, min, max, onChange });
   const start = useRef(value);
   useLayoutEffect(() => { current.current = { value, min, max, onChange }; }, [value, min, max, onChange]);
   /* eslint-disable react-hooks/refs */
   const [responder] = useState(() => PanResponder.create({
     onStartShouldSetPanResponder: () => true,
-    onPanResponderGrant: () => { start.current = current.current.value; },
+    onPanResponderGrant: () => { start.current = current.current.value; setDragging(true); },
     onPanResponderMove: (_event, gesture) => {
       const { min: lower, max: upper, onChange: update } = current.current;
       update(Math.max(lower, Math.min(upper, start.current + gesture.dx)));
     },
+    onPanResponderRelease: () => setDragging(false),
+    onPanResponderTerminate: () => setDragging(false),
     onPanResponderTerminationRequest: () => false,
     onShouldBlockNativeResponder: () => true,
   }));
@@ -31,11 +34,12 @@ export function ResizeHandle({ value, min, max, onChange, label }: {
       const delta = nativeEvent.actionName === "increment" ? 32 : nativeEvent.actionName === "decrement" ? -32 : 0;
       if (delta) onChange(Math.max(min, Math.min(max, value + delta)));
     }}>
-    <View style={[styles.mark, { backgroundColor: palette.textFaint }]} />
+    <View style={[styles.mark, { backgroundColor: dragging ? palette.accent : palette.textFaint }, dragging && styles.markDragging]} />
   </View>;
 }
 
 const styles = StyleSheet.create({
   handle: { flex: 1, width: 24, alignSelf: "stretch", justifyContent: "center", alignItems: "center" },
   mark: { width: 4, height: 40, borderRadius: 2, opacity: 0.65 },
+  markDragging: { height: 48, opacity: 0.95 },
 });

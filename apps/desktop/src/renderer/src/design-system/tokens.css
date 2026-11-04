@@ -60,9 +60,11 @@
   --diff-removed: #b83f47;
   --diff-removed-bg: #fde9ea;
   --diff-modified: #966118;
-  --terminal-background: #111827;
-  --terminal-foreground: #dce5f2;
-  --terminal-selection: #304a78;
+  --terminal-background: #16171a;
+  --terminal-surface: #1d1e22;
+  --terminal-border: #2c2e35;
+  --terminal-foreground: #e6e8ee;
+  --terminal-selection: #2c3e66;
   --code-background: #f0f0f2;
   --code-foreground: #24304a;
   --dag-node: #fafafa;

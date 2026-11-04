@@ -1,6 +1,6 @@
 # Prospero owns the window, session process, and application shortcuts.
-background = #1a1b26
-foreground = #c0caf5
+background = #16171a
+foreground = #e6e8ee
 font-family = Menlo
 font-size = 13
 mouse-scroll-multiplier = precision:1.5

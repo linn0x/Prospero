@@ -458,14 +458,14 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
         activate: openTerminalExternalUrl,
       },
       theme: {
-        background: "#1a1b26", foreground: "#c0caf5", cursor: "#c0caf5",
-        cursorAccent: "#1a1b26", selectionBackground: "#283457",
-        selectionInactiveBackground: "#242b49", scrollbarSliderBackground: "#7aa2f733",
-        scrollbarSliderHoverBackground: "#7dcfff66", scrollbarSliderActiveBackground: "#7dcfff88",
-        black: "#15161e", brightBlack: "#414868", red: "#f7768e", brightRed: "#f7768e",
-        green: "#9ece6a", brightGreen: "#9ece6a", yellow: "#e0af68", brightYellow: "#e0af68",
-        blue: "#7aa2f7", brightBlue: "#7aa2f7", magenta: "#bb9af7", brightMagenta: "#bb9af7",
-        cyan: "#7dcfff", brightCyan: "#7dcfff", white: "#a9b1d6", brightWhite: "#c0caf5",
+        background: "#16171a", foreground: "#e6e8ee", cursor: "#e6e8ee",
+        cursorAccent: "#16171a", selectionBackground: "#2c3e66",
+        selectionInactiveBackground: "#232d45", scrollbarSliderBackground: "#8ba9ff33",
+        scrollbarSliderHoverBackground: "#8ba9ff55", scrollbarSliderActiveBackground: "#8ba9ff77",
+        black: "#131417", brightBlack: "#4b4e58", red: "#e16767", brightRed: "#f48585",
+        green: "#58b99a", brightGreen: "#74ceaf", yellow: "#f0b45a", brightYellow: "#f5c57c",
+        blue: "#8ba9ff", brightBlue: "#a2baff", magenta: "#c49bff", brightMagenta: "#d4b5ff",
+        cyan: "#6bc5e8", brightCyan: "#89d4f0", white: "#c8ccd4", brightWhite: "#ececef",
       },
     });
     configureRustTerminalUnicode(terminal);

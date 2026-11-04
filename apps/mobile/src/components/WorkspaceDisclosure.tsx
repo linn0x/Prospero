@@ -26,7 +26,7 @@ export function WorkspaceDisclosure({ expanded, header, children }: {
   useLayoutEffect(() => {
     expandedRef.current = expanded;
     let active = true;
-    const options = { duration: reduceMotion ? 0 : 240, easing: Easing.inOut(Easing.cubic), useNativeDriver: false };
+    const options = { duration: reduceMotion ? 0 : 200, easing: Easing.out(Easing.cubic), useNativeDriver: false };
     const animation = Animated.parallel([
       Animated.timing(progress, { ...options, toValue: expanded ? 1 : 0 }),
       Animated.timing(height, { ...options, toValue: expanded ? contentHeight : 0 }),

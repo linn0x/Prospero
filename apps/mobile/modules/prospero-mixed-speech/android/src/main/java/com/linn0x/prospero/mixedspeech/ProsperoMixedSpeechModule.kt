@@ -275,14 +275,14 @@ class ProsperoMixedSpeechModule : Module() {
     }
 
     AsyncFunction<Unit>("prepare") {
-      check(hasBundledModel()) {
-        "安卓版离线语音模型不完整，请重新构建并安装完整 APK。"
-      }
       if (
         samsungAccessAllowed == null &&
         SamsungIntelliVoiceSession.isAvailable(context)
       ) {
         samsungAccessAllowed = SamsungIntelliVoiceSession.probe(context)
+      }
+      check(shouldUseSamsung() || hasBundledModel()) {
+        "安卓版未内置离线语音模型，且设备不支持三星本地语音识别。"
       }
       Log.i(TAG, "Prepared Android offline speech; preferred engine=${selectedEngine()}")
     }
@@ -409,9 +409,9 @@ class ProsperoMixedSpeechModule : Module() {
   }.getOrDefault(false)
 
   private fun selectedEngine(): String = when {
-    !hasBundledModel() -> "unavailable"
     shouldUseSamsung() -> "samsung"
-    else -> "whisper"
+    hasBundledModel() -> "whisper"
+    else -> "unavailable"
   }
 
   private fun shouldUseSamsung(): Boolean =
