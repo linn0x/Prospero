@@ -468,7 +468,7 @@ export class RustRuntime {
     const [summary, active, recent, workspaces, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
-      client.sidebarSessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
+      client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       client.health(signal),
       client.devices(signal).catch((error: unknown) => {
@@ -530,7 +530,7 @@ export class RustRuntime {
       ...(health.relay ? { relay: health.relay as unknown as JsonObject } : {}),
       metadataRevision: `${pid}:${this.sequence}`,
       workspaceCounts: Object.fromEntries(workspaces.items.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
-      sessionSummary: { total: summary.total, active: summary.active, terminal: summary.archived, attention: summary.attention, activeLimit: 100, attentionLimit: 0, recentTerminalLimit: 20 },
+      sessionSummary: { total: summary.total, active: summary.active, terminal: summary.archived, attention: summary.attention, activeLimit: 100, attentionLimit: 0, recentTerminalLimit: 100 },
       schedules: schedules as unknown as JsonObject[],
     } });
   }

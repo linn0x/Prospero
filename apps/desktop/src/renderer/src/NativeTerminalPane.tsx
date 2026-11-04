@@ -12,11 +12,13 @@ export function supportsNativeTerminal(session: SessionInfo): boolean {
 }
 
 const OVERLAY_SELECTORS = [
-  '[role="dialog"]', '[role="alertdialog"]', '[role="menu"]', '[role="listbox"]', '[role="tooltip"]',
+  '[role="dialog"]', '[role="alertdialog"]', '[role="menu"]', '[role="listbox"]',
   '[data-slot="sheet-overlay"]', '[data-slot="dialog-overlay"]', '[data-slot="popover-content"]',
-  '[data-slot="dropdown-menu-content"]', '[data-slot="tooltip-content"]', '[data-slot="sheet-content"]',
+  '[data-slot="dropdown-menu-content"]', '[data-slot="sheet-content"]',
   '[data-slot="dialog-content"]', '[data-radix-popper-content-wrapper]',
 ].join(",");
+
+const CLOSING_OR_HIDDEN_OVERLAY_SELECTOR = '[data-closed], [data-ending-style], [data-state="closed"], [aria-hidden="true"], [hidden], [inert]';
 
 function nodeIntersectsOverlay(node: Node): boolean {
   if (!(node instanceof Element)) return false;
@@ -26,7 +28,13 @@ function nodeIntersectsOverlay(node: Node): boolean {
 function mutationAffectsTerminal(records: MutationRecord[], element: HTMLElement): boolean {
   for (const record of records) {
     const target = record.target;
-    if (target === document.body || target === document.documentElement || target.contains(element) || nodeIntersectsOverlay(target)) return true;
+    if (
+      target === document.body ||
+      target === document.documentElement ||
+      (target instanceof Element && target.parentElement === document.body) ||
+      target.contains(element) ||
+      nodeIntersectsOverlay(target)
+    ) return true;
     for (const added of record.addedNodes) if (nodeIntersectsOverlay(added)) return true;
     for (const removed of record.removedNodes) if (nodeIntersectsOverlay(removed)) return true;
   }
@@ -36,10 +44,11 @@ function mutationAffectsTerminal(records: MutationRecord[], element: HTMLElement
 function overlayCovers(rect: DOMRect): boolean {
   for (const element of document.querySelectorAll<HTMLElement>(OVERLAY_SELECTORS)) {
     if (!element.isConnected) continue;
+    if (element.matches(CLOSING_OR_HIDDEN_OVERLAY_SELECTOR) || element.closest(CLOSING_OR_HIDDEN_OVERLAY_SELECTOR)) continue;
     const box = element.getBoundingClientRect();
     if (box.width <= 0 || box.height <= 0 || box.left >= rect.right || box.right <= rect.left || box.top >= rect.bottom || box.bottom <= rect.top) continue;
     const style = getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
+    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none" || Number(style.opacity) === 0) continue;
     return true;
   }
   return false;
@@ -67,8 +76,10 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
   const notifiedClosedIds = useRef(new Set<number>());
   const lastNativeError = useRef<string | undefined>(undefined);
   const boundsFrame = useRef<number | undefined>(undefined);
-  const liveSessionSeenRef = useRef(supportsNativeTerminal(session));
-  if (supportsNativeTerminal(session)) liveSessionSeenRef.current = true;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const autoRetryCount = useRef(0);
+  const autoRetryTimer = useRef<number | undefined>(undefined);
   activeRef.current = active;
   focusedRef.current = focused;
   stateRef.current = state;
@@ -93,14 +104,14 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
   };
 
   useEffect(() => {
-    if (!supportsNativeTerminal(session) && !liveSessionSeenRef.current) { setMode("fallback"); return; }
+    if (!supportsNativeTerminal(session) && nativeId.current === undefined) { setMode("fallback"); return; }
     if (!active || mode !== "pending") return;
     let cancelled = false;
     void window.prospero.nativeTerminal.available().then(result => {
       if (!cancelled) setMode(result.available ? "native" : "fallback");
     }).catch(() => { if (!cancelled) setMode("fallback"); });
     return () => { cancelled = true; };
-  }, [active, mode, retry, session.id, session.kind, session.terminalMode]);
+  }, [active, mode, retry, session.id, session.kind, session.status, session.terminalMode]);
 
   useEffect(() => {
     if (mode === "native") onNativeAvailabilityChange(true);
@@ -109,14 +120,46 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
 
   useEffect(() => {
     if (mode !== "native" || nativeId.current !== undefined) return;
+    if (!supportsNativeTerminal(sessionRef.current)) {
+      setMode("fallback");
+      return;
+    }
     let cancelled = false;
     let opened: number | undefined;
+    const scheduleAutoReconnect = (): void => {
+      if (cancelled) return;
+      if (!supportsNativeTerminal(sessionRef.current)) {
+        setMode("fallback");
+        return;
+      }
+      if (autoRetryCount.current < 3) {
+        autoRetryCount.current += 1;
+        if (autoRetryTimer.current !== undefined) window.clearTimeout(autoRetryTimer.current);
+        autoRetryTimer.current = window.setTimeout(() => {
+          autoRetryTimer.current = undefined;
+          if (cancelled) return;
+          if (!supportsNativeTerminal(sessionRef.current)) {
+            setMode("fallback");
+            return;
+          }
+          const syncing = { ...stateRef.current, connected: false, syncing: true };
+          setState(syncing);
+          stateRef.current = syncing;
+          onNativeStateChange(syncing);
+          setMode("pending");
+          setRetry(value => value + 1);
+        }, 600 * autoRetryCount.current);
+      }
+    };
     const unsubscribeState = window.prospero.nativeTerminal.subscribeState(event => {
       if (closedNativeIds.current.has(event.id)) return;
       if (event.id === nativeId.current) {
         setState(event.state);
         onNativeStateChange(event.state);
-        if (event.state.connected && !event.state.syncing) lastNativeError.current = undefined;
+        if (event.state.connected && !event.state.syncing) {
+          lastNativeError.current = undefined;
+          autoRetryCount.current = 0;
+        }
       }
       else {
         earlyStates.current.set(event.id, event.state);
@@ -130,7 +173,12 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
           nativeId.current = undefined;
           setNativeIdValue(undefined);
           lastBounds.current = undefined;
-          notifyClosedNative(event.id);
+          if (!supportsNativeTerminal(sessionRef.current)) {
+            setMode("fallback");
+            return;
+          }
+          if (autoRetryCount.current >= 3) notifyClosedNative(event.id);
+          scheduleAutoReconnect();
         }
       }
     });
@@ -150,26 +198,44 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
       const initialState = earlyStates.current.get(result.id);
       if (initialState) {
         setState(initialState); onNativeStateChange(initialState); earlyStates.current.delete(result.id);
-        if (initialState.connected && !initialState.syncing) lastNativeError.current = undefined;
+        if (initialState.connected && !initialState.syncing) {
+          lastNativeError.current = undefined;
+          autoRetryCount.current = 0;
+        }
       }
       const initialError = earlyErrors.current.get(result.id);
       if (initialError) { lastNativeError.current = initialError; earlyErrors.current.delete(result.id); }
       if (closedNativeIds.current.has(result.id)) {
         nativeId.current = undefined; setNativeIdValue(undefined);
-        notifyClosedNative(result.id);
+        if (!supportsNativeTerminal(sessionRef.current)) {
+          setMode("fallback");
+          return;
+        }
+        if (autoRetryCount.current >= 3) notifyClosedNative(result.id);
+        scheduleAutoReconnect();
       }
       lastBounds.current = undefined;
       if (nativeId.current !== undefined) scheduleBounds();
     }).catch(reason => {
       if (!cancelled) {
+        const message = displayError(reason);
+        if (!supportsNativeTerminal(sessionRef.current) || /does not support terminal streaming|not available|unavailable|not installed|could not be loaded/i.test(message)) {
+          setMode("fallback");
+          return;
+        }
         const disconnected = { connected: false, syncing: false, controller: false, exited: false, readOnly: true };
         setState(disconnected);
         onNativeStateChange(disconnected);
-        notifyNativeIssue(displayError(reason));
+        if (autoRetryCount.current >= 3) notifyNativeIssue(message);
+        scheduleAutoReconnect();
       }
     });
     return () => {
       cancelled = true;
+      if (autoRetryTimer.current !== undefined) {
+        window.clearTimeout(autoRetryTimer.current);
+        autoRetryTimer.current = undefined;
+      }
       unsubscribeState(); unsubscribeError();
       if (opened !== undefined) void window.prospero.nativeTerminal.close(opened);
       if (nativeId.current === opened) nativeId.current = undefined;
@@ -240,16 +306,25 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     const mutationObserver = new MutationObserver((records) => {
       if (mutationAffectsTerminal(records, element)) scheduleBounds();
     });
-    mutationObserver.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["class", "style", "open", "data-state", "aria-hidden"] });
+    mutationObserver.observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["class", "style", "open", "data-state", "data-open", "data-closed", "data-ending-style", "aria-hidden", "hidden", "inert"],
+    });
     window.addEventListener("resize", scheduleBounds);
     window.addEventListener("scroll", scheduleBounds, true);
     document.addEventListener("visibilitychange", scheduleBounds);
+    document.documentElement.addEventListener("transitionend", scheduleBounds, true);
+    document.documentElement.addEventListener("animationend", scheduleBounds, true);
     scheduleBounds();
     return () => {
       resizeObserver.disconnect(); mutationObserver.disconnect();
       window.removeEventListener("resize", scheduleBounds);
       window.removeEventListener("scroll", scheduleBounds, true);
       document.removeEventListener("visibilitychange", scheduleBounds);
+      document.documentElement.removeEventListener("transitionend", scheduleBounds, true);
+      document.documentElement.removeEventListener("animationend", scheduleBounds, true);
       if (boundsFrame.current !== undefined) cancelAnimationFrame(boundsFrame.current);
       boundsFrame.current = undefined;
     };
@@ -304,6 +379,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     scheduleBounds();
   };
   const reconnect = useCallback((): void => {
+    autoRetryCount.current = 0;
     const syncing = { ...stateRef.current, connected: false, syncing: true };
     setState(syncing);
     stateRef.current = syncing;
@@ -340,6 +416,15 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
       <button type="button" disabled={!searchText} aria-label={t("下一个", "Next")} onClick={() => searchText && nativeId.current !== undefined && void window.prospero.nativeTerminal.searchStep(nativeId.current, "next").catch(() => undefined)}>↓</button>
       <button type="button" aria-label={t("关闭查找", "Close find")} onClick={closeSearch}>×</button>
     </div>
+    {nativeIdValue === undefined && !state.connected && !state.syncing && !state.exited && (
+      <div className="native-terminal-disconnected-banner" role="status">
+        <span>{lastNativeError.current ?? t("原生终端连接已断开", "Native terminal disconnected")}</span>
+        <div className="native-terminal-disconnected-actions">
+          <button type="button" onClick={reconnect}>{t("重新连接", "Reconnect")}</button>
+          <button type="button" onClick={() => setMode("fallback")}>{t("切换内置视图", "Built-in view")}</button>
+        </div>
+      </div>
+    )}
     <div ref={host} className="native-terminal-host" data-native-id={nativeIdValue} data-native-state={state.connected ? "connected" : state.syncing ? "syncing" : state.exited ? "exited" : "disconnected"} tabIndex={-1} onPointerDownCapture={() => { pendingFocus.current = true; scheduleBounds(); }} />
   </section>;
 }

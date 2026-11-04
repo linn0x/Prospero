@@ -61,7 +61,7 @@ type NativeSession = {
   closing: boolean;
 };
 
-const ACK_TIMEOUT_MS = 5_000;
+const ACK_TIMEOUT_MS = 30_000;
 const MAX_NATIVE_CHUNK = 48 * 1024;
 const MAX_PENDING_STREAM_BYTES = 256 * 1024;
 const require = createRequire(import.meta.url);
@@ -495,8 +495,12 @@ export class NativeGhosttyManager {
   }
 
   private failSession(id: number, message: string): void {
-    if (!this.sessions.has(id)) return;
+    const session = this.sessions.get(id);
+    if (!session) return;
     this.publishError(id, message);
+    const disconnected: TerminalStreamState = { ...session.controllerState, connected: false, syncing: false, controller: false, readOnly: true };
+    session.controllerState = disconnected;
+    this.publishState(id, disconnected);
     this.close(id);
   }
 

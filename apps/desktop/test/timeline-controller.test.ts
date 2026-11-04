@@ -125,6 +125,48 @@ describe("paged materialized timelines", () => {
     expect(controller.getSnapshot().page?.items[0]?.preview).toBe("very old answer");
     controller.stop();
   });
+
+  it("batches lookupTimeline calls in chunks of 40 when a long materialized turn updates", async () => {
+    vi.useFakeTimers();
+    const records = [
+      turnEntry(1, "turn1", { kind: "message", role: "user", finalAnswer: false }, "question"),
+      turnEntry(2, "turn1", { kind: "message", role: "assistant", finalAnswer: true }, "complete answer"),
+      ...Array.from({ length: 85 }, (_, index) => turnEntry(index + 3, "turn1", { kind: "tool", name: "bash", state: "running", summary: "running" }, `tool ${index}`)),
+      turnEntry(88, "turn1", { kind: "turn_end", finish: "completed" }),
+    ];
+    const readTimeline = vi.fn(async (_id: string, query: TimelineQuery): Promise<TimelinePage> => {
+      const eligible = query.after !== null
+        ? records.filter(item => item.position > query.after!).slice(0, query.limit ?? 40)
+        : records.filter(item => item.position < (query.before ?? Number.MAX_SAFE_INTEGER)).slice(-(query.limit ?? 40));
+      return { items: eligible, older: eligible[0]!.position > 1 ? eligible[0]!.position : null, newer: eligible.at(-1)!.position < records.length ? eligible.at(-1)!.position : null, latestPosition: records.length, revision: 10 };
+    });
+    const updatedPositions = Array.from({ length: 85 }, (_, index) => index + 3);
+    const lookupTimeline = vi.fn(async (_id: string, ids: string[]) => ({
+      items: ids.map(recordId => {
+        const position = Number(recordId.replace("record-", ""));
+        return { ...records[position - 1]!, revision: 2, preview: `updated ${position}` };
+      }),
+      latestPosition: records.length,
+      revision: 11,
+    }));
+    const controller = new TimelineController({
+      readTimeline,
+      readTimelineChanges: vi.fn().mockResolvedValueOnce(changes(11, updatedPositions)).mockResolvedValue(changes(11)),
+      lookupTimeline,
+      cancelSessionPage: vi.fn(async () => {}),
+    }, "session");
+    controller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(lookupTimeline).toHaveBeenCalledTimes(3);
+    expect(lookupTimeline.mock.calls[0]?.[1]).toHaveLength(40);
+    expect(lookupTimeline.mock.calls[1]?.[1]).toHaveLength(40);
+    expect(lookupTimeline.mock.calls[2]?.[1]).toHaveLength(5);
+    expect(controller.getSnapshot().error).toBeUndefined();
+    expect(controller.getSnapshot().page?.items[2]?.preview).toBe("updated 3");
+    expect(controller.getSnapshot().page?.items[86]?.preview).toBe("updated 87");
+    controller.stop();
+  });
 });
 
 describe("timeline view projection", () => {
