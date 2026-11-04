@@ -98,9 +98,10 @@ pub(super) async fn launch_worker_start(
             | crate::protocol::AgentKind::Codex
             | crate::protocol::AgentKind::Deepseek
             | crate::protocol::AgentKind::Opencode
+            | crate::protocol::AgentKind::Pi
     ) {
         return Err(Error::Invalid(
-            "Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode".into(),
+            "Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode/Pi".into(),
         ));
     }
     let policy = match input.approval_policy.as_deref().unwrap_or("standard") {
@@ -119,6 +120,9 @@ pub(super) async fn launch_worker_start(
         }
         None | Some("") | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
         Some(crate::agent::NATIVE_CODEX_ID) if input.agent == crate::protocol::AgentKind::Codex => {
+            None
+        }
+        Some(crate::accounts::NATIVE_PI_ID) if input.agent == crate::protocol::AgentKind::Pi => {
             None
         }
         Some(_) if input.agent == crate::protocol::AgentKind::Deepseek => {

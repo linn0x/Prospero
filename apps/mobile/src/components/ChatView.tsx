@@ -567,6 +567,7 @@ const agentLabel: Record<AgentKind, string> = {
   codex: "Codex",
   deepseek: "DeepSeek Harness",
   opencode: "OpenCode",
+  pi: "Pi",
   grok: "Grok",
   trae: "Trae",
   shell: "Shell",

@@ -581,7 +581,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
       void inputBuffer.flush();
     };
     const pasteImage = (): void => {
-      if (session.agent !== "claude" && session.agent !== "codex") { showNotice(tRef.current("此终端暂不支持图片粘贴，请保存图片后使用文件路径", "Image paste is unavailable in this terminal; save the image and use its file path")); return; }
+      if (session.agent !== "claude" && session.agent !== "codex" && session.agent !== "pi") { showNotice(tRef.current("此终端暂不支持图片粘贴，请保存图片后使用文件路径", "Image paste is unavailable in this terminal; save the image and use its file path")); return; }
       void window.prospero.saveTerminalClipboardImage(session.id).then(({ path }) => {
         if (terminalRef.current !== terminal) return;
         if (!focusedRef.current || !host.current?.contains(document.activeElement)) { showNotice(tRef.current("图片已保存；回到此终端后可重新粘贴", "Image saved; return to this terminal and paste again")); return; }
@@ -786,7 +786,11 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
     // Ended sessions have no live host to attach to. This is an explicit
     // static-history route selected from session metadata, never a fallback
     // after a stream error.
-    if (session.terminalMode !== "events" || terminalSessionIsReadOnly(session.status)) { setStreamMode("legacy"); return; }
+    if (session.terminalMode !== "events") { setStreamMode("legacy"); return; }
+    if (terminalSessionIsReadOnly(session.status)) {
+      if (!liveSessionSeen || !hasPresentedFrameRef.current) setStreamMode("legacy");
+      return;
+    }
     let alive = true;
     const requestId = crypto.randomUUID();
     const applyState = (state: TerminalStreamState): void => {

@@ -1138,7 +1138,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * Codex 通过 catalogOnly 跳过 thread/start，Claude SDK 则在读取后立即释放。
    */
   async launchModels(
-    agent: "claude" | "codex" | "deepseek" | "opencode",
+    agent: "claude" | "codex" | "deepseek" | "opencode" | "pi",
     accountId?: string,
   ): Promise<AgentModelCatalog> {
     const account = accountId && agent !== "deepseek" ? this.resolveAccount(agent, accountId) : undefined;

@@ -1057,7 +1057,10 @@ impl Store {
         // The native id collapses to NULL; anything else must reference a
         // surviving managed account so sessions never bind to a deleted row.
         let account_id = match input.account_id.as_deref() {
-            None | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+            None
+            | Some(crate::accounts::NATIVE_CLAUDE_ID)
+            | Some(crate::agent::NATIVE_CODEX_ID)
+            | Some(crate::accounts::NATIVE_PI_ID) => None,
             Some(id) => {
                 crate::database::validate_id(id)?;
                 let _record = self.managed_account(id)?;
@@ -1077,6 +1080,7 @@ impl Store {
                 account_id: account_id.clone().or_else(|| match agent {
                     AgentKind::Codex => Some(crate::agent::NATIVE_CODEX_ID.into()),
                     AgentKind::Claude => Some(crate::accounts::NATIVE_CLAUDE_ID.into()),
+                    AgentKind::Pi => Some(crate::accounts::NATIVE_PI_ID.into()),
                     _ => None,
                 }),
                 model: model.clone(),
@@ -1235,6 +1239,7 @@ impl Store {
             "codex" => AgentKind::Codex,
             "deepseek" => AgentKind::Deepseek,
             "opencode" => AgentKind::Opencode,
+            "pi" => AgentKind::Pi,
             _ => {
                 return Err(Error::Invalid(
                     "Agent 暂未接入 Rust structured runtime".into(),
@@ -1347,11 +1352,13 @@ impl Store {
                 compact: agent == "claude"
                     || agent == "codex"
                     || agent == "deepseek"
-                    || agent == "opencode",
+                    || agent == "opencode"
+                    || agent == "pi",
                 model: (agent == "claude"
                     || agent == "codex"
                     || agent == "deepseek"
-                    || agent == "opencode")
+                    || agent == "opencode"
+                    || agent == "pi")
                     && !profile_bound,
                 mode: (agent == "claude" || agent == "codex") && !profile_bound,
                 current_model: row.get(3)?,

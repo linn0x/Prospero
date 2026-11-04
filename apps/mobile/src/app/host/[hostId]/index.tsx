@@ -73,11 +73,11 @@ import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
 const AGENTS: AgentKind[] = [
-  "claude", "codex", "deepseek", "opencode", "grok", "trae", "shell",
+  "claude", "codex", "pi", "deepseek", "opencode", "grok", "trae", "shell",
 ];
 /** 有结构化适配器的 agent(会话会以对话形态呈现) */
-const STRUCTURED: AgentKind[] = ["claude", "codex", "opencode", "deepseek"];
-const RESUMABLE: AgentKind[] = ["claude", "codex", "deepseek"];
+const STRUCTURED: AgentKind[] = ["claude", "codex", "pi", "opencode", "deepseek"];
+const RESUMABLE: AgentKind[] = ["claude", "codex", "pi", "deepseek"];
 const PLAN_CAPABLE: AgentKind[] = ["claude", "codex"];
 const APPROVAL_POLICIES: readonly {
   value: ApprovalPolicy;
@@ -260,7 +260,7 @@ export default function HostScreen() {
     end: width - composerStart,
   };
 
-  const codeAgent = agent === "claude" || agent === "codex" || agent === "opencode" ? agent : null;
+  const codeAgent = agent === "claude" || agent === "codex" || agent === "opencode" || agent === "pi" ? agent : null;
   const launchCatalogAgent = codeAgent ?? (agent === "deepseek" ? "deepseek" : null);
   const matchingAccounts = codeAgent
     ? agentAccounts.filter((account) => getAgentAccountEngine(account) === codeAgent)
@@ -274,7 +274,7 @@ export default function HostScreen() {
   const selectedAccountCapabilities = selectedAccount ? getAgentAccountCapabilities(selectedAccount) : undefined;
   const accountRequiresStructured = selectedAccountCapabilities?.sessionKinds.length === 1 && selectedAccountCapabilities.sessionKinds[0] === "structured";
   const effectiveSessionKind: SessionKind = accountRequiresStructured ? "structured" : sessionKind;
-  const managedAgentTerminal = effectiveSessionKind === "pty" && (agent === "claude" || agent === "codex");
+  const managedAgentTerminal = effectiveSessionKind === "pty" && (agent === "claude" || agent === "codex" || agent === "pi");
   const displayedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : approvalPolicy;
   const accountCanPlan = selectedAccountCapabilities?.plan ?? true;
   const accountCanResume = selectedAccountCapabilities?.resume ?? true;
@@ -390,7 +390,7 @@ export default function HostScreen() {
           setAgentAccounts(next);
           setSelectedAccountIds((current) => {
             const updated = { ...current };
-            for (const kind of ["claude", "codex", "opencode"] as const) {
+            for (const kind of ["claude", "codex", "opencode", "pi"] as const) {
               const available = next.filter((account) => getAgentAccountEngine(account) === kind);
               if (!available.some((account) => account.id === updated[kind])) {
                 updated[kind] = available.find((account) => account.isDefault)?.id ?? available[0]?.id;
@@ -893,7 +893,7 @@ export default function HostScreen() {
   // 所有行都会被判定为 props 变化,memo 等于没做。
   const sessionSwipeActions = useCallback((session: SessionInfo): SwipeAction[] => {
     const archived = session.archived ?? archivedIds.has(session.id);
-    const canResume = session.kind === "structured" || ["claude", "codex"].includes(session.agent);
+    const canResume = session.kind === "structured" || ["claude", "codex", "pi"].includes(session.agent);
     return [
       {
         id: "toggle-archive",

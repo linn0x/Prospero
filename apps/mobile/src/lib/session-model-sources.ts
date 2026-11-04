@@ -9,6 +9,7 @@ export function modelSourcePresentation(width: number, height: number): "side" |
 }
 
 export function sourceRouteMatchesAgent(route: Pick<ModelSourceRoute, "protocol">, preferred: CodeAgentKind): boolean {
+  if (preferred === "pi") return true;
   if (preferred === "claude") return route.protocol === "anthropic";
   if (preferred === "opencode") return route.protocol === "openai_chat_completions";
   return route.protocol === "openai_responses" || route.protocol === "openai_chat_completions";
@@ -37,6 +38,7 @@ export function catalogRouteInput(model: AgentApiCatalogModel, protocol: ModelSo
 
 /** Pick the compatible Agent automatically when selecting a model source route. */
 export function agentForSourceRoute(route: ModelSourceRoute, preferred: CodeAgentKind): CodeAgentKind {
+  if (preferred === "pi") return "pi";
   if (route.protocol === "anthropic") return "claude";
   if (route.protocol === "openai_chat_completions" && preferred === "opencode") return "opencode";
   return "codex";

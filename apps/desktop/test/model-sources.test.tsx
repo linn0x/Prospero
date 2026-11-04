@@ -144,10 +144,11 @@ describe("model source selection and IPC", () => {
     expect(html).not.toContain('type="password"');
   });
 
-  it("keeps OpenCode available in the shared model source session runtime selector", () => {
+  it("keeps OpenCode and Pi available in the shared model source session runtime selector", () => {
     const app = readFileSync(new URL("../src/renderer/src/App.tsx", import.meta.url), "utf8");
     expect(app).toContain('<NativeSelectOption value="opencode">OpenCode</NativeSelectOption>');
-    expect(app).toContain('input.agent === "claude" || input.agent === "opencode" ? input.agent : "codex"');
+    expect(app).toContain('<NativeSelectOption value="pi">Pi</NativeSelectOption>');
+    expect(app).toContain('input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" ? input.agent : "codex"');
   });
 
   it("keeps sources and native accounts on the same page, without a new navigation tab", () => {

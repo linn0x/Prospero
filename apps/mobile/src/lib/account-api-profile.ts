@@ -42,6 +42,7 @@ export function accountApiProtocolsForAgent(
   if (!supportsProtocols) return [accountApiProtocolForAgent(agent)];
   if (agent === "claude") return ["anthropic"];
   if (agent === "opencode") return ["openai_chat_completions"];
+  if (agent === "pi") return ["anthropic", "openai_responses", "openai_chat_completions"];
   return ["openai_responses", "openai_chat_completions"];
 }
 
@@ -58,6 +59,7 @@ export function accountApiProfileRequiresStructured(
   agent: CodeAgentKind,
   protocol: string | undefined,
 ): boolean {
+  if (agent === "pi") return false;
   return accountApiProtocolFromProfile(agent, protocol) === "openai_chat_completions";
 }
 

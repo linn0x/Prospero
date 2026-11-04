@@ -204,9 +204,13 @@ enum Driver {
     Codex(CodexTurn),
     Deepseek(DeepseekTurn),
     Opencode(OpencodeTurn),
+    Pi(super::pi::PiTurn),
 }
 
 fn engine_agent(agent: AgentKind, profile: Option<&crate::accounts::ApiProfile>) -> AgentKind {
+    if agent == AgentKind::Pi {
+        return AgentKind::Pi;
+    }
     profile
         .map(crate::accounts::profile::agent_kind)
         .unwrap_or(agent)
@@ -230,6 +234,7 @@ impl Driver {
             Driver::Codex(driver) => driver.take_events(),
             Driver::Deepseek(driver) => driver.take_events(),
             Driver::Opencode(driver) => driver.take_events(),
+            Driver::Pi(driver) => driver.take_events(),
         }
     }
 
@@ -239,6 +244,7 @@ impl Driver {
             Driver::Codex(driver) => driver.interrupt().await,
             Driver::Deepseek(driver) => driver.interrupt().await,
             Driver::Opencode(driver) => driver.interrupt().await,
+            Driver::Pi(driver) => driver.interrupt(),
         }
     }
 
@@ -276,6 +282,10 @@ impl Driver {
                     .await
                     .map(|_| ControlEffectState::Delivered)
             }
+            Driver::Pi(driver) => driver
+                .steer(text, attachments)
+                .await
+                .map(|_| ControlEffectState::Delivered),
         }
     }
 
@@ -285,6 +295,7 @@ impl Driver {
             Driver::Codex(driver) => driver.compact().await,
             Driver::Deepseek(driver) => driver.compact().await,
             Driver::Opencode(driver) => driver.compact().await,
+            Driver::Pi(driver) => driver.compact().await,
         }
     }
 
@@ -294,7 +305,7 @@ impl Driver {
                 .send_to_subagent(subagent, text)
                 .await
                 .map(|_| ControlEffectState::Delivered),
-            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) => {
+            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) | Driver::Pi(_) => {
                 Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into()))
             }
         }
@@ -306,7 +317,9 @@ impl Driver {
     ) -> Result<Option<Vec<serde_json::Value>>> {
         match self {
             Driver::Codex(driver) => driver.read_subagent_history(subagent).await,
-            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) => Ok(None),
+            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) | Driver::Pi(_) => {
+                Ok(None)
+            }
         }
     }
 
@@ -316,6 +329,7 @@ impl Driver {
             Driver::Codex(driver) => driver.apply_selection(model, effort).await,
             Driver::Deepseek(driver) => driver.apply_selection(model, effort).await,
             Driver::Opencode(driver) => driver.apply_selection(model).await,
+            Driver::Pi(driver) => driver.apply_selection(model, effort).await,
         }
     }
 
@@ -323,7 +337,7 @@ impl Driver {
         match self {
             Driver::Deepseek(driver) => Some(driver.models().await),
             Driver::Opencode(driver) => Some(driver.models(workspace).await),
-            Driver::Claude(_) | Driver::Codex(_) => None,
+            Driver::Claude(_) | Driver::Codex(_) | Driver::Pi(_) => None,
         }
     }
 
@@ -333,6 +347,7 @@ impl Driver {
             Driver::Codex(driver) => driver.kill().await,
             Driver::Deepseek(driver) => driver.kill().await,
             Driver::Opencode(driver) => driver.kill().await,
+            Driver::Pi(driver) => driver.kill().await,
         }
     }
 
@@ -342,6 +357,7 @@ impl Driver {
             Driver::Codex(driver) => driver.lifecycle(),
             Driver::Deepseek(driver) => driver.lifecycle(),
             Driver::Opencode(driver) => driver.lifecycle(),
+            Driver::Pi(driver) => driver.lifecycle(),
         }
     }
 }
@@ -987,6 +1003,7 @@ impl Agents {
                 | crate::protocol::AgentKind::Codex
                 | crate::protocol::AgentKind::Deepseek
                 | crate::protocol::AgentKind::Opencode
+                | crate::protocol::AgentKind::Pi
         ) {
             return Err(Error::Invalid(
                 "Agent 暂未接入 Rust structured runtime".into(),
@@ -1008,6 +1025,16 @@ impl Agents {
         {
             input.account_id = None;
         }
+        if input.agent == crate::protocol::AgentKind::Pi
+            && input.account_id.as_deref() == Some(crate::accounts::NATIVE_PI_ID)
+        {
+            input.account_id = None;
+        }
+        if input.agent == crate::protocol::AgentKind::Pi
+            && input.mode.as_deref() == Some("plan")
+        {
+            return Err(Error::Invalid("Pi Agent 不支持 Plan 模式".into()));
+        }
         if input.agent == crate::protocol::AgentKind::Codex {
             match input.account_id.as_deref() {
                 None | Some(crate::agent::NATIVE_CODEX_ID) => {}
@@ -1026,6 +1053,30 @@ impl Agents {
                         _ => {
                             return Err(Error::Invalid(
                                 "所选账号不支持 Codex structured runtime".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if input.agent == crate::protocol::AgentKind::Pi {
+            match input.account_id.as_deref() {
+                None | Some(crate::accounts::NATIVE_PI_ID) => {}
+                Some(account_id) => {
+                    let data = self.0.database.directory().to_owned();
+                    let account_id = account_id.to_owned();
+                    let profile = self
+                        .0
+                        .database
+                        .call_control("agent.create", move |store| {
+                            Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile)
+                        })
+                        .await?;
+                    match profile.as_ref().map(|profile| profile.protocol()) {
+                        Some("anthropic" | "openai_responses" | "openai_chat_completions") => {}
+                        _ => {
+                            return Err(Error::Invalid(
+                                "所选账号不支持 Pi structured runtime".into(),
                             ));
                         }
                     }
@@ -1090,7 +1141,12 @@ impl Agents {
                     {
                         return Err(Error::Invalid(message));
                     }
-                    if account_id != crate::accounts::NATIVE_CLAUDE_ID {
+                    if !matches!(
+                        account_id,
+                        crate::accounts::NATIVE_CLAUDE_ID
+                            | crate::agent::NATIVE_CODEX_ID
+                            | crate::accounts::NATIVE_PI_ID
+                    ) {
                         let record = store.managed_snapshot_row(&data, account_id)?;
                         if let Some(profile) = record.api_profile.as_ref() {
                             if !account_agent_matches(create.agent, &record) {
@@ -1173,11 +1229,13 @@ impl Agents {
             .database
             .call(move |store| Ok((store.session(&source_id)?, store.agent_run(&source_id)?)))
             .await?;
-        if !matches!(run.agent, AgentKind::Codex | AgentKind::Claude)
-            || head.kind != SessionKind::Structured
+        if !matches!(
+            run.agent,
+            AgentKind::Codex | AgentKind::Claude | AgentKind::Pi
+        ) || head.kind != SessionKind::Structured
         {
             return Err(Error::Invalid(
-                "当前仅 Codex 和 Claude 对话支持保留历史的聊天分支".into(),
+                "当前仅 Codex、Claude 和 Pi 对话支持保留历史的聊天分支".into(),
             ));
         }
         if !matches!(head.status, SessionStatus::Idle | SessionStatus::Completed) {
@@ -1200,6 +1258,8 @@ impl Agents {
         };
         let forked_id = if run.agent == AgentKind::Claude {
             super::claude::fork_session(&head.workspace, native_id, &options).await?
+        } else if run.agent == AgentKind::Pi {
+            super::pi::fork_session_file(&options.environment, native_id, &head.workspace)?
         } else {
             super::codex::fork_thread(
                 self.0.database.directory(),
@@ -1273,10 +1333,10 @@ impl Agents {
         crate::database::validate_text(&input.task, 65_536, false)?;
         if !matches!(
             input.agent,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
         ) {
             return Err(Error::Invalid(
-                "跨模型子任务仅支持 Claude、Codex 或 OpenCode".into(),
+                "跨模型子任务仅支持 Claude、Codex、OpenCode 或 Pi".into(),
             ));
         }
         let data = self.0.database.directory().to_owned();
@@ -2258,6 +2318,15 @@ impl Agents {
             )
             .await
             .map(Driver::Opencode),
+            AgentKind::Pi => super::pi::spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )
+            .await
+            .map(Driver::Pi),
             _ => Err(Error::Invalid(
                 "Agent 暂未接入 Rust structured runtime".into(),
             )),
@@ -3667,6 +3736,55 @@ impl Agents {
         super::opencode::launch_catalog(Path::new(&home)).await
     }
 
+    pub async fn pi_launch_catalog(&self, account_id: Option<&str>) -> Result<LaunchModelCatalog> {
+        let account_id = match account_id {
+            None | Some(crate::accounts::NATIVE_PI_ID) => None,
+            Some(id) => {
+                crate::database::validate_id(id)?;
+                let id_owned = id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.managed_account(&id_owned)?.id))
+                    .await?;
+                Some(id.to_owned())
+            }
+        };
+        let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
+        if let Some(id) = account_id.as_deref() {
+            let data = self.0.database.directory().to_owned();
+            let id = id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if let Some(profile) = profile {
+                let efforts = profile
+                    .model_capabilities
+                    .as_ref()
+                    .and_then(|caps| caps.supported_efforts.clone())
+                    .unwrap_or_default();
+                let model = profile.model.clone();
+                return Ok(LaunchModelCatalog {
+                    models: vec![LaunchModelInfo {
+                        id: model,
+                        label: profile.model.clone(),
+                        description: None,
+                        supported_efforts: efforts,
+                        default_effort: None,
+                        is_default: true,
+                    }],
+                    current_model: Some(profile.model),
+                    current_effort: None,
+                    presets: Vec::new(),
+                    current_preset: None,
+                });
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        super::pi::launch_catalog(Path::new(&home), &environment).await
+    }
+
     /// Catalog for a specific account: managed accounts probe through their
     /// isolated config root, so the directory reflects their own identity.
     pub async fn launch_catalog_for(&self, account_id: Option<&str>) -> Result<LaunchModelCatalog> {
@@ -4023,7 +4141,12 @@ impl Agents {
         let id = id.to_owned();
         self.0
             .database
-            .call(move |store| store.set_agent_mode(&id, mode))
+            .call(move |store| {
+                if mode == PermissionMode::Plan && store.agent_run(&id)?.agent == AgentKind::Pi {
+                    return Err(Error::Invalid("Pi Agent 不支持 Plan 模式".into()));
+                }
+                store.set_agent_mode(&id, mode)
+            })
             .await?;
         self.publish();
         Ok(())
@@ -4103,6 +4226,11 @@ impl Agents {
         }
         let models = if run.agent == AgentKind::Codex {
             super::usage::read_native_codex_models(self.0.database.directory())
+                .await?
+                .models
+        } else if run.agent == AgentKind::Pi {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            super::pi::launch_catalog(Path::new(&home), &environment)
                 .await?
                 .models
         } else {
@@ -4219,6 +4347,11 @@ impl Agents {
             super::usage::read_native_codex_models(self.0.database.directory())
                 .await?
                 .models
+        } else if run.agent == AgentKind::Pi {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            super::pi::launch_catalog(Path::new(&home), &environment)
+                .await?
+                .models
         } else {
             super::claude::fetch_launch_catalog(&environment).await?
         };
@@ -4228,10 +4361,10 @@ impl Agents {
             .ok_or_else(|| {
                 Error::Invalid(format!(
                     "{} 模型不可用:{model}",
-                    if run.agent == AgentKind::Codex {
-                        "Codex"
-                    } else {
-                        "Claude"
+                    match run.agent {
+                        AgentKind::Codex => "Codex",
+                        AgentKind::Pi => "Pi",
+                        _ => "Claude",
                     }
                 ))
             })?;

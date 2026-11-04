@@ -26,6 +26,7 @@ use crate::error::Result;
 use crate::worker::Database;
 
 pub const NATIVE_CLAUDE_ID: &str = "native-claude";
+pub const NATIVE_PI_ID: &str = "native-pi";
 const NATIVE_NAME: &str = "本机默认";
 const CODEX_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(12);
@@ -358,12 +359,57 @@ fn codex_capabilities() -> AccountCapabilities {
     }
 }
 
+fn pi_capabilities() -> AccountCapabilities {
+    AccountCapabilities {
+        session_kinds: vec![
+            crate::protocol::SessionKind::Pty,
+            crate::protocol::SessionKind::Structured,
+        ],
+        plan: false,
+        resume: true,
+        model_selection: true,
+        reasoning_effort: true,
+    }
+}
+
 pub(crate) fn parse_code_agent(value: &str) -> Result<crate::protocol::AgentKind> {
     match value {
         "claude" => Ok(crate::protocol::AgentKind::Claude),
         "codex" => Ok(crate::protocol::AgentKind::Codex),
         "opencode" => Ok(crate::protocol::AgentKind::Opencode),
+        "pi" => Ok(crate::protocol::AgentKind::Pi),
         _ => Err(crate::error::Error::Invalid("Agent 不支持账号隔离".into())),
+    }
+}
+
+fn probe_pi_status(pi_runtime_ok: bool) -> AuthProbe {
+    if !pi_runtime_ok {
+        return AuthProbe {
+            status: AccountStatus::Unavailable,
+            detail: Some("未安装 pi".into()),
+            ..Default::default()
+        };
+    }
+    let agent_dir = crate::agent::pi::pi_agent_dir(&[]);
+    let auth_path = agent_dir.join("auth.json");
+    let auth_configured = std::fs::read_to_string(auth_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|val| val.as_object().map(|obj| !obj.is_empty()))
+        .unwrap_or(false);
+    let models_configured = agent_dir.join("models.json").is_file();
+    if auth_configured || models_configured {
+        AuthProbe {
+            status: AccountStatus::SignedIn,
+            auth_method: Some("本机配置".into()),
+            detail: Some("pi CLI 已配置凭据或模型".into()),
+        }
+    } else {
+        AuthProbe {
+            status: AccountStatus::SignedIn,
+            auth_method: Some("本机环境".into()),
+            detail: Some("pi CLI 就绪（可在终端 /login 或绑定模型源）".into()),
+        }
     }
 }
 
@@ -554,6 +600,19 @@ fn opencode_profile_capabilities() -> AccountCapabilities {
     }
 }
 
+fn pi_profile_capabilities() -> AccountCapabilities {
+    AccountCapabilities {
+        session_kinds: vec![
+            crate::protocol::SessionKind::Pty,
+            crate::protocol::SessionKind::Structured,
+        ],
+        plan: false,
+        resume: true,
+        model_selection: false,
+        reasoning_effort: false,
+    }
+}
+
 /// Builds one account row for a legacy managed (OAuth/imported-key) account.
 async fn managed_row(
     database: &Database,
@@ -593,6 +652,7 @@ async fn managed_row(
 /// never run `claude auth status` (the isolated key is not a CLI login);
 /// status derives from runtime availability, key presence and the recorded
 /// revision-checked validation.
+#[allow(clippy::too_many_arguments)]
 async fn profile_row(
     database: &Database,
     record: managed::ManagedRecord,
@@ -600,6 +660,7 @@ async fn profile_row(
     claude_runtime_ok: bool,
     codex_runtime_ok: bool,
     opencode_runtime_ok: bool,
+    pi_runtime_ok: bool,
     model_source: Option<sources::SourceBindingView>,
 ) -> Result<NativeAccount> {
     let profile = record
@@ -615,10 +676,15 @@ async fn profile_row(
     })
     .await
     .map_err(|_| crate::error::Error::Closed)??;
-    let engine_agent = profile::agent_kind(profile);
+    let engine_agent = if record.agent == crate::protocol::AgentKind::Pi {
+        crate::protocol::AgentKind::Pi
+    } else {
+        profile::agent_kind(profile)
+    };
     let runtime_ok = match engine_agent {
         crate::protocol::AgentKind::Opencode => opencode_runtime_ok,
         crate::protocol::AgentKind::Codex => codex_runtime_ok,
+        crate::protocol::AgentKind::Pi => pi_runtime_ok,
         _ => claude_runtime_ok,
     };
     let (status, auth_method, detail) = if !runtime_ok {
@@ -627,12 +693,11 @@ async fn profile_row(
             None,
             Some(format!(
                 "{} CLI 不可用",
-                if engine_agent == crate::protocol::AgentKind::Opencode {
-                    "opencode"
-                } else if engine_agent == crate::protocol::AgentKind::Codex {
-                    "codex"
-                } else {
-                    "claude"
+                match engine_agent {
+                    crate::protocol::AgentKind::Opencode => "opencode",
+                    crate::protocol::AgentKind::Codex => "codex",
+                    crate::protocol::AgentKind::Pi => "pi",
+                    _ => "claude",
                 }
             )),
         )
@@ -670,12 +735,13 @@ async fn profile_row(
     let engine = match engine_agent {
         crate::protocol::AgentKind::Codex => "codex",
         crate::protocol::AgentKind::Opencode => "opencode",
+        crate::protocol::AgentKind::Pi => "pi",
         _ => "claude",
     };
-    let capabilities = if engine_agent == crate::protocol::AgentKind::Opencode {
-        opencode_profile_capabilities()
-    } else {
-        profile_capabilities()
+    let capabilities = match engine_agent {
+        crate::protocol::AgentKind::Opencode => opencode_profile_capabilities(),
+        crate::protocol::AgentKind::Pi => pi_profile_capabilities(),
+        _ => profile_capabilities(),
     };
     Ok(NativeAccount {
         id: record.id,
@@ -720,7 +786,7 @@ async fn snapshot_with(
 ) -> Result<AccountListResult> {
     let db = database.clone();
     let data = database.directory().to_owned();
-    let (managed, native_active, native_codex_active, mut managed_active, bindings) = db
+    let (managed, native_active, native_codex_active, native_pi_active, mut managed_active, bindings) = db
         .call({
             let data = data.clone();
             move |store| {
@@ -729,6 +795,8 @@ async fn snapshot_with(
                 let (native_active, managed_active) = store.account_active_counts(&ids)?;
                 let native_codex_active =
                     store.native_account_active_count("codex", crate::agent::NATIVE_CODEX_ID)?;
+                let native_pi_active =
+                    store.native_account_active_count("pi", NATIVE_PI_ID)?;
                 let sources = sources::ModelSources::open(&data)?;
                 let bindings = ids
                     .iter()
@@ -738,6 +806,7 @@ async fn snapshot_with(
                     managed,
                     native_active,
                     native_codex_active,
+                    native_pi_active,
                     managed_active,
                     bindings,
                 ))
@@ -751,7 +820,9 @@ async fn snapshot_with(
     let claude_runtime_ok = probe::runtime_available().await;
     let codex_runtime_ok = probe::codex_runtime_available().await;
     let opencode_runtime_ok = probe::opencode_runtime_available().await;
+    let pi_runtime_ok = probe::pi_runtime_available().await;
     let codex_probe = probe_codex_status(&data).await;
+    let pi_probe = probe_pi_status(pi_runtime_ok);
     let now = crate::database::now();
     let mut accounts = vec![
         NativeAccount {
@@ -794,6 +865,26 @@ async fn snapshot_with(
             updated_at: now,
             active_sessions: native_codex_active,
         },
+        NativeAccount {
+            id: NATIVE_PI_ID.into(),
+            agent: crate::protocol::AgentKind::Pi,
+            name: NATIVE_NAME.into(),
+            managed: false,
+            is_default: true,
+            status: pi_probe.status,
+            capabilities: pi_capabilities(),
+            api_profile: None,
+            model_source: None,
+            engine: Some("pi".into()),
+            api_validation: None,
+            api_engine_validation: None,
+            model_capability_support: None,
+            auth_method: pi_probe.auth_method,
+            detail: pi_probe.detail,
+            created_at: 0,
+            updated_at: now,
+            active_sessions: native_pi_active,
+        },
     ];
     for record in managed {
         let active = managed_active.remove(&record.id).unwrap_or(0);
@@ -807,6 +898,7 @@ async fn snapshot_with(
                     claude_runtime_ok,
                     codex_runtime_ok,
                     opencode_runtime_ok,
+                    pi_runtime_ok,
                     binding,
                 )
                 .await?,

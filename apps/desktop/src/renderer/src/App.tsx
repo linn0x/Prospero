@@ -2529,7 +2529,7 @@ function AgentsPane({
         .filter(Boolean),
     ]),
   ];
-  const agents = ids.length ? ids : ["codex", "claude", "opencode"];
+  const agents = ids.length ? ids : ["codex", "claude", "opencode", "pi"];
   return (
     <div className="view-scroll">
       <div className="view-container">
@@ -2896,7 +2896,7 @@ function NewSessionDialog({
       ? initialDraft.input.approvalPolicy
       : "yolo",
   );
-  const sourceRuntimeAgent: SourceRuntimeAgent = input.agent === "claude" || input.agent === "opencode" ? input.agent : "codex";
+  const sourceRuntimeAgent: SourceRuntimeAgent = input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" ? input.agent : "codex";
   const sourceChoice = selectedSourceRoute(sourceState.sources, sourceSelection, sourceRuntimeAgent);
   const setSourceRuntimeAgent = (agent: SourceRuntimeAgent): void => {
     setInput((current) => ({
@@ -2932,7 +2932,7 @@ function NewSessionDialog({
     (account) => account.id === input.accountId,
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
-  const selectedKind: SessionCreateInput["kind"] = useSource ? sourceChoice?.route.protocol === "openai_chat_completions" ? "structured" : input.kind : requiresStructured ? "structured" : input.kind;
+  const selectedKind: SessionCreateInput["kind"] = useSource ? (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi" ? "structured" : input.kind) : requiresStructured ? "structured" : input.kind;
   const managedAgentTerminal = selectedKind === "pty" && (input.agent === "codex" || input.agent === "claude");
   const selectedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : input.approvalPolicy;
   const supportsApprovalPolicy = selectedKind === "structured" || input.agent === "codex" || input.agent === "claude";
@@ -2977,6 +2977,7 @@ function NewSessionDialog({
     "claude",
     "deepseek",
     "opencode",
+    "pi",
   ].includes(input.agent);
   const supportsLaunchModels =
     !useSource &&
@@ -2984,7 +2985,8 @@ function NewSessionDialog({
     (selectedAccount?.capabilities?.modelSelection ?? true) &&
     (input.agent === "codex" ||
       input.agent === "claude" ||
-      input.agent === "deepseek");
+      input.agent === "deepseek" ||
+      input.agent === "pi");
   useEffect(() => {
     if (!requiresStructured) return;
     setInput((current) => current.kind === "structured" ? current : { ...current, kind: "structured" });
@@ -3005,7 +3007,7 @@ function NewSessionDialog({
     const catalogKey = JSON.stringify([input.agent, input.accountId, input.kind, launchModelsRetry]);
     if (launchCatalogKey.current === catalogKey) return;
     let cancelled = false;
-    const agent = input.agent as "codex" | "claude" | "deepseek" | "opencode";
+    const agent = input.agent as "codex" | "claude" | "deepseek" | "opencode" | "pi";
     const accountId = input.accountId;
     const kind = input.kind;
     setLaunchModels([]);
@@ -3181,7 +3183,7 @@ function NewSessionDialog({
             <Settings />{t("配置账号与模型", "Configure accounts & models")}
           </Button>
           <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("本机账号 / API 配置", "Local account / API profile")}</Button></div>
-          {useSource ? <><div className="grid gap-4 sm:grid-cols-2"><Field><FieldLabel htmlFor="source-runtime-agent">Agent</FieldLabel><NativeSelect id="source-runtime-agent" value={sourceRuntimeAgent} disabled={busy} onChange={event => setSourceRuntimeAgent(event.target.value as SourceRuntimeAgent)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect><FieldDescription>{t("选择负责执行代码和工具操作的 Agent。", "Choose the agent that runs code and tools.")}</FieldDescription></Field><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></div><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /></> : <>
+          {useSource ? <><div className="grid gap-4 sm:grid-cols-2"><Field><FieldLabel htmlFor="source-runtime-agent">Agent</FieldLabel><NativeSelect id="source-runtime-agent" value={sourceRuntimeAgent} disabled={busy} onChange={event => setSourceRuntimeAgent(event.target.value as SourceRuntimeAgent)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption><NativeSelectOption value="pi">Pi</NativeSelectOption></NativeSelect><FieldDescription>{t("选择负责执行代码和工具操作的 Agent。", "Choose the agent that runs code and tools.")}</FieldDescription></Field><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi")} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></div><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /></> : <>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field>
               <FieldLabel htmlFor="session-agent">Agent</FieldLabel>
@@ -3213,6 +3215,7 @@ function NewSessionDialog({
                 <NativeSelectOption value="opencode">
                   OpenCode
                 </NativeSelectOption>
+                <NativeSelectOption value="pi">Pi</NativeSelectOption>
                 <NativeSelectOption value="grok">Grok</NativeSelectOption>
                 <NativeSelectOption value="trae">Trae</NativeSelectOption>
                 <NativeSelectOption value="shell">Shell</NativeSelectOption>
@@ -3230,7 +3233,7 @@ function NewSessionDialog({
                   setInput({
                     ...input,
                     kind,
-                    ...(kind === "pty"
+                    ...(kind === "pty" && input.agent !== "pi"
                       ? { model: undefined, effort: undefined }
                       : {}),
                   });
@@ -3249,7 +3252,7 @@ function NewSessionDialog({
               {requiresStructured && <FieldDescription>{t("当前账号仅支持对话会话。", "This account supports conversation sessions only.")}</FieldDescription>}
             </Field>
           </div>
-          {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode") && (
+          {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi") && (
             <Field>
               <FieldLabel htmlFor="session-account">
                 {t("账号", "Account")}
@@ -4068,6 +4071,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         "claude",
         "deepseek",
         "opencode",
+        "pi",
         "grok",
         "trae",
         "shell",
@@ -4085,7 +4089,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           : "standard";
       const kind =
         session.kind === "structured" &&
-        ["codex", "claude", "deepseek", "opencode"].includes(agent)
+        ["codex", "claude", "deepseek", "opencode", "pi"].includes(agent)
           ? "structured"
           : "pty";
       const accountState = duplicateSessionAccountState(snapshotRef.current.accounts, session);

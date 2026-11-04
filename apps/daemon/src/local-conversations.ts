@@ -25,6 +25,9 @@ export async function searchLocalConversations(
   if (agent === "deepseek") {
     return DeepseekAdapter.searchLocalConversations(query, limit);
   }
+  if (agent === "pi") {
+    return [];
+  }
 
   if (environment?.["CLAUDE_CONFIG_DIR"]) {
     return searchClaudeConversations(environment["CLAUDE_CONFIG_DIR"], query, limit);

@@ -66,6 +66,7 @@ const NATIVE_IDS: Record<CodeAgentKind, string> = {
   codex: "native-codex",
   claude: "native-claude",
   opencode: "native-opencode",
+  pi: "native-pi",
 };
 
 interface StoredAccount {

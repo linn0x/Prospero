@@ -1057,6 +1057,7 @@ fn agent_name(agent: prospero_protocol_rs::AgentKind) -> &'static str {
         prospero_protocol_rs::AgentKind::Claude => "claude",
         prospero_protocol_rs::AgentKind::Opencode => "opencode",
         prospero_protocol_rs::AgentKind::Deepseek => "deepseek",
+        prospero_protocol_rs::AgentKind::Pi => "pi",
         prospero_protocol_rs::AgentKind::Grok => "grok",
         prospero_protocol_rs::AgentKind::Trae => "trae",
         prospero_protocol_rs::AgentKind::Shell => "shell",

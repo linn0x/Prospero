@@ -1954,6 +1954,15 @@ async fn remote_launch_models(
                 Err(error) => out["error"] = json!(error.to_string()),
             }
         }
+        "pi" => match api.agents.pi_launch_catalog(account_id.as_deref()).await {
+            Ok(catalog) => {
+                let catalog = serde_json::to_value(catalog)?;
+                out["models"] = catalog["models"].clone();
+                out["currentModel"] = catalog["currentModel"].clone();
+                out["currentEffort"] = catalog["currentEffort"].clone();
+            }
+            Err(error) => out["error"] = json!(error.to_string()),
+        },
         _ => out["error"] = json!("invalid model catalog agent"),
     }
     send_remote_json(socket, channel, &out).await
@@ -2734,8 +2743,17 @@ async fn remote_conversation_search(
             crate::agent::conversations::search_deepseek_conversations(account_id, query, limit)
                 .await
         }
+        "pi" => {
+            crate::agent::conversations::search_pi_conversations(
+                &api.database,
+                account_id,
+                query,
+                limit,
+            )
+            .await
+        }
         _ => Err(Error::Invalid(
-            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek 本机对话".into(),
+            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek/Pi 本机对话".into(),
         )),
     };
     match conversations {
@@ -4540,9 +4558,13 @@ async fn conversation_search(
     State(api): State<Api>,
     Query(query): Query<ConversationSearchQuery>,
 ) -> std::result::Result<Json<crate::agent::ConversationSearchResult>, ApiError> {
-    if query.agent != "claude" && query.agent != "codex" && query.agent != "deepseek" {
+    if query.agent != "claude"
+        && query.agent != "codex"
+        && query.agent != "deepseek"
+        && query.agent != "pi"
+    {
         return Err(ApiError(Error::Invalid(
-            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek 本机对话".into(),
+            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek/Pi 本机对话".into(),
         )));
     }
     if query.query.chars().count() > 300 || query.query.chars().any(char::is_control) {
@@ -4566,6 +4588,16 @@ async fn conversation_search(
         "deepseek" => (
             crate::protocol::AgentKind::Deepseek,
             crate::agent::conversations::search_deepseek_conversations(
+                query.account_id,
+                query.query,
+                query.limit,
+            )
+            .await?,
+        ),
+        "pi" => (
+            crate::protocol::AgentKind::Pi,
+            crate::agent::conversations::search_pi_conversations(
+                &api.database,
                 query.account_id,
                 query.query,
                 query.limit,
@@ -6074,6 +6106,13 @@ async fn launch_models(
     if query.agent == "codex" {
         return Ok(Json(
             codex_launch_catalog(&api, query.account_id.as_deref()).await?,
+        ));
+    }
+    if query.agent == "pi" {
+        return Ok(Json(
+            api.agents
+                .pi_launch_catalog(query.account_id.as_deref())
+                .await?,
         ));
     }
     if query.agent != "claude" {

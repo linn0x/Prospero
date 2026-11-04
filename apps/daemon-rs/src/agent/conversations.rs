@@ -324,6 +324,168 @@ pub(crate) async fn search_claude_conversations(
         .map_err(|_| Error::Closed)?
 }
 
+fn parse_pi_file(
+    path: &Path,
+    needle: &str,
+    fallback_cwd: &str,
+) -> Option<ResumableConversation> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    let stem = path.file_stem()?.to_str()?;
+    let default_id = stem
+        .rsplit_once('_')
+        .map_or(stem, |(_, id)| id)
+        .to_owned();
+    let mut session_id = default_id;
+    let mut cwd = fallback_cwd.to_owned();
+    let mut first_prompt = String::new();
+    let mut title = String::new();
+    let mut created_at = None;
+
+    for line in raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(MAX_HEADER_LINES)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                if let Some(id) = value.get("id").and_then(Value::as_str)
+                    && !id.trim().is_empty()
+                {
+                    session_id = id.to_owned();
+                }
+                if let Some(dir) = value.get("cwd").and_then(Value::as_str)
+                    && !dir.trim().is_empty()
+                {
+                    cwd = dir.to_owned();
+                }
+                if created_at.is_none()
+                    && let Some(ts) = value.get("timestamp").and_then(Value::as_str)
+                {
+                    created_at = chrono_like_parse_millis(ts);
+                }
+            }
+            Some("session_info") => {
+                if let Some(name) = value.get("name").and_then(Value::as_str)
+                    && !name.trim().is_empty()
+                {
+                    title = name.to_owned();
+                }
+            }
+            Some("message") => {
+                if first_prompt.is_empty()
+                    && let Some(message) = value.get("message").and_then(Value::as_object)
+                    && message.get("role").and_then(Value::as_str) == Some("user")
+                    && let Some(content) = message.get("content")
+                {
+                    first_prompt = text_from_content(content);
+                }
+            }
+            _ => {}
+        }
+        if !first_prompt.is_empty() && !title.is_empty() {
+            break;
+        }
+    }
+
+    let display_title = trim_chars(
+        if title.trim().is_empty() {
+            if first_prompt.trim().is_empty() {
+                "Pi 对话"
+            } else {
+                &first_prompt
+            }
+        } else {
+            &title
+        },
+        500,
+    );
+    let preview = (!first_prompt.trim().is_empty()).then(|| trim_chars(&first_prompt, 4_000));
+    if !needle.is_empty() {
+        let matches = [
+            &display_title,
+            first_prompt.trim(),
+            cwd.trim(),
+            session_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.to_lowercase().contains(needle));
+        if !matches {
+            return None;
+        }
+    }
+    let updated_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_else(crate::database::now);
+    Some(ResumableConversation {
+        id: trim_chars(&session_id, 256),
+        agent: AgentKind::Pi,
+        title: display_title,
+        preview,
+        cwd: trim_chars(&cwd, 4096),
+        created_at,
+        updated_at,
+    })
+}
+
+pub(crate) fn search_pi_config_dir(
+    config_dir: &Path,
+    query: &str,
+    requested_limit: Option<usize>,
+) -> Result<Vec<ResumableConversation>> {
+    if query.chars().count() > MAX_QUERY_CHARS || query.chars().any(char::is_control) {
+        return Err(Error::Invalid("对话搜索词无效".into()));
+    }
+    let limit = requested_limit.unwrap_or(20).clamp(1, MAX_RESULTS);
+    let fallback = home_dir()
+        .unwrap_or_else(|_| PathBuf::from("/"))
+        .to_string_lossy()
+        .into_owned();
+    let needle = query.trim().to_lowercase();
+    let mut files = Vec::new();
+    collect_jsonl_files(&config_dir.join("sessions"), &mut files);
+    let mut results = files
+        .iter()
+        .filter_map(|path| parse_pi_file(path, &needle, &fallback))
+        .collect::<Vec<_>>();
+    results.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
+    results.truncate(limit);
+    Ok(results)
+}
+
+pub(crate) async fn search_pi_conversations(
+    database: &crate::worker::Database,
+    account_id: Option<String>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<ResumableConversation>> {
+    let data = database.directory().to_owned();
+    let config_dir = match account_id.as_deref() {
+        None | Some(crate::accounts::NATIVE_PI_ID) => {
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home_dir().unwrap_or_else(|_| PathBuf::from("/")).join(".pi/agent"))
+        }
+        Some(id) => {
+            crate::database::validate_id(id)?;
+            crate::accounts::managed::profile_account_root_for_agent(&data, id, AgentKind::Pi)?
+                .join("pi-agent")
+        }
+    };
+    tokio::task::spawn_blocking(move || search_pi_config_dir(&config_dir, &query, limit))
+        .await
+        .map_err(|_| Error::Closed)?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

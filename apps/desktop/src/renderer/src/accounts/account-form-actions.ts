@@ -4,6 +4,7 @@ import { accountApiConnectionLocked, accountApiProfileNameAction, accountApiProt
 
 export interface AccountEditDraft {
   name: string;
+  agent?: "codex" | "claude" | "opencode" | "pi";
   protocol: AccountApiProtocol;
   baseUrl: string;
   model: string;
@@ -23,7 +24,8 @@ export function accountCreateApiInput(draft: AccountEditDraft, protocolsSupporte
   if (!draft.name.trim() || !draft.baseUrl.trim() || !draft.model.trim() || !draft.apiKey.trim()) throw new Error("Complete the API connection fields / 请填写完整 API 连接配置");
   if (!protocolsSupported && draft.protocol === "openai_chat_completions") throw new Error("Upgrade the daemon to use Chat Completions / 请升级 daemon 后使用 Chat Completions");
   const modelCapabilities = validationSupported ? parseModelCapabilities(draft.modelCapabilities, {}, draft.protocol) : null;
-  return { agent: accountApiProtocolDefaults(draft.protocol).agent, name: draft.name.trim(), baseUrl: draft.baseUrl.trim(), model: draft.model.trim(), apiKey: draft.apiKey.trim(),
+  const targetAgent = draft.agent ?? accountApiProtocolDefaults(draft.protocol).agent;
+  return { agent: targetAgent, name: draft.name.trim(), baseUrl: draft.baseUrl.trim(), model: draft.model.trim(), apiKey: draft.apiKey.trim(),
     ...(protocolsSupported ? { provider: accountApiProvider(draft.protocol), protocol: draft.protocol } : {}),
     ...(modelCapabilities ? { modelCapabilities } : {}),
   };

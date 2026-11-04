@@ -400,6 +400,24 @@ pub async fn run(
             }
             args.splice(0..0, ["resume".into(), id.clone()]);
         }
+        if !args
+            .iter()
+            .any(|arg| arg.starts_with("tui.keymap.editor.kill_whole_line="))
+        {
+            args.extend([
+                "-c".into(),
+                "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]".into(),
+            ]);
+        }
+        if !args
+            .iter()
+            .any(|arg| arg.starts_with("tui.keymap.chat.interrupt_turn="))
+        {
+            args.extend([
+                "-c".into(),
+                "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl+u\"]".into(),
+            ]);
+        }
         args.extend([
             "--remote".into(),
             format!("ws://{address}"),

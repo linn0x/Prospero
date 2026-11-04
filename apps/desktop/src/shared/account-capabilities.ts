@@ -13,7 +13,8 @@ function record(value: unknown): JsonObject {
 }
 
 export function accountEngine(account: JsonObject): string {
-  if (typeof account["engine"] === "string" && ["codex", "claude", "opencode"].includes(account["engine"])) return account["engine"];
+  if (typeof account["engine"] === "string" && ["codex", "claude", "opencode", "pi"].includes(account["engine"])) return account["engine"];
+  if (account["agent"] === "pi") return "pi";
   return record(account["apiProfile"])["protocol"] === "openai_chat_completions"
     ? "opencode" : typeof account["agent"] === "string" ? account["agent"] : "codex";
 }
@@ -21,7 +22,9 @@ export function accountEngine(account: JsonObject): string {
 export function accountCapabilities(account?: JsonObject): AccountCapabilities {
   const profile = record(account?.["apiProfile"]);
   const isApi = Object.keys(profile).length > 0;
-  const chat = accountEngine(account ?? {}) === "opencode";
+  const engine = accountEngine(account ?? {});
+  const chat = engine === "opencode";
+  const isPi = engine === "pi";
   const disabled = typeof account?.["apiProfileError"] === "string" || record(profile["modelCapabilities"])["tools"] === false;
   const supplied = record(account?.["capabilities"]);
   const kinds = supplied["sessionKinds"];
@@ -30,7 +33,16 @@ export function accountCapabilities(account?: JsonObject): AccountCapabilities {
       ? kinds.filter((kind): kind is "pty" | "structured" => kind === "pty" || kind === "structured")
       : chat ? ["structured"] : ["pty", "structured"],
     ...Object.fromEntries((["plan", "resume", "modelSelection", "reasoningEffort"] as const).map((key) => [
-      key, !disabled && (typeof supplied[key] === "boolean" ? supplied[key] : key === "plan" || key === "resume" ? !chat : !isApi),
+      key,
+      !disabled && (
+        typeof supplied[key] === "boolean"
+          ? supplied[key]
+          : key === "plan"
+            ? (!chat && !isPi)
+            : key === "resume"
+              ? !chat
+              : (!isApi || isPi)
+      ),
     ])) as Pick<AccountCapabilities, "plan" | "resume" | "modelSelection" | "reasoningEffort">,
   };
 }

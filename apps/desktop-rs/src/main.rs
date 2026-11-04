@@ -3772,7 +3772,12 @@ impl Desktop {
         content = content.push(text("Schedules").size(theme::TEXT_LEAD));
         if let Some(form) = &self.management.schedule_form {
             let mut agents = row![].spacing(5);
-            for agent in [AgentKind::Claude, AgentKind::Codex, AgentKind::Deepseek] {
+            for agent in [
+                AgentKind::Claude,
+                AgentKind::Codex,
+                AgentKind::Deepseek,
+                AgentKind::Pi,
+            ] {
                 agents = agents.push(
                     button(text(format!("{agent:?}")))
                         .on_press(Message::ScheduleAgentChanged(agent))
@@ -3956,7 +3961,12 @@ impl Desktop {
         }
         if let Some(form) = &self.management.account_form {
             let mut agents = row![].spacing(5);
-            for agent in [AgentKind::Claude, AgentKind::Codex, AgentKind::Opencode] {
+            for agent in [
+                AgentKind::Claude,
+                AgentKind::Codex,
+                AgentKind::Opencode,
+                AgentKind::Pi,
+            ] {
                 agents = agents.push(
                     button(text(format!("{agent:?}")))
                         .on_press(Message::AccountAgentChanged(agent))
@@ -5142,6 +5152,7 @@ impl Desktop {
             AgentKind::Codex,
             AgentKind::Deepseek,
             AgentKind::Opencode,
+            AgentKind::Pi,
             AgentKind::Grok,
             AgentKind::Trae,
             AgentKind::Shell,
@@ -6910,6 +6921,7 @@ fn agent_name(agent: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Opencode => "opencode",
         AgentKind::Deepseek => "deepseek",
+        AgentKind::Pi => "pi",
         AgentKind::Grok => "grok",
         AgentKind::Trae => "trae",
         AgentKind::Shell => "shell",
@@ -6920,7 +6932,7 @@ fn agent_name(agent: AgentKind) -> &'static str {
 fn resumable_agent(agent: AgentKind) -> bool {
     matches!(
         agent,
-        AgentKind::Claude | AgentKind::Codex | AgentKind::Deepseek
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Deepseek | AgentKind::Pi
     )
 }
 

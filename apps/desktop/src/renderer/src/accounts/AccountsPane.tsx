@@ -33,7 +33,7 @@ export function AccountsPane({ snapshot, onOpenSession, onUseModelSource }: { sn
   const disabled = Boolean(actions.busy || actions.loading || editing || configuring || !snapshot.daemon.running);
   const edited = editing ? snapshot.accounts.find(account => account["id"] === editing["id"]) ?? editing : undefined;
   const providers = [
-    ["codex", "Codex"], ["claude", "Claude"], ["opencode", "OpenCode"], ["deepseek", "DeepSeek"], ["trae", "Trae"],
+    ["codex", "Codex"], ["claude", "Claude"], ["opencode", "OpenCode"], ["pi", "Pi"], ["deepseek", "DeepSeek"], ["trae", "Trae"],
   ] as const;
   return <div className="page accounts-page">
     <header className="page-header"><div><h1>{t("Agent 与账号", "Agents & accounts")}</h1><p>{t("管理模型连接、账号与启动配置。", "Manage model connections, accounts, and startup settings.")}</p></div>

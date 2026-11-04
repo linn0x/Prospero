@@ -1121,6 +1121,15 @@ impl Terminals {
                 .await
                 .map_err(|_| Error::Closed)??
             }
+            crate::protocol::AgentKind::Pi => {
+                let (environment, _, _) = self.resolve_pi_terminal_account(head.account_id).await?;
+                let config = crate::agent::pi::pi_agent_dir(&environment);
+                tokio::task::spawn_blocking(move || {
+                    crate::agent::conversations::search_pi_config_dir(&config, &query, Some(50))
+                })
+                .await
+                .map_err(|_| Error::Closed)??
+            }
             _ => return Err(Error::Invalid("此终端不支持原生会话绑定".into())),
         };
         let workspace = std::fs::canonicalize(&head.workspace)?;
@@ -1588,6 +1597,10 @@ impl Terminals {
                             crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS
                         )?
                     ),
+                    "-c".into(),
+                    "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]".into(),
+                    "-c".into(),
+                    "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl+u\"]".into(),
                 ]);
                 if let Some(profile) = profile.as_ref() {
                     if profile.protocol() != "openai_responses" {
@@ -1630,6 +1643,41 @@ impl Terminals {
                     args: Vec::new(),
                     environment: Vec::new(),
                     account_id: None,
+                }))
+            }
+            (crate::protocol::AgentKind::Pi, None) => {
+                let (environment, account_id, profile) = self
+                    .resolve_pi_terminal_account(input.account_id.clone())
+                    .await?;
+                let effective_model = model.or_else(|| profile.as_ref().map(|p| p.model.clone()));
+                input.model = effective_model.clone();
+                input.effort = effort.clone();
+                let mut args = Vec::new();
+                if let Some(model) = effective_model {
+                    let model_arg = if profile.is_some() && !model.contains('/') {
+                        format!("prospero-profile/{model}")
+                    } else {
+                        model
+                    };
+                    args.extend(["--model".into(), model_arg]);
+                }
+                if let Some(effort) = effort {
+                    let level = match effort.trim() {
+                        "none" | "off" => "off",
+                        "minimal" => "minimal",
+                        "low" => "low",
+                        "medium" => "medium",
+                        "high" => "high",
+                        "xhigh" | "max" => "xhigh",
+                        other => other,
+                    };
+                    args.extend(["--thinking".into(), level.into()]);
+                }
+                Ok(Some(ProgramSpec {
+                    program: crate::agent::pi::binary(),
+                    args,
+                    environment,
+                    account_id,
                 }))
             }
             (crate::protocol::AgentKind::Grok, None) => {
@@ -1769,6 +1817,63 @@ impl Terminals {
                     ));
                 }
                 if record.agent != crate::protocol::AgentKind::Codex {
+                    return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                }
+                let env_id = record.id.clone();
+                let env_profile = profile.clone();
+                let agent = record.agent;
+                let env = tokio::task::spawn_blocking(move || {
+                    crate::accounts::managed::profile_account_environment(
+                        &data,
+                        &env_id,
+                        agent,
+                        &env_profile,
+                    )
+                })
+                .await
+                .map_err(|_| Error::Closed)??;
+                Ok((env, Some(record.id), Some(profile)))
+            }
+        }
+    }
+
+    async fn resolve_pi_terminal_account(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<(
+        Vec<(String, String)>,
+        Option<String>,
+        Option<crate::accounts::ApiProfile>,
+    )> {
+        match account_id.as_deref() {
+            None => Ok((Vec::new(), None, None)),
+            Some(crate::accounts::NATIVE_PI_ID) => {
+                Ok((Vec::new(), Some(crate::accounts::NATIVE_PI_ID.into()), None))
+            }
+            Some(account_id) => {
+                let data = self.0.database.directory().to_owned();
+                let id = account_id.to_owned();
+                let record = self
+                    .0
+                    .database
+                    .call({
+                        let database = self.0.database.clone();
+                        let data = data.clone();
+                        let id = id.clone();
+                        move |store| {
+                            if let Some(message) =
+                                crate::accounts::source_bound_launch_error(&database, &id)?
+                            {
+                                return Err(Error::Invalid(message));
+                            }
+                            store.managed_snapshot_row(&data, &id)
+                        }
+                    })
+                    .await?;
+                let profile = record
+                    .api_profile
+                    .ok_or_else(|| Error::Invalid("所选账号不支持 Pi PTY".into()))?;
+                if record.agent != crate::protocol::AgentKind::Pi {
                     return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
                 }
                 let env_id = record.id.clone();
