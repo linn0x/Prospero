@@ -1355,6 +1355,19 @@ function ShellSidebar({
                     : projectSessionCount}
             </span>
           </CollapsibleTrigger>
+          <button
+            type="button"
+            className="workspace-project-new-session"
+            aria-label={t(`在 ${name} 中新建会话`, `New session in ${name}`)}
+            title={t(`在 ${name} 中新建会话`, `New session in ${name}`)}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              newSession(project);
+            }}
+          >
+            <Plus aria-hidden="true" />
+          </button>
           </ContextMenuTrigger>
           <ContextMenuContent>
             <ContextMenuGroup>
@@ -1504,7 +1517,7 @@ function ShellSidebar({
         <nav className="sidebar-nav-fixed" aria-label={t("主导航", "Main navigation")}>
           <SidebarGroup>
             <SidebarGroupContent>
-              <SidebarMenu>{renderNav(primaryNav)}</SidebarMenu>
+              <SidebarMenu className="sidebar-primary-grid">{renderNav(primaryNav)}</SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
         </nav>
@@ -1808,9 +1821,8 @@ function ShellSidebar({
       <SidebarFooter className="sidebar-shell-footer">
         <nav className="sidebar-resource-nav" aria-label={t("连接与工具", "Connections & tools")}>
           <SidebarGroup>
-            <SidebarGroupLabel>{t("连接与工具", "Connections & tools")}</SidebarGroupLabel>
             <SidebarGroupContent>
-              <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
+              <SidebarMenu className="sidebar-resource-dock">{renderNav(resourceNav)}</SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
         </nav>
@@ -3785,15 +3797,36 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     () => validOpenSessionIds(openIds, sessionSnapshot.daemon.sessions),
     [openIds, sessionSnapshot.daemon.sessions],
   );
-  const openMetadataKey = validOpenIds.slice(0, 100).join("|");
+  useEffect(() => {
+    if (snapshot.daemon.sessions.length === 0) return;
+    const trackedIds = new Set(activeId ? [activeId, ...openIds] : openIds);
+    if (trackedIds.size === 0) return;
+    const liveTracked = snapshot.daemon.sessions.filter((session) => trackedIds.has(session.id));
+    if (liveTracked.length === 0) return;
+    setHydratedSessions((current) => {
+      const currentById = new Map(current.map((item) => [item.id, item]));
+      let changed = false;
+      for (const session of liveTracked) {
+        const existing = currentById.get(session.id);
+        if (!existing || existing.status !== session.status || existing.title !== session.title || existing.displayTitle !== session.displayTitle || existing.preview !== session.preview || existing.terminalMode !== session.terminalMode) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) return current;
+      const updatedIds = new Set(liveTracked.map((item) => item.id));
+      return [...liveTracked, ...current.filter((item) => !updatedIds.has(item.id))].slice(0, HYDRATED_SESSION_CACHE_LIMIT);
+    });
+  }, [activeId, openIds, snapshot.daemon.sessions]);
+  const openMetadataKey = openIds.slice(0, 100).join("|");
   useEffect(() => {
     if (!snapshot.daemon.metadataRevision || !openMetadataKey || !snapshot.daemon.running) return;
     let cancelled = false;
     const ids = openMetadataKey.split("|");
     void window.prospero.listSessions({ ids, limit: 100 }).then(page => {
       if (cancelled) return;
-      const requested = new Set(ids);
-      setHydratedSessions(current => [...page.items, ...current.filter(item => !requested.has(item.id))].slice(0, HYDRATED_SESSION_CACHE_LIMIT));
+      const returnedIds = new Set(page.items.map(item => item.id));
+      setHydratedSessions(current => [...page.items, ...current.filter(item => !returnedIds.has(item.id))].slice(0, HYDRATED_SESSION_CACHE_LIMIT));
     }).catch(() => {});
     return () => { cancelled = true; };
   }, [openMetadataKey, snapshot.daemon.metadataRevision, snapshot.daemon.running]);
@@ -3855,28 +3888,28 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     };
   }, [restoredSessionsReady, sessionRestoreAttempt, snapshot.daemon.running]);
   useEffect(() => {
-    if (!restoredSessionsReady) return;
+    if (!restoredSessionsReady || !snapshot.daemon.running) return;
     try {
       localStorage.setItem(
         OPEN_SESSIONS_STORAGE_KEY,
         JSON.stringify(validOpenIds),
       );
     } catch {}
-  }, [restoredSessionsReady, validOpenIds]);
+  }, [restoredSessionsReady, snapshot.daemon.running, validOpenIds]);
   useEffect(() => {
     try {
       localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view);
     } catch {}
   }, [view]);
   useEffect(() => {
-    if (!restoredSessionsReady) return;
+    if (!restoredSessionsReady || !snapshot.daemon.running) return;
     try {
       if (activeId) localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, activeId);
       else localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
     } catch {}
-  }, [activeId, restoredSessionsReady]);
+  }, [activeId, restoredSessionsReady, snapshot.daemon.running]);
   useEffect(() => {
-    if (!restoredSessionsReady) return;
+    if (!restoredSessionsReady || !snapshot.daemon.running) return;
     if (
       activeId &&
       !sessionSnapshot.daemon.sessions.some((session) => session.id === activeId)
@@ -3888,6 +3921,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     sessionSnapshot.daemon.sessions,
     activeId,
     restoredSessionsReady,
+    snapshot.daemon.running,
     validOpenIds,
   ]);
   useLayoutEffect(() => {
@@ -4252,7 +4286,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             )}
           </Suspense>
           {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
-              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} />}
+              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} onNewSession={openNewSession} />}
               <WorkspacePane
                 active={localWorkspaceVisible}
                 focus={focus}

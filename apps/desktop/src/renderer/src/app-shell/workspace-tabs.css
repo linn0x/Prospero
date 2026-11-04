@@ -1,3 +1,28 @@
 /* Maintain readable labels instead of shrinking every tab as more sessions open. */
 .topbar-workspace-tabs.tab-strip .workspace-tab { flex: 0 0 196px; min-width: 196px; max-width: 196px; }
 .topbar-workspace-tabs.tab-strip .workspace-tab-main > .truncate { flex: 1; }
+.topbar-workspace-tabs.tab-strip .workspace-tab-new {
+  order: 9999;
+  display: inline-grid;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  margin-left: 2px;
+  padding: 0;
+  color: var(--muted-foreground);
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-control, 6px);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.topbar-workspace-tabs.tab-strip .workspace-tab-new:hover,
+.topbar-workspace-tabs.tab-strip .workspace-tab-new:focus-visible {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+}
+.topbar-workspace-tabs.tab-strip .workspace-tab-new svg {
+  width: 14px;
+  height: 14px;
+}

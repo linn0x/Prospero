@@ -667,12 +667,46 @@ kbd {
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group"] { padding-block: 4px; }
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="menu-button"] { height: 28px; min-height: 28px; padding-block: 4px; }
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { height: 22px; }
+.prospero-sidebar:not([data-collapsible="icon"]) .sidebar-primary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+}
+.prospero-sidebar:not([data-collapsible="icon"]) .sidebar-primary-grid [data-sidebar="menu-button"] {
+  height: 27px;
+  min-height: 27px;
+  padding-inline: 8px;
+  font-size: var(--ui-text-caption);
+}
 .sidebar-workspace-scroll { min-height: 96px; flex: 1 0 96px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; }
-.sidebar-resource-nav { margin-bottom: 8px; max-height: 35vh; overflow-y: auto; scrollbar-width: thin; }
+.sidebar-resource-nav { margin-bottom: 6px; max-height: 35vh; overflow-y: auto; scrollbar-width: thin; }
 .sidebar-resource-nav [data-sidebar="group"] { padding: 0; }
-.sidebar-resource-nav [data-sidebar="menu-button"] { height: 30px; font-size: var(--ui-text-small); }
+.sidebar-resource-nav [data-sidebar="menu-button"] { height: 28px; font-size: var(--ui-text-small); }
 .sidebar-resource-nav [data-sidebar="group-label"] { height: 26px; }
-.sidebar-shell-footer { position: relative; flex: none; padding: 10px 12px; }
+.prospero-sidebar:not([data-collapsible="icon"]) .sidebar-resource-dock {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+}
+.prospero-sidebar:not([data-collapsible="icon"]) .sidebar-resource-dock [data-sidebar="menu-button"] {
+  justify-content: center;
+  height: 28px;
+  min-height: 28px;
+  padding-inline: 0;
+  border-radius: var(--ui-radius-control);
+}
+.prospero-sidebar:not([data-collapsible="icon"]) .sidebar-resource-dock [data-sidebar="menu-button"] > span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.sidebar-shell-footer { position: relative; flex: none; padding: 8px 12px; }
 .sidebar-shell-footer::before { position: absolute; top: 0; right: 12px; left: 12px; height: 1px; background: color-mix(in srgb, var(--sidebar-border) 72%, transparent); content: ""; }
 .sidebar-footer-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
 .sidebar-footer-actions > [data-sidebar="menu-item"] { min-width: 0; }
@@ -1585,3 +1619,73 @@ label.check-row { display: flex; }
 .prospero-sidebar .workspace-session-item:focus-within > .workspace-session-link { background: color-mix(in srgb, var(--sidebar-foreground) 10%, transparent); color: var(--sidebar-foreground); box-shadow: none; }
 
 .session-action-error { position: absolute; z-index: 45; top: 12px; left: 12px; right: 12px; width: auto; max-height: 50%; overflow: auto; background: var(--popover); box-shadow: var(--shadow); }
+
+.workspace-project-context { position: relative; display: flex; align-items: center; }
+.workspace-project-new-session {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  color: var(--muted-foreground);
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+  transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+.workspace-project-new-session svg { width: 13px; height: 13px; }
+.workspace-project-new-session:hover,
+.workspace-project-new-session:focus-visible {
+  color: var(--sidebar-foreground);
+  background: var(--sidebar-accent);
+  opacity: 1;
+  pointer-events: auto;
+}
+.workspace-project-context:hover > .workspace-project-new-session,
+.workspace-project-context:focus-within > .workspace-project-new-session {
+  opacity: 1;
+  pointer-events: auto;
+}
+.workspace-project-context:hover .workspace-session-count,
+.workspace-project-context:focus-within .workspace-session-count {
+  opacity: 0;
+}
+
+.native-terminal-disconnected-banner {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 20px;
+  color: var(--terminal-foreground, #e6e8ee);
+  background: var(--terminal-background, #16171a);
+  font-size: var(--ui-text-small);
+  text-align: center;
+}
+.native-terminal-disconnected-actions {
+  display: flex;
+  gap: 8px;
+}
+.native-terminal-disconnected-actions button {
+  padding: 6px 12px;
+  color: var(--terminal-foreground, #e6e8ee);
+  border: 1px solid var(--terminal-border, #2c2e35);
+  border-radius: var(--ui-radius-control);
+  background: var(--terminal-surface, #1d1e22);
+  font-size: var(--ui-text-caption);
+  cursor: pointer;
+}
+.native-terminal-disconnected-actions button:hover {
+  background: #292b30;
+}

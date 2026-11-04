@@ -121,10 +121,14 @@ export class TimelineController {
       const changed = page.items.filter(item => ids.has(item.id)).map(item => item.id);
       let items = page.items;
       if (changed.length) {
-        const updates = await pageRequest(this.api, controller.signal, id => this.api.lookupTimeline(this.sessionId, changed, id));
-        if (controller.signal.aborted) return;
-        this.validate(updates.items);
-        const byId = new Map(updates.items.map(item => [item.id, item]));
+        const byId = new Map<string, TimelineRecord>();
+        for (let index = 0; index < changed.length; index += 40) {
+          const batch = changed.slice(index, index + 40);
+          const updates = await pageRequest(this.api, controller.signal, id => this.api.lookupTimeline(this.sessionId, batch, id));
+          if (controller.signal.aborted) return;
+          this.validate(updates.items);
+          for (const item of updates.items) byId.set(item.id, item);
+        }
         items = items.map(item => { const update = byId.get(item.id); return update && update.revision > item.revision ? update : item; });
       }
       this.sequence = changes.nextSeq; this.failures = 0;

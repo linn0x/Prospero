@@ -1,17 +1,18 @@
 import { sessionTabLabels } from "../workspace/session-tab-labels";
 import "./workspace-tabs.css";
-import { Pin, X } from "lucide-react";
+import { Pin, Plus, X } from "lucide-react";
 import { TabStrip } from "../components/TabStrip";
 import type { DesktopSnapshot } from "../../../shared/types";
 import { useLocale } from "../locale";
 import { cn } from "../lib/utils";
 import { sessionLabel, sessionStatusLabel, SessionAgentIcon, StatusMark } from "../workspace/session-presentation";
 
-export function WorkspaceTabs({ snapshot, openIds, activeId, onActivate, onClose, onTogglePin, onReorder }: { snapshot: DesktopSnapshot; openIds: string[]; activeId: string | undefined; onActivate: (id: string) => void; onClose: (id: string) => void; onTogglePin: (id: string) => void; onReorder: (ids: string[]) => void }) {
+export function WorkspaceTabs({ snapshot, openIds, activeId, onActivate, onClose, onTogglePin, onReorder, onNewSession }: { snapshot: DesktopSnapshot; openIds: string[]; activeId: string | undefined; onActivate: (id: string) => void; onClose: (id: string) => void; onTogglePin: (id: string) => void; onReorder: (ids: string[]) => void; onNewSession?: (project?: string) => void }) {
   const { t } = useLocale();
   const sessions = new Map(snapshot.daemon.sessions.map((session) => [session.id, session]));
   const labels = sessionTabLabels(snapshot.daemon.sessions);
   const ids = openIds.filter((id) => sessions.has(id));
+  const activeSession = activeId ? sessions.get(activeId) : undefined;
   return <TabStrip className="topbar-workspace-tabs" listClassName="workspace-tabs" label={t("打开的会话", "Open sessions")} items={ids.map(id => ({ id, label: `${labels.get(id)} · ${sessionStatusLabel(sessions.get(id)!, snapshot.unreadSessionIds.includes(id), t)} — ${sessions.get(id)!.cwd}`, onSelect: () => onActivate(id), onClose: () => onClose(id) }))} activeId={activeId} onReorder={onReorder}>
     {ids.map((id, index) => {
       const session = sessions.get(id)!;
@@ -25,5 +26,16 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, onActivate, onClose
         <button type="button" data-slot="workspace-tab-close" data-testid="workspace-tab-close" className="workspace-tab-action" aria-label={t(`关闭 ${label}`, `Close ${label}`)} onPointerDown={event => event.stopPropagation()} onClick={event => { event.preventDefault(); event.stopPropagation(); onClose(id); }}><X aria-hidden="true" /></button>
       </div>;
     })}
+    {onNewSession && (
+      <button
+        type="button"
+        className="workspace-tab-new"
+        aria-label={t("新建会话标签页", "New session tab")}
+        title={t("在当前工作区新建会话 (⌘N)", "New session in current workspace (⌘N)")}
+        onClick={() => onNewSession(activeSession?.cwd)}
+      >
+        <Plus aria-hidden="true" />
+      </button>
+    )}
   </TabStrip>;
 }
