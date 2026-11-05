@@ -374,9 +374,45 @@ export class StateStore extends EventEmitter {
       }));
       this.hydrateSessions(sessions);
       const summary = reuseEquivalent(previous?.daemon.sessionSummary, sessionSummary(status["sessionSummary"], sessions));
-      const capabilities = arrayValue(status["capabilities"])
+      const rawCapabilities = arrayValue(status["capabilities"])
         .filter((value): value is string => typeof value === "string" && value.length > 0 && value.length <= 200)
         .slice(0, 100);
+      const capabilities = rawCapabilities.length > 0
+        ? reuseEquivalent(previous?.daemon.capabilities, rawCapabilities)
+        : undefined;
+      const persistenceSnapshot = reuseEquivalent(previous?.daemon.persistence, {
+        pty: booleanValue(persistence["pty"]),
+        structured: booleanValue(persistence["structured"]),
+      });
+      const relay = reuseEquivalent(previous?.daemon.relay, relaySnapshot(status["relay"], config["relay"]));
+      const schedules = reuseEquivalent(previous?.daemon.schedules, records(status["schedules"]));
+      const workspaceCounts = this.backend === "api"
+        ? reuseEquivalent(
+            previous?.daemon.workspaceCounts,
+            Object.fromEntries(Object.entries(objectValue(status["workspaceCounts"])).slice(0, 100).map(([workspace, entry]) => {
+              const counts = objectValue(entry);
+              return [workspace, { revision: nonNegativeInteger(counts["revision"]), total: nonNegativeInteger(counts["total"]), active: nonNegativeInteger(counts["active"]), archived: nonNegativeInteger(counts["archived"]), attention: nonNegativeInteger(counts["attention"]) }];
+            })),
+          )
+        : undefined;
+      const workspaceTabs = this.backend === "api" && status["workspaceTabs"]
+        ? reuseEquivalent(
+            previous?.daemon.workspaceTabs,
+            Object.fromEntries(Object.entries(objectValue(status["workspaceTabs"])).slice(0, 100).map(([workspace, entry]) => {
+              const tabs = objectValue(entry);
+              const openSessionIds = arrayValue(tabs["openSessionIds"]).filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200).slice(0, 64);
+              const activeSessionId = stringValue(tabs["activeSessionId"]);
+              const splitSessionId = stringValue(tabs["splitSessionId"]);
+              return [workspace, {
+                openSessionIds,
+                ...(activeSessionId ? { activeSessionId } : {}),
+                ...(splitSessionId ? { splitSessionId } : {}),
+                updatedAt: nonNegativeInteger(tabs["updatedAt"]),
+                revision: nonNegativeInteger(tabs["revision"]),
+              }];
+            })),
+          )
+        : undefined;
       const candidate: DaemonSnapshot = {
         running,
         managed: running && rawPid === this.managedPid,
@@ -391,37 +427,17 @@ export class StateStore extends EventEmitter {
         buildId: stringValue(status["buildId"]),
         expectedBuildId: stringValue(status["expectedBuildId"]),
         updatePending: booleanValue(status["updatePending"]),
-        persistence: {
-          pty: booleanValue(persistence["pty"]),
-          structured: booleanValue(persistence["structured"]),
-        },
-        ...(capabilities.length > 0 ? { capabilities } : {}),
-        relay: relaySnapshot(status["relay"], config["relay"]),
+        persistence: persistenceSnapshot,
+        ...(capabilities ? { capabilities } : {}),
+        relay,
         ...(this.runtimeSwitch ? { runtime: this.runtimeSwitch } : {}),
         sessionSummary: summary,
         sessions,
-        schedules: records(status["schedules"]),
+        schedules,
         ...(this.backend === "api" ? {
           metadataRevision: stringValue(status["metadataRevision"]),
-          workspaceCounts: Object.fromEntries(Object.entries(objectValue(status["workspaceCounts"])).slice(0, 100).map(([workspace, entry]) => {
-            const counts = objectValue(entry);
-            return [workspace, { revision: nonNegativeInteger(counts["revision"]), total: nonNegativeInteger(counts["total"]), active: nonNegativeInteger(counts["active"]), archived: nonNegativeInteger(counts["archived"]), attention: nonNegativeInteger(counts["attention"]) }];
-          })),
-          ...(status["workspaceTabs"] ? {
-            workspaceTabs: Object.fromEntries(Object.entries(objectValue(status["workspaceTabs"])).slice(0, 100).map(([workspace, entry]) => {
-              const tabs = objectValue(entry);
-              const openSessionIds = arrayValue(tabs["openSessionIds"]).filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200).slice(0, 64);
-              const activeSessionId = stringValue(tabs["activeSessionId"]);
-              const splitSessionId = stringValue(tabs["splitSessionId"]);
-              return [workspace, {
-                openSessionIds,
-                ...(activeSessionId ? { activeSessionId } : {}),
-                ...(splitSessionId ? { splitSessionId } : {}),
-                updatedAt: nonNegativeInteger(tabs["updatedAt"]),
-                revision: nonNegativeInteger(tabs["revision"]),
-              }];
-            })),
-          } : {}),
+          ...(workspaceCounts ? { workspaceCounts } : {}),
+          ...(workspaceTabs ? { workspaceTabs } : {}),
         } : {}),
         ...(running ? { pid: rawPid } : {}),
         ...(this.lastError ? { lastError: this.lastError } : {}),
@@ -552,9 +568,10 @@ export class StateStore extends EventEmitter {
 
   setApiState(state: ApiState): void {
     if (this.backend !== "api") throw new Error("API data is not enabled");
-    if (arrayValue(state.status["sessions"]).length > 200 || state.projects.length > 100 || Buffer.byteLength(JSON.stringify(state)) > 2 * 1024 * 1024) throw new Error("API projection exceeds page limit");
-    if (isDeepStrictEqual(this.apiState, state)) return;
-    this.apiState = {
+    if (arrayValue(state.status["sessions"]).length > 200 || state.projects.length > 100) {
+      throw new Error("API projection exceeds page limit");
+    }
+    const next: ApiState = {
       config: reuseEquivalent(this.apiState.config, state.config),
       status: reuseEquivalent(this.apiState.status, state.status),
       devices: reuseEquivalent(this.apiState.devices, state.devices),
@@ -562,6 +579,20 @@ export class StateStore extends EventEmitter {
       running: state.running,
       projects: reuseEquivalent(this.apiState.projects, state.projects),
     };
+    if (
+      next.config === this.apiState.config
+      && next.status === this.apiState.status
+      && next.devices === this.apiState.devices
+      && next.orchestration === this.apiState.orchestration
+      && next.running === this.apiState.running
+      && next.projects === this.apiState.projects
+    ) {
+      return;
+    }
+    if (Buffer.byteLength(JSON.stringify(state)) > 2 * 1024 * 1024) {
+      throw new Error("API projection exceeds page limit");
+    }
+    this.apiState = next;
     this.changed();
   }
 

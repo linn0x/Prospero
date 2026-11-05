@@ -302,6 +302,104 @@ impl Store {
                     revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0)
                 ) STRICT;",
             )?;
+            let managed_accounts_sql: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='managed_accounts'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if managed_accounts_sql
+                .as_deref()
+                .is_some_and(|sql| !sql.contains("'pi'"))
+            {
+                transaction.execute_batch(
+                    "CREATE TABLE managed_accounts_pi_upgrade (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 80),
+                        is_default INTEGER NOT NULL CHECK(is_default IN (0,1)),
+                        created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                        updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                        api_profile TEXT,
+                        api_validation TEXT,
+                        api_validation_revision TEXT,
+                        api_engine_validation TEXT,
+                        api_engine_validation_revision TEXT,
+                        agent TEXT CHECK(agent IS NULL OR agent IN ('claude','codex','opencode','pi'))
+                    ) STRICT;
+                    INSERT INTO managed_accounts_pi_upgrade(
+                        id,name,is_default,created_at,updated_at,
+                        api_profile,api_validation,api_validation_revision,
+                        api_engine_validation,api_engine_validation_revision,agent
+                    )
+                    SELECT
+                        id,name,is_default,created_at,updated_at,
+                        api_profile,api_validation,api_validation_revision,
+                        api_engine_validation,api_engine_validation_revision,agent
+                    FROM managed_accounts;
+                    DROP TABLE managed_accounts;
+                    ALTER TABLE managed_accounts_pi_upgrade RENAME TO managed_accounts;",
+                )?;
+            }
+            let agent_runs_sql: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='agent_runs'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if agent_runs_sql
+                .as_deref()
+                .is_some_and(|sql| !sql.contains("'pi'"))
+            {
+                transaction.execute_batch(
+                    "DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert;
+                    DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update;
+                    CREATE TABLE agent_runs_pi_upgrade (
+                        session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
+                        agent TEXT NOT NULL CHECK(agent IN ('claude','codex','deepseek','opencode','pi')),
+                        active INTEGER NOT NULL CHECK(active IN (0,1)),
+                        approval_policy TEXT NOT NULL CHECK(approval_policy IN ('manual','auto')),
+                        turn INTEGER NOT NULL DEFAULT 0 CHECK(turn >= 0),
+                        native_id TEXT CHECK(native_id IS NULL OR length(native_id) <= 256),
+                        permission_mode TEXT NOT NULL DEFAULT 'default' CHECK(permission_mode IN ('default','plan')),
+                        model TEXT,
+                        effort TEXT,
+                        account_id TEXT,
+                        agent_preset TEXT,
+                        execution_unknown INTEGER NOT NULL DEFAULT 0 CHECK(execution_unknown IN (0,1))
+                    ) STRICT;
+                    INSERT INTO agent_runs_pi_upgrade(
+                        session_id,agent,active,approval_policy,turn,native_id,
+                        permission_mode,model,effort,account_id,agent_preset,execution_unknown
+                    )
+                    SELECT
+                        session_id,agent,active,approval_policy,turn,native_id,
+                        permission_mode,model,effort,account_id,agent_preset,execution_unknown
+                    FROM agent_runs;
+                    DROP TABLE agent_runs;
+                    ALTER TABLE agent_runs_pi_upgrade RENAME TO agent_runs;
+                    CREATE INDEX agent_active ON agent_runs(session_id) WHERE active=1;
+                    CREATE TRIGGER orch_dispatch_legacy_unknown_insert
+                    BEFORE INSERT ON orch_dispatches
+                    WHEN NEW.state IN ('starting','running') AND EXISTS (
+                        SELECT 1 FROM orch_dispatches d JOIN agent_runs a ON a.session_id=d.session_id
+                        WHERE d.task_id=NEW.task_id AND d.id!=NEW.id AND (a.active=1 OR a.execution_unknown=1)
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT,'legacy execution exit remains unknown');
+                    END;
+                    CREATE TRIGGER orch_dispatch_legacy_unknown_update
+                    BEFORE UPDATE OF task_id,session_id,state ON orch_dispatches
+                    WHEN NEW.state IN ('starting','running') AND EXISTS (
+                        SELECT 1 FROM orch_dispatches d JOIN agent_runs a ON a.session_id=d.session_id
+                        WHERE d.task_id=NEW.task_id AND d.id!=NEW.id AND (a.active=1 OR a.execution_unknown=1)
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT,'legacy execution exit remains unknown');
+                    END;",
+                )?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }

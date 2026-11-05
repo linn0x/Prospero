@@ -359,6 +359,24 @@ async fn source_bind_accepts_explicit_runtime_agent() {
     assert_eq!(opencode_account["agent"], "opencode");
     assert_eq!(opencode_account["engine"], "opencode");
 
+    let (status, pi) = harness
+        .post(envelope(
+            json!({"kind":"bind","sourceId":source_id,"routeId":route_id,"revision":revision,"agent":"pi"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{pi}");
+    let pi_id = pi["accountId"].as_str().unwrap().to_owned();
+    assert_ne!(pi_id, codex_id);
+    assert_ne!(pi_id, opencode_id);
+    let pi_account = pi["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == pi_id)
+        .unwrap();
+    assert_eq!(pi_account["agent"], "pi");
+    assert_eq!(pi_account["engine"], "pi");
+
     let (status, invalid) = harness
         .post(envelope(
             json!({"kind":"bind","sourceId":source_id,"routeId":route_id,"revision":revision,"agent":"claude"}),

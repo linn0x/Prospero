@@ -185,9 +185,9 @@
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 body { background: var(--bg); color: var(--text); font-size: var(--ui-text-body); }
-button:not([data-slot]) { border: 1px solid var(--border); background: var(--surface-2); border-radius: var(--ui-radius-panel); padding: 7px 10px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
-button:not([data-slot]):hover:not(:disabled) { background: var(--surface-3); border-color: var(--border-strong); }
-button:not([data-slot]):disabled { opacity: .45; cursor: default; }
+button:where(:not([data-slot])) { border: 1px solid var(--border); background: var(--surface-2); border-radius: var(--ui-radius-panel); padding: 7px 10px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+button:where(:not([data-slot])):hover:not(:disabled) { background: var(--surface-3); border-color: var(--border-strong); }
+button:where(:not([data-slot])):disabled { opacity: .45; cursor: default; }
 button.primary { background: var(--primary); color: var(--primary-foreground); border-color: transparent; font-weight: 600; }
 button.primary:hover:not(:disabled) { background: var(--primary-hover); }
 button.danger { color: var(--red); }
@@ -297,9 +297,9 @@ button:not([data-slot]), input:not([data-slot]), textarea:not([data-slot]), sele
 code, pre, kbd, .log-view, .usage-summary-grid strong, .usage-summary-grid span {
   font-family: var(--ui-font-mono);
 }
-button:not([data-slot]), input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { border-radius: var(--ui-radius-control); }
-button:not([data-slot]) { padding: 7px 10px; border-color: var(--border); background: var(--surface-2); }
-button:not([data-slot]):hover:not(:disabled) { border-color: var(--border-strong); background: var(--surface-3); }
+button:where(:not([data-slot])), input:where(:not([data-slot])), textarea:where(:not([data-slot])), select:where(:not([data-slot])) { border-radius: var(--ui-radius-control); }
+button:where(:not([data-slot])) { padding: 7px 10px; border-color: var(--border); background: var(--surface-2); }
+button:where(:not([data-slot])):hover:not(:disabled) { border-color: var(--border-strong); background: var(--surface-3); }
 button.primary { color: var(--primary-foreground); background: var(--primary); box-shadow: 0 1px 2px #0003; }
 button.primary:hover:not(:disabled) { background: var(--primary-hover); }
 input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { background: var(--surface-1); }
@@ -1621,18 +1621,26 @@ label.check-row { display: flex; }
 .session-action-error { position: absolute; z-index: 45; top: 12px; left: 12px; right: 12px; width: auto; max-height: 50%; overflow: auto; background: var(--popover); box-shadow: var(--shadow); }
 
 .workspace-project-context { position: relative; display: flex; align-items: center; }
+.workspace-project-context:hover > .workspace-project-button,
+.workspace-project-context:focus-within > .workspace-project-button {
+  background: color-mix(in srgb, var(--sidebar-foreground) 10%, transparent);
+  color: var(--sidebar-foreground);
+}
 .workspace-project-new-session {
+  appearance: none;
   position: absolute;
   top: 50%;
-  right: 4px;
+  right: 5px;
   transform: translateY(-50%);
   display: grid;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   place-items: center;
   padding: 0;
-  color: var(--muted-foreground);
+  color: color-mix(in srgb, var(--sidebar-foreground) 72%, var(--sidebar));
   border: 0;
+  outline: 0;
+  box-shadow: none;
   border-radius: var(--ui-radius-control);
   background: transparent;
   opacity: 0;
@@ -1640,14 +1648,15 @@ label.check-row { display: flex; }
   cursor: pointer;
   transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
 }
-.workspace-project-new-session svg { width: 13px; height: 13px; }
+.workspace-project-new-session svg { display: block; width: 14px; height: 14px; flex: none; stroke: currentColor; }
 .workspace-project-new-session:hover,
 .workspace-project-new-session:focus-visible {
   color: var(--sidebar-foreground);
-  background: var(--sidebar-accent);
+  background: color-mix(in srgb, var(--sidebar-foreground) 12%, transparent);
   opacity: 1;
   pointer-events: auto;
 }
+.workspace-project-new-session:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 .workspace-project-context:hover > .workspace-project-new-session,
 .workspace-project-context:focus-within > .workspace-project-new-session {
   opacity: 1;

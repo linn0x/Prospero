@@ -1357,6 +1357,7 @@ function ShellSidebar({
           </CollapsibleTrigger>
           <button
             type="button"
+            data-slot="workspace-project-new-session"
             className="workspace-project-new-session"
             aria-label={t(`在 ${name} 中新建会话`, `New session in ${name}`)}
             title={t(`在 ${name} 中新建会话`, `New session in ${name}`)}

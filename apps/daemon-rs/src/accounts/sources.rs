@@ -1105,6 +1105,9 @@ impl ModelSources {
         known_accounts: &std::collections::HashSet<String>,
         account_agents: &std::collections::HashMap<String, AgentKind>,
     ) -> Result<BindOutcome> {
+        self.registry
+            .bindings
+            .retain(|binding| known_accounts.contains(&binding.account_id));
         let bound = self.require_source(source_id, revision)?;
         let route = bound
             .routes
