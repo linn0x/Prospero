@@ -95,6 +95,7 @@ const api: DesktopApi = {
   forgetProject: (path: string) => ipcRenderer.invoke("project:forget", path),
   renameProject: (path: string, name: string) => ipcRenderer.invoke("project:rename", path, name),
   setProjectPinned: (path: string, pinned: boolean) => ipcRenderer.invoke("project:pin", path, pinned),
+  setWorkspaceTabs: (input) => ipcRenderer.invoke("workspace:tabs:set", input),
   setSessionPinned: (sessionId: string, pinned: boolean) => ipcRenderer.invoke("session:pin", sessionId, pinned),
   setSessionArchived: (sessionId: string, archived: boolean, nativeId?: string) => ipcRenderer.invoke("session:archive", sessionId, archived, nativeId),
   nativeConversationCandidates: (sessionId: string, query: string) => ipcRenderer.invoke("session:native-candidates", sessionId, query),

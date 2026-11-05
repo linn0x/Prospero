@@ -182,6 +182,42 @@ pub struct WorkspacePage {
     pub latest_seq: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTabsEntry {
+    pub workspace: String,
+    #[serde(default)]
+    pub open_session_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_session_id: Option<String>,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+    #[ts(type = "number")]
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceTabsUpdate {
+    pub workspace: String,
+    #[serde(default)]
+    pub open_session_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTabsList {
+    pub items: Vec<WorkspaceTabsEntry>,
+    #[ts(type = "number")]
+    pub latest_seq: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionLookup {

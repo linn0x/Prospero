@@ -3797,6 +3797,51 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     () => validOpenSessionIds(openIds, sessionSnapshot.daemon.sessions),
     [openIds, sessionSnapshot.daemon.sessions],
   );
+  const syncedDaemonTabRevisions = useRef<Record<string, number>>({});
+  useEffect(() => {
+    const workspaceTabs = snapshot.daemon.workspaceTabs;
+    if (!workspaceTabs) return;
+    const newlyDiscoveredIds: string[] = [];
+    let preferredActiveId: string | undefined;
+    let latestUpdatedAt = -1;
+    for (const [workspace, entry] of Object.entries(workspaceTabs)) {
+      const previousRevision = syncedDaemonTabRevisions.current[workspace] ?? 0;
+      if (entry.revision <= previousRevision) continue;
+      syncedDaemonTabRevisions.current[workspace] = entry.revision;
+      for (const id of entry.openSessionIds) {
+        if (!newlyDiscoveredIds.includes(id)) newlyDiscoveredIds.push(id);
+      }
+      if (entry.activeSessionId && entry.updatedAt > latestUpdatedAt) {
+        latestUpdatedAt = entry.updatedAt;
+        preferredActiveId = entry.activeSessionId;
+      }
+    }
+    if (newlyDiscoveredIds.length > 0) {
+      setOpenIds((current) => {
+        const missing = newlyDiscoveredIds.filter((id) => !current.includes(id));
+        return missing.length > 0 ? [...current, ...missing] : current;
+      });
+    }
+    if (preferredActiveId) {
+      setActiveId((current) => current ?? preferredActiveId);
+    }
+  }, [snapshot.daemon.workspaceTabs]);
+  const persistWorkspaceTabs = useCallback((workspace: string | undefined, allOpenIds: readonly string[], currentActiveId: string | undefined): void => {
+    if (!workspace || !window.prospero.setWorkspaceTabs || !snapshotRef.current.daemon.running) return;
+    const sessionsById = new Map(sessionSnapshot.daemon.sessions.map((item) => [item.id, item]));
+    const workspaceOpenIds = allOpenIds.filter((id) => {
+      const candidate = sessionsById.get(id);
+      return candidate && (projectForSession(snapshotRef.current.projects, candidate) ?? candidate.cwd) === workspace;
+    });
+    const activeInWorkspace = currentActiveId && workspaceOpenIds.includes(currentActiveId)
+      ? currentActiveId
+      : workspaceOpenIds[0];
+    void window.prospero.setWorkspaceTabs({
+      workspace,
+      openSessionIds: workspaceOpenIds,
+      ...(activeInWorkspace ? { activeSessionId: activeInWorkspace } : {}),
+    }).catch(() => undefined);
+  }, [sessionSnapshot.daemon.sessions]);
   useEffect(() => {
     if (snapshot.daemon.sessions.length === 0) return;
     const trackedIds = new Set(activeId ? [activeId, ...openIds] : openIds);
@@ -3975,16 +4020,22 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         upsertHydratedSession(current, session, HYDRATED_SESSION_CACHE_LIMIT),
       );
     }
+    const targetSession = session ?? sessionSnapshot.daemon.sessions.find((item) => item.id === id);
+    const workspace = targetSession ? (projectForSession(snapshotRef.current.projects, targetSession) ?? targetSession.cwd) : undefined;
     if (options.openTab !== false) {
-      setOpenIds((current) =>
-        current.includes(id) ? current : [...current, id],
-      );
+      setOpenIds((current) => {
+        const next = current.includes(id) ? current : [...current, id];
+        persistWorkspaceTabs(workspace, next, id);
+        return next;
+      });
+    } else {
+      persistWorkspaceTabs(workspace, openIds, id);
     }
     setActiveId(id);
     setView("workspaces");
     if (snapshotRef.current.unreadSessionIds.includes(id))
       void window.prospero.setSessionUnread(id, false);
-  }, []);
+  }, [openIds, persistWorkspaceTabs, sessionSnapshot.daemon.sessions]);
   const openRun = useCallback((runId?: string, taskId?: string): void => {
     setRunTargetId(runId);
     setTaskTargetId(taskId);
@@ -4000,10 +4051,25 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setView(next);
   }, [remote.refresh]);
   const closeSession = (id: string): void => {
+    const closingSession = sessionSnapshot.daemon.sessions.find((item) => item.id === id);
+    const workspace = closingSession ? (projectForSession(snapshotRef.current.projects, closingSession) ?? closingSession.cwd) : undefined;
     const index = validOpenIds.indexOf(id);
     const next = validOpenIds.filter((item) => item !== id);
     setOpenIds(next);
-    if (activeId === id) setActiveId(next[Math.max(0, index - 1)]);
+    let nextActive = activeId;
+    if (activeId === id) {
+      const workspaceTabs = workspace
+        ? validOpenIds.filter((item) => {
+            const candidate = sessionSnapshot.daemon.sessions.find((s) => s.id === item);
+            return candidate && (projectForSession(snapshotRef.current.projects, candidate) ?? candidate.cwd) === workspace;
+          })
+        : [];
+      const wsIndex = workspaceTabs.indexOf(id);
+      const remainingWsTabs = workspaceTabs.filter((item) => item !== id);
+      nextActive = remainingWsTabs[Math.max(0, wsIndex - 1)] ?? next[Math.max(0, index - 1)];
+      setActiveId(nextActive);
+    }
+    persistWorkspaceTabs(workspace, next, nextActive);
   };
   const forgetMissingSession = useCallback((id: string): void => {
     setHydratedSessions((current) => current.filter((session) => session.id !== id));
@@ -4286,7 +4352,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             )}
           </Suspense>
           {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
-              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} onNewSession={openNewSession} />}
+              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => { const next = [...ids, ...current.filter(id => !ids.includes(id))]; const first = sessionSnapshot.daemon.sessions.find(item => item.id === ids[0]); persistWorkspaceTabs(first ? (projectForSession(snapshotRef.current.projects, first) ?? first.cwd) : undefined, next, activeId); return next; })} onNewSession={openNewSession} />}
               <WorkspacePane
                 active={localWorkspaceVisible}
                 focus={focus}

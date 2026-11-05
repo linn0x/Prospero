@@ -746,6 +746,10 @@ sys.stdout.flush()
                     .unwrap()
             ),
             "-c",
+            "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]",
+            "-c",
+            "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl+u\"]",
+            "-c",
             "model=\"gpt-6-test\"",
             "-c",
             "model_reasoning_effort=\"high\""
@@ -947,7 +951,8 @@ async fn caps_active_processes_and_shutdown_releases_every_slot() {
     let directory = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();
     let database = Database::open(directory.path().into()).await.unwrap();
-    let runtime = Terminals::new(database.clone());
+    assert_eq!(Terminals::new(database.clone()).capacity(), 64);
+    let runtime = Terminals::with_capacity(database.clone(), 16);
     for _ in 0..16 {
         runtime.create(input(&workspace)).await.unwrap();
     }

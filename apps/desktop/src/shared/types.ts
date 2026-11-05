@@ -147,8 +147,17 @@ export type RuntimeSwitchState = {
   lastRollbackReason?: string;
 };
 
+export type WorkspaceTabsSnapshot = {
+  openSessionIds: string[];
+  activeSessionId?: string;
+  splitSessionId?: string;
+  updatedAt: number;
+  revision: number;
+};
+
 export type DaemonSnapshot = {
   workspaceCounts?: Record<string, { revision: number; total: number; active: number; archived: number; attention: number }>;
+  workspaceTabs?: Record<string, WorkspaceTabsSnapshot>;
   metadataRevision?: string;
   running: boolean;
   managed: boolean;
@@ -365,6 +374,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   forgetProject(path: string): Promise<DesktopSnapshot>;
   renameProject(path: string, name: string): Promise<DesktopSnapshot>;
   setProjectPinned(path: string, pinned: boolean): Promise<DesktopSnapshot>;
+  setWorkspaceTabs?(input: { workspace: string; openSessionIds: string[]; activeSessionId?: string; splitSessionId?: string }): Promise<DesktopSnapshot>;
   setSessionPinned(sessionId: string, pinned: boolean): Promise<DesktopSnapshot>;
   setSessionArchived(sessionId: string, archived: boolean, nativeId?: string): Promise<DesktopSnapshot>;
   nativeConversationCandidates(sessionId: string, query: string): Promise<import("@prospero/protocol/rust-daemon").ResumableConversation[]>;

@@ -548,3 +548,48 @@ fn workspace_revisions_change_only_for_the_affected_workspace() {
         2
     );
 }
+
+#[test]
+fn workspace_tabs_track_open_sessions_archive_and_explicit_reordering() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let a = create(&mut store, "First", "/alpha");
+    let b = create(&mut store, "Second", "/alpha");
+    let c = create(&mut store, "Third", "/beta");
+    let tabs = store.workspace_tabs().unwrap();
+    let alpha = tabs.items.iter().find(|item| item.workspace == "/alpha").unwrap();
+    assert_eq!(alpha.open_session_ids, vec![a.id.clone(), b.id.clone()]);
+    assert_eq!(alpha.active_session_id.as_deref(), Some(b.id.as_str()));
+    let beta = tabs.items.iter().find(|item| item.workspace == "/beta").unwrap();
+    assert_eq!(beta.open_session_ids, vec![c.id.clone()]);
+    assert_eq!(beta.active_session_id.as_deref(), Some(c.id.as_str()));
+
+    let updated = store
+        .set_workspace_tabs(prosperod_rs::protocol::WorkspaceTabsUpdate {
+            workspace: "/alpha".into(),
+            open_session_ids: vec![b.id.clone(), a.id.clone()],
+            active_session_id: Some(a.id.clone()),
+            split_session_id: Some(b.id.clone()),
+        })
+        .unwrap();
+    assert_eq!(updated.open_session_ids, vec![b.id.clone(), a.id.clone()]);
+    assert_eq!(updated.active_session_id.as_deref(), Some(a.id.as_str()));
+    assert_eq!(updated.split_session_id.as_deref(), Some(b.id.as_str()));
+
+    store
+        .update_session(
+            &a.id,
+            UpdateSession {
+                revision: a.revision,
+                title: None,
+                lifecycle: Some(SessionLifecycle::Archived),
+                status: Some(SessionStatus::Completed),
+            },
+        )
+        .unwrap();
+    let tabs = store.workspace_tabs().unwrap();
+    let alpha = tabs.items.iter().find(|item| item.workspace == "/alpha").unwrap();
+    assert_eq!(alpha.open_session_ids, vec![b.id.clone()]);
+    assert_eq!(alpha.active_session_id.as_deref(), Some(b.id.as_str()));
+    assert_eq!(alpha.split_session_id, None);
+}

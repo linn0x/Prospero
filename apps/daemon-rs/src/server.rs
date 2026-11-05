@@ -105,7 +105,7 @@ const DEFAULT_IDLE_WORKER_TIMEOUT_MS: i64 = 30 * 60 * 1000;
 /// Manual Agent PTYs are user-owned, so reclaim them much more conservatively
 /// and only after the terminal runtime verifies a recognized idle prompt.
 const DEFAULT_IDLE_TERMINAL_TIMEOUT_MS: i64 = 6 * 60 * 60 * 1000;
-const TERMINAL_RECLAIM_HIGH_WATER: usize = 12;
+const TERMINAL_RECLAIM_HIGH_WATER: usize = 48;
 
 fn configured_dispatch_thresholds(value: impl Fn(&str) -> Option<String>) -> (i64, i64, i64) {
     let read = |name: &str, fallback: i64| {
@@ -195,8 +195,8 @@ impl Api {
             diagnostics_requests: Arc::new(Semaphore::new(1)),
             control_health: Arc::new(Mutex::new(ControlPlaneHealth::default())),
             streams: Arc::new(Semaphore::new(16)),
-            terminal_reads: Arc::new(Semaphore::new(16)),
-            terminal_snapshots: Arc::new(Semaphore::new(2)),
+            terminal_reads: Arc::new(Semaphore::new(64)),
+            terminal_snapshots: Arc::new(Semaphore::new(8)),
             api_tests: Arc::new(Semaphore::new(4)),
             api_testing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             api_features: Arc::new(Semaphore::new(4)),
@@ -584,6 +584,7 @@ impl Api {
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
             .route("/v1/workspaces", get(workspaces))
+            .route("/v1/workspaces/tabs", get(workspace_tabs).post(set_workspace_tabs))
             .route("/v1/sessions/{id}", get(session).patch(rename))
             .route("/v1/sessions/{id}/contents", get(contents))
             .route("/v1/sessions/{id}/content/{content}", get(content))
@@ -4088,7 +4089,7 @@ async fn runtime_health(api: &Api) -> Result<Health> {
     control.agent_sessions_active = api.agents.count();
     control.agent_sessions_capacity = api.agents.capacity();
     control.terminal_sessions_active = api.terminals.count();
-    control.terminal_sessions_capacity = 16;
+    control.terminal_sessions_capacity = api.terminals.capacity();
     control.start_rejections_recent = api.database.recent_rejections("worker.start")
         + api.database.recent_rejections("agent.create");
     let mut reasons = Vec::new();
@@ -4490,6 +4491,7 @@ fn health_capabilities() -> Vec<String> {
         "session.lookup",
         "session.workspace.page",
         "workspace.page",
+        "workspace.tabs.v1",
         "session.content",
         "session.timeline",
         "agent.claude",
@@ -7106,6 +7108,29 @@ async fn workspaces(
             .read("workspaces.list", move |store| store.workspaces(query))
             .await?,
     ))
+}
+
+async fn workspace_tabs(
+    State(api): State<Api>,
+) -> std::result::Result<Json<WorkspaceTabsList>, ApiError> {
+    Ok(Json(
+        api.database
+            .read("workspaces.tabs", move |store| store.workspace_tabs())
+            .await?,
+    ))
+}
+
+async fn set_workspace_tabs(
+    State(api): State<Api>,
+    body: std::result::Result<Json<WorkspaceTabsUpdate>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<WorkspaceTabsEntry>, ApiError> {
+    let Json(input) =
+        body.map_err(|_| Error::Invalid("invalid workspace tabs request".into()))?;
+    let entry = api
+        .call(move |store| store.set_workspace_tabs(input))
+        .await?;
+    api.publish();
+    Ok(Json(entry))
 }
 
 async fn lookup(

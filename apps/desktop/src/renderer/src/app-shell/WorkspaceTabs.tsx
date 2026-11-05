@@ -1,4 +1,5 @@
 import { sessionTabLabels } from "../workspace/session-tab-labels";
+import { projectForSession } from "../workspace-sidebar-state";
 import "./workspace-tabs.css";
 import { Pin, Plus, X } from "lucide-react";
 import { TabStrip } from "../components/TabStrip";
@@ -11,8 +12,16 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, onActivate, onClose
   const { t } = useLocale();
   const sessions = new Map(snapshot.daemon.sessions.map((session) => [session.id, session]));
   const labels = sessionTabLabels(snapshot.daemon.sessions);
-  const ids = openIds.filter((id) => sessions.has(id));
+  const allIds = openIds.filter((id) => sessions.has(id));
   const activeSession = activeId ? sessions.get(activeId) : undefined;
+  const activeWorkspace = activeSession ? (projectForSession(snapshot.projects, activeSession) ?? activeSession.cwd) : undefined;
+  const workspaceScopedIds = activeWorkspace
+    ? allIds.filter((id) => {
+        const candidate = sessions.get(id);
+        return candidate && (projectForSession(snapshot.projects, candidate) ?? candidate.cwd) === activeWorkspace;
+      })
+    : allIds;
+  const ids = workspaceScopedIds.length > 0 ? workspaceScopedIds : allIds;
   return <TabStrip className="topbar-workspace-tabs" listClassName="workspace-tabs" label={t("打开的会话", "Open sessions")} items={ids.map(id => ({ id, label: `${labels.get(id)} · ${sessionStatusLabel(sessions.get(id)!, snapshot.unreadSessionIds.includes(id), t)} — ${sessions.get(id)!.cwd}`, onSelect: () => onActivate(id), onClose: () => onClose(id) }))} activeId={activeId} onReorder={onReorder}>
     {ids.map((id, index) => {
       const session = sessions.get(id)!;
