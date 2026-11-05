@@ -16,14 +16,13 @@ const snapshot = {
 } as DesktopSnapshot;
 
 describe("settings pane", () => {
-  it("retains all desktop controls across six accessible categories", () => {
+  it("retains all desktop controls across five accessible categories", () => {
     vi.stubGlobal("window", { prospero: { platform: "darwin" } });
-    const html = renderToStaticMarkup(<SettingsPane snapshot={snapshot} onOpenAccounts={() => {}} />);
-    for (const id of ["start-daemon-on-launch", "minimize-to-tray", "launch-at-login", "interface-language", "desktop-theme", "open-accounts", "terminal-font-family", "terminal-font-size", "daemon-bind", "relay-url"]) expect(html).toContain(`id="${id}"`);
-    expect(html.match(/role="tab"/g)).toHaveLength(6);
-    expect(html.match(/role="tabpanel"/g)).toHaveLength(6);
-    expect(html.match(/hidden=""/g)).toHaveLength(5);
-    expect(html).toContain("1 accounts configured.");
+    const html = renderToStaticMarkup(<SettingsPane snapshot={snapshot} />);
+    for (const id of ["start-daemon-on-launch", "minimize-to-tray", "launch-at-login", "interface-language", "desktop-theme", "terminal-font-family", "terminal-font-size", "daemon-bind", "relay-url"]) expect(html).toContain(`id="${id}"`);
+    expect(html.match(/role="tab"/g)).toHaveLength(5);
+    expect(html.match(/role="tabpanel"/g)).toHaveLength(5);
+    expect(html.match(/hidden=""/g)).toHaveLength(4);
     expect(html).toContain('value="127.0.0.1" selected=""');
     expect(html).not.toContain('id="full-access-permission"');
     expect(html).not.toContain("settings-grid");

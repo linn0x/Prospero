@@ -139,8 +139,7 @@ describe("model source selection and IPC", () => {
     expect(html).toContain('id="session-model-source"');
     expect(html).toContain('id="session-source-route"');
     expect(html).toContain("Shared key");
-    expect(html).toContain("Source updates do not change existing sessions.");
-    expect(html).toContain("Connection details");
+    expect(html).toContain("model-b");
     expect(html).not.toContain('type="password"');
   });
 
@@ -156,7 +155,7 @@ describe("model source selection and IPC", () => {
     expect(accounts).toContain("<ModelSourcesPane");
     expect(accounts).toContain("<AccountCreateForm");
     expect(accounts).not.toContain('role="tab"');
-    expect(accounts).toContain("showBindings || !account.modelSource");
+    expect(accounts).toContain("!account.modelSource");
     expect(accountApiConnectionLocked({ activeSessions: 0, modelSource: { sourceId: "source" } })).toBe(true);
   });
 

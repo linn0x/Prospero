@@ -5,15 +5,15 @@ afterEach(() => vi.useRealTimers());
 
 describe("settings categories", () => {
   it("keeps every existing setting family reachable", () => {
-    expect(settingsCategories.map((category) => category.id)).toEqual(["general", "appearance", "accounts", "terminal", "runtime", "relay"]);
+    expect(settingsCategories.map((category) => category.id)).toEqual(["general", "appearance", "terminal", "runtime", "relay"]);
     expect(settingsCategories.every((category) => category.zh && category.en)).toBe(true);
   });
 
   it("supports horizontal and vertical navigation with wrapping and boundaries", () => {
     expect(nextSettingsCategory("general", "ArrowLeft")).toBe("relay");
     expect(nextSettingsCategory("relay", "ArrowDown")).toBe("general");
-    expect(nextSettingsCategory("accounts", "ArrowRight")).toBe("terminal");
-    expect(nextSettingsCategory("accounts", "ArrowUp")).toBe("appearance");
+    expect(nextSettingsCategory("appearance", "ArrowRight")).toBe("terminal");
+    expect(nextSettingsCategory("terminal", "ArrowUp")).toBe("appearance");
     expect(nextSettingsCategory("runtime", "Home")).toBe("general");
     expect(nextSettingsCategory("general", "End")).toBe("relay");
     expect(nextSettingsCategory("general", "Tab")).toBeUndefined();

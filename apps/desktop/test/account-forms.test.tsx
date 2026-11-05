@@ -8,18 +8,16 @@ import { modelCapabilityDraft } from "../src/renderer/src/account-profile-form";
 vi.mock("../src/renderer/src/locale", () => ({ useLocale: () => ({ t: (_zh: string, en: string) => en }) }));
 
 describe("account form presentation", () => {
-  it("starts with an accessible CLI form and a separate API profile tab", () => {
-    const html = renderToStaticMarkup(<AccountCreateForm disabled={false} onCreateManaged={async () => true} onCreateApi={async () => true} />);
-    expect(html.match(/role="tab"/g)).toHaveLength(2);
-    expect(html).toContain('aria-selected="true"');
-    expect(html).toContain('role="tabpanel"');
+  it("renders a dedicated CLI subscription form without legacy API tabs", () => {
+    const html = renderToStaticMarkup(<AccountCreateForm disabled={false} onCreateManaged={async () => true} />);
+    expect(html).not.toContain('role="tab"');
     expect(html).toContain("Create and sign in");
-    expect(html).toContain("API Profile");
+    expect(html).not.toContain("API Profile");
     expect(html).not.toContain('type="password"');
   });
 
   it("disables creation during parent mutations and exposes retry errors near the action", () => {
-    const html = renderToStaticMarkup(<AccountCreateForm disabled busy="managed-create" error="Try again" onCreateManaged={async () => true} onCreateApi={async () => true} />);
+    const html = renderToStaticMarkup(<AccountCreateForm disabled busy="managed-create" error="Try again" onCreateManaged={async () => true} />);
     expect(html).toContain('<fieldset disabled=""');
     expect(html).toContain('role="alert" tabindex="-1"');
     expect(html).toContain("Try again");
