@@ -22,6 +22,7 @@ pub enum AgentKind {
     Claude,
     Opencode,
     Pi,
+    Agy,
     Deepseek,
     Grok,
     Trae,

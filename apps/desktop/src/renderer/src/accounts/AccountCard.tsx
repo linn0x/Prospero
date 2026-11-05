@@ -36,7 +36,7 @@ export function AccountCard({ account, usage, disabled, busy, error, apiValidati
       {Boolean(account.modelSource) && <p className="usage-note">{text(record(account.modelSource).sourceName)} · {text(record(account.modelSource).routeName)} · v{String(record(account.modelSource).revision)}{record(account.modelSource).current !== true ? t(" · 历史绑定", " · Historical binding") : ""}</p>}
       {!hasApi && Boolean(text(account["detail"])) && <p className="usage-note">{text(account["detail"])}</p>}
       {hasApi && <ApiValidationDetails account={account} engineValidationSupported={engineValidationSupported} />}
-      {usage || !hasApi ? <UsageMeters usage={usage} /> : <p className="usage-note">{t("API 额度由服务商管理", "API usage is managed by the provider")}</p>}
+      {usage || (!hasApi && agent !== "agy") ? <UsageMeters usage={usage} /> : !hasApi ? <p className="usage-note">{t("使用本机 Antigravity 订阅配额", "Uses local Antigravity subscription quota")}</p> : <p className="usage-note">{t("API 额度由服务商管理", "API usage is managed by the provider")}</p>}
     </div>
     <div className="button-row compact">
       {hasApi && apiValidationSupported && <Button variant="outline" size="sm" aria-busy={pending("agent.account.api.test:protocol")} disabled={disabled || Boolean(account["apiProfileError"]) || account["status"] === "signed_out"} onClick={() => action("agent.account.api.test")}>{pending("agent.account.api.test:protocol") && <DesktopIcon name="refresh" className="daemon-spinner" />}{t("测试连接", "Test connection")}</Button>}

@@ -311,7 +311,7 @@ impl Store {
                 .optional()?;
             if managed_accounts_sql
                 .as_deref()
-                .is_some_and(|sql| !sql.contains("'pi'"))
+                .is_some_and(|sql| !sql.contains("'pi'") || !sql.contains("'agy'"))
             {
                 transaction.execute_batch(
                     "CREATE TABLE managed_accounts_pi_upgrade (
@@ -325,7 +325,7 @@ impl Store {
                         api_validation_revision TEXT,
                         api_engine_validation TEXT,
                         api_engine_validation_revision TEXT,
-                        agent TEXT CHECK(agent IS NULL OR agent IN ('claude','codex','opencode','pi'))
+                        agent TEXT CHECK(agent IS NULL OR agent IN ('claude','codex','opencode','pi','agy'))
                     ) STRICT;
                     INSERT INTO managed_accounts_pi_upgrade(
                         id,name,is_default,created_at,updated_at,
@@ -350,14 +350,14 @@ impl Store {
                 .optional()?;
             if agent_runs_sql
                 .as_deref()
-                .is_some_and(|sql| !sql.contains("'pi'"))
+                .is_some_and(|sql| !sql.contains("'pi'") || !sql.contains("'agy'"))
             {
                 transaction.execute_batch(
                     "DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert;
                     DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update;
                     CREATE TABLE agent_runs_pi_upgrade (
                         session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
-                        agent TEXT NOT NULL CHECK(agent IN ('claude','codex','deepseek','opencode','pi')),
+                        agent TEXT NOT NULL CHECK(agent IN ('claude','codex','deepseek','opencode','pi','agy')),
                         active INTEGER NOT NULL CHECK(active IN (0,1)),
                         approval_policy TEXT NOT NULL CHECK(approval_policy IN ('manual','auto')),
                         turn INTEGER NOT NULL DEFAULT 0 CHECK(turn >= 0),

@@ -62,9 +62,10 @@ pub async fn start_automation(
             | crate::protocol::AgentKind::Deepseek
             | crate::protocol::AgentKind::Opencode
             | crate::protocol::AgentKind::Pi
+            | crate::protocol::AgentKind::Agy
     ) {
         return Err(Error::Invalid(
-            "automation currently supports Claude/Codex/DeepSeek/OpenCode/Pi workers".into(),
+            "automation currently supports Claude/Codex/DeepSeek/OpenCode/Pi/Antigravity workers".into(),
         ));
     }
     if input.agent == crate::protocol::AgentKind::Deepseek && input.account_id.is_some() {

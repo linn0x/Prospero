@@ -9,7 +9,7 @@ import { useLocale } from "./locale";
 
 export function needsNativeBinding(session: SessionInfo): boolean {
   if (session.title?.endsWith(" · 登录")) return false;
-  return session.kind === "pty" && ["claude", "codex"].includes(session.agent) && !session.nativeSession?.managed && !session.nativeSession?.nativeId;
+  return session.kind === "pty" && ["claude", "codex", "agy"].includes(session.agent) && !session.nativeSession?.managed && !session.nativeSession?.nativeId;
 }
 
 export function NativeSessionBindingDialog({ session, archived, onClose, onDone }: { session: SessionInfo; archived: boolean; onClose(): void; onDone(session: SessionInfo): void }) {

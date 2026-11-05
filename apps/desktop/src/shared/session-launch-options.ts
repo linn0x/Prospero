@@ -94,7 +94,7 @@ export function sessionLaunchAccounts(
   accounts: JsonObject[],
   agent: SessionCreateInput["agent"],
 ): SessionLaunchAccount[] {
-  if (agent !== "codex" && agent !== "claude" && agent !== "opencode" && agent !== "pi") return [];
+  if (agent !== "codex" && agent !== "claude" && agent !== "opencode" && agent !== "pi" && agent !== "agy") return [];
   return accounts.flatMap((account): SessionLaunchAccount[] => {
     const id = stringValue(account["id"]);
     const engine = accountEngine(account);

@@ -84,7 +84,7 @@ function scheduleCreateInput(input: JsonObject): ScheduleCreate {
     ["id", input["id"] === undefined ? undefined : requireScheduleId(input["id"])],
     ["kind", optionalScheduleEnum(input["kind"], ["cron", "heartbeat"], "定时任务类型无效")],
     ["status", optionalScheduleEnum(input["status"], ["ENABLED", "PAUSED"], "定时任务状态无效")],
-    ["agent", optionalScheduleEnum(input["agent"], ["claude", "codex", "deepseek", "opencode", "pi", "grok"], "Agent 无效")],
+    ["agent", optionalScheduleEnum(input["agent"], ["claude", "codex", "deepseek", "opencode", "pi", "agy", "grok"], "Agent 无效")],
     ["approvalPolicy", optionalScheduleEnum(input["approvalPolicy"], ["strict", "standard", "yolo"], "审批策略无效")],
     ["cwd", optionalSchedulePath(input["cwd"])],
     ["cwds", Array.isArray(input["cwds"]) ? input["cwds"].map(optionalSchedulePath).filter((value): value is string => typeof value === "string").slice(0, 20) : undefined],
@@ -108,7 +108,7 @@ function scheduleUpdateInput(id: string, input: JsonObject): ScheduleUpdate {
     ["prompt", optionalScheduleText(input["prompt"], 200_000, "提示无效")],
     ["rrule", optionalScheduleText(input["rrule"], 500, "RRULE 无效")],
     ["status", optionalScheduleEnum(input["status"], ["ENABLED", "PAUSED"], "定时任务状态无效")],
-    ["agent", optionalScheduleEnum(input["agent"], ["claude", "codex", "deepseek", "opencode", "pi", "grok"], "Agent 无效")],
+    ["agent", optionalScheduleEnum(input["agent"], ["claude", "codex", "deepseek", "opencode", "pi", "agy", "grok"], "Agent 无效")],
     ["approvalPolicy", optionalScheduleEnum(input["approvalPolicy"], ["strict", "standard", "yolo"], "审批策略无效")],
     ["cwd", optionalSchedulePath(input["cwd"])],
     ["cwds", Array.isArray(input["cwds"]) ? input["cwds"].map(optionalSchedulePath).filter((value): value is string => typeof value === "string").slice(0, 20) : undefined],
@@ -126,6 +126,7 @@ function scheduleUpdateInput(id: string, input: JsonObject): ScheduleUpdate {
 const NATIVE_CLAUDE_ACCOUNT = "native-claude";
 const NATIVE_CODEX_ACCOUNT = "native-codex";
 const NATIVE_PI_ACCOUNT = "native-pi";
+const NATIVE_AGY_ACCOUNT = "native-agy";
 const MANAGED_ACCOUNT_TYPES = new Set([
   "agent.account.create", "agent.account.rename", "agent.account.default",
   "agent.account.login", "agent.account.credential.set", "agent.account.logout",
@@ -226,7 +227,7 @@ function toQueuedChat(item: QueuedMessage): QueuedChatMessage {
 
 /** Mirror of the daemon's managed-account id charset (uuid-safe path segment). */
 function requireManagedAccountId(raw: unknown): string {
-  if (typeof raw !== "string" || raw === NATIVE_CLAUDE_ACCOUNT || raw === NATIVE_CODEX_ACCOUNT || raw === NATIVE_PI_ACCOUNT || !/^[A-Za-z0-9_-]{1,100}$/.test(raw)) throw new Error("账号 ID 无效");
+  if (typeof raw !== "string" || raw === NATIVE_CLAUDE_ACCOUNT || raw === NATIVE_CODEX_ACCOUNT || raw === NATIVE_PI_ACCOUNT || raw === NATIVE_AGY_ACCOUNT || !/^[A-Za-z0-9_-]{1,100}$/.test(raw)) throw new Error("账号 ID 无效");
   return raw;
 }
 
@@ -930,7 +931,7 @@ export class RustRuntime {
 
     if (path === "/_prospero/control/conversation/search" && init?.method === "POST" && input) {
       const agent = input["agent"];
-      if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "pi") throw new Error("Agent 无效");
+      if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "pi" && agent !== "agy") throw new Error("Agent 无效");
       const requestId = requireRequestId(input["requestId"]);
       const query = String(input["query"] ?? "");
       if ([...query].length > 300 || /[\r\n\0]/.test(query)) throw new Error("对话搜索词无效");
@@ -942,7 +943,8 @@ export class RustRuntime {
         if (agent === "claude") accountId = rawAccountId === NATIVE_CLAUDE_ACCOUNT ? NATIVE_CLAUDE_ACCOUNT : requireManagedAccountId(rawAccountId);
         else if (agent === "codex") accountId = rawAccountId === NATIVE_CODEX_ACCOUNT ? NATIVE_CODEX_ACCOUNT : requireManagedAccountId(rawAccountId);
         else if (agent === "pi") accountId = rawAccountId === NATIVE_PI_ACCOUNT ? NATIVE_PI_ACCOUNT : requireManagedAccountId(rawAccountId);
-        else throw new Error("Rust daemon 当前仅支持搜索 Claude/Codex/Pi 本机对话");
+        else if (agent === "agy") accountId = rawAccountId === NATIVE_AGY_ACCOUNT ? NATIVE_AGY_ACCOUNT : requireManagedAccountId(rawAccountId);
+        else throw new Error("Rust daemon 当前仅支持搜索 Claude/Codex/Pi/Antigravity 本机对话");
       }
       const conversations = await this.current().client.localConversations(agent, query, limit, accountId, signal);
       return { type: "conversation.results", requestId, agent, conversations } as unknown as JsonObject;
@@ -1147,7 +1149,7 @@ export class RustRuntime {
     if (launchModelsRoute && (!init?.method || init.method === "GET")) {
       const params = new URLSearchParams(launchModelsRoute[1] ?? "");
       const agent = params.get("agent");
-      if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi") throw new Error("此 Agent 的模型目录尚未接入 Rust daemon");
+      if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi" && agent !== "agy") throw new Error("此 Agent 的模型目录尚未接入 Rust daemon");
       const accountId =
         params.get("accountId") ??
         (agent === "codex"
@@ -1156,13 +1158,17 @@ export class RustRuntime {
             ? NATIVE_CLAUDE_ACCOUNT
             : agent === "pi"
               ? NATIVE_PI_ACCOUNT
-              : undefined);
+              : agent === "agy"
+                ? NATIVE_AGY_ACCOUNT
+                : undefined);
       const nativeId =
         agent === "codex"
           ? NATIVE_CODEX_ACCOUNT
           : agent === "pi"
             ? NATIVE_PI_ACCOUNT
-            : NATIVE_CLAUDE_ACCOUNT;
+            : agent === "agy"
+              ? NATIVE_AGY_ACCOUNT
+              : NATIVE_CLAUDE_ACCOUNT;
       if (agent === "deepseek" || agent === "opencode") {
         const catalog = await this.current().client.launchModels(agent, accountId, signal, init?.timeoutMs ?? 30_000);
         return catalog as unknown as JsonObject;
@@ -1218,7 +1224,7 @@ export class RustRuntime {
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
       if (input["kind"] === "pty") {
         const agent = input["agent"];
-        if (typeof agent !== "string" || !["codex", "claude", "opencode", "pi", "grok", "trae", "shell", "custom"].includes(agent)) throw new Error("Agent 无效");
+        if (typeof agent !== "string" || !["codex", "claude", "opencode", "pi", "agy", "grok", "trae", "shell", "custom"].includes(agent)) throw new Error("Agent 无效");
         const policy = input["approvalPolicy"] ?? "standard";
         if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
         const command = input["command"];
@@ -1233,22 +1239,28 @@ export class RustRuntime {
             accountId = rawAccountId === NATIVE_CODEX_ACCOUNT ? NATIVE_CODEX_ACCOUNT : requireManagedAccountId(rawAccountId);
           } else if (agent === "pi") {
             accountId = rawAccountId === NATIVE_PI_ACCOUNT ? NATIVE_PI_ACCOUNT : requireManagedAccountId(rawAccountId);
+          } else if (agent === "agy") {
+            if (rawAccountId !== NATIVE_AGY_ACCOUNT) throw new Error("Antigravity (agy) 仅支持本机 Antigravity 订阅账号");
+            accountId = NATIVE_AGY_ACCOUNT;
           } else throw new Error("此 Agent 的账号选择尚未接入 Rust daemon");
         }
-        if ((model || effort) && agent !== "claude" && agent !== "codex" && agent !== "pi") throw new Error("此 Agent 的模型参数尚未接入 Rust daemon");
+        if ((model || effort) && agent !== "claude" && agent !== "codex" && agent !== "pi" && agent !== "agy") throw new Error("此 Agent 的模型参数尚未接入 Rust daemon");
         const head = await this.current().client.createTerminal({ title: agent === "shell" && !command ? "Terminal" : `${agent} · ${basename(String(input["cwd"]))}`, workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) }, agent: agent as never, approvalPolicy: policy, ...(command ? { command } : {}), ...(accountId ? { accountId } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) }, signal, init.timeoutMs ?? 180_000);
         await this.refresh(true);
         return rustSessionInfo(head);
       }
       const agent = input["agent"];
-      if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi") throw new Error("Rust Agent 当前仅接入 Claude/Codex/DeepSeek/OpenCode/Pi");
+      if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi" && agent !== "agy") throw new Error("Rust Agent 当前仅接入 Claude/Codex/DeepSeek/OpenCode/Pi/Antigravity");
       if (agent === "opencode" && input["accountId"] === undefined) throw new Error("OpenCode 需要 API Profile");
+      if (agent === "agy" && input["accountId"] !== undefined && input["accountId"] !== NATIVE_AGY_ACCOUNT) throw new Error("Antigravity (agy) 仅支持本机 Antigravity 订阅账号");
       const accountId =
         agent === "deepseek" ||
+        agent === "agy" ||
         input["accountId"] === undefined ||
         input["accountId"] === NATIVE_CLAUDE_ACCOUNT ||
         input["accountId"] === NATIVE_CODEX_ACCOUNT ||
-        input["accountId"] === NATIVE_PI_ACCOUNT
+        input["accountId"] === NATIVE_PI_ACCOUNT ||
+        input["accountId"] === NATIVE_AGY_ACCOUNT
           ? undefined
           : requireManagedAccountId(input["accountId"]);
       if (input["kind"] !== "structured" || input["command"]) throw new Error("此 Agent 选项尚未接入 Rust daemon");
@@ -1263,7 +1275,7 @@ export class RustRuntime {
       if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
       const head = await this.current().client.createAgentSession({
         agent,
-        title: resume?.title ?? (agent === "deepseek" ? "DeepSeek" : agent === "opencode" ? "OpenCode" : agent === "pi" ? "Pi" : agent === "codex" ? "Codex" : "Claude"),
+        title: resume?.title ?? (agent === "deepseek" ? "DeepSeek" : agent === "opencode" ? "OpenCode" : agent === "pi" ? "Pi" : agent === "agy" ? "Antigravity" : agent === "codex" ? "Codex" : "Claude"),
         workspace: String(input["cwd"]),
         autoApprove: policy === "yolo",
         ...(mode !== undefined ? { mode } : {}),

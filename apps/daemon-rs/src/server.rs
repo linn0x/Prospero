@@ -1964,6 +1964,15 @@ async fn remote_launch_models(
             }
             Err(error) => out["error"] = json!(error.to_string()),
         },
+        "agy" => match api.agents.agy_launch_catalog().await {
+            Ok(catalog) => {
+                let catalog = serde_json::to_value(catalog)?;
+                out["models"] = catalog["models"].clone();
+                out["currentModel"] = catalog["currentModel"].clone();
+                out["currentEffort"] = catalog["currentEffort"].clone();
+            }
+            Err(error) => out["error"] = json!(error.to_string()),
+        },
         _ => out["error"] = json!("invalid model catalog agent"),
     }
     send_remote_json(socket, channel, &out).await
@@ -2753,8 +2762,11 @@ async fn remote_conversation_search(
             )
             .await
         }
+        "agy" => {
+            crate::agent::conversations::search_agy_conversations(account_id, query, limit).await
+        }
         _ => Err(Error::Invalid(
-            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek/Pi 本机对话".into(),
+            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek/Pi/Antigravity 本机对话".into(),
         )),
     };
     match conversations {
@@ -4564,9 +4576,10 @@ async fn conversation_search(
         && query.agent != "codex"
         && query.agent != "deepseek"
         && query.agent != "pi"
+        && query.agent != "agy"
     {
         return Err(ApiError(Error::Invalid(
-            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek/Pi 本机对话".into(),
+            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek/Pi/Antigravity 本机对话".into(),
         )));
     }
     if query.query.chars().count() > 300 || query.query.chars().any(char::is_control) {
@@ -4600,6 +4613,15 @@ async fn conversation_search(
             crate::protocol::AgentKind::Pi,
             crate::agent::conversations::search_pi_conversations(
                 &api.database,
+                query.account_id,
+                query.query,
+                query.limit,
+            )
+            .await?,
+        ),
+        "agy" => (
+            crate::protocol::AgentKind::Agy,
+            crate::agent::conversations::search_agy_conversations(
                 query.account_id,
                 query.query,
                 query.limit,
@@ -5830,6 +5852,7 @@ async fn account_control_result(
                     crate::accounts::NATIVE_CLAUDE_ID
                         | crate::agent::NATIVE_CODEX_ID
                         | crate::accounts::NATIVE_PI_ID
+                        | crate::accounts::NATIVE_AGY_ID
                 )
             {
                 // The native environment can never be renamed, logged out or
@@ -5881,7 +5904,10 @@ async fn account_config(
         }
     };
     let load = async {
-        if account_id == crate::accounts::NATIVE_PI_ID {
+        if matches!(
+            account_id.as_str(),
+            crate::accounts::NATIVE_PI_ID | crate::accounts::NATIVE_AGY_ID
+        ) {
             return Err(Error::Forbidden);
         }
         let data = api.database.directory().to_owned();
@@ -6217,6 +6243,9 @@ async fn launch_models(
                 .pi_launch_catalog(query.account_id.as_deref())
                 .await?,
         ));
+    }
+    if query.agent == "agy" {
+        return Ok(Json(api.agents.agy_launch_catalog().await?));
     }
     if query.agent != "claude" {
         return Err(ApiError(Error::Invalid(

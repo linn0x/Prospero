@@ -205,11 +205,15 @@ enum Driver {
     Deepseek(DeepseekTurn),
     Opencode(OpencodeTurn),
     Pi(super::pi::PiTurn),
+    Agy(super::agy::AgyTurn),
 }
 
 fn engine_agent(agent: AgentKind, profile: Option<&crate::accounts::ApiProfile>) -> AgentKind {
     if agent == AgentKind::Pi {
         return AgentKind::Pi;
+    }
+    if agent == AgentKind::Agy {
+        return AgentKind::Agy;
     }
     profile
         .map(crate::accounts::profile::agent_kind)
@@ -235,6 +239,7 @@ impl Driver {
             Driver::Deepseek(driver) => driver.take_events(),
             Driver::Opencode(driver) => driver.take_events(),
             Driver::Pi(driver) => driver.take_events(),
+            Driver::Agy(driver) => driver.take_events(),
         }
     }
 
@@ -245,6 +250,7 @@ impl Driver {
             Driver::Deepseek(driver) => driver.interrupt().await,
             Driver::Opencode(driver) => driver.interrupt().await,
             Driver::Pi(driver) => driver.interrupt(),
+            Driver::Agy(driver) => driver.interrupt().await,
         }
     }
 
@@ -286,6 +292,7 @@ impl Driver {
                 .steer(text, attachments)
                 .await
                 .map(|_| ControlEffectState::Delivered),
+            Driver::Agy(_) => Err(Error::Conflict),
         }
     }
 
@@ -296,6 +303,7 @@ impl Driver {
             Driver::Deepseek(driver) => driver.compact().await,
             Driver::Opencode(driver) => driver.compact().await,
             Driver::Pi(driver) => driver.compact().await,
+            Driver::Agy(_) => Err(Error::Invalid("Antigravity CLI 暂不支持手动压缩上下文".into())),
         }
     }
 
@@ -305,7 +313,11 @@ impl Driver {
                 .send_to_subagent(subagent, text)
                 .await
                 .map(|_| ControlEffectState::Delivered),
-            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) | Driver::Pi(_) => {
+            Driver::Claude(_)
+            | Driver::Deepseek(_)
+            | Driver::Opencode(_)
+            | Driver::Pi(_)
+            | Driver::Agy(_) => {
                 Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into()))
             }
         }
@@ -317,9 +329,11 @@ impl Driver {
     ) -> Result<Option<Vec<serde_json::Value>>> {
         match self {
             Driver::Codex(driver) => driver.read_subagent_history(subagent).await,
-            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) | Driver::Pi(_) => {
-                Ok(None)
-            }
+            Driver::Claude(_)
+            | Driver::Deepseek(_)
+            | Driver::Opencode(_)
+            | Driver::Pi(_)
+            | Driver::Agy(_) => Ok(None),
         }
     }
 
@@ -330,6 +344,7 @@ impl Driver {
             Driver::Deepseek(driver) => driver.apply_selection(model, effort).await,
             Driver::Opencode(driver) => driver.apply_selection(model).await,
             Driver::Pi(driver) => driver.apply_selection(model, effort).await,
+            Driver::Agy(_) => Ok(()),
         }
     }
 
@@ -337,7 +352,7 @@ impl Driver {
         match self {
             Driver::Deepseek(driver) => Some(driver.models().await),
             Driver::Opencode(driver) => Some(driver.models(workspace).await),
-            Driver::Claude(_) | Driver::Codex(_) | Driver::Pi(_) => None,
+            Driver::Claude(_) | Driver::Codex(_) | Driver::Pi(_) | Driver::Agy(_) => None,
         }
     }
 
@@ -348,6 +363,7 @@ impl Driver {
             Driver::Deepseek(driver) => driver.kill().await,
             Driver::Opencode(driver) => driver.kill().await,
             Driver::Pi(driver) => driver.kill().await,
+            Driver::Agy(driver) => driver.kill().await,
         }
     }
 
@@ -358,6 +374,7 @@ impl Driver {
             Driver::Deepseek(driver) => driver.lifecycle(),
             Driver::Opencode(driver) => driver.lifecycle(),
             Driver::Pi(driver) => driver.lifecycle(),
+            Driver::Agy(driver) => driver.lifecycle(),
         }
     }
 }
@@ -1004,6 +1021,7 @@ impl Agents {
                 | crate::protocol::AgentKind::Deepseek
                 | crate::protocol::AgentKind::Opencode
                 | crate::protocol::AgentKind::Pi
+                | crate::protocol::AgentKind::Agy
         ) {
             return Err(Error::Invalid(
                 "Agent 暂未接入 Rust structured runtime".into(),
@@ -1029,6 +1047,18 @@ impl Agents {
             && input.account_id.as_deref() == Some(crate::accounts::NATIVE_PI_ID)
         {
             input.account_id = None;
+        }
+        if input.agent == crate::protocol::AgentKind::Agy {
+            match input.account_id.as_deref() {
+                None | Some(crate::accounts::NATIVE_AGY_ID) => {
+                    input.account_id = None;
+                }
+                Some(_) => {
+                    return Err(Error::Invalid(
+                        "Antigravity (agy) 仅支持使用本机 Antigravity 订阅账号".into(),
+                    ));
+                }
+            }
         }
         if input.agent == crate::protocol::AgentKind::Pi
             && input.mode.as_deref() == Some("plan")
@@ -1147,6 +1177,7 @@ impl Agents {
                         crate::accounts::NATIVE_CLAUDE_ID
                             | crate::agent::NATIVE_CODEX_ID
                             | crate::accounts::NATIVE_PI_ID
+                            | crate::accounts::NATIVE_AGY_ID
                     ) {
                         let record = store.managed_snapshot_row(&data, account_id)?;
                         if let Some(profile) = record.api_profile.as_ref() {
@@ -2377,6 +2408,15 @@ impl Agents {
             )
             .await
             .map(Driver::Pi),
+            AgentKind::Agy => super::agy::spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )
+            .await
+            .map(Driver::Agy),
             _ => Err(Error::Invalid(
                 "Agent 暂未接入 Rust structured runtime".into(),
             )),
@@ -3835,6 +3875,10 @@ impl Agents {
         super::pi::launch_catalog(Path::new(&home), &environment).await
     }
 
+    pub async fn agy_launch_catalog(&self) -> Result<LaunchModelCatalog> {
+        super::agy::launch_catalog().await
+    }
+
     /// Catalog for a specific account: managed accounts probe through their
     /// isolated config root, so the directory reflects their own identity.
     pub async fn launch_catalog_for(&self, account_id: Option<&str>) -> Result<LaunchModelCatalog> {
@@ -3954,6 +3998,7 @@ impl Agents {
             crate::accounts::NATIVE_CLAUDE_ID
                 | crate::agent::NATIVE_CODEX_ID
                 | crate::accounts::NATIVE_PI_ID
+                | crate::accounts::NATIVE_AGY_ID
         ) {
             return Ok(None);
         }
@@ -3985,7 +4030,10 @@ impl Agents {
             .await
             .map_err(|_| Error::Closed)?;
         }
-        if id == crate::agent::NATIVE_CODEX_ID || id == crate::accounts::NATIVE_PI_ID {
+        if id == crate::agent::NATIVE_CODEX_ID
+            || id == crate::accounts::NATIVE_PI_ID
+            || id == crate::accounts::NATIVE_AGY_ID
+        {
             return tokio::task::spawn_blocking(move || {
                 crate::accounts::config::read_runtime_environment(&data, &id)
             })
@@ -4365,6 +4413,7 @@ impl Agents {
                 crate::accounts::NATIVE_CLAUDE_ID
                     | crate::agent::NATIVE_CODEX_ID
                     | crate::accounts::NATIVE_PI_ID
+                    | crate::accounts::NATIVE_AGY_ID
             )
         {
             let data = self.0.database.directory().to_owned();
@@ -4416,6 +4465,8 @@ impl Agents {
             super::pi::launch_catalog(Path::new(&home), &environment)
                 .await?
                 .models
+        } else if run.agent == AgentKind::Agy {
+            super::agy::launch_catalog().await?.models
         } else {
             super::claude::fetch_launch_catalog(&environment).await?
         };
@@ -4523,6 +4574,7 @@ impl Agents {
                 crate::accounts::NATIVE_CLAUDE_ID
                     | crate::agent::NATIVE_CODEX_ID
                     | crate::accounts::NATIVE_PI_ID
+                    | crate::accounts::NATIVE_AGY_ID
             )
         {
             let data = self.0.database.directory().to_owned();
@@ -4558,6 +4610,8 @@ impl Agents {
             super::pi::launch_catalog(Path::new(&home), &environment)
                 .await?
                 .models
+        } else if run.agent == AgentKind::Agy {
+            super::agy::launch_catalog().await?.models
         } else {
             super::claude::fetch_launch_catalog(&environment).await?
         };
@@ -4570,6 +4624,7 @@ impl Agents {
                     match run.agent {
                         AgentKind::Codex => "Codex",
                         AgentKind::Pi => "Pi",
+                        AgentKind::Agy => "Antigravity",
                         _ => "Claude",
                     }
                 ))

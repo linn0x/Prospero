@@ -1060,7 +1060,8 @@ impl Store {
             None
             | Some(crate::accounts::NATIVE_CLAUDE_ID)
             | Some(crate::agent::NATIVE_CODEX_ID)
-            | Some(crate::accounts::NATIVE_PI_ID) => None,
+            | Some(crate::accounts::NATIVE_PI_ID)
+            | Some(crate::accounts::NATIVE_AGY_ID) => None,
             Some(id) => {
                 crate::database::validate_id(id)?;
                 let _record = self.managed_account(id)?;
@@ -1081,6 +1082,7 @@ impl Store {
                     AgentKind::Codex => Some(crate::agent::NATIVE_CODEX_ID.into()),
                     AgentKind::Claude => Some(crate::accounts::NATIVE_CLAUDE_ID.into()),
                     AgentKind::Pi => Some(crate::accounts::NATIVE_PI_ID.into()),
+                    AgentKind::Agy => Some(crate::accounts::NATIVE_AGY_ID.into()),
                     _ => None,
                 }),
                 model: model.clone(),
@@ -1240,6 +1242,7 @@ impl Store {
             "deepseek" => AgentKind::Deepseek,
             "opencode" => AgentKind::Opencode,
             "pi" => AgentKind::Pi,
+            "agy" => AgentKind::Agy,
             _ => {
                 return Err(Error::Invalid(
                     "Agent 暂未接入 Rust structured runtime".into(),

@@ -27,7 +27,9 @@ use crate::worker::Database;
 
 pub const NATIVE_CLAUDE_ID: &str = "native-claude";
 pub const NATIVE_PI_ID: &str = "native-pi";
+pub const NATIVE_AGY_ID: &str = "native-agy";
 const NATIVE_NAME: &str = "本机默认";
+const NATIVE_AGY_NAME: &str = "Antigravity 订阅";
 const CODEX_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(12);
 /// Mirrors the legacy agent-accounts runner output cap.
@@ -380,13 +382,56 @@ fn pi_capabilities() -> AccountCapabilities {
     }
 }
 
+fn agy_capabilities() -> AccountCapabilities {
+    AccountCapabilities {
+        session_kinds: vec![
+            crate::protocol::SessionKind::Pty,
+            crate::protocol::SessionKind::Structured,
+        ],
+        plan: true,
+        resume: true,
+        model_selection: true,
+        reasoning_effort: true,
+    }
+}
+
 pub(crate) fn parse_code_agent(value: &str) -> Result<crate::protocol::AgentKind> {
     match value {
         "claude" => Ok(crate::protocol::AgentKind::Claude),
         "codex" => Ok(crate::protocol::AgentKind::Codex),
         "opencode" => Ok(crate::protocol::AgentKind::Opencode),
         "pi" => Ok(crate::protocol::AgentKind::Pi),
+        "agy" => Ok(crate::protocol::AgentKind::Agy),
         _ => Err(crate::error::Error::Invalid("Agent 不支持账号隔离".into())),
+    }
+}
+
+fn probe_agy_status(agy_runtime_ok: bool) -> AuthProbe {
+    if !agy_runtime_ok {
+        return AuthProbe {
+            status: AccountStatus::Unavailable,
+            detail: Some("未安装 agy".into()),
+            ..Default::default()
+        };
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let has_state = home.as_ref().is_some_and(|h| {
+        h.join(".gemini/antigravity-cli/jetski_state.pbtxt").is_file()
+            || h.join(".gemini/antigravity/antigravity_state.pbtxt").is_file()
+            || h.join(".gemini/antigravity-cli/installation_id").is_file()
+    });
+    if has_state {
+        AuthProbe {
+            status: AccountStatus::SignedIn,
+            auth_method: Some("Antigravity 订阅".into()),
+            detail: Some("Antigravity CLI 订阅已就绪".into()),
+        }
+    } else {
+        AuthProbe {
+            status: AccountStatus::SignedIn,
+            auth_method: Some("Antigravity 订阅".into()),
+            detail: Some("agy CLI 就绪（使用本机 Antigravity 订阅）".into()),
+        }
     }
 }
 
@@ -970,7 +1015,7 @@ async fn snapshot_with(
 ) -> Result<AccountListResult> {
     let db = database.clone();
     let data = database.directory().to_owned();
-    let (managed, native_active, native_codex_active, native_pi_active, mut managed_active, bindings) = db
+    let (managed, native_active, native_codex_active, native_pi_active, native_agy_active, mut managed_active, bindings) = db
         .call({
             let data = data.clone();
             move |store| {
@@ -981,6 +1026,8 @@ async fn snapshot_with(
                     store.native_account_active_count("codex", crate::agent::NATIVE_CODEX_ID)?;
                 let native_pi_active =
                     store.native_account_active_count("pi", NATIVE_PI_ID)?;
+                let native_agy_active =
+                    store.native_account_active_count("agy", NATIVE_AGY_ID)?;
                 let sources = sources::ModelSources::open(&data)?;
                 let bindings = ids
                     .iter()
@@ -991,6 +1038,7 @@ async fn snapshot_with(
                     native_active,
                     native_codex_active,
                     native_pi_active,
+                    native_agy_active,
                     managed_active,
                     bindings,
                 ))
@@ -1014,6 +1062,7 @@ async fn snapshot_with(
         codex_runtime_ok,
         opencode_runtime_ok,
         pi_runtime_ok,
+        agy_runtime_ok,
         codex_probe,
     ) = tokio::join!(
         probe_auth_status(&native_claude_env),
@@ -1021,9 +1070,11 @@ async fn snapshot_with(
         probe::codex_runtime_available(),
         probe::opencode_runtime_available(),
         probe::pi_runtime_available(),
+        probe::agy_runtime_available(),
         probe_codex_status(&data),
     );
     let pi_probe = probe_pi_status(pi_runtime_ok);
+    let agy_probe = probe_agy_status(agy_runtime_ok);
     let native_claude_summary = config::read_override_summary(&data, NATIVE_CLAUDE_ID);
     let native_codex_summary =
         config::read_override_summary(&data, crate::agent::NATIVE_CODEX_ID);
@@ -1088,6 +1139,26 @@ async fn snapshot_with(
             created_at: 0,
             updated_at: now,
             active_sessions: native_pi_active,
+        },
+        NativeAccount {
+            id: NATIVE_AGY_ID.into(),
+            agent: crate::protocol::AgentKind::Agy,
+            name: NATIVE_AGY_NAME.into(),
+            managed: false,
+            is_default: true,
+            status: agy_probe.status,
+            capabilities: agy_capabilities(),
+            api_profile: None,
+            model_source: None,
+            engine: Some("agy".into()),
+            api_validation: None,
+            api_engine_validation: None,
+            model_capability_support: None,
+            auth_method: agy_probe.auth_method,
+            detail: agy_probe.detail,
+            created_at: 0,
+            updated_at: now,
+            active_sessions: native_agy_active,
         },
     ];
     let row_futures = managed.into_iter().map(|record| {

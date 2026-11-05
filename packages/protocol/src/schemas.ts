@@ -15,13 +15,14 @@ export const AgentKindSchema = z.enum([
   "deepseek",
   "opencode",
   "pi",
+  "agy",
   "grok",
   "trae",
   "custom",
 ]);
 
 /** 第一批支持独立账号环境的 Code Agent。 */
-export const CodeAgentKindSchema = z.enum(["claude", "codex", "opencode", "pi"]);
+export const CodeAgentKindSchema = z.enum(["claude", "codex", "opencode", "pi", "agy"]);
 
 /** Claude managed accounts support either a subscription token or a Console API key. */
 export const AgentCredentialKindSchema = z.enum(["oauth_token", "api_key"]);
@@ -35,7 +36,7 @@ export const AgentApiProtocolSchema = z.enum([
   "anthropic",
 ]);
 
-export const AgentExecutionEngineSchema = z.enum(["codex", "claude", "opencode", "pi"]);
+export const AgentExecutionEngineSchema = z.enum(["codex", "claude", "opencode", "pi", "agy"]);
 export const AgentReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 export const AgentAccountCapabilitiesSchema = z.object({
   sessionKinds: z.array(z.enum(["pty", "structured"])).max(2),
@@ -439,7 +440,7 @@ export const C2SSessionCreateSchema = z.object({
 /** 可由 Prospero 接回的 Agent 原生本机对话。 */
 export const ResumableConversationSchema = z.object({
   id: z.string().min(1).max(500),
-  agent: z.enum(["claude", "codex", "deepseek", "pi"]),
+  agent: z.enum(["claude", "codex", "deepseek", "pi", "agy"]),
   title: z.string().min(1).max(500),
   preview: z.string().max(4000).optional(),
   cwd: z.string().min(1),
@@ -450,7 +451,7 @@ export const ResumableConversationSchema = z.object({
 export const C2SConversationSearchSchema = z.object({
   type: z.literal("conversation.search"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex", "deepseek", "pi"]),
+  agent: z.enum(["claude", "codex", "deepseek", "pi", "agy"]),
   /** 搜索对应隔离环境中的原生会话历史。 */
   accountId: z.string().min(1).max(100).optional(),
   /** 空字符串表示列出最近对话。 */
@@ -771,7 +772,7 @@ export const C2SAgentModelsGetSchema = z.object({
 export const C2SLaunchModelsGetSchema = z.object({
   type: z.literal("launch.models.get"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex", "deepseek", "opencode", "pi"]),
+  agent: z.enum(["claude", "codex", "deepseek", "opencode", "pi", "agy"]),
   accountId: z.string().min(1).max(100).optional(),
 });
 
@@ -1925,7 +1926,7 @@ export const S2CAgentModelsSchema = z.object({
 export const S2CLaunchModelsSchema = z.object({
   type: z.literal("launch.models"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex", "deepseek", "opencode", "pi"]),
+  agent: z.enum(["claude", "codex", "deepseek", "opencode", "pi", "agy"]),
   models: z.array(AgentModelSchema).max(100),
   presets: z.array(AgentPresetSchema).max(100).optional(),
   currentPreset: z.string().min(1).max(300).nullish().transform(value => value ?? undefined),
@@ -2046,7 +2047,7 @@ export const S2CWorkspaceListingSchema = z.object({
 export const S2CConversationResultsSchema = z.object({
   type: z.literal("conversation.results"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex", "deepseek", "pi"]),
+  agent: z.enum(["claude", "codex", "deepseek", "pi", "agy"]),
   conversations: z.array(ResumableConversationSchema).max(50),
   error: z.string().max(2000).optional(),
 });
@@ -2498,7 +2499,7 @@ export function parseC2S(v: unknown): C2SMessage {
       if (r.data.kind === "pty") {
         throw new ProtocolError("session.create model requires the structured track", "format");
       }
-      if (r.data.agent !== "claude" && r.data.agent !== "codex" && r.data.agent !== "deepseek" && r.data.agent !== "pi") {
+      if (r.data.agent !== "claude" && r.data.agent !== "codex" && r.data.agent !== "deepseek" && r.data.agent !== "pi" && r.data.agent !== "agy") {
         throw new ProtocolError("session.create model is unavailable for this agent", "format");
       }
     }

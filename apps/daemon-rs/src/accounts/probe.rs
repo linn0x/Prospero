@@ -120,6 +120,10 @@ fn pi_binary() -> String {
     crate::agent::pi::binary()
 }
 
+fn agy_binary() -> String {
+    crate::agent::agy::binary()
+}
+
 async fn runtime_version() -> std::result::Result<Option<String>, ProbeFailure> {
     command_version(
         "claude",
@@ -246,6 +250,10 @@ pub(crate) async fn codex_runtime_available() -> bool {
 
 pub(crate) async fn pi_runtime_available() -> bool {
     command_available(pi_binary(), &[("PI_CODING_AGENT_DIR", "config")]).await
+}
+
+pub(crate) async fn agy_runtime_available() -> bool {
+    command_available(agy_binary(), &[]).await
 }
 
 async fn engine_runtime_version(

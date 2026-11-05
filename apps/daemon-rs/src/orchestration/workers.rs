@@ -99,9 +99,10 @@ pub(super) async fn launch_worker_start(
             | crate::protocol::AgentKind::Deepseek
             | crate::protocol::AgentKind::Opencode
             | crate::protocol::AgentKind::Pi
+            | crate::protocol::AgentKind::Agy
     ) {
         return Err(Error::Invalid(
-            "Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode/Pi".into(),
+            "Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode/Pi/Antigravity".into(),
         ));
     }
     let policy = match input.approval_policy.as_deref().unwrap_or("standard") {
@@ -124,6 +125,14 @@ pub(super) async fn launch_worker_start(
         }
         Some(crate::accounts::NATIVE_PI_ID) if input.agent == crate::protocol::AgentKind::Pi => {
             None
+        }
+        Some(crate::accounts::NATIVE_AGY_ID) if input.agent == crate::protocol::AgentKind::Agy => {
+            None
+        }
+        Some(_) if input.agent == crate::protocol::AgentKind::Agy => {
+            return Err(Error::Invalid(
+                "Antigravity worker 使用本机 Antigravity 订阅账号".into(),
+            ));
         }
         Some(_) if input.agent == crate::protocol::AgentKind::Deepseek => {
             return Err(Error::Invalid(

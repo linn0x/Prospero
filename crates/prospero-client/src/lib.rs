@@ -186,6 +186,8 @@ impl Client {
             prospero_protocol_rs::AgentKind::Claude
                 | prospero_protocol_rs::AgentKind::Codex
                 | prospero_protocol_rs::AgentKind::Deepseek
+                | prospero_protocol_rs::AgentKind::Pi
+                | prospero_protocol_rs::AgentKind::Agy
         ) || !(1..=50).contains(&limit)
             || query.chars().count() > 300
             || query.chars().any(char::is_control)
@@ -1058,6 +1060,7 @@ fn agent_name(agent: prospero_protocol_rs::AgentKind) -> &'static str {
         prospero_protocol_rs::AgentKind::Opencode => "opencode",
         prospero_protocol_rs::AgentKind::Deepseek => "deepseek",
         prospero_protocol_rs::AgentKind::Pi => "pi",
+        prospero_protocol_rs::AgentKind::Agy => "agy",
         prospero_protocol_rs::AgentKind::Grok => "grok",
         prospero_protocol_rs::AgentKind::Trae => "trae",
         prospero_protocol_rs::AgentKind::Shell => "shell",

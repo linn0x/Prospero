@@ -279,7 +279,7 @@ export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon" | "or
 export type SessionCreateInput = {
   cwd: string;
   sourceSessionId?: string;
-  agent: "codex" | "claude" | "deepseek" | "opencode" | "pi" | "grok" | "trae" | "shell" | "custom";
+  agent: "codex" | "claude" | "deepseek" | "opencode" | "pi" | "agy" | "grok" | "trae" | "shell" | "custom";
   kind: "structured" | "pty";
   approvalPolicy: "strict" | "standard" | "yolo";
   mode?: "default" | "plan";
@@ -419,7 +419,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   revealSkill(path: string, cwd: string): Promise<{ ok: boolean; error?: string }>;
   getAgentModes(sessionId: string): Promise<AgentModeCatalog>;
   setAgentMode(sessionId: string, mode: string): Promise<{ currentMode: string }>;
-  getLaunchModels(agent: "codex" | "claude" | "deepseek" | "opencode" | "pi", accountId?: string): Promise<AgentModelCatalog>;
+  getLaunchModels(agent: "codex" | "claude" | "deepseek" | "opencode" | "pi" | "agy", accountId?: string): Promise<AgentModelCatalog>;
   getAgentModels(sessionId: string): Promise<AgentModelCatalog>;
   setAgentModel(sessionId: string, model: string, effort?: string): Promise<{ currentModel: string; currentEffort?: string }>;
   orchestrationAction(method: string, params: JsonObject): Promise<JsonObject>;

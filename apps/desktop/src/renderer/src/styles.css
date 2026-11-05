@@ -228,6 +228,7 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .provider-logo { width: 42px; height: 42px; flex: none; display: grid; place-items: center; border-radius: var(--ui-radius-window); background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
 .provider-codex .provider-logo { color: var(--text); }
 .provider-claude .provider-logo { color: #d87855; background: color-mix(in srgb, #d87855 10%, var(--surface-2)); }
+.provider-agy .provider-logo { color: #3b82f6; background: color-mix(in srgb, #3b82f6 10%, var(--surface-2)); }
 .provider-pi .provider-logo { color: #10b981; background: color-mix(in srgb, #10b981 10%, var(--surface-2)); }
 .provider-deepseek .provider-logo { color: #4d72ff; background: color-mix(in srgb, #4d72ff 10%, var(--surface-2)); }
 .provider-trae .provider-logo { color: #6f7cf7; background: color-mix(in srgb, #6f7cf7 10%, var(--surface-2)); }

@@ -6,6 +6,7 @@ type AccountMetadata = Pick<AgentAccount, "agent" | "apiProfile" | "apiProfileEr
 export function getAgentAccountEngine(account: AccountMetadata): AgentExecutionEngine {
   if (account.engine) return account.engine;
   if (account.agent === "pi") return "pi";
+  if (account.agent === "agy") return "agy";
   return account.apiProfile?.protocol === "anthropic"
     ? "claude"
     : account.apiProfile?.protocol === "openai_responses"

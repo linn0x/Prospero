@@ -169,7 +169,7 @@ export class RustClient {
   createCrossModelChild(parentId: string, input: CreateCrossModelChild, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<CrossModelChild> {
     return this.json(`/v1/agent-sessions/${id(parentId)}/cross-model-children`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
-  localConversations(agent: "claude" | "codex" | "deepseek" | "pi", query: string, limit = 20, accountId?: string, signal: AbortSignal | null = null): Promise<ResumableConversation[]> {
+  localConversations(agent: "claude" | "codex" | "deepseek" | "pi" | "agy", query: string, limit = 20, accountId?: string, signal: AbortSignal | null = null): Promise<ResumableConversation[]> {
     const params = new URLSearchParams({ agent, query, limit: String(limit) });
     if (accountId) params.set("accountId", accountId);
     return this.json<ConversationSearchResult>(`/v1/conversations?${params}`, { signal, timeoutMs: 30_000 }).then(result => result.conversations);
@@ -604,7 +604,7 @@ export class RustClient {
   }
 
   // ── Launch model catalog ────────────────────────────────────────────────
-  launchModels(agent: "claude" | "codex" | "deepseek" | "opencode" | "pi" = "claude", accountId?: string, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
+  launchModels(agent: "claude" | "codex" | "deepseek" | "opencode" | "pi" | "agy" = "claude", accountId?: string, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
     const params = new URLSearchParams({ agent });
     if (accountId) params.set("accountId", accountId);
     return this.json(`/v1/launch/models?${params.toString()}`, { signal, timeoutMs });
