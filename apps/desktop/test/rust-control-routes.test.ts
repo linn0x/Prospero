@@ -157,4 +157,30 @@ describe("Rust desktop control routes", () => {
     })).resolves.toMatchObject({ id: "session-1" });
     expect(calls[0]).toMatchObject({ agent: "codex", accountId: "work-codex" });
   });
+
+  it("allows advanced account config for native-codex and native-claude as well as managed accounts", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      accountFeature: async (input: unknown) => {
+        calls.push(input);
+        return { type: "agent.account.config.result", requestId: "req-1", ok: true };
+      },
+    };
+    const store = { backend: "api", setManagedState: () => undefined, setApiState: () => undefined } as unknown as StateStore;
+    const runtime = new RustRuntime(store, "/opt/prosperod-rs", "/tmp/prospero-rust/daemon");
+    (runtime as unknown as { connection: unknown }).connection = { client, pid: 10, baseUrl: "http://127.0.0.1:7423" };
+
+    await expect(runtime.request("/_prospero/control/accounts", {
+      method: "POST",
+      body: { type: "agent.account.config.get", requestId: "req-1", accountId: "native-codex" },
+    })).resolves.toMatchObject({ ok: true });
+    await expect(runtime.request("/_prospero/control/accounts", {
+      method: "POST",
+      body: { type: "agent.account.config.get", requestId: "req-2", accountId: "native-claude" },
+    })).resolves.toMatchObject({ ok: true });
+    expect(calls).toEqual([
+      { type: "agent.account.config.get", requestId: "req-1", accountId: "native-codex" },
+      { type: "agent.account.config.get", requestId: "req-2", accountId: "native-claude" },
+    ]);
+  });
 });

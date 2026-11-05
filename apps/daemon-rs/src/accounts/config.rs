@@ -18,7 +18,6 @@ use super::profile::ModelCapabilities;
 const MAX_BYTES: usize = 16_384;
 const MAX_ENV_ENTRIES: usize = 64;
 const ALLOWED_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const RESERVED_ENV_KEYS: &[&str] = &[
     "PATH",
     "HOME",
@@ -532,7 +531,7 @@ fn supported_efforts(
     };
     let mut result = Vec::new();
     for value in values {
-        if CLAUDE_EFFORTS.contains(&value.as_str()) && !result.contains(&value) {
+        if ALLOWED_EFFORTS.contains(&value.as_str()) && !result.contains(&value) {
             result.push(value);
         }
     }
