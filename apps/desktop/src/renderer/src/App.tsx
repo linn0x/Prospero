@@ -3745,10 +3745,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const openMetadataKey = openIds.slice(0, 100).join("|");
   useEffect(() => {
     if (!snapshot.daemon.metadataRevision || !openMetadataKey || !snapshot.daemon.running) return;
+    const liveIds = new Set(snapshotRef.current.daemon.sessions.map(session => session.id));
+    const missingIds = openMetadataKey.split("|").filter(id => id && !liveIds.has(id));
+    if (missingIds.length === 0) return;
     let cancelled = false;
-    const ids = openMetadataKey.split("|");
-    void window.prospero.listSessions({ ids, limit: 100 }).then(page => {
-      if (cancelled) return;
+    void window.prospero.listSessions({ ids: missingIds, limit: 100 }).then(page => {
+      if (cancelled || page.items.length === 0) return;
       const returnedIds = new Set(page.items.map(item => item.id));
       setHydratedSessions(current => [...page.items, ...current.filter(item => !returnedIds.has(item.id))].slice(0, HYDRATED_SESSION_CACHE_LIMIT));
     }).catch(() => {});

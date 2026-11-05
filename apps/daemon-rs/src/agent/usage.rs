@@ -351,8 +351,45 @@ impl CodexRpc {
     }
 }
 
+fn codex_usage_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, Option<UsageReport>)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, (std::time::Instant, Option<UsageReport>)>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn codex_usage_cache_key(data: &Path, cwd: &Path, env: &[(String, String)]) -> String {
+    let mut key = format!("{}:{}:", data.display(), cwd.display());
+    for (k, v) in env {
+        key.push_str(k);
+        key.push('=');
+        key.push_str(v);
+        key.push(';');
+    }
+    if let Some((_, home)) = env.iter().find(|(k, _)| k == "CODEX_HOME") {
+        let auth_path = Path::new(home).join("auth.json");
+        if let Ok(meta) = std::fs::metadata(auth_path) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            key.push_str(&format!("auth:{mtime}:{};", meta.len()));
+        }
+    }
+    key
+}
+
 pub(crate) async fn read_native_codex_usage(data: &Path) -> Result<Option<UsageReport>> {
-    let (cwd, env) = native_codex_environment(data)?;
+    let data_for_env = data.to_owned();
+    let (cwd, env) = tokio::task::spawn_blocking(move || native_codex_environment(&data_for_env))
+        .await
+        .map_err(|_| Error::Closed)??;
     read_codex_usage_with_env(data, cwd, &env).await
 }
 
@@ -376,6 +413,16 @@ async fn read_codex_usage_with_env(
     cwd: PathBuf,
     env: &[(String, String)],
 ) -> Result<Option<UsageReport>> {
+    let cache_key = std::env::var_os("PROSPERO_CODEX_BIN")
+        .is_none()
+        .then(|| codex_usage_cache_key(data, &cwd, env));
+    if let Some(key) = &cache_key
+        && let Ok(guard) = codex_usage_cache().lock()
+        && let Some((checked_at, cached)) = guard.get(key)
+        && checked_at.elapsed() < Duration::from_secs(20)
+    {
+        return Ok(cached.clone());
+    }
     let mut rpc = CodexRpc::start(data, cwd, env).await?;
     let result = async {
         let mut identity = rpc
@@ -417,6 +464,11 @@ async fn read_codex_usage_with_env(
     }
     .await;
     rpc.shutdown().await;
+    if let (Some(key), Ok(report)) = (cache_key, &result)
+        && let Ok(mut guard) = codex_usage_cache().lock()
+    {
+        guard.insert(key, (std::time::Instant::now(), report.clone()));
+    }
     result
 }
 

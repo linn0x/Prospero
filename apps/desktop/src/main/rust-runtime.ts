@@ -346,6 +346,10 @@ export class RustRuntime {
   private orchestrationRetryPending = false;
   private orchestrationConnection: string | undefined;
   private nextDevicesPollAt = 0;
+  private slowMetadataReadAt = 0;
+  private cachedHealth: Awaited<ReturnType<RustDaemonClient["health"]>> | undefined;
+  private cachedDevices: { items: unknown[] } | undefined;
+  private cachedSchedules: unknown[] | undefined;
   private ready = false;
   private readonly terminalRecovery: TerminalRecovery;
   flushTerminalRecovery(): Promise<void> { return this.terminalRecovery.flush(); }
@@ -434,6 +438,10 @@ export class RustRuntime {
     this.orchestrationRetryPending = false;
     this.orchestrationConnection = undefined;
     this.nextDevicesPollAt = 0;
+    this.slowMetadataReadAt = 0;
+    this.cachedHealth = undefined;
+    this.cachedDevices = undefined;
+    this.cachedSchedules = undefined;
     this.store.setApiState({ running: false, config: { bind: "127.0.0.1", port: 0 }, status: {}, devices: {}, orchestration: {}, projects: [] });
   }
 
@@ -457,31 +465,45 @@ export class RustRuntime {
       this.orchestrationReady = false;
       this.orchestrationRetryPending = false;
       this.orchestrationConnection = connection;
+      this.slowMetadataReadAt = 0;
+      this.cachedHealth = undefined;
+      this.cachedDevices = undefined;
+      this.cachedSchedules = undefined;
     }
     const signal = this.controller.signal;
+    const now = Date.now();
+    const refreshSlowMetadata = force
+      || !this.cachedHealth
+      || !this.cachedDevices
+      || !this.cachedSchedules
+      || now - this.slowMetadataReadAt >= 5_000;
     const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
     // Runtime observations can change without a graph event, so even identical
     // revisions are reused for at most two seconds during active refreshes.
     const refreshOrchestration = Boolean(orchCursor && (force || !this.orchestrationReady
       || this.orchestrationRetryPending || orchCursor.resyncRequired
-      || orchCursor.latestSeq !== this.orchestrationSequence || Date.now() - this.orchestrationReadAt >= 2_000));
+      || orchCursor.latestSeq !== this.orchestrationSequence || now - this.orchestrationReadAt >= 2_000));
     const [summary, active, recent, workspaces, workspaceTabs, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
       client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       (typeof client.workspaceTabs === "function" ? client.workspaceTabs(signal) : Promise.resolve({ items: [], latestSeq: 0 })).catch(() => ({ items: [], latestSeq: 0 })),
-      client.health(signal),
-      client.devices(signal).catch((error: unknown) => {
-        // Device rows are management UI state; a transient read failure must
-        // not blank the existing device list or prevent the daemon from starting.
-        this.store.appendLog(`[rust] devices read failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        return { items: this.store.snapshot().devices };
-      }),
-      client.schedules(signal).catch((error: unknown) => {
-        this.store.appendLog(`[rust] schedules read failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        return [];
-      }),
+      refreshSlowMetadata ? client.health(signal) : Promise.resolve(this.cachedHealth!),
+      refreshSlowMetadata
+        ? client.devices(signal).catch((error: unknown) => {
+          // Device rows are management UI state; a transient read failure must
+          // not blank the existing device list or prevent the daemon from starting.
+          this.store.appendLog(`[rust] devices read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          return { items: this.store.snapshot().devices };
+        })
+        : Promise.resolve(this.cachedDevices!),
+      refreshSlowMetadata
+        ? client.schedules(signal).catch((error: unknown) => {
+          this.store.appendLog(`[rust] schedules read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          return [];
+        })
+        : Promise.resolve(this.cachedSchedules!),
       client.agentQueues(signal).catch((error: unknown) => {
         // The queue projection is additive UI state; a stale daemon or read
         // failure must not blank the session list.
@@ -502,6 +524,12 @@ export class RustRuntime {
         : Promise.resolve(null),
     ]);
     signal.throwIfAborted();
+    if (refreshSlowMetadata) {
+      this.cachedHealth = health;
+      this.cachedDevices = devices;
+      this.cachedSchedules = schedules;
+      this.slowMetadataReadAt = Date.now();
+    }
     if (orchestration && orchCursor) {
       this.orchestrationWindow = orchestration;
       this.orchestrationSequence = orchCursor.latestSeq;

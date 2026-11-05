@@ -180,6 +180,7 @@ impl Store {
         let mut active_check = self.connection.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1 AND lifecycle='active' AND NOT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1))",
         )?;
+        let mut active_cache = std::collections::HashMap::new();
         let mut items = Vec::with_capacity(rows.len());
         for (workspace, raw_ids, active_id, split_id, updated_at, revision) in rows {
             let parsed = serde_json::from_str::<Vec<String>>(&raw_ids).unwrap_or_default();
@@ -189,7 +190,13 @@ impl Store {
                 if !seen.insert(id.clone()) {
                     continue;
                 }
-                let is_active: bool = active_check.query_row([&id], |row| row.get(0))?;
+                let is_active: bool = if let Some(&cached) = active_cache.get(&id) {
+                    cached
+                } else {
+                    let value = active_check.query_row([&id], |row| row.get(0))?;
+                    active_cache.insert(id.clone(), value);
+                    value
+                };
                 if is_active {
                     open_session_ids.push(id);
                 }
@@ -248,12 +255,11 @@ impl Store {
             let result = self.lookup_sessions_inner(input)?;
             let mut items = Vec::with_capacity(result.items.len());
             let mut missing_ids = result.missing_ids;
+            let mut child_check = self.connection.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1)",
+            )?;
             for head in result.items {
-                let child: bool = self.connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1)",
-                    [&head.id],
-                    |row| row.get(0),
-                )?;
+                let child: bool = child_check.query_row([&head.id], |row| row.get(0))?;
                 if child {
                     missing_ids.push(head.id);
                 } else {

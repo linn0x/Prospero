@@ -4033,108 +4033,129 @@ impl Agents {
 
     pub async fn account_usage(&self) -> Result<Vec<UsageAccount>> {
         let snapshot = crate::accounts::list_accounts(&self.0.database, "usage").await?;
-        let mut sessions = Vec::new();
-        for (id, entry) in self.0.entries.lock().await.iter() {
-            let run = self
+        let entries: Vec<_> = self
+            .0
+            .entries
+            .lock()
+            .await
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect();
+        let sessions = if entries.is_empty() {
+            Vec::new()
+        } else {
+            let ids: Vec<String> = entries.iter().map(|(id, _)| id.clone()).collect();
+            let runs = self
                 .0
                 .database
-                .call({
-                    let id = id.clone();
-                    move |store| store.agent_run(&id)
+                .call(move |store| {
+                    ids.into_iter()
+                        .map(|id| store.agent_run(&id))
+                        .collect::<Result<Vec<_>>>()
                 })
                 .await?;
-            sessions.push((run.account_id, run.agent, entry.clone()));
-        }
-        let mut accounts = Vec::new();
-        for account in snapshot
+            runs.into_iter()
+                .zip(entries.into_iter().map(|(_, entry)| entry))
+                .map(|(run, entry)| (run.account_id, run.agent, entry))
+                .collect()
+        };
+        let data_dir = self.0.database.directory();
+        let filtered_accounts: Vec<_> = snapshot
             .accounts
             .into_iter()
             .filter(|row| {
                 row.status != crate::accounts::AccountStatus::Unavailable
                     && row.id != super::usage::NATIVE_CODEX_ID
             })
-        {
-            let live = sessions.iter().find(|(account_id, agent, _)| {
-                *agent == account.agent
-                    && (account_id.as_deref() == Some(account.id.as_str())
-                        || (account_id.is_none() && !account.managed))
-            });
-            let mut report = if let Some((_, _, entry)) = live {
-                let report = entry.usage.lock().await.clone();
-                (report.cost_usd.is_some()
-                    || report.input_tokens.is_some()
-                    || report.output_tokens.is_some()
-                    || report.usage_finalized.is_some()
-                    || !report.windows.is_empty()
-                    || report.subscription.is_some())
-                .then_some(report)
-            } else {
-                None
-            };
-            if report.is_none()
-                && account.agent == crate::protocol::AgentKind::Codex
-                && account.api_profile.is_none()
-                && account.managed
-                && account.status == crate::accounts::AccountStatus::SignedIn
-            {
-                report = super::usage::read_codex_usage_for_account(
-                    self.0.database.directory(),
-                    &account.id,
-                )
-                .await
-                .ok()
-                .flatten();
+            .collect();
+        let account_futures = filtered_accounts.into_iter().map(|account| {
+            let live_entry = sessions
+                .iter()
+                .find(|(account_id, agent, _)| {
+                    *agent == account.agent
+                        && (account_id.as_deref() == Some(account.id.as_str())
+                            || (account_id.is_none() && !account.managed))
+                })
+                .map(|(_, _, entry)| entry.clone());
+            async move {
+                let mut report = if let Some(entry) = live_entry {
+                    let report = entry.usage.lock().await.clone();
+                    (report.cost_usd.is_some()
+                        || report.input_tokens.is_some()
+                        || report.output_tokens.is_some()
+                        || report.usage_finalized.is_some()
+                        || !report.windows.is_empty()
+                        || report.subscription.is_some())
+                    .then_some(report)
+                } else {
+                    None
+                };
+                if report.is_none()
+                    && account.agent == crate::protocol::AgentKind::Codex
+                    && account.api_profile.is_none()
+                    && account.managed
+                    && account.status == crate::accounts::AccountStatus::SignedIn
+                {
+                    report = super::usage::read_codex_usage_for_account(data_dir, &account.id)
+                        .await
+                        .ok()
+                        .flatten();
+                }
+                let source = if account.api_profile.is_some()
+                    || account
+                        .auth_method
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains("api"))
+                {
+                    "api"
+                } else if report
+                    .as_ref()
+                    .and_then(|value| value.subscription.as_ref())
+                    .is_some()
+                    || account.status == crate::accounts::AccountStatus::SignedIn
+                {
+                    "subscription"
+                } else {
+                    "unknown"
+                }
+                .to_owned();
+                let available = report.is_some() || source == "api";
+                let reason = if report.is_none() {
+                    Some(
+                        if source == "api" {
+                            "API 模型由服务商按 API 用量计费，不提供订阅窗口。"
+                        } else {
+                            "暂时读不到账号额度，请确认 CLI 已登录并刷新。"
+                        }
+                        .into(),
+                    )
+                } else if report
+                    .as_ref()
+                    .is_some_and(|value| value.windows.is_empty())
+                {
+                    Some("这个后端不提供套餐限流窗口。".into())
+                } else {
+                    None
+                };
+                UsageAccount {
+                    agent: account.agent,
+                    account_id: Some(account.id),
+                    account_name: Some(account.name),
+                    source: Some(source),
+                    available,
+                    report: report.unwrap_or_else(|| UsageReport {
+                        windows: Vec::new(),
+                        ..Default::default()
+                    }),
+                    reason,
+                }
             }
-            let source = if account.api_profile.is_some()
-                || account
-                    .auth_method
-                    .as_deref()
-                    .is_some_and(|value| value.to_ascii_lowercase().contains("api"))
-            {
-                "api"
-            } else if report
-                .as_ref()
-                .and_then(|value| value.subscription.as_ref())
-                .is_some()
-                || account.status == crate::accounts::AccountStatus::SignedIn
-            {
-                "subscription"
-            } else {
-                "unknown"
-            }
-            .to_owned();
-            let available = report.is_some() || source == "api";
-            let reason = if report.is_none() {
-                Some(
-                    if source == "api" {
-                        "API 模型由服务商按 API 用量计费，不提供订阅窗口。"
-                    } else {
-                        "暂时读不到账号额度，请确认 CLI 已登录并刷新。"
-                    }
-                    .into(),
-                )
-            } else if report
-                .as_ref()
-                .is_some_and(|value| value.windows.is_empty())
-            {
-                Some("这个后端不提供套餐限流窗口。".into())
-            } else {
-                None
-            };
-            accounts.push(UsageAccount {
-                agent: account.agent,
-                account_id: Some(account.id),
-                account_name: Some(account.name),
-                source: Some(source),
-                available,
-                report: report.unwrap_or_else(|| UsageReport {
-                    windows: Vec::new(),
-                    ..Default::default()
-                }),
-                reason,
-            });
-        }
-        match super::usage::read_native_codex_usage(self.0.database.directory()).await {
+        });
+        let (mut accounts, native_codex) = tokio::join!(
+            futures_util::future::join_all(account_futures),
+            super::usage::read_native_codex_usage(data_dir),
+        );
+        match native_codex {
             Ok(Some(report)) => {
                 accounts.push(UsageAccount {
                     agent: crate::protocol::AgentKind::Codex,
