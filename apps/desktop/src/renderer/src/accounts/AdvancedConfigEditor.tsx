@@ -3,11 +3,12 @@ import type { AgentAccountConfig, AgentAccountFeatureError, AgentReasoningEffort
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
 import { featureErrorText } from "./feature-errors";
-import { AccountRequestGate, configDraftChanged, configEffortSupported } from "./account-request-state";
+import { AccountRequestGate, configDraftChanged, configEffortSupported, formatEnvLines, parseEnvLines } from "./account-request-state";
 
 export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { accountId: string; name: string; onClose: () => void; onSaved: () => void }) {
   const { t } = useLocale();
@@ -15,6 +16,9 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
   const [documentId, setDocumentId] = useState("");
   const [content, setContent] = useState("");
   const [effort, setEffort] = useState("");
+  const [proxyUrl, setProxyUrl] = useState("");
+  const [noProxy, setNoProxy] = useState("");
+  const [envText, setEnvText] = useState("");
   const [raw, setRaw] = useState(false);
   const [busy, setBusy] = useState<"load" | "save">();
   const [error, setError] = useState<AgentAccountFeatureError>();
@@ -28,7 +32,14 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
   const errorRef = useRef<HTMLDivElement>(null);
   const config = storedConfig?.accountId === accountId ? storedConfig : undefined;
   const selected = config?.documents.find(document => document.id === documentId);
-  const dirty = configDraftChanged(config, documentId, content, effort);
+  const supportsEnvOverrides = Boolean(selected?.editableKeys.includes("proxy_url"));
+  const dirty = configDraftChanged(
+    config,
+    documentId,
+    content,
+    effort,
+    supportsEnvOverrides ? { proxyUrl, noProxy, envText } : undefined,
+  );
   const invalidEffort = Boolean(config && !configEffortSupported(config, effort));
   const apply = (next: AgentAccountConfig, preferredDocument = documentId) => {
     const document = next.documents.find(item => item.id === preferredDocument) ?? next.documents[0];
@@ -36,6 +47,9 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
     setDocumentId(document?.id ?? "");
     setContent(document?.content ?? "");
     setEffort(next.defaultEffort ?? "");
+    setProxyUrl(next.proxyUrl ?? "");
+    setNoProxy(next.noProxy ?? "");
+    setEnvText(formatEnvLines(next.env));
     setConflicted(false);
   };
   const load = async (preferredDocument = documentId) => {
@@ -63,6 +77,7 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
     requests.invalidate();
     phase.current = undefined;
     setConfig(undefined); setDocumentId(""); setContent(""); setEffort("");
+    setProxyUrl(""); setNoProxy(""); setEnvText("");
     setError(undefined); setSaved(false); setDiscard(undefined); setRaw(false); setConflicted(false);
     void load("");
     return () => { requests.invalidate(); phase.current = undefined; };
@@ -70,6 +85,15 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
   useEffect(() => { if (error) errorRef.current?.focus(); }, [error]);
   const save = async () => {
     if (!selected?.writable || !dirty || conflicted || invalidEffort) return;
+    let parsedEnv: Record<string, string> | null | undefined;
+    if (supportsEnvOverrides && envText.trim() !== formatEnvLines(config?.env).trim()) {
+      const parsed = parseEnvLines(envText);
+      if (parsed.error) {
+        setError({ code: "invalid_config", message: parsed.error });
+        return;
+      }
+      parsedEnv = parsed.env;
+    }
     const token = requests.begin();
     if (token === undefined) return;
     phase.current = "save";
@@ -79,10 +103,15 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
         setError({ code: "unsupported", message: "Configuration saving unavailable" });
         return;
       }
+      const trimmedProxy = proxyUrl.trim();
+      const trimmedNoProxy = noProxy.trim();
       const result = await window.prospero.setAccountConfig({
         accountId, documentId: selected.id, revision: selected.revision,
         ...(content !== selected.content ? { content } : {}),
         ...(effort !== (config?.defaultEffort ?? "") ? { defaultEffort: effort ? effort as AgentReasoningEffort : null } : {}),
+        ...(supportsEnvOverrides && trimmedProxy !== (config?.proxyUrl ?? "") ? { proxyUrl: trimmedProxy || null } : {}),
+        ...(supportsEnvOverrides && trimmedNoProxy !== (config?.noProxy ?? "") ? { noProxy: trimmedNoProxy || null } : {}),
+        ...(supportsEnvOverrides && parsedEnv !== undefined ? { env: parsedEnv } : {}),
       });
       if (!requests.current(token) || currentAccount.current !== accountId) return;
       if (!result.ok || !result.config) {
@@ -105,7 +134,7 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
   return <>
     <Dialog open onOpenChange={open => { if (!open) close(); }}>
       <DialogContent className="account-config-dialog" showCloseButton={busy !== "save"} closeLabel={t("关闭", "Close")} aria-busy={Boolean(busy)}>
-        <DialogHeader><DialogTitle>{t("高级配置", "Advanced configuration")} · {name}</DialogTitle><DialogDescription>{t("修改账号支持的启动配置，新会话生效。", "Edit supported account startup settings. Changes apply to new sessions.")}</DialogDescription></DialogHeader>
+        <DialogHeader><DialogTitle>{t("高级配置", "Advanced configuration")} · {name}</DialogTitle><DialogDescription>{t("修改账号支持的独立代理、环境变量与启动配置，新会话与登录/额度查询生效。", "Edit independent proxy, environment variables, and startup settings for this account.")}</DialogDescription></DialogHeader>
         {busy === "load" && <p className="account-feature-state" role="status"><DesktopIcon name="refresh" className="daemon-spinner" />{t("读取配置中…", "Loading configuration…")}</p>}
         {config && <div className="account-config-fields">
           {!config.documents.length && <p role="status">{t("这个账号没有可编辑的配置文档。", "This account does not expose any configuration documents.")}</p>}
@@ -125,6 +154,19 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
               {invalidEffort && <FieldDescription id="account-config-effort-warning">{t("已保存的强度不再受当前模型支持。保存前请选择其他强度，或使用模型默认值以清除。", "The saved effort is no longer supported by this model. Choose another value or use the model default to clear it before saving.")}</FieldDescription>}
               {!config.supportedEfforts.length && <FieldDescription>{t("当前模型或引擎未声明可选推理强度，使用模型默认值。API 模型可在模型能力中声明支持范围。", "No effort options are declared for this model or engine. API models can declare supported values in model capabilities.")}</FieldDescription>}
             </Field>
+            {supportsEnvOverrides && <>
+              <Field><FieldLabel htmlFor="account-proxy-url">{t("独立代理地址 (Proxy URL)", "Independent Proxy URL")}</FieldLabel>
+                <Input id="account-proxy-url" value={proxyUrl} placeholder="http://127.0.0.1:7890 / socks5://127.0.0.1:1080" disabled={Boolean(busy) || !selected.writable} onChange={event => { setProxyUrl(event.target.value); setSaved(false); }} />
+                <FieldDescription>{t("为该订阅账号的登录、额度轮询、模型列表及会话独立注入 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY。留空则使用系统环境。", "Injects HTTPS_PROXY / HTTP_PROXY / ALL_PROXY exclusively for this subscription account.")}</FieldDescription>
+              </Field>
+              <Field><FieldLabel htmlFor="account-no-proxy">{t("跳过代理 (NO_PROXY)", "NO_PROXY")}</FieldLabel>
+                <Input id="account-no-proxy" value={noProxy} placeholder="localhost,127.0.0.1,*.internal" disabled={Boolean(busy) || !selected.writable} onChange={event => { setNoProxy(event.target.value); setSaved(false); }} />
+              </Field>
+              <Field><FieldLabel htmlFor="account-custom-env">{t("独立环境变量 (KEY=VALUE)", "Custom Environment Variables (KEY=VALUE)")}</FieldLabel>
+                <textarea id="account-custom-env" className="account-config-source" rows={4} value={envText} placeholder={"CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000\nCUSTOM_FLAG=1"} disabled={Boolean(busy) || !selected.writable} spellCheck={false} onChange={event => { setEnvText(event.target.value); setSaved(false); }} />
+                <FieldDescription>{t("每行一个 KEY=VALUE。仅在该订阅账号启动 CLI 会话或登录时生效，不会污染其它账号。", "One KEY=VALUE per line. Applied only to CLI sessions and login for this subscription account.")}</FieldDescription>
+              </Field>
+            </>}
             <details open={raw} onToggle={event => setRaw(event.currentTarget.open)}>
               <summary>{t("编辑配置源文件", "Edit configuration source")} · {selected.format.toUpperCase()}</summary>
               <FieldDescription>{t("仅允许编辑：", "Editable fields: ")}{selected.editableKeys.join(", ")}{selected.generated && t(" · 由 Prospero 管理", " · Managed by Prospero")}</FieldDescription>

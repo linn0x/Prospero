@@ -5792,8 +5792,12 @@ async fn account_control_result(
                 Err(error) => return ApiError(error).into_response(),
             };
             let id = account_id.clone();
-            let environment = match tokio::task::spawn_blocking(move || {
-                crate::accounts::managed::claude_environment(&data, &id, true)
+            let login_agent = record.agent;
+            let environment = match tokio::task::spawn_blocking(move || match login_agent {
+                crate::protocol::AgentKind::Codex => {
+                    crate::accounts::managed::codex_subscription_environment(&data, &id)
+                }
+                _ => crate::accounts::managed::claude_environment(&data, &id, true),
             })
             .await
             .map_err(|_| ApiError(Error::Closed))
@@ -5804,8 +5808,9 @@ async fn account_control_result(
             };
             let head = match api
                 .terminals
-                .create_login(
+                .create_login_for_agent(
                     account_id,
+                    record.agent,
                     format!("{} · 登录", record.name),
                     size,
                     environment,
@@ -5820,17 +5825,24 @@ async fn account_control_result(
         }
         other => {
             if let Some(id) = other.account_id()
-                && id == crate::accounts::NATIVE_CLAUDE_ID
+                && matches!(
+                    id,
+                    crate::accounts::NATIVE_CLAUDE_ID
+                        | crate::agent::NATIVE_CODEX_ID
+                        | crate::accounts::NATIVE_PI_ID
+                )
             {
                 // The native environment can never be renamed, logged out or
                 // deleted, matching legacy account_not_managed (403).
                 return ApiError(Error::Forbidden).into_response();
             }
             if let crate::accounts::AccountControl::Create { agent, .. } = other
-                && agent != "claude"
+                && !matches!(agent.as_str(), "claude" | "codex")
             {
-                return ApiError(Error::Invalid("Rust 当前仅支持 Claude 托管账号".into()))
-                    .into_response();
+                return ApiError(Error::Invalid(
+                    "当前仅支持 Claude 与 Codex 订阅账号托管".into(),
+                ))
+                .into_response();
             }
             let account_id = match crate::accounts::execute_control(&api.database, &control).await {
                 Ok(account_id) => account_id,
@@ -5869,14 +5881,42 @@ async fn account_config(
         }
     };
     let load = async {
-        if account_id == crate::accounts::NATIVE_CLAUDE_ID {
+        if account_id == crate::accounts::NATIVE_PI_ID {
             return Err(Error::Forbidden);
         }
         let data = api.database.directory().to_owned();
         let id = account_id.clone();
-        let (target, source_bound) = api
+        let (target, account_agent, source_bound) = api
             .database
             .call(move |store| {
+                if id == crate::accounts::NATIVE_CLAUDE_ID {
+                    let active_sessions = store
+                        .native_account_active_count("claude", crate::accounts::NATIVE_CLAUDE_ID)?;
+                    return Ok((
+                        ConfigTarget {
+                            account_id: id,
+                            model: None,
+                            model_capabilities: None,
+                            active_sessions,
+                        },
+                        crate::protocol::AgentKind::Claude,
+                        false,
+                    ));
+                }
+                if id == crate::agent::NATIVE_CODEX_ID {
+                    let active_sessions = store
+                        .native_account_active_count("codex", crate::agent::NATIVE_CODEX_ID)?;
+                    return Ok((
+                        ConfigTarget {
+                            account_id: id,
+                            model: None,
+                            model_capabilities: None,
+                            active_sessions,
+                        },
+                        crate::protocol::AgentKind::Codex,
+                        false,
+                    ));
+                }
                 let record = store.managed_snapshot_row(&data, &id)?;
                 let active_sessions = store.active_session_count(&id)?;
                 let source_bound =
@@ -5894,6 +5934,7 @@ async fn account_config(
                             .and_then(|profile| profile.model_capabilities.clone()),
                         active_sessions,
                     },
+                    record.agent,
                     source_bound,
                 ))
             })
@@ -5905,10 +5946,16 @@ async fn account_config(
             ));
         }
         let catalog = if target.model.is_none() {
-            api.agents
-                .launch_catalog_for(Some(&target.account_id))
-                .await
-                .ok()
+            if account_agent == crate::protocol::AgentKind::Codex {
+                codex_launch_catalog(api, Some(&target.account_id))
+                    .await
+                    .ok()
+            } else {
+                api.agents
+                    .launch_catalog_for(Some(&target.account_id))
+                    .await
+                    .ok()
+            }
         } else {
             None
         };
@@ -5924,13 +5971,20 @@ async fn account_config(
                 revision,
                 content,
                 default_effort,
+                proxy_url,
+                no_proxy,
+                env,
                 ..
             } => {
                 let document_id = document_id.clone();
                 let revision = revision.clone();
                 let content = content.clone();
                 let default_effort = default_effort.clone();
-                api.database
+                let proxy_url = proxy_url.clone();
+                let no_proxy = no_proxy.clone();
+                let env = env.clone();
+                let saved = api
+                    .database
                     .call(move |_| {
                         config::save_config(
                             &data,
@@ -5939,10 +5993,15 @@ async fn account_config(
                             &revision,
                             content.as_deref(),
                             default_effort,
+                            proxy_url,
+                            no_proxy,
+                            env,
                             catalog.as_ref(),
                         )
                     })
-                    .await
+                    .await?;
+                api.publish();
+                Ok(saved)
             }
             _ => Err(Error::Invalid("unsupported account config action".into())),
         }
@@ -6035,6 +6094,17 @@ async fn codex_launch_catalog(
             crate::agent::read_native_codex_models(api.database.directory()).await
         }
         Some(id) => {
+            crate::database::validate_id(id)?;
+            let data = api.database.directory().to_owned();
+            let id_owned = id.to_owned();
+            let record = api
+                .database
+                .call(move |store| store.managed_snapshot_row(&data, &id_owned))
+                .await?;
+            if record.api_profile.is_none() && record.agent == crate::protocol::AgentKind::Codex {
+                return crate::agent::read_codex_models_for_account(api.database.directory(), id)
+                    .await;
+            }
             profile_launch_catalog(api, id, crate::protocol::AgentKind::Codex, "Codex").await
         }
     }

@@ -213,6 +213,12 @@ pub(crate) enum AccountControl {
         content: Option<String>,
         #[serde(rename = "defaultEffort", default)]
         default_effort: Option<Option<String>>,
+        #[serde(rename = "proxyUrl", default)]
+        proxy_url: Option<Option<String>>,
+        #[serde(rename = "noProxy", default)]
+        no_proxy: Option<Option<String>>,
+        #[serde(default)]
+        env: Option<Option<std::collections::BTreeMap<String, String>>>,
     },
     #[serde(rename = "agent.account.rename")]
     Rename {
@@ -424,6 +430,13 @@ async fn probe_codex_status(data: &std::path::Path) -> AuthProbe {
             };
         }
     };
+    probe_codex_status_with_env(&cwd, &environment).await
+}
+
+async fn probe_codex_status_with_env(
+    cwd: &std::path::Path,
+    environment: &[(String, String)],
+) -> AuthProbe {
     let binary = std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut command = Command::new(binary);
     command
@@ -477,6 +490,16 @@ async fn probe_codex_status(data: &std::path::Path) -> AuthProbe {
             detail: Some("Codex CLI 无法读取登录状态".into()),
             ..Default::default()
         },
+    }
+}
+
+fn merge_detail(base: Option<String>, override_summary: Option<String>) -> Option<String> {
+    match (base, override_summary) {
+        (Some(base), Some(summary)) if !base.trim().is_empty() => {
+            Some(format!("{base} · {summary}"))
+        }
+        (None, Some(summary)) | (Some(_), Some(summary)) => Some(summary),
+        (base, None) => base,
     }
 }
 
@@ -613,13 +636,47 @@ fn pi_profile_capabilities() -> AccountCapabilities {
     }
 }
 
-/// Builds one account row for a legacy managed (OAuth/imported-key) account.
+/// Builds one account row for a managed subscription (OAuth/imported-key) account.
 async fn managed_row(
     database: &Database,
     record: managed::ManagedRecord,
     active_sessions: i64,
 ) -> Result<NativeAccount> {
     let data = database.directory().to_owned();
+    let override_summary = config::read_override_summary(&data, &record.id);
+    if record.agent == crate::protocol::AgentKind::Codex {
+        let id = record.id.clone();
+        let data_for_env = data.clone();
+        let environment = tokio::task::spawn_blocking(move || {
+            managed::codex_subscription_environment(&data_for_env, &id)
+        })
+        .await
+        .map_err(|_| crate::error::Error::Closed)??;
+        let cwd = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let probe = probe_codex_status_with_env(&cwd, &environment).await;
+        return Ok(NativeAccount {
+            id: record.id,
+            agent: crate::protocol::AgentKind::Codex,
+            name: record.name,
+            managed: true,
+            is_default: record.is_default,
+            status: probe.status,
+            capabilities: codex_capabilities(),
+            api_profile: None,
+            model_source: None,
+            engine: None,
+            api_validation: None,
+            api_engine_validation: None,
+            model_capability_support: None,
+            auth_method: probe.auth_method,
+            detail: merge_detail(probe.detail, override_summary),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            active_sessions,
+        });
+    }
     let id = record.id.clone();
     let environment =
         tokio::task::spawn_blocking(move || managed::claude_environment(&data, &id, false))
@@ -641,7 +698,7 @@ async fn managed_row(
         api_engine_validation: None,
         model_capability_support: None,
         auth_method: probe.auth_method,
-        detail: probe.detail,
+        detail: merge_detail(probe.detail, override_summary),
         created_at: record.created_at,
         updated_at: record.updated_at,
         active_sessions,
@@ -813,8 +870,14 @@ async fn snapshot_with(
             }
         })
         .await?;
-    let any_default = managed.iter().any(|record| record.is_default);
-    let probe = probe_auth_status(&[]).await;
+    let any_claude_default = managed
+        .iter()
+        .any(|record| record.agent == crate::protocol::AgentKind::Claude && record.is_default);
+    let any_codex_default = managed
+        .iter()
+        .any(|record| record.agent == crate::protocol::AgentKind::Codex && record.is_default);
+    let native_claude_env = managed::native_claude_environment(&data).unwrap_or_default();
+    let probe = probe_auth_status(&native_claude_env).await;
     // The isolated runtime probe feeds both the native row and profile rows;
     // run it once per snapshot.
     let claude_runtime_ok = probe::runtime_available().await;
@@ -823,6 +886,9 @@ async fn snapshot_with(
     let pi_runtime_ok = probe::pi_runtime_available().await;
     let codex_probe = probe_codex_status(&data).await;
     let pi_probe = probe_pi_status(pi_runtime_ok);
+    let native_claude_summary = config::read_override_summary(&data, NATIVE_CLAUDE_ID);
+    let native_codex_summary =
+        config::read_override_summary(&data, crate::agent::NATIVE_CODEX_ID);
     let now = crate::database::now();
     let mut accounts = vec![
         NativeAccount {
@@ -830,7 +896,7 @@ async fn snapshot_with(
             agent: crate::protocol::AgentKind::Claude,
             name: NATIVE_NAME.into(),
             managed: false,
-            is_default: !any_default,
+            is_default: !any_claude_default,
             status: probe.status,
             capabilities: claude_capabilities(),
             api_profile: None,
@@ -840,7 +906,7 @@ async fn snapshot_with(
             api_engine_validation: None,
             model_capability_support: None,
             auth_method: probe.auth_method,
-            detail: probe.detail,
+            detail: merge_detail(probe.detail, native_claude_summary),
             created_at: 0,
             updated_at: now,
             active_sessions: native_active,
@@ -850,7 +916,7 @@ async fn snapshot_with(
             agent: crate::protocol::AgentKind::Codex,
             name: NATIVE_NAME.into(),
             managed: false,
-            is_default: true,
+            is_default: !any_codex_default,
             status: codex_probe.status,
             capabilities: codex_capabilities(),
             api_profile: None,
@@ -860,7 +926,7 @@ async fn snapshot_with(
             api_engine_validation: None,
             model_capability_support: None,
             auth_method: codex_probe.auth_method,
-            detail: codex_probe.detail,
+            detail: merge_detail(codex_probe.detail, native_codex_summary),
             created_at: 0,
             updated_at: now,
             active_sessions: native_codex_active,
@@ -947,16 +1013,21 @@ pub(crate) async fn execute_control(
     match control {
         AccountControl::List { .. } => Ok(None),
         AccountControl::Create { agent, name, .. } => {
-            if agent != "claude" {
-                return Err(crate::error::Error::Invalid(
-                    "Rust 当前仅支持 Claude 托管账号".into(),
-                ));
-            }
+            let agent_kind = match agent.as_str() {
+                "claude" => crate::protocol::AgentKind::Claude,
+                "codex" => crate::protocol::AgentKind::Codex,
+                _ => {
+                    return Err(crate::error::Error::Invalid(
+                        "当前仅支持 Claude 与 Codex 订阅账号托管".into(),
+                    ));
+                }
+            };
             let data = database.directory().to_owned();
             let name = name.clone();
             let record = db
                 .call(move |store| {
-                    let record = store.create_managed_account(&data, &name)?;
+                    let record =
+                        store.create_managed_account_for_agent(&data, agent_kind, &name)?;
                     Ok(record.id)
                 })
                 .await?;

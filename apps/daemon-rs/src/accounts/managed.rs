@@ -141,6 +141,8 @@ pub(crate) fn execution_account_root(
         profile_account_root_for_agent(data, id, agent)
     } else if agent == AgentKind::Claude {
         account_root(data, id)
+    } else if agent == AgentKind::Codex {
+        account_root_for_agent(data, "codex", id)
     } else {
         Err(Error::Invalid(
             "managed account is incompatible with execution engine".into(),
@@ -238,7 +240,8 @@ pub(crate) fn claude_environment(
             None => (String::new(), MISSING_CLAUDE_CREDENTIAL.into()),
         }
     };
-    Ok(vec![
+    let mut env = super::config::read_runtime_environment(data, id).unwrap_or_default();
+    env.extend([
         ("ANTHROPIC_API_KEY".into(), api_key),
         ("ANTHROPIC_AUTH_TOKEN".into(), String::new()),
         ("CLAUDE_CODE_OAUTH_TOKEN".into(), oauth_token),
@@ -252,7 +255,37 @@ pub(crate) fn claude_environment(
             "CLAUDE_CONFIG_DIR".into(),
             root.to_string_lossy().into_owned(),
         ),
-    ])
+    ]);
+    Ok(env)
+}
+
+/// Runtime proxy and custom environment overrides for the native Claude subscription.
+pub(crate) fn native_claude_environment(data: &Path) -> Result<Vec<(String, String)>> {
+    super::config::read_runtime_environment(data, super::NATIVE_CLAUDE_ID)
+}
+
+/// Isolated `CODEX_HOME` and `CODEX_SQLITE_HOME` environment for a managed Codex
+/// subscription account, merged with account-level proxy and environment overrides.
+pub(crate) fn codex_subscription_environment(
+    data: &Path,
+    id: &str,
+) -> Result<Vec<(String, String)>> {
+    let root = account_root_for_agent(data, "codex", id)?;
+    ensure_private_dir(&root)?;
+    crate::cross_model_tool::install_codex_skill(&root)?;
+    let mut env = super::config::read_runtime_environment(data, id).unwrap_or_default();
+    env.extend([
+        ("OPENAI_API_KEY".into(), String::new()),
+        ("CODEX_API_KEY".into(), String::new()),
+        ("CODEX_ACCESS_TOKEN".into(), String::new()),
+        ("CODEX_REFRESH_TOKEN".into(), String::new()),
+        ("CODEX_HOME".into(), root.to_string_lossy().into_owned()),
+        (
+            "CODEX_SQLITE_HOME".into(),
+            root.to_string_lossy().into_owned(),
+        ),
+    ]);
+    Ok(env)
 }
 
 pub(crate) fn clean_api_key(raw: &str) -> Result<String> {
@@ -816,26 +849,42 @@ impl crate::database::Store {
             .ok_or(Error::NotFound)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn create_managed_account(
         &mut self,
         data: &Path,
         raw_name: &str,
     ) -> Result<ManagedRecord> {
+        self.create_managed_account_for_agent(data, AgentKind::Claude, raw_name)
+    }
+
+    pub(crate) fn create_managed_account_for_agent(
+        &mut self,
+        data: &Path,
+        agent: AgentKind,
+        raw_name: &str,
+    ) -> Result<ManagedRecord> {
+        let label = match agent {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+            _ => return Err(Error::Invalid("当前仅支持 Claude 与 Codex 订阅账号托管".into())),
+        };
         let name = clean_name(raw_name)?;
         let existing = self.list_managed_accounts(data)?;
-        let becomes_default = !existing.iter().any(|account| account.is_default);
+        let becomes_default = !existing
+            .iter()
+            .any(|account| account.agent == agent && account.is_default);
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at) \
-             VALUES(?1,'claude',?2,?3,?4,?4)",
-            params![id, name, becomes_default as i64, timestamp],
+             VALUES(?1,?2,?3,?4,?5,?5)",
+            params![id, label, name, becomes_default as i64, timestamp],
         )?;
         transaction.commit()?;
-        // Create the isolated private root eagerly (legacy lazily mkdirs on
-        // resolve; doing it at create time keeps later turns off the fs path).
-        ensure_private_dir(&account_root(data, &id)?)?;
+        let root = profile_account_root_for_agent(data, &id, agent)?;
+        ensure_private_dir(&root)?;
         self.managed_account(&id)
     }
 
@@ -1123,9 +1172,13 @@ impl crate::database::Store {
     }
 
     pub(crate) fn set_default_managed_account(&mut self, id: &str) -> Result<()> {
-        let _record = self.managed_account(id)?;
+        let record = self.managed_account(id)?;
+        let label = agent_label_value(record.agent);
         let transaction = self.connection.transaction()?;
-        transaction.execute("UPDATE managed_accounts SET is_default=0", [])?;
+        transaction.execute(
+            "UPDATE managed_accounts SET is_default=0 WHERE COALESCE(agent,'claude')=?1",
+            [label],
+        )?;
         transaction.execute(
             "UPDATE managed_accounts SET is_default=1,updated_at=?1 WHERE id=?2",
             params![now(), id],
@@ -1188,15 +1241,16 @@ impl crate::database::Store {
         }
         let root = match record.api_profile.as_ref() {
             Some(_) => profile_account_root_for_agent(data, id, record.agent)?,
-            None => account_root(data, id)?,
+            None => profile_account_root_for_agent(data, id, record.agent)?,
         };
         match fs::remove_file(credential_path(&root)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        // Credentials written by older builds into the config root.
+        // Credentials written by older builds or Codex CLI into the isolated config root.
         let _ = fs::remove_file(root.join(".credentials.json"));
+        let _ = fs::remove_file(root.join("auth.json"));
         self.connection.execute(
             "UPDATE managed_accounts SET updated_at=?1,api_validation=NULL, \
              api_validation_revision=NULL,api_engine_validation=NULL, \
@@ -1218,14 +1272,16 @@ impl crate::database::Store {
         }
         self.connection
             .execute("DELETE FROM managed_accounts WHERE id=?", [id])?;
-        let root = match record.api_profile.as_ref() {
-            Some(_) => profile_account_root_for_agent(data, id, record.agent)?,
-            None => account_root(data, id)?,
-        };
+        let root = profile_account_root_for_agent(data, id, record.agent)?;
         match fs::remove_dir_all(&root) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
+        }
+        if let Ok(override_root) = account_root(data, id)
+            && override_root != root
+        {
+            let _ = fs::remove_dir_all(&override_root);
         }
         Ok(())
     }
@@ -1289,21 +1345,31 @@ impl crate::database::Store {
         managed_ids: &[String],
     ) -> Result<(i64, std::collections::HashMap<String, i64>)> {
         let mut statement = self.connection.prepare(
-            "SELECT COALESCE(ar.account_id, tr.account_id) AS bound
+            "SELECT json_extract(sh.payload, '$.agent') AS agent,
+                    COALESCE(ar.account_id, tr.account_id) AS bound
              FROM session_heads sh
              LEFT JOIN agent_runs ar ON ar.session_id = sh.id
              LEFT JOIN terminal_runs tr ON tr.session_id = sh.id
-             WHERE sh.lifecycle = 'active'
-               AND json_extract(sh.payload, '$.agent') = 'claude'",
+             WHERE sh.lifecycle = 'active'",
         )?;
-        let bindings = statement.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        let bindings = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?;
         let mut native = 0i64;
         let mut counts: std::collections::HashMap<String, i64> =
             managed_ids.iter().map(|id| (id.clone(), 0)).collect();
         for binding in bindings {
-            match binding? {
+            let (agent, bound) = binding?;
+            match bound {
+                Some(id) if id == super::NATIVE_CLAUDE_ID && agent.as_deref() == Some("claude") => {
+                    native += 1;
+                }
                 Some(id) => *counts.entry(id).or_insert(0) += 1,
-                None => native += 1,
+                None if agent.as_deref() == Some("claude") => native += 1,
+                None => {}
             }
         }
         Ok((native, counts))

@@ -155,10 +155,13 @@ pub(crate) fn native_codex_environment(data: &Path) -> Result<(PathBuf, Vec<(Str
         .join(NATIVE_CODEX_ID);
     std::fs::create_dir_all(&root)?;
     set_private_dir_permissions(&root)?;
-    Ok((
-        user_home().unwrap_or_else(|| PathBuf::from("/")),
-        prepare_native_codex_environment(&root.join("home"), &root.join("sqlite"))?,
-    ))
+    let mut env = crate::accounts::config::read_runtime_environment(data, NATIVE_CODEX_ID)
+        .unwrap_or_default();
+    env.extend(prepare_native_codex_environment(
+        &root.join("home"),
+        &root.join("sqlite"),
+    )?);
+    Ok((user_home().unwrap_or_else(|| PathBuf::from("/")), env))
 }
 
 pub(crate) fn native_codex_terminal_environment(data: &Path) -> Result<Vec<(String, String)>> {
@@ -166,7 +169,10 @@ pub(crate) fn native_codex_terminal_environment(data: &Path) -> Result<Vec<(Stri
         .join("agent-accounts")
         .join("codex")
         .join(NATIVE_CODEX_ID);
-    prepare_native_codex_environment(&root, &root)
+    let mut env = crate::accounts::config::read_runtime_environment(data, NATIVE_CODEX_ID)
+        .unwrap_or_default();
+    env.extend(prepare_native_codex_environment(&root, &root)?);
+    Ok(env)
 }
 
 struct CodexRpc {
@@ -336,7 +342,30 @@ impl CodexRpc {
 
 pub(crate) async fn read_native_codex_usage(data: &Path) -> Result<Option<UsageReport>> {
     let (cwd, env) = native_codex_environment(data)?;
-    let mut rpc = CodexRpc::start(data, cwd, &env).await?;
+    read_codex_usage_with_env(data, cwd, &env).await
+}
+
+pub(crate) async fn read_codex_usage_for_account(
+    data: &Path,
+    account_id: &str,
+) -> Result<Option<UsageReport>> {
+    let data_for_env = data.to_owned();
+    let id = account_id.to_owned();
+    let env = tokio::task::spawn_blocking(move || {
+        crate::accounts::managed::codex_subscription_environment(&data_for_env, &id)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
+    let cwd = user_home().unwrap_or_else(|| PathBuf::from("/"));
+    read_codex_usage_with_env(data, cwd, &env).await
+}
+
+async fn read_codex_usage_with_env(
+    data: &Path,
+    cwd: PathBuf,
+    env: &[(String, String)],
+) -> Result<Option<UsageReport>> {
+    let mut rpc = CodexRpc::start(data, cwd, env).await?;
     let result = async {
         let identity = rpc
             .request("account/read", json!({ "refreshToken": true }))
@@ -738,6 +767,21 @@ pub(crate) async fn read_native_codex_models(
     data: &Path,
 ) -> Result<crate::agent::LaunchModelCatalog> {
     let (cwd, env) = native_codex_environment(data)?;
+    read_codex_models(data, cwd, &env, &[]).await
+}
+
+pub(crate) async fn read_codex_models_for_account(
+    data: &Path,
+    account_id: &str,
+) -> Result<crate::agent::LaunchModelCatalog> {
+    let data_for_env = data.to_owned();
+    let id = account_id.to_owned();
+    let env = tokio::task::spawn_blocking(move || {
+        crate::accounts::managed::codex_subscription_environment(&data_for_env, &id)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
+    let cwd = user_home().unwrap_or_else(|| PathBuf::from("/"));
     read_codex_models(data, cwd, &env, &[]).await
 }
 
