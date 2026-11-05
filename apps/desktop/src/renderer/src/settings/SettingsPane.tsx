@@ -19,7 +19,7 @@ function relayPresentation(state: string, enabled: boolean): { dot: string; zh: 
   return { dot: "paused", zh: "等待连接", en: "Waiting to connect" };
 }
 
-export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSnapshot; onOpenAccounts: () => void }) {
+export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot; onOpenAccounts?: () => void }) {
   const { language, setLanguage, t, status } = useLocale();
   const [active, setActive] = useState<SettingsCategory>("general");
   const [feedback, setFeedback] = useState<Record<string, SettingFeedback | undefined>>({});
@@ -156,11 +156,6 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
           <p>Prospero · Aa Bb 0123456789</p>
         </div>
         <p className="settings-detail-note">{t("界面会遵循系统的降低动态效果、高对比度和降低透明度偏好。", "The interface follows system preferences for reduced motion, high contrast, and reduced transparency.")}</p>
-      </SettingsSection>}
-      {category.id === "accounts" && <SettingsSection id="accounts" title={t("Agent 与账号", "Agents and accounts")} description={t("管理登录账号、API 连接与模型配置。", "Manage signed-in accounts, API connections, and model configuration.")}>
-        <SettingRow id="open-accounts" title={t("账号管理", "Account management")} description={t(`已配置 ${snapshot.accounts.length} 个账号。`, `${snapshot.accounts.length} accounts configured.`)}>
-          <button id="open-accounts" type="button" aria-describedby="open-accounts-description" onClick={onOpenAccounts}>{t("管理账号", "Manage accounts")}<DesktopIcon name="arrowRight" size={14} /></button>
-        </SettingRow>
       </SettingsSection>}
       {category.id === "terminal" && <SettingsSection id="terminal" title={t("终端", "Terminal")} description={t("按 Enter 或移开焦点保存，立即应用到终端。", "Press Enter or move focus away to save and apply terminal appearance.")}>
         <SettingRow id="terminal-font-family" title={t("等宽字体", "Monospaced font")} description={t("可用逗号分隔多个备用字体。", "Separate fallback font families with commas.")} {...rowFeedback("terminal-font-family")}>

@@ -1,7 +1,6 @@
 export const settingsCategories = [
   { id: "general", zh: "通用", en: "General" },
   { id: "appearance", zh: "外观", en: "Appearance" },
-  { id: "accounts", zh: "Agent 与账号", en: "Agents and accounts" },
   { id: "terminal", zh: "终端", en: "Terminal" },
   { id: "runtime", zh: "运行时与网络", en: "Runtime and network" },
   { id: "relay", zh: "Relay", en: "Relay" },

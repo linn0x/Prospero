@@ -47,11 +47,7 @@ export function SourceSelector({ sources, loading, error, value, agent, onChange
     </div>
     {error && <p role="alert">{error}</p>}
     {selection && <div className="session-auth-status-bar">
-      <span>{t("协议：", "Protocol: ")}{accountApiProtocolLabel(selection.route.protocol)} · {t("凭据：", "Key: ")}{selection.source.credentials.find(item => item.id === selection.route.credentialId)?.name}{selection.route.defaultEffort ? ` · ${selection.route.defaultEffort}` : ""}</span>
-      <details className="text-xs text-muted-foreground">
-        <summary className="cursor-pointer">{t("连接详情", "Connection details")}</summary>
-        <FieldDescription className="mt-1">{t("模型源更新不会改变已创建的会话。", "Source updates do not change existing sessions.")}</FieldDescription>
-      </details>
+      <span>{t("协议：", "Protocol: ")}{accountApiProtocolLabel(selection.route.protocol)} · {t("模型：", "Model: ")}<code>{selection.route.model}</code> · {t("凭据：", "Key: ")}{selection.source.credentials.find(item => item.id === selection.route.credentialId)?.name}{selection.route.defaultEffort ? ` · ${selection.route.defaultEffort}` : ""}</span>
     </div>}
     {source && value && source.revision !== value.revision && <p role="alert">{t("模型源已更新，请确认后使用新配置。", "The source changed. Confirm before using its new configuration.")}<Button variant="ghost" size="sm" disabled={disabled} onClick={() => onChange(defaultSourceSelection([source], value, agent))}>{t("使用新配置", "Use updated configuration")}</Button></p>}
     {!loading && !sources.some(item => item.enabled && item.routes.some(route => route.enabled)) && <p className="text-xs text-muted-foreground">{t("请在“账号与模型源”页面的 API 模型源中添加并启用模型。", "Add a source and enable models on the Accounts & model sources page.")}</p>}

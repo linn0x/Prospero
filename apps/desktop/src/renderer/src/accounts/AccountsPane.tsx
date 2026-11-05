@@ -24,8 +24,7 @@ export function AccountsPane({ snapshot, onOpenSession, onUseModelSource }: { sn
   const [showLegacyApi, setShowLegacyApi] = useState(false);
   const [editing, setEditing] = useState<JsonObject>();
   const [configuring, setConfiguring] = useState<JsonObject>();
-  const [showBindings, setShowBindings] = useState(false);
-  const visibleAccounts = snapshot.accounts.filter(account => showBindings || !account.modelSource);
+  const visibleAccounts = snapshot.accounts.filter(account => !account.modelSource);
   const subscriptionAccounts = visibleAccounts.filter(account => !account["apiProfile"] && !account["apiProfileError"]);
   const legacyApiAccounts = visibleAccounts.filter(account => Boolean(account["apiProfile"] || account["apiProfileError"]));
   const displayedAccounts = (showLegacyApi ? visibleAccounts : subscriptionAccounts).filter(account => providerFilter === "all" || accountEngine(account) === providerFilter);
@@ -96,7 +95,6 @@ export function AccountsPane({ snapshot, onOpenSession, onUseModelSource }: { sn
         <div className="split-management account-layout">
           <section>
             <div className="section-title"><DesktopIcon name="accounts" />{t("官方 CLI 订阅登录态", "Official CLI subscription sign-ins")} <span>{displayedAccounts.length}</span></div>
-            {snapshot.accounts.some(account => account.modelSource) && <label className="model-source-bound-toggle"><input type="checkbox" checked={showBindings} onChange={event => setShowBindings(event.target.checked)} />{t("显示模型源的会话绑定版本", "Show pinned model-source account versions")}</label>}
             <div className="card-grid account-grid">{displayedAccounts.map(account => {
               const id = text(account["id"]);
               const usage = actions.usage.find(item => item.accountId === id) ?? actions.usage.find(item => !item.accountId && item.agent === account["agent"]);
@@ -109,9 +107,9 @@ export function AccountsPane({ snapshot, onOpenSession, onUseModelSource }: { sn
           </section>
           <section ref={createForm} className="form-card account-form">
             <div className="section-title"><DesktopIcon name="add" />{t("新增订阅登录态", "Add subscription sign-in")}</div>
-            <AccountCreateForm subscriptionOnly capabilities={capabilities} disabled={disabled} busy={actions.busy === "api-create" || actions.busy === "managed-create" ? actions.busy : undefined}
-              error={actions.error?.key === "api-create" || actions.error?.key === "managed-create" ? actions.error.message : undefined}
-              onCreateManaged={actions.createManaged} onCreateApi={actions.createApi} />
+            <AccountCreateForm disabled={disabled} busy={actions.busy === "managed-create" ? actions.busy : undefined}
+              error={actions.error?.key === "managed-create" ? actions.error.message : undefined}
+              onCreateManaged={actions.createManaged} />
           </section>
         </div>
       </>

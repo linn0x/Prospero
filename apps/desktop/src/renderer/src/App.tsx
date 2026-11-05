@@ -397,10 +397,10 @@ function getViewCopy(
         ),
       },
       providers: {
-        title: t("Agent 与账号", "Agents & accounts"),
+        title: t("账号与模型源", "Accounts & model sources"),
         description: t(
-          "Agent、模型、账号与额度",
-          "Agents, models, accounts, and usage",
+          "官方订阅登录态与第三方 API 模型源",
+          "Official subscriptions and third-party API model sources",
         ),
       },
       skills: {
@@ -2523,157 +2523,6 @@ function InboxPane({
   );
 }
 
-function AgentsPane({
-  snapshot,
-  onOpenSession,
-  onNewSession,
-}: {
-  snapshot: DesktopSnapshot;
-  onOpenSession: (id: string) => void;
-  onNewSession: () => void;
-}) {
-  const { t, status } = useLocale();
-  const ids = [
-    ...new Set([
-      ...snapshot.daemon.sessions.map((session) => session.agent),
-      ...snapshot.accounts
-        .map((account) => text(account["agent"]))
-        .filter(Boolean),
-    ]),
-  ];
-  const agents = ids.length ? ids : ["codex", "claude", "opencode", "pi"];
-  return (
-    <div className="view-scroll">
-      <div className="view-container">
-        <PageHeading
-          eyebrow={t("AI 协作者", "AI COLLABORATORS")}
-          title={t("协作者", "Agents")}
-          description={t(
-            "Agent 是可复用的工作角色；账号、模型来源和执行环境在各自页面管理。",
-            "Agents are reusable roles; accounts, providers, and runtimes are managed separately.",
-          )}
-          actions={
-            <Button onClick={onNewSession}>
-              <Plus data-icon="inline-start" />
-              {t("运行 Agent", "Run agent")}
-            </Button>
-          }
-        />
-        <div className="agent-grid">
-          {agents.map((agent) => {
-            const sessions = snapshot.daemon.sessions.filter(
-              (session) => session.agent === agent,
-            );
-            const active = sessions.filter((session) =>
-              [
-                "running",
-                "starting",
-                "waiting_input",
-                "waiting_approval",
-              ].includes(session.status),
-            );
-            const account = snapshot.accounts.find(
-              (item) => text(item["agent"]) === agent,
-            );
-            return (
-              <Card key={agent} className="agent-card">
-                <CardHeader>
-                  <div className="agent-card-identity">
-                    <Avatar className="size-11">
-                      <AvatarFallback>
-                        <AgentLogo agent={agent} size={25} />
-                      </AvatarFallback>
-                    </Avatar>
-                    <div>
-                      <CardTitle className="capitalize">{agent}</CardTitle>
-                      <CardDescription>
-                        {agent === "codex"
-                          ? t(
-                              "编码、重构与仓库工作",
-                              "Coding, refactoring, and repository work",
-                            )
-                          : agent === "claude"
-                            ? t(
-                                "分析、写作与复杂推理",
-                                "Analysis, writing, and complex reasoning",
-                              )
-                            : t(
-                                "本地 Agent 协作者",
-                                "Local agent collaborator",
-                              )}
-                      </CardDescription>
-                    </div>
-                    <StatusMark
-                      status={active.length ? "running" : "completed"}
-                    />
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  <dl className="agent-facts">
-                    <div>
-                      <dt>{t("默认模型", "Default model")}</dt>
-                      <dd>
-                        {text(
-                          account?.["model"],
-                          t("Agent 默认", "Agent default"),
-                        )}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>{t("权限", "Permission")}</dt>
-                      <dd>{sessions[0]?.approvalPolicy || "standard"}</dd>
-                    </div>
-                    <div>
-                      <dt>{t("活跃任务", "Active tasks")}</dt>
-                      <dd>{active.length}</dd>
-                    </div>
-                    <div>
-                      <dt>{t("最近运行", "Recent runs")}</dt>
-                      <dd>{sessions.length}</dd>
-                    </div>
-                  </dl>
-                  {active.slice(0, 2).map((session) => (
-                    <button
-                      className="agent-active-task"
-                      key={session.id}
-                      onClick={() => onOpenSession(session.id)}
-                    >
-                      <StatusMark status={session.status} busySince={session.busySince} />
-                      <span className="truncate">{sessionLabel(session)}</span>
-                      <ChevronRight />
-                    </button>
-                  ))}
-                </CardContent>
-                <CardFooter>
-                  <Badge
-                    variant={
-                      text(account?.["status"]) === "signed_in"
-                        ? "secondary"
-                        : "outline"
-                    }
-                  >
-                    {account
-                      ? status(text(account["status"]))
-                      : t("使用本地环境", "Uses local environment")}
-                  </Badge>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={!sessions[0]}
-                    onClick={() => sessions[0] && onOpenSession(sessions[0].id)}
-                  >
-                    {t("打开", "Open")}
-                  </Button>
-                </CardFooter>
-              </Card>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function ProjectRenameDialog({
   project,
   currentName,
@@ -3178,10 +3027,12 @@ function NewSessionDialog({
               )}
               {remoteWorkspaces.length > 0 && <NativeSelectOptGroup label={t("远程工作区", "Remote workspaces")}>{remoteWorkspaces.map(workspace => <NativeSelectOption key={workspace.id} value={workspace.id}>{workspace.name} · {workspace.hostName}</NativeSelectOption>)}</NativeSelectOptGroup>}
             </NativeSelect>
-            <Button variant={launchWorkspaces.length === 0 ? "outline" : "ghost"} size="sm" className="w-fit" disabled={busy || choosingWorkspace} onClick={() => setTab("workspace")}>
-              {choosingWorkspace ? <Spinner data-icon="inline-start" /> : <FolderPlus data-icon="inline-start" />}
-              {choosingWorkspace ? t("正在选择…", "Choosing…") : launchWorkspaces.length === 0 ? t("添加第一个工作区", "Add your first workspace") : t("添加其他工作区", "Add another workspace")}
-            </Button>
+            {launchWorkspaces.length === 0 && remoteWorkspaces.length === 0 && (
+              <Button variant="outline" size="sm" className="w-fit" disabled={busy || choosingWorkspace} onClick={() => setTab("workspace")}>
+                {choosingWorkspace ? <Spinner data-icon="inline-start" /> : <FolderPlus data-icon="inline-start" />}
+                {choosingWorkspace ? t("正在选择…", "Choosing…") : t("添加第一个工作区", "Add your first workspace")}
+              </Button>
+            )}
             <FieldDescription className="truncate" title={remoteTarget?.cwd ?? selectedWorkspace?.detail}>
               {remoteTarget ? `${remoteTarget.hostName} · ${remoteTarget.cwd}` : launchWorkspaces.length === 0
                 ? t("选择一个本地项目后即可在此创建会话。", "Choose a local project to create a session here.")
@@ -4374,7 +4225,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             ) : view === "diagnostics" ? (
               <LogsPane snapshot={sessionSnapshot} />
             ) : (
-              <SettingsPane snapshot={sessionSnapshot} onOpenAccounts={() => selectView("providers")} />
+              <SettingsPane snapshot={sessionSnapshot} />
             )}
           </Suspense>
           {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
