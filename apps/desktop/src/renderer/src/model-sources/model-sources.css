@@ -53,7 +53,11 @@
 .model-source-migration-group code { font-size: var(--ui-text-small); overflow-wrap: anywhere; }
 .model-source-bindings > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: var(--ui-text-small); padding: 7px 0; }
 .model-source-bindings > p { margin-block: 8px; }
-.model-source-session-mode { display: flex; align-items: center; gap: 4px; }
+.model-source-session-mode { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--background); }
+.session-auth-card { display: grid; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--card); }
+.session-auth-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.session-auth-card-title { font-size: var(--ui-text-small); font-weight: 600; color: var(--foreground); }
+.session-auth-status-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-md, 8px); background: var(--background); font-size: var(--ui-text-caption); color: var(--muted-foreground); }
 .model-source-bound-toggle { display: flex; align-items: center; gap: 7px; font-size: var(--ui-text-small); color: var(--muted-foreground); }
 @media (max-width: 1050px) { .model-source-layout { grid-template-columns: minmax(150px, 190px) minmax(0, 1fr); } .model-source-detail { padding: 12px; } .model-source-section-heading, .model-source-detail-heading { flex-wrap: wrap; } }
 @media (max-width: 800px) { .model-source-layout { grid-template-columns: minmax(0, 1fr); } .model-source-list { max-height: 180px; border-right: 0; border-bottom: 1px solid var(--border); } .model-source-selector-fields, .model-source-endpoint-form { grid-template-columns: minmax(0, 1fr); } }

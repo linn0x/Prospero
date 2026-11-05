@@ -34,3 +34,7 @@
 .accounts-page .account-form { grid-row: auto; order: 0; }
 .accounts-page .account-layout > section:first-child { grid-row: auto; }
 .accounts-page .account-card-rich { grid-template-rows: auto minmax(0, 1fr) auto; align-content: start; }
+.accounts-dimension-switcher { display: flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--card); }
+.subscriptions-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+.subscriptions-filter-pills { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.legacy-api-migration-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--card); font-size: var(--ui-text-small); color: var(--muted-foreground); }

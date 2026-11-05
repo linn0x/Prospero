@@ -3191,20 +3191,23 @@ function NewSessionDialog({
             </FieldDescription>
           </Field>
           {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
-          <Button className="session-configure-accounts w-fit" variant="ghost" size="sm" onClick={() => onConfigureAccounts({ input: { ...input, approvalPolicy: selectedApprovalPolicy }, useSource, sourceSelection })}>
-            <Settings />{t("配置账号与模型", "Configure accounts & models")}
-          </Button>
-          <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("本机账号 / API 配置", "Local account / API profile")}</Button></div>
-          {useSource ? <><div className="grid gap-4 sm:grid-cols-2"><Field><FieldLabel htmlFor="source-runtime-agent">Agent</FieldLabel><NativeSelect id="source-runtime-agent" value={sourceRuntimeAgent} disabled={busy} onChange={event => setSourceRuntimeAgent(event.target.value as SourceRuntimeAgent)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption><NativeSelectOption value="pi">Pi</NativeSelectOption></NativeSelect><FieldDescription>{t("选择负责执行代码和工具操作的 Agent。", "Choose the agent that runs code and tools.")}</FieldDescription></Field><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi")} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></div><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /></> : <>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field>
               <FieldLabel htmlFor="session-agent">Agent</FieldLabel>
               <NativeSelect
                 id="session-agent"
-                value={input.agent}
+                value={useSource ? sourceRuntimeAgent : input.agent}
+                disabled={busy}
                 onChange={(event) => {
                   const agent = event.target
                     .value as SessionCreateInput["agent"];
+                  const nextAccounts = sessionLaunchAccounts(independentAccounts, agent);
+                  const supportsModelSource = agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi";
+                  if (!supportsModelSource) {
+                    setUseSource(false);
+                  } else if (agent === "pi" && nextAccounts.length === 0 && sourceSupported) {
+                    setUseSource(true);
+                  }
                   setInput({
                     ...input,
                     agent,
@@ -3221,17 +3224,14 @@ function NewSessionDialog({
               >
                 <NativeSelectOption value="codex">Codex</NativeSelectOption>
                 <NativeSelectOption value="claude">Claude</NativeSelectOption>
-                <NativeSelectOption value="deepseek">
-                  DeepSeek
-                </NativeSelectOption>
-                <NativeSelectOption value="opencode">
-                  OpenCode
-                </NativeSelectOption>
                 <NativeSelectOption value="pi">Pi</NativeSelectOption>
+                <NativeSelectOption value="opencode">OpenCode</NativeSelectOption>
+                <NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption>
                 <NativeSelectOption value="grok">Grok</NativeSelectOption>
                 <NativeSelectOption value="trae">Trae</NativeSelectOption>
                 <NativeSelectOption value="shell">Shell</NativeSelectOption>
               </NativeSelect>
+              <FieldDescription>{t("选择负责执行代码和工具操作的 Agent。", "Choose the agent that runs code and tools.")}</FieldDescription>
             </Field>
             <Field>
               <FieldLabel htmlFor="session-kind">
@@ -3240,12 +3240,13 @@ function NewSessionDialog({
               <NativeSelect
                 id="session-kind"
                 value={selectedKind}
+                disabled={busy || (useSource && sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi")}
                 onChange={(event) => {
                   const kind = event.target.value as SessionCreateInput["kind"];
                   setInput({
                     ...input,
                     kind,
-                    ...(kind === "pty" && input.agent !== "pi"
+                    ...(!useSource && kind === "pty" && input.agent !== "pi"
                       ? { model: undefined, effort: undefined }
                       : {}),
                   });
@@ -3253,137 +3254,162 @@ function NewSessionDialog({
               >
                 <NativeSelectOption
                   value="structured"
-                  disabled={!supportsStructured || (input.agent === "opencode" && !selectedAccount) || selectedAccount?.capabilities?.sessionKinds.includes("structured") === false}
+                  disabled={!useSource && (!supportsStructured || (input.agent === "opencode" && !selectedAccount) || selectedAccount?.capabilities?.sessionKinds.includes("structured") === false)}
                 >
                   {t("对话", "Conversation")}
                 </NativeSelectOption>
-                <NativeSelectOption value="pty" disabled={input.agent === "deepseek" || selectedAccount?.capabilities?.sessionKinds.includes("pty") === false || requiresStructured}>
-                  {t("Agent TUI · 终端", "Agent TUI · Terminal")}
+                <NativeSelectOption value="pty" disabled={!useSource && (input.agent === "deepseek" || selectedAccount?.capabilities?.sessionKinds.includes("pty") === false || requiresStructured)}>
+                  {t("终端 (Agent TUI)", "Agent TUI · Terminal")}
                 </NativeSelectOption>
               </NativeSelect>
-              {requiresStructured && <FieldDescription>{t("当前账号仅支持对话会话。", "This account supports conversation sessions only.")}</FieldDescription>}
+              {!useSource && requiresStructured && <FieldDescription>{t("当前账号仅支持对话会话。", "This account supports conversation sessions only.")}</FieldDescription>}
             </Field>
           </div>
-          {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi") && (
-            <Field>
-              <FieldLabel htmlFor="session-account">
-                {t("账号", "Account")}
-              </FieldLabel>
-              <NativeSelect
-                id="session-account"
-                value={input.accountId ?? ""}
-                onChange={(event) =>
-                  setInput({
-                    ...input,
-                    accountId: event.target.value || undefined,
-                    ...(input.agent === "opencode" ? { kind: event.target.value ? "structured" as const : "pty" as const } : {}),
-                    model: undefined,
-                    effort: undefined,
-                  })
-                }
-              >
-                {input.agent === "opencode" && <NativeSelectOption value="">{t("本机 OpenCode CLI", "Local OpenCode CLI")}</NativeSelectOption>}
-                {input.agent !== "opencode" && launchAccounts.length === 0 && (
-                  <NativeSelectOption value="" disabled>
-                    {t("没有可用账号", "No accounts available")}
-                  </NativeSelectOption>
-                )}
-                {launchAccounts.map((account) => (
-                  <NativeSelectOption value={account.id} key={account.id}>
-                    {account.name}
-                    {account.isDefault ? t("（默认）", " (default)") : ""}
-                  </NativeSelectOption>
-                ))}
-              </NativeSelect>
-              <FieldDescription>
-                {selectedAccount
-                  ? selectedAccount.apiProfileError ?? (selectedAccount.apiProfile ? `${t("模型", "Model")} · ${text(selectedAccount.apiProfile["model"])}` : status(selectedAccount.status))
-                  : input.agent === "opencode" ? t("使用本机 OpenCode 的登录和模型配置。", "Use the local OpenCode login and model configuration.") : t("在 Agents 与账号页面添加或登录账号。", "Add or sign in to an account from Agents & accounts.")}
-              </FieldDescription>
-            </Field>
-          )}
-          {supportsLaunchModels && (
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <FieldLabel htmlFor="session-model">
-                  {t("模型", "Model")}
-                </FieldLabel>
-                <NativeSelect
-                  id="session-model"
-                  value={input.model ?? ""}
-                  disabled={launchModelsLoading || launchModels.length === 0}
-                  aria-busy={launchModelsLoading}
-                  aria-describedby={launchModelsError ? "session-model-error" : undefined}
-                  aria-invalid={Boolean(launchModelsError)}
-                  onChange={(event) => {
-                    const model = launchModels.find(
-                      (candidate) => candidate.id === event.target.value,
-                    );
-                    setInput({
-                      ...input,
-                      model: model?.id,
-                      effort:
-                        model?.defaultEffort ?? model?.supportedEfforts[0],
-                    });
-                  }}
-                >
-                  <NativeSelectOption value="" disabled>
-                    {launchModelsLoading
-                      ? t("读取模型中…", "Loading models…")
-                      : t("没有可用模型", "No models available")}
-                  </NativeSelectOption>
-                  {launchModels.map((model) => (
-                    <NativeSelectOption value={model.id} key={model.id}>
-                      {model.label}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
-                <FieldDescription
-                  id={launchModelsError ? "session-model-error" : undefined}
-                  role={launchModelsError ? "alert" : undefined}
-                >
-                  {launchModelsError ??
-                    selectedLaunchModel?.description ??
-                    t("目录随所选账号实时读取。", "Catalog loaded for the selected account.")}
-                </FieldDescription>
-                {!launchModelsLoading && (launchModelsError || launchModels.length === 0) && <Button
-                  className="session-retry-models w-fit" variant="ghost" size="sm"
-                  onClick={() => setLaunchModelsRetry(value => value + 1)}
-                ><RefreshCw />{launchModelsError ? t("重试读取模型", "Retry loading models") : t("刷新模型列表", "Refresh model list")}</Button>}
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="session-effort">
-                  {t("推理强度", "Reasoning effort")}
-                </FieldLabel>
-                <NativeSelect
-                  id="session-effort"
-                  value={input.effort ?? ""}
-                  disabled={selectedAccount?.capabilities?.reasoningEffort === false || !selectedLaunchModel?.supportedEfforts.length}
-                  onChange={(event) =>
-                    setInput({
-                      ...input,
-                      effort: event.target.value || undefined,
-                    })
-                  }
-                >
-                  <NativeSelectOption value="" disabled>
-                    {t("使用模型默认值", "Use model default")}
-                  </NativeSelectOption>
-                  {selectedLaunchModel?.supportedEfforts.map((effort) => (
-                    <NativeSelectOption value={effort} key={effort}>
-                      {effort}
-                    </NativeSelectOption>
-                  ))}
-                </NativeSelect>
-                <FieldDescription>
-                  {selectedLaunchModel?.supportedEfforts.length
-                    ? t("只显示该模型支持的档位。", "Only efforts supported by this model are shown.")
-                    : t("当前模型没有可选档位。", "This model has no selectable effort levels.")}
-                </FieldDescription>
-              </Field>
+          {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" || input.agent === "deepseek") && (
+            <div className="session-auth-card">
+              <div className="session-auth-card-head">
+                <span className="session-auth-card-title">{t("模型与认证来源", "Model & authentication source")}</span>
+                <Button className="session-configure-accounts w-fit h-7 px-2 text-xs" variant="ghost" size="sm" onClick={() => onConfigureAccounts({ input: { ...input, approvalPolicy: selectedApprovalPolicy }, useSource, sourceSelection })}>
+                  <Settings />{t("管理订阅与模型源", "Manage subscriptions & model sources")}
+                </Button>
+              </div>
+              {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi") && (
+                <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}>
+                  <Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>
+                    {t("订阅登录态", "Subscription login")}{launchAccounts.length > 0 ? ` (${launchAccounts.length})` : ""}
+                  </Button>
+                  <Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>
+                    {t("API 模型源", "API model source")}
+                  </Button>
+                </div>
+              )}
+              {useSource ? (
+                <SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} />
+              ) : (
+                <>
+                  {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi") && (
+                    <Field>
+                      <FieldLabel htmlFor="session-account">
+                        {t("订阅账号", "Subscription account")}
+                      </FieldLabel>
+                      <NativeSelect
+                        id="session-account"
+                        value={input.accountId ?? ""}
+                        onChange={(event) =>
+                          setInput({
+                            ...input,
+                            accountId: event.target.value || undefined,
+                            ...(input.agent === "opencode" ? { kind: event.target.value ? "structured" as const : "pty" as const } : {}),
+                            model: undefined,
+                            effort: undefined,
+                          })
+                        }
+                      >
+                        {input.agent === "opencode" && <NativeSelectOption value="">{t("本机 OpenCode CLI", "Local OpenCode CLI")}</NativeSelectOption>}
+                        {input.agent !== "opencode" && launchAccounts.length === 0 && (
+                          <NativeSelectOption value="" disabled>
+                            {t("没有可用订阅账号（可切换到上方 API 模型源）", "No subscription accounts (switch to API model source above)")}
+                          </NativeSelectOption>
+                        )}
+                        {launchAccounts.map((account) => (
+                          <NativeSelectOption value={account.id} key={account.id}>
+                            {account.name}
+                            {account.isDefault ? t("（默认）", " (default)") : ""}
+                          </NativeSelectOption>
+                        ))}
+                      </NativeSelect>
+                      <FieldDescription>
+                        {selectedAccount
+                          ? selectedAccount.apiProfileError ?? (selectedAccount.apiProfile ? `${t("模型", "Model")} · ${text(selectedAccount.apiProfile["model"])}` : `● ${status(selectedAccount.status)}`)
+                          : input.agent === "opencode" ? t("使用本机 OpenCode 的登录和模型配置。", "Use the local OpenCode login and model configuration.") : t("在“账号与模型源”页面的订阅管理中添加或登录官方订阅。", "Add or sign in to a subscription from Accounts & model sources.")}
+                      </FieldDescription>
+                    </Field>
+                  )}
+                  {supportsLaunchModels && (
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <Field>
+                        <FieldLabel htmlFor="session-model">
+                          {t("模型", "Model")}
+                        </FieldLabel>
+                        <NativeSelect
+                          id="session-model"
+                          value={input.model ?? ""}
+                          disabled={launchModelsLoading || launchModels.length === 0}
+                          aria-busy={launchModelsLoading}
+                          aria-describedby={launchModelsError ? "session-model-error" : undefined}
+                          aria-invalid={Boolean(launchModelsError)}
+                          onChange={(event) => {
+                            const model = launchModels.find(
+                              (candidate) => candidate.id === event.target.value,
+                            );
+                            setInput({
+                              ...input,
+                              model: model?.id,
+                              effort:
+                                model?.defaultEffort ?? model?.supportedEfforts[0],
+                            });
+                          }}
+                        >
+                          <NativeSelectOption value="" disabled>
+                            {launchModelsLoading
+                              ? t("读取模型中…", "Loading models…")
+                              : t("没有可用模型", "No models available")}
+                          </NativeSelectOption>
+                          {launchModels.map((model) => (
+                            <NativeSelectOption value={model.id} key={model.id}>
+                              {model.label}
+                            </NativeSelectOption>
+                          ))}
+                        </NativeSelect>
+                        <FieldDescription
+                          id={launchModelsError ? "session-model-error" : undefined}
+                          role={launchModelsError ? "alert" : undefined}
+                        >
+                          {launchModelsError ??
+                            selectedLaunchModel?.description ??
+                            t("目录随所选订阅账号实时读取。", "Catalog loaded for the selected subscription.")}
+                        </FieldDescription>
+                        {!launchModelsLoading && (launchModelsError || launchModels.length === 0) && <Button
+                          className="session-retry-models w-fit" variant="ghost" size="sm"
+                          onClick={() => setLaunchModelsRetry(value => value + 1)}
+                        ><RefreshCw />{launchModelsError ? t("重试读取模型", "Retry loading models") : t("刷新模型列表", "Refresh model list")}</Button>}
+                      </Field>
+                      <Field>
+                        <FieldLabel htmlFor="session-effort">
+                          {t("推理强度", "Reasoning effort")}
+                        </FieldLabel>
+                        <NativeSelect
+                          id="session-effort"
+                          value={input.effort ?? ""}
+                          disabled={selectedAccount?.capabilities?.reasoningEffort === false || !selectedLaunchModel?.supportedEfforts.length}
+                          onChange={(event) =>
+                            setInput({
+                              ...input,
+                              effort: event.target.value || undefined,
+                            })
+                          }
+                        >
+                          <NativeSelectOption value="" disabled>
+                            {t("使用模型默认值", "Use model default")}
+                          </NativeSelectOption>
+                          {selectedLaunchModel?.supportedEfforts.map((effort) => (
+                            <NativeSelectOption value={effort} key={effort}>
+                              {effort}
+                            </NativeSelectOption>
+                          ))}
+                        </NativeSelect>
+                        <FieldDescription>
+                          {selectedLaunchModel?.supportedEfforts.length
+                            ? t("只显示该模型支持的档位。", "Only efforts supported by this model are shown.")
+                            : t("当前模型没有可选档位。", "This model has no selectable effort levels.")}
+                        </FieldDescription>
+                      </Field>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           )}
-          </>}
           <Field>
             <FieldLabel htmlFor="session-approval">
               {t("操作确认", "Action approval")}
