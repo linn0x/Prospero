@@ -402,11 +402,11 @@ pub async fn run(
         }
         if !args
             .iter()
-            .any(|arg| arg.starts_with("tui.keymap.editor.kill_whole_line="))
+            .any(|arg| arg.starts_with("tui.keymap.editor.kill_line_start="))
         {
             args.extend([
                 "-c".into(),
-                "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]".into(),
+                "tui.keymap.editor.kill_line_start=[]".into(),
             ]);
         }
         if !args
@@ -415,7 +415,7 @@ pub async fn run(
         {
             args.extend([
                 "-c".into(),
-                "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl+u\"]".into(),
+                "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl-u\"]".into(),
             ]);
         }
         args.extend([

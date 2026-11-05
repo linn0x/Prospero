@@ -102,7 +102,7 @@ fn is_codex_command(command: &CommandBuilder) -> bool {
         .any(|pair| pair[0] == "--agent" && pair[1] == "codex")
         || argv
             .iter()
-            .any(|arg| arg == "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]")
+            .any(|arg| arg == "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl-u\"]")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
