@@ -421,10 +421,72 @@ fn probe_pi_status(pi_runtime_ok: bool) -> AuthProbe {
     }
 }
 
+fn path_stamp(path: &std::path::Path) -> (u128, u64) {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (mtime, meta.len())
+        })
+        .unwrap_or((0, 0))
+}
+
+fn env_files_fingerprint(
+    environment: &[(String, String)],
+    dir_key: &str,
+    files: &[&str],
+) -> String {
+    let mut out = String::from(dir_key);
+    out.push('|');
+    for (k, v) in environment {
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+        out.push(';');
+    }
+    let dir = environment
+        .iter()
+        .find(|(k, _)| k == dir_key)
+        .map(|(_, v)| std::path::PathBuf::from(v))
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
+    if let Some(dir) = dir {
+        let (dm, dl) = path_stamp(&dir);
+        out.push_str(&format!("dir:{dm}:{dl};"));
+        for file in files {
+            let (fm, fl) = path_stamp(&dir.join(file));
+            out.push_str(&format!("{file}:{fm}:{fl};"));
+        }
+    }
+    out
+}
+
+fn auth_probe_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, AuthProbe)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, AuthProbe)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn invalidate_probe_cache() {
+    if let Ok(mut guard) = auth_probe_cache().lock() {
+        guard.clear();
+    }
+}
+
 async fn probe_codex_status(data: &std::path::Path) -> AuthProbe {
-    let (cwd, environment) = match crate::agent::native_codex_environment(data) {
-        Ok(value) => value,
-        Err(_) => {
+    let data = data.to_owned();
+    let prepared =
+        tokio::task::spawn_blocking(move || crate::agent::native_codex_environment(&data)).await;
+    let (cwd, environment) = match prepared {
+        Ok(Ok(value)) => value,
+        _ => {
             return AuthProbe {
                 status: AccountStatus::Error,
                 detail: Some("无法准备 Codex 账号目录".into()),
@@ -439,6 +501,24 @@ async fn probe_codex_status_with_env(
     cwd: &std::path::Path,
     environment: &[(String, String)],
 ) -> AuthProbe {
+    let cache_key = std::env::var_os("PROSPERO_CODEX_BIN").is_none().then(|| {
+        format!(
+            "codex:{}:{}",
+            cwd.display(),
+            env_files_fingerprint(
+                environment,
+                "CODEX_HOME",
+                &["auth.json", "config.toml", ".codex/auth.json", ".codex/config.toml"],
+            )
+        )
+    });
+    if let Some(key) = &cache_key
+        && let Ok(guard) = auth_probe_cache().lock()
+        && let Some((checked_at, cached)) = guard.get(key)
+        && checked_at.elapsed() < Duration::from_secs(30)
+    {
+        return cached.clone();
+    }
     let binary = std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut command = Command::new(binary);
     command
@@ -451,7 +531,7 @@ async fn probe_codex_status_with_env(
         command.env(key, value);
     }
     let output = command.output();
-    match tokio::time::timeout(CODEX_STATUS_TIMEOUT, output).await {
+    let result = match tokio::time::timeout(CODEX_STATUS_TIMEOUT, output).await {
         Ok(Ok(output)) => {
             let raw = format!(
                 "{}\n{}",
@@ -460,26 +540,26 @@ async fn probe_codex_status_with_env(
             );
             let raw = raw.trim();
             if raw.is_empty() || raw.to_ascii_lowercase().contains("not logged in") {
-                return AuthProbe::default();
-            }
-            if !output.status.success() {
-                return AuthProbe {
+                AuthProbe::default()
+            } else if !output.status.success() {
+                AuthProbe {
                     status: AccountStatus::Error,
                     detail: Some("Codex CLI 无法读取登录状态".into()),
                     ..Default::default()
-                };
-            }
-            let auth_method = raw
-                .to_ascii_lowercase()
-                .split("logged in")
-                .nth(1)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.chars().take(200).collect::<String>());
-            AuthProbe {
-                status: AccountStatus::SignedIn,
-                auth_method,
-                detail: None,
+                }
+            } else {
+                let auth_method = raw
+                    .to_ascii_lowercase()
+                    .split("logged in")
+                    .nth(1)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.chars().take(200).collect::<String>());
+                AuthProbe {
+                    status: AccountStatus::SignedIn,
+                    auth_method,
+                    detail: None,
+                }
             }
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => AuthProbe {
@@ -492,7 +572,17 @@ async fn probe_codex_status_with_env(
             detail: Some("Codex CLI 无法读取登录状态".into()),
             ..Default::default()
         },
+    };
+    if let Some(key) = cache_key
+        && matches!(
+            result.status,
+            AccountStatus::SignedIn | AccountStatus::SignedOut | AccountStatus::Unavailable
+        )
+        && let Ok(mut guard) = auth_probe_cache().lock()
+    {
+        guard.insert(key, (std::time::Instant::now(), result.clone()));
     }
+    result
 }
 
 fn merge_detail(base: Option<String>, override_summary: Option<String>) -> Option<String> {
@@ -505,7 +595,7 @@ fn merge_detail(base: Option<String>, override_summary: Option<String>) -> Optio
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthProbe {
     status: AccountStatus,
     auth_method: Option<String>,
@@ -525,6 +615,29 @@ impl Default for AuthProbe {
 /// Runs `<claude> auth status --json` with the given environment overrides.
 /// Read-only: stdin/null, never clears the inherited environment.
 async fn probe_auth_status(environment: &[(String, String)]) -> AuthProbe {
+    let cache_key = std::env::var_os("PROSPERO_CLAUDE_BIN").is_none().then(|| {
+        format!(
+            "claude:{}",
+            env_files_fingerprint(
+                environment,
+                "CLAUDE_CONFIG_DIR",
+                &[
+                    ".credentials.json",
+                    ".claude.json",
+                    "settings.json",
+                    ".claude/.credentials.json",
+                    ".claude/settings.json",
+                ],
+            )
+        )
+    });
+    if let Some(key) = &cache_key
+        && let Ok(guard) = auth_probe_cache().lock()
+        && let Some((checked_at, cached)) = guard.get(key)
+        && checked_at.elapsed() < Duration::from_secs(30)
+    {
+        return cached.clone();
+    }
     let mut command = Command::new(binary());
     command
         .arg("auth")
@@ -540,11 +653,17 @@ async fn probe_auth_status(environment: &[(String, String)]) -> AuthProbe {
     let child = match tokio::time::timeout(STATUS_TIMEOUT, output).await {
         Ok(Ok(child)) => child,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return AuthProbe {
+            let probe = AuthProbe {
                 status: AccountStatus::Unavailable,
                 detail: Some("未安装 claude".into()),
                 ..Default::default()
             };
+            if let Some(key) = cache_key
+                && let Ok(mut guard) = auth_probe_cache().lock()
+            {
+                guard.insert(key, (std::time::Instant::now(), probe.clone()));
+            }
+            return probe;
         }
         Ok(Err(_)) | Err(_) => {
             return AuthProbe {
@@ -563,29 +682,35 @@ async fn probe_auth_status(environment: &[(String, String)]) -> AuthProbe {
     }
     let raw = String::from_utf8_lossy(&child.stdout);
     let raw = raw.trim();
-    if raw.is_empty() {
-        return AuthProbe::default();
-    }
-    let parsed: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(value) => value,
-        Err(_) => return AuthProbe::default(),
+    let probe = if raw.is_empty() {
+        AuthProbe::default()
+    } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+        if parsed.get("loggedIn") != Some(&serde_json::Value::Bool(true)) {
+            AuthProbe::default()
+        } else {
+            let auth_method = parsed
+                .get("authMethod")
+                .and_then(|value| value.as_str())
+                .map(|value| value.chars().take(200).collect::<String>());
+            let detail = parsed
+                .get("apiProvider")
+                .and_then(|value| value.as_str())
+                .map(|value| value.chars().take(1000).collect::<String>());
+            AuthProbe {
+                status: AccountStatus::SignedIn,
+                auth_method,
+                detail,
+            }
+        }
+    } else {
+        AuthProbe::default()
     };
-    if parsed.get("loggedIn") != Some(&serde_json::Value::Bool(true)) {
-        return AuthProbe::default();
+    if let Some(key) = cache_key
+        && let Ok(mut guard) = auth_probe_cache().lock()
+    {
+        guard.insert(key, (std::time::Instant::now(), probe.clone()));
     }
-    let auth_method = parsed
-        .get("authMethod")
-        .and_then(|value| value.as_str())
-        .map(|value| value.chars().take(200).collect::<String>());
-    let detail = parsed
-        .get("apiProvider")
-        .and_then(|value| value.as_str())
-        .map(|value| value.chars().take(1000).collect::<String>());
-    AuthProbe {
-        status: AccountStatus::SignedIn,
-        auth_method,
-        detail,
-    }
+    probe
 }
 
 #[allow(dead_code)]
@@ -872,6 +997,9 @@ async fn snapshot_with(
             }
         })
         .await?;
+    if action != "list" {
+        invalidate_probe_cache();
+    }
     let any_claude_default = managed
         .iter()
         .any(|record| record.agent == crate::protocol::AgentKind::Claude && record.is_default);
@@ -879,14 +1007,22 @@ async fn snapshot_with(
         .iter()
         .any(|record| record.agent == crate::protocol::AgentKind::Codex && record.is_default);
     let native_claude_env = managed::native_claude_environment(&data).unwrap_or_default();
-    let probe = probe_auth_status(&native_claude_env).await;
-    // The isolated runtime probe feeds both the native row and profile rows;
-    // run it once per snapshot.
-    let claude_runtime_ok = probe::runtime_available().await;
-    let codex_runtime_ok = probe::codex_runtime_available().await;
-    let opencode_runtime_ok = probe::opencode_runtime_available().await;
-    let pi_runtime_ok = probe::pi_runtime_available().await;
-    let codex_probe = probe_codex_status(&data).await;
+    // Run the isolated runtime probes and native status probes concurrently.
+    let (
+        probe,
+        claude_runtime_ok,
+        codex_runtime_ok,
+        opencode_runtime_ok,
+        pi_runtime_ok,
+        codex_probe,
+    ) = tokio::join!(
+        probe_auth_status(&native_claude_env),
+        probe::runtime_available(),
+        probe::codex_runtime_available(),
+        probe::opencode_runtime_available(),
+        probe::pi_runtime_available(),
+        probe_codex_status(&data),
+    );
     let pi_probe = probe_pi_status(pi_runtime_ok);
     let native_claude_summary = config::read_override_summary(&data, NATIVE_CLAUDE_ID);
     let native_codex_summary =
@@ -954,11 +1090,11 @@ async fn snapshot_with(
             active_sessions: native_pi_active,
         },
     ];
-    for record in managed {
+    let row_futures = managed.into_iter().map(|record| {
         let active = managed_active.remove(&record.id).unwrap_or(0);
-        if record.api_profile.is_some() {
-            let binding = bindings.get(&record.id).cloned();
-            accounts.push(
+        let binding = bindings.get(&record.id).cloned();
+        async move {
+            if record.api_profile.is_some() {
                 profile_row(
                     database,
                     record,
@@ -969,12 +1105,14 @@ async fn snapshot_with(
                     pi_runtime_ok,
                     binding,
                 )
-                .await?,
-            );
-        } else {
-            accounts.push(managed_row(database, record, active).await?);
+                .await
+            } else {
+                managed_row(database, record, active).await
+            }
         }
-    }
+    });
+    let managed_rows = futures_util::future::try_join_all(row_futures).await?;
+    accounts.extend(managed_rows);
     Ok(AccountListResult {
         kind: "agent.accounts.result".into(),
         request_id: request_id.chars().take(100).collect(),

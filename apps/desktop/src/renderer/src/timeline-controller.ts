@@ -58,7 +58,14 @@ export class TimelineController {
   }
 
   private validate(items: TimelineRecord[]): void {
-    if (items.length > 40 || new TextEncoder().encode(JSON.stringify(items)).byteLength > 1024 * 1024) throw new Error("Timeline page exceeds limit");
+    if (items.length > 40) throw new Error("Timeline page exceeds limit");
+    let estimatedMaxBytes = 64;
+    for (const item of items) {
+      estimatedMaxBytes += 2048 + (item.preview?.length ?? 0) * 6;
+    }
+    if (estimatedMaxBytes > 1024 * 1024 && new TextEncoder().encode(JSON.stringify(items)).byteLength > 1024 * 1024) {
+      throw new Error("Timeline page exceeds limit");
+    }
   }
 
   /**
