@@ -758,8 +758,8 @@ export class RustRuntime {
           || input["protocol"] !== undefined || input["headers"] !== undefined;
         if (accountId !== undefined) {
           if (hasDraft) throw new Error("模型目录请求不能同时指定账号与草稿配置");
-          modelsBody["accountId"] = accountId === NATIVE_CLAUDE_ACCOUNT
-            ? NATIVE_CLAUDE_ACCOUNT
+          modelsBody["accountId"] = accountId === NATIVE_CLAUDE_ACCOUNT || accountId === NATIVE_CODEX_ACCOUNT
+            ? accountId
             : requireManagedAccountId(accountId);
         } else {
           if (input["protocol"] !== undefined) {
@@ -778,10 +778,13 @@ export class RustRuntime {
         return models as unknown as JsonObject;
       }
       if (ACCOUNT_CONFIG_TYPES.has(type)) {
+        const rawAccountId = input["accountId"];
         const configBody: Record<string, unknown> = {
           type,
           requestId: input["requestId"],
-          accountId: requireManagedAccountId(input["accountId"]),
+          accountId: rawAccountId === NATIVE_CLAUDE_ACCOUNT || rawAccountId === NATIVE_CODEX_ACCOUNT
+            ? rawAccountId
+            : requireManagedAccountId(rawAccountId),
         };
         if (type === "agent.account.config.set") {
           const documentId = input["documentId"] ?? "claude-overrides";
