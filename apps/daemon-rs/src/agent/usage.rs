@@ -133,6 +133,17 @@ fn prepare_native_codex_environment(home: &Path, sqlite: &Path) -> Result<Vec<(S
             replace_file_atomically(&shared_config, &target_config)?;
         }
     }
+    let target_models = home.join("models_cache.json");
+    let shared_models = shared_codex_home().join("models_cache.json");
+    if shared_models != target_models && shared_models.is_file() {
+        let shared_time = std::fs::metadata(&shared_models)?.modified()?;
+        let target_time = std::fs::metadata(&target_models)
+            .and_then(|value| value.modified())
+            .ok();
+        if target_time.is_none_or(|time| shared_time > time) {
+            let _ = replace_file_atomically(&shared_models, &target_models);
+        }
+    }
     FileExt::unlock(&lock)?;
 
     Ok(vec![
@@ -762,17 +773,233 @@ fn codex_models_from_response(value: &Value, models: &mut Vec<crate::agent::Laun
                 .and_then(Value::as_str)
                 .map(|value| trim_codex(value, 1000)),
             supported_efforts,
-            default_effort: None,
+            default_effort: row
+                .get("defaultReasoningEffort")
+                .or_else(|| row.get("default_reasoning_level"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| trim_codex(value, 80)),
             is_default: row.get("isDefault").and_then(Value::as_bool) == Some(true),
         });
     }
+}
+
+fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchModelInfo>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    let rows = parsed.get("models")?.as_array()?;
+    let mut models = Vec::new();
+    for item in rows {
+        let Some(row) = item.as_object() else {
+            continue;
+        };
+        if let Some(visibility) = row.get("visibility").and_then(Value::as_str)
+            && visibility != "list"
+        {
+            continue;
+        }
+        let id = row
+            .get("slug")
+            .or_else(|| row.get("model"))
+            .or_else(|| row.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() || id.chars().count() > 160 {
+            continue;
+        }
+        let label = row
+            .get("display_name")
+            .or_else(|| row.get("displayName"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(id);
+        let supported_efforts = row
+            .get("supported_reasoning_levels")
+            .or_else(|| row.get("supportedReasoningEfforts"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.as_str().or_else(|| {
+                            entry
+                                .as_object()
+                                .and_then(|item| {
+                                    item.get("effort").or_else(|| item.get("reasoningEffort"))
+                                })
+                                .and_then(Value::as_str)
+                        })
+                    })
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.chars().take(80).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let is_default = models.is_empty();
+        models.push(crate::agent::LaunchModelInfo {
+            id: id.to_owned(),
+            label: trim_codex(label, 160),
+            description: row
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|value| trim_codex(value, 1000)),
+            supported_efforts,
+            default_effort: row
+                .get("default_reasoning_level")
+                .or_else(|| row.get("defaultReasoningEffort"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| trim_codex(value, 80)),
+            is_default,
+        });
+    }
+    (!models.is_empty()).then_some(models)
+}
+
+fn codex_config_defaults(codex_home: &Path) -> (Option<String>, Option<String>) {
+    let Ok(source) = std::fs::read_to_string(codex_home.join("config.toml")) else {
+        return (None, None);
+    };
+    let Ok(config) = toml::from_str::<toml::Value>(&source) else {
+        return (None, None);
+    };
+    let selected = config
+        .get("profile")
+        .and_then(toml::Value::as_str)
+        .and_then(|name| config.get("profiles")?.get(name));
+    let value = |key: &str| {
+        selected
+            .and_then(|table| table.get(key))
+            .or_else(|| config.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    (value("model"), value("model_reasoning_effort"))
+}
+
+fn apply_codex_catalog_defaults(
+    catalog: &mut crate::agent::LaunchModelCatalog,
+    preferred_model: Option<String>,
+    preferred_effort: Option<String>,
+) {
+    if let Some(model_id) = preferred_model
+        && catalog.models.iter().any(|model| model.id == model_id)
+    {
+        catalog.current_model = Some(model_id);
+    }
+    let active_model = catalog
+        .current_model
+        .as_deref()
+        .and_then(|id| catalog.models.iter().find(|model| model.id == id))
+        .or_else(|| catalog.models.iter().find(|model| model.is_default))
+        .or_else(|| catalog.models.first());
+    if let Some(effort) = preferred_effort
+        && active_model
+            .is_some_and(|model| model.supported_efforts.iter().any(|item| item == &effort))
+    {
+        catalog.current_effort = Some(effort);
+    } else if catalog.current_effort.is_none() {
+        catalog.current_effort = active_model.and_then(|model| model.default_effort.clone());
+    }
+}
+
+pub(crate) fn fast_codex_catalog_for_account(
+    data: &Path,
+    account_id: &str,
+) -> crate::agent::LaunchModelCatalog {
+    let target = crate::accounts::config::ConfigTarget {
+        account_id: account_id.to_owned(),
+        model: None,
+        model_capabilities: None,
+        active_sessions: 0,
+    };
+    let (override_model, override_effort) =
+        crate::accounts::config::read_defaults(data, &target).unwrap_or((None, None));
+    let account_home = if account_id == NATIVE_CODEX_ID {
+        shared_codex_home()
+    } else {
+        data.join("agent-accounts").join("codex").join(account_id)
+    };
+    let (config_model, config_effort) = if std::env::var_os("PROSPERO_CODEX_BIN").is_none() {
+        let local = codex_config_defaults(&account_home);
+        if local.0.is_some() || local.1.is_some() {
+            local
+        } else {
+            codex_config_defaults(&shared_codex_home())
+        }
+    } else {
+        (None, None)
+    };
+    let models = if std::env::var_os("PROSPERO_CODEX_BIN").is_none() {
+        codex_models_from_cache_file(&account_home.join("models_cache.json"))
+            .or_else(|| codex_models_from_cache_file(&shared_codex_home().join("models_cache.json")))
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        vec![crate::agent::LaunchModelInfo {
+            id: "default".into(),
+            label: "Default".into(),
+            description: None,
+            supported_efforts: vec![
+                "minimal".into(),
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+                "ultra".into(),
+            ],
+            default_effort: Some("medium".into()),
+            is_default: true,
+        }]
+    });
+    let current_model = models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| models.first())
+        .map(|model| model.id.clone());
+    let mut catalog = crate::agent::LaunchModelCatalog {
+        models,
+        current_model,
+        current_effort: None,
+        presets: Vec::new(),
+        current_preset: None,
+    };
+    apply_codex_catalog_defaults(
+        &mut catalog,
+        override_model.or(config_model),
+        override_effort.or(config_effort),
+    );
+    catalog
 }
 
 pub(crate) async fn read_native_codex_models(
     data: &Path,
 ) -> Result<crate::agent::LaunchModelCatalog> {
     let (cwd, env) = native_codex_environment(data)?;
-    read_codex_models(data, cwd, &env, &[]).await
+    let target = crate::accounts::config::ConfigTarget {
+        account_id: NATIVE_CODEX_ID.to_owned(),
+        model: None,
+        model_capabilities: None,
+        active_sessions: 0,
+    };
+    let (override_model, override_effort) =
+        crate::accounts::config::read_defaults(data, &target).unwrap_or((None, None));
+    let mut catalog = read_codex_models(data, cwd, &env, &[]).await?;
+    let (config_model, config_effort) = if std::env::var_os("PROSPERO_CODEX_BIN").is_none() {
+        codex_config_defaults(&shared_codex_home())
+    } else {
+        (None, None)
+    };
+    apply_codex_catalog_defaults(
+        &mut catalog,
+        override_model.or(config_model),
+        override_effort.or(config_effort),
+    );
+    Ok(catalog)
 }
 
 pub(crate) async fn read_codex_models_for_account(
@@ -781,13 +1008,36 @@ pub(crate) async fn read_codex_models_for_account(
 ) -> Result<crate::agent::LaunchModelCatalog> {
     let data_for_env = data.to_owned();
     let id = account_id.to_owned();
-    let env = tokio::task::spawn_blocking(move || {
-        crate::accounts::managed::codex_subscription_environment(&data_for_env, &id)
+    let (env, (override_model, override_effort)) = tokio::task::spawn_blocking(move || {
+        let env = crate::accounts::managed::codex_subscription_environment(&data_for_env, &id)?;
+        let target = crate::accounts::config::ConfigTarget {
+            account_id: id,
+            model: None,
+            model_capabilities: None,
+            active_sessions: 0,
+        };
+        let defaults =
+            crate::accounts::config::read_defaults(&data_for_env, &target).unwrap_or((None, None));
+        Ok::<_, Error>((env, defaults))
     })
     .await
     .map_err(|_| Error::Closed)??;
     let cwd = user_home().unwrap_or_else(|| PathBuf::from("/"));
-    read_codex_models(data, cwd, &env, &[]).await
+    let mut catalog = read_codex_models(data, cwd, &env, &[]).await?;
+    let (config_model, config_effort) = if std::env::var_os("PROSPERO_CODEX_BIN").is_none() {
+        env.iter()
+            .find(|(key, _)| key == "CODEX_HOME")
+            .map(|(_, path)| codex_config_defaults(Path::new(path)))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+    apply_codex_catalog_defaults(
+        &mut catalog,
+        override_model.or(config_model),
+        override_effort.or(config_effort),
+    );
+    Ok(catalog)
 }
 
 async fn read_codex_models(
@@ -796,6 +1046,30 @@ async fn read_codex_models(
     env: &[(String, String)],
     app_server_args: &[String],
 ) -> Result<crate::agent::LaunchModelCatalog> {
+    if std::env::var_os("PROSPERO_CODEX_BIN").is_none() && app_server_args.is_empty() {
+        let codex_home = env
+            .iter()
+            .find(|(key, _)| key == "CODEX_HOME")
+            .map(|(_, value)| PathBuf::from(value));
+        let cached = codex_home
+            .as_deref()
+            .and_then(|home| codex_models_from_cache_file(&home.join("models_cache.json")))
+            .or_else(|| codex_models_from_cache_file(&shared_codex_home().join("models_cache.json")));
+        if let Some(models) = cached {
+            let current_model = models
+                .iter()
+                .find(|model| model.is_default)
+                .or_else(|| models.first())
+                .map(|model| model.id.clone());
+            return Ok(crate::agent::LaunchModelCatalog {
+                models,
+                current_model,
+                current_effort: None,
+                presets: Vec::new(),
+                current_preset: None,
+            });
+        }
+    }
     let mut rpc = CodexRpc::start_with_args(data, cwd, env, app_server_args).await?;
     let result = async {
         let mut models = Vec::new();

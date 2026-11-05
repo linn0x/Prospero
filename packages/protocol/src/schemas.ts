@@ -36,7 +36,7 @@ export const AgentApiProtocolSchema = z.enum([
 ]);
 
 export const AgentExecutionEngineSchema = z.enum(["codex", "claude", "opencode", "pi"]);
-export const AgentReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+export const AgentReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 export const AgentAccountCapabilitiesSchema = z.object({
   sessionKinds: z.array(z.enum(["pty", "structured"])).max(2),
   plan: z.boolean(),
@@ -528,6 +528,7 @@ export const C2SAgentAccountConfigSetSchema = z.object({
   documentId: z.string().regex(/^[a-z][a-z0-9-]{0,79}$/),
   revision: z.string().regex(/^[a-f0-9]{64}$/),
   content: z.string().max(16_384).optional(),
+  defaultModel: z.string().max(300).nullable().optional(),
   defaultEffort: AgentReasoningEffortSchema.nullable().optional(),
   proxyUrl: z.string().max(2000).nullable().optional(),
   noProxy: z.string().max(1000).nullable().optional(),

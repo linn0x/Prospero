@@ -170,7 +170,9 @@ fn positive_limit(value: &serde_json::Value) -> Option<i64> {
         .filter(|value| (1..=100_000_000).contains(value))
 }
 
-const ALLOWED_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const ALLOWED_EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 /// Derives model capabilities from one catalog row, Anthropic field names.
 fn row_capabilities(row: &serde_json::Value) -> Option<ModelCapabilities> {

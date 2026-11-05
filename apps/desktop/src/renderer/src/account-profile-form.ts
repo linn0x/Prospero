@@ -20,7 +20,7 @@ export const accountApiProtocols: AccountApiProtocol[] = [
 ];
 
 export const ACCOUNT_API_PROTOCOLS_CAPABILITY = "agent.api-protocols.v1";
-export const accountReasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const accountReasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 export function supportsAccountApiValidation(capabilities?: readonly string[]): boolean {
   return capabilities?.includes("agent.api-validation.v1") === true;

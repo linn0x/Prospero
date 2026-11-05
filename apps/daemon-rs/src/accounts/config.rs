@@ -17,7 +17,9 @@ use super::profile::ModelCapabilities;
 
 const MAX_BYTES: usize = 16_384;
 const MAX_ENV_ENTRIES: usize = 64;
-const ALLOWED_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const ALLOWED_EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 const RESERVED_ENV_KEYS: &[&str] = &[
     "PATH",
     "HOME",
@@ -525,6 +527,7 @@ fn supported_efforts(
                 model
                     .and_then(|model| catalog.models.iter().find(|entry| entry.id == *model))
                     .or_else(|| catalog.models.iter().find(|entry| entry.is_default))
+                    .or_else(|| catalog.models.first())
             })
             .map(|entry| entry.supported_efforts.clone())
             .unwrap_or_default()
@@ -546,7 +549,12 @@ pub(crate) fn read_defaults(
     let file = file_path(&root);
     let original = read_file(&file)?.unwrap_or_default();
     let overrides = parse(&original, target, false)?;
-    Ok((overrides.default_model, overrides.default_effort))
+    let default_effort = overrides.default_effort.or_else(|| {
+        super::sources::ModelSources::open(data)
+            .ok()
+            .and_then(|sources| sources.bound_default_effort(&target.account_id))
+    });
+    Ok((overrides.default_model, default_effort))
 }
 
 /// Returns environment variable overrides (`HTTPS_PROXY`, `HTTP_PROXY`,
@@ -630,6 +638,11 @@ pub(crate) fn get_config(
     let overrides = parse(&original, &target, false)?;
     let content = stringify(&overrides);
     let efforts = supported_efforts(&target, &overrides, catalog);
+    let default_effort = overrides.default_effort.or_else(|| {
+        super::sources::ModelSources::open(data)
+            .ok()
+            .and_then(|sources| sources.bound_default_effort(&target.account_id))
+    });
     Ok(AgentAccountConfig {
         account_id: target.account_id,
         documents: vec![AccountConfigDocument {
@@ -652,7 +665,7 @@ pub(crate) fn get_config(
                 ]
             },
         }],
-        default_effort: overrides.default_effort,
+        default_effort,
         default_model: overrides.default_model,
         proxy_url: overrides.proxy_url,
         no_proxy: overrides.no_proxy,
@@ -670,6 +683,7 @@ pub(crate) fn save_config(
     document_id: &str,
     revision: &str,
     content: Option<&str>,
+    default_model: Option<Option<String>>,
     default_effort: Option<Option<String>>,
     proxy_url: Option<Option<String>>,
     no_proxy: Option<Option<String>>,
@@ -683,6 +697,7 @@ pub(crate) fn save_config(
         ));
     }
     if content.is_none()
+        && default_model.is_none()
         && default_effort.is_none()
         && proxy_url.is_none()
         && no_proxy.is_none()
@@ -693,7 +708,12 @@ pub(crate) fn save_config(
             "没有需要保存的配置".into(),
         ));
     }
-    if target.model.is_some() && (proxy_url.is_some() || no_proxy.is_some() || env.is_some()) {
+    if target.model.is_some()
+        && (default_model.is_some()
+            || proxy_url.is_some()
+            || no_proxy.is_some()
+            || env.is_some())
+    {
         return Err(Error::Feature(
             "invalid_config".into(),
             "API 模型源账号请通过模型源端点与请求头配置连接".into(),
@@ -710,6 +730,20 @@ pub(crate) fn save_config(
         ));
     }
     let mut next = parse(content.unwrap_or(&previous), &target, true)?;
+    match &default_model {
+        Some(Some(raw)) if !raw.trim().is_empty() => {
+            let clean = raw.trim();
+            if clean.chars().count() > 300 || clean.chars().any(|c| c.is_control()) {
+                return Err(Error::Feature(
+                    "invalid_config".into(),
+                    "默认模型无效".into(),
+                ));
+            }
+            next.default_model = Some(clean.to_owned());
+        }
+        Some(_) => next.default_model = None,
+        None => {}
+    }
     match default_effort {
         Some(Some(effort)) => {
             if !ALLOWED_EFFORTS.contains(&effort.as_str()) {
@@ -755,7 +789,11 @@ pub(crate) fn save_config(
         Some(None) => next.env.clear(),
         None => {}
     }
-    if next.default_effort.is_some() && target.model.is_none() && next.default_model.is_none() {
+    if next.default_effort.is_some()
+        && target.model.is_none()
+        && next.default_model.is_none()
+        && default_model.is_none()
+    {
         if let Some(model) = catalog.and_then(|catalog| catalog.current_model.clone()) {
             next.default_model = Some(model);
         } else if let Some(model) = catalog.and_then(|catalog| {
@@ -767,15 +805,6 @@ pub(crate) fn save_config(
         }) {
             next.default_model = Some(model);
         }
-    }
-    if let Some(default_model) = next.default_model.as_deref()
-        && !catalog
-            .is_some_and(|catalog| catalog.models.iter().any(|model| model.id == default_model))
-    {
-        return Err(Error::Feature(
-            "invalid_config".into(),
-            "默认模型不在当前账号的可用模型目录中".into(),
-        ));
     }
     if let Some(default_effort) = next.default_effort.as_deref()
         && !supported_efforts(&target, &next, catalog)

@@ -305,7 +305,7 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
         || snapshot.default_effort.as_ref().is_some_and(|effort| {
             !matches!(
                 effort.as_str(),
-                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
             )
         })
     {

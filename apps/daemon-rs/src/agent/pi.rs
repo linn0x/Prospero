@@ -175,7 +175,7 @@ fn normalize_thinking_level(effort: &str) -> Option<&'static str> {
         "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
-        "xhigh" | "max" => Some("xhigh"),
+        "xhigh" | "max" | "ultra" => Some("xhigh"),
         _ => None,
     }
 }

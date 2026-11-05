@@ -14,7 +14,7 @@ export function ModelCapabilitiesFields({ value, onChange, disabled, protocol, e
 }) {
   const { t } = useLocale();
   const id = useId();
-  return <details>
+  return <details open>
     <summary className="cursor-pointer">{t("模型能力（可选）", "Model capabilities (optional)")}</summary>
     <FieldGroup className="mt-3 gap-3">
       <FieldDescription>{t("按服务商文档填写。留空或未知不代表已验证；保存后查看当前引擎的生效情况。", "Use the provider's documented limits. Empty or unknown values are unverified. Engine support is shown after saving.")}</FieldDescription>
@@ -32,7 +32,7 @@ export function ModelCapabilitiesFields({ value, onChange, disabled, protocol, e
       {value.tools === "false" && <FieldDescription>{t("Agent 需要工具调用；此设置将停用会话启动。", "Agents require tool calls; this setting disables session launch.")}</FieldDescription>}
       {effortSupported && <Field>
         <FieldLabel htmlFor={`${id}-efforts`}>{t("支持的推理强度", "Supported reasoning efforts")}</FieldLabel>
-        <Input id={`${id}-efforts`} value={value.supportedEfforts} maxLength={160} disabled={disabled} autoComplete="off" spellCheck={false} placeholder="low, medium, high" onChange={event => onChange({ ...value, supportedEfforts: event.target.value })} />
+        <Input id={`${id}-efforts`} value={value.supportedEfforts} maxLength={160} disabled={disabled} autoComplete="off" spellCheck={false} placeholder={protocol === "anthropic" ? "low, medium, high, xhigh, max" : "low, medium, high, xhigh, max, ultra"} onChange={event => onChange({ ...value, supportedEfforts: event.target.value })} />
         <FieldDescription>{t("按当前模型的服务商文档填写，以逗号分隔。留空表示未知；默认推理强度在高级配置中选择。", "Enter values documented for this model, separated by commas. Empty means unknown; choose the default effort in advanced configuration.")}</FieldDescription>
         {protocol === "openai_chat_completions" && <FieldDescription>{t("当前 OpenCode 引擎尚不应用推理强度设置。", "The current OpenCode engine does not apply reasoning effort settings.")}</FieldDescription>}
       </Field>}

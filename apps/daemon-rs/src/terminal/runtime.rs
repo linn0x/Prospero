@@ -1590,16 +1590,21 @@ impl Terminals {
                     .await?;
                 let mut effective_model = model.clone();
                 let mut effective_effort = effort.clone();
-                if profile.is_none() {
+                {
                     let data = self.0.database.directory().to_owned();
                     let target_id = account_id
                         .clone()
                         .unwrap_or_else(|| NATIVE_CODEX_ID.to_owned());
+                    let profile_model = profile.as_ref().map(|p| p.model.clone());
+                    let profile_caps = profile
+                        .as_ref()
+                        .and_then(|p| p.model_capabilities.clone());
+                    let has_profile = profile.is_some();
                     let override_defaults = tokio::task::spawn_blocking(move || {
                         let target = crate::accounts::config::ConfigTarget {
                             account_id: target_id,
-                            model: None,
-                            model_capabilities: None,
+                            model: profile_model,
+                            model_capabilities: profile_caps,
                             active_sessions: 0,
                         };
                         crate::accounts::config::read_defaults(&data, &target).ok()
@@ -1607,7 +1612,9 @@ impl Terminals {
                     .await
                     .map_err(|_| Error::Closed)?;
                     if let Some((default_model, default_effort)) = override_defaults {
-                        effective_model = effective_model.or(default_model);
+                        if !has_profile {
+                            effective_model = effective_model.or(default_model);
+                        }
                         effective_effort = effective_effort.or(default_effort);
                     }
                 }
@@ -1734,7 +1741,7 @@ impl Terminals {
                         "low" => "low",
                         "medium" => "medium",
                         "high" => "high",
-                        "xhigh" | "max" => "xhigh",
+                        "xhigh" | "max" | "ultra" => "xhigh",
                         other => other,
                     };
                     args.extend(["--thinking".into(), level.into()]);

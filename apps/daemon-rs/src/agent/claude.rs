@@ -134,6 +134,124 @@ const CATALOG_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Bounds a live-turn control request (model/effort switch).
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
+const CLAUDE_CATALOG_TTL: Duration = Duration::from_secs(300);
+
+fn claude_catalog_cache() -> &'static std::sync::Mutex<
+    HashMap<String, (std::time::Instant, Vec<crate::agent::LaunchModelInfo>)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<crate::agent::LaunchModelInfo>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn claude_catalog_cache_key(environment: &[(String, String)]) -> String {
+    environment
+        .iter()
+        .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| "native".into())
+}
+
+pub(crate) fn claude_settings_defaults(
+    config_dir: Option<&std::path::Path>,
+) -> (Option<String>, Option<String>) {
+    let dir = config_dir.map(std::path::Path::to_path_buf).or_else(|| {
+        std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|home| std::path::PathBuf::from(home).join(".claude"))
+            })
+    });
+    let Some(dir) = dir else {
+        return (None, None);
+    };
+    let Ok(raw) = std::fs::read_to_string(dir.join("settings.json")) else {
+        return (None, None);
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+        return (None, None);
+    };
+    let model = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let effort = parsed
+        .get("effortLevel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    (model, effort)
+}
+
+pub(crate) fn fast_claude_catalog_for_account(
+    data: &std::path::Path,
+    account_id: &str,
+) -> crate::agent::LaunchModelCatalog {
+    let target = crate::accounts::config::ConfigTarget {
+        account_id: account_id.to_owned(),
+        model: None,
+        model_capabilities: None,
+        active_sessions: 0,
+    };
+    let (override_model, override_effort) =
+        crate::accounts::config::read_defaults(data, &target).unwrap_or((None, None));
+    let config_dir = (account_id != crate::accounts::NATIVE_CLAUDE_ID)
+        .then(|| crate::accounts::managed::account_root(data, account_id).ok())
+        .flatten();
+    let cache_key = config_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "native".into());
+    let cached_models = claude_catalog_cache()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&cache_key).map(|(_, models)| models.clone()));
+    let models = cached_models.unwrap_or_else(|| {
+        let efforts = vec![
+            "low".to_owned(),
+            "medium".to_owned(),
+            "high".to_owned(),
+            "xhigh".to_owned(),
+            "max".to_owned(),
+        ];
+        vec![crate::agent::LaunchModelInfo {
+            id: "default".into(),
+            label: "Default".into(),
+            description: None,
+            supported_efforts: efforts,
+            default_effort: None,
+            is_default: true,
+        }]
+    });
+    let (settings_model, settings_effort) =
+        claude_settings_defaults(config_dir.as_deref());
+    let preferred_model = override_model.or(settings_model);
+    let preferred_effort = override_effort.or(settings_effort);
+    let current_model = preferred_model
+        .filter(|id| models.iter().any(|model| model.id == *id))
+        .or_else(|| models.first().map(|model| model.id.clone()));
+    let current_effort = preferred_effort.filter(|effort| {
+        models
+            .iter()
+            .find(|model| Some(model.id.as_str()) == current_model.as_deref())
+            .or_else(|| models.first())
+            .is_some_and(|model| model.supported_efforts.iter().any(|item| item == effort))
+    });
+    crate::agent::LaunchModelCatalog {
+        models,
+        current_model,
+        current_effort,
+        presets: Vec::new(),
+        current_preset: None,
+    }
+}
+
 /// Fetches the launch model catalog without running a user turn: a headless
 /// CLI process is started, sent a single `initialize` control request, and
 /// shut down after reading its `control_response`. This is the same handshake
@@ -141,6 +259,15 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) async fn fetch_launch_catalog(
     environment: &[(String, String)],
 ) -> Result<Vec<crate::agent::LaunchModelInfo>> {
+    let use_cache = std::env::var_os("PROSPERO_CLAUDE_BIN").is_none();
+    let cache_key = claude_catalog_cache_key(environment);
+    if use_cache
+        && let Ok(guard) = claude_catalog_cache().lock()
+        && let Some((instant, cached)) = guard.get(&cache_key)
+        && instant.elapsed() < CLAUDE_CATALOG_TTL
+    {
+        return Ok(cached.clone());
+    }
     let mut command = Command::new(binary());
     command
         .args([
@@ -214,6 +341,9 @@ pub(super) async fn fetch_launch_catalog(
     match tokio::time::timeout(CATALOG_TIMEOUT, read).await {
         Ok(Ok(models)) => {
             child.kill().await.ok();
+            if use_cache && let Ok(mut guard) = claude_catalog_cache().lock() {
+                guard.insert(cache_key, (std::time::Instant::now(), models.clone()));
+            }
             Ok(models)
         }
         Ok(Err(error)) => {

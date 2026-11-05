@@ -3896,11 +3896,47 @@ impl Agents {
             }
         }
         let models = super::claude::fetch_launch_catalog(&environment).await?;
-        let current_model = models.first().map(|model| model.id.clone());
+        let data = self.0.database.directory().to_owned();
+        let target_account = account_id
+            .clone()
+            .unwrap_or_else(|| crate::accounts::NATIVE_CLAUDE_ID.to_owned());
+        let (override_model, override_effort) = tokio::task::spawn_blocking(move || {
+            let target = crate::accounts::config::ConfigTarget {
+                account_id: target_account,
+                model: None,
+                model_capabilities: None,
+                active_sessions: 0,
+            };
+            crate::accounts::config::read_defaults(&data, &target).unwrap_or((None, None))
+        })
+        .await
+        .map_err(|_| Error::Closed)?;
+        let (settings_model, settings_effort) = if std::env::var_os("PROSPERO_CLAUDE_BIN").is_none()
+        {
+            let config_dir = environment
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| PathBuf::from(value));
+            super::claude::claude_settings_defaults(config_dir.as_deref())
+        } else {
+            (None, None)
+        };
+        let preferred_model = override_model.or(settings_model);
+        let preferred_effort = override_effort.or(settings_effort);
+        let current_model = preferred_model
+            .filter(|id| models.iter().any(|model| model.id == *id))
+            .or_else(|| models.first().map(|model| model.id.clone()));
+        let current_effort = preferred_effort.filter(|effort| {
+            models
+                .iter()
+                .find(|model| Some(model.id.as_str()) == current_model.as_deref())
+                .or_else(|| models.first())
+                .is_some_and(|model| model.supported_efforts.iter().any(|item| item == effort))
+        });
         Ok(LaunchModelCatalog {
             models,
             current_model,
-            current_effort: None,
+            current_effort,
             presets: Vec::new(),
             current_preset: None,
         })
