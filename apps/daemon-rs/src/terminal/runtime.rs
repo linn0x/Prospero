@@ -1620,9 +1620,9 @@ impl Terminals {
                         )?
                     ),
                     "-c".into(),
-                    "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]".into(),
+                    "tui.keymap.editor.kill_line_start=[]".into(),
                     "-c".into(),
-                    "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl+u\"]".into(),
+                    "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl-u\"]".into(),
                 ]);
                 if let Some(profile) = profile.as_ref() {
                     if profile.protocol() != "openai_responses" {

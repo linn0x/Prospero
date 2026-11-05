@@ -746,9 +746,9 @@ sys.stdout.flush()
                     .unwrap()
             ),
             "-c",
-            "tui.keymap.editor.kill_whole_line=[\"ctrl+u\"]",
+            "tui.keymap.editor.kill_line_start=[]",
             "-c",
-            "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl+u\"]",
+            "tui.keymap.chat.interrupt_turn=[\"esc\",\"ctrl-u\"]",
             "-c",
             "model=\"gpt-6-test\"",
             "-c",
