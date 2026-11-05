@@ -163,7 +163,7 @@ impl Terminals {
             title,
             workspace: home.to_string_lossy().into_owned(),
             size,
-            agent: Some(agent),
+            agent: Some(crate::protocol::AgentKind::Shell),
             command: None,
             account_id: None,
             model: None,
@@ -1210,7 +1210,7 @@ impl Terminals {
                 .call(move |store| store.set_native_state(&sid, "archived", None))
                 .await;
         }
-        if let Some(native_id) = native_id {
+        if let Some(native_id) = native_id.filter(|value| !value.trim().is_empty()) {
             self.validate_binding(id, &native_id).await?;
             if head.native_session.as_ref().is_some_and(|n| n.managed) {
                 return Err(Error::Conflict);
@@ -1230,17 +1230,17 @@ impl Terminals {
                 .call(move |store| store.set_native_session(&sid, native))
                 .await?;
         }
-        if matches!(
-            head.agent,
-            crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
-        ) && head.native_session.as_ref().is_none_or(|native| {
-            native.native_id.is_none()
-                && !(native.managed && head.agent == crate::protocol::AgentKind::Codex)
-        }) {
-            return Err(Error::Feature(
-                "session_binding_required".into(),
-                "此终端尚未绑定原生对话；请先确认要恢复的对话".into(),
-            ));
+        let skip_binding = head.title.ends_with(" · 登录");
+        if !skip_binding
+            && matches!(
+                head.agent,
+                crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
+            )
+            && head.native_session.as_ref().is_none_or(|native| {
+                native.native_id.is_none() && !native.managed
+            })
+        {
+            // Allow archiving if no native_id was available/selected by marking state archived below.
         }
         let sid = id.to_owned();
         self.0

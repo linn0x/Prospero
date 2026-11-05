@@ -215,9 +215,9 @@ export function provisionalAccountLoginSession(
     : agent;
   return {
     id: sessionId,
-    agent,
+    agent: "shell",
     kind: "pty",
-    title: name,
+    title: `${name} · 登录`,
     cwd: "",
     status: "starting",
     createdAt,
