@@ -505,4 +505,46 @@ describe("Electron state snapshot caching", () => {
     expect(changed?.projects).toContain(project);
     expect(store.snapshot()).toBe(changed);
   });
+
+  it("preserves archived and nativeSession metadata in api mode and derives archivedSessionIds", () => {
+    const home = testHome();
+    const store = new StateStore(home, "api");
+    store.setApiState({
+      running: true,
+      config: {},
+      devices: {},
+      orchestration: {},
+      projects: [home],
+      status: {
+        pid: 1234,
+        port: 7424,
+        bind: "127.0.0.1",
+        capabilities: ["session.lifecycle.v1"],
+        sessions: [
+          {
+            id: "active-crashed",
+            cwd: home,
+            agent: "codex",
+            kind: "pty",
+            status: "failed",
+            archived: false,
+            nativeSession: { runtimeId: "active-crashed", nativeId: "uuid-1", managed: true, state: "failed" },
+          },
+          {
+            id: "archived-done",
+            cwd: home,
+            agent: "claude",
+            kind: "pty",
+            status: "completed",
+            archived: true,
+            nativeSession: { runtimeId: "archived-done", nativeId: "uuid-2", managed: false, state: "archived" },
+          },
+        ],
+      },
+    });
+    const snap = store.snapshot();
+    expect(snap.archivedSessionIds).toEqual(["archived-done"]);
+    expect(snap.daemon.sessions.find((s) => s.id === "active-crashed")?.nativeSession?.state).toBe("failed");
+    expect(snap.daemon.sessions.find((s) => s.id === "archived-done")?.archived).toBe(true);
+  });
 });

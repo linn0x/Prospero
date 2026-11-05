@@ -1629,6 +1629,7 @@ label.check-row { display: flex; }
 .workspace-project-new-session {
   appearance: none;
   position: absolute;
+  z-index: 2;
   top: 50%;
   right: 5px;
   transform: translateY(-50%);

@@ -145,7 +145,7 @@ impl Store {
 
     pub fn fail_terminal(&mut self, id: &str) -> Result<()> {
         let head = self.session(id)?;
-        self.update_session_with(
+        let updated = self.update_session_with(
             id,
             UpdateSession {
                 revision: head.revision,
@@ -161,6 +161,9 @@ impl Store {
                 Ok(())
             },
         )?;
+        if let Some(native) = &updated.native_session {
+            self.set_native_state(id, "failed", native.error.clone())?;
+        }
         Ok(())
     }
 
@@ -517,5 +520,48 @@ mod tests {
             .unwrap();
         assert_eq!(page.events.len(), 2);
         assert_eq!(page.latest_seq, 3);
+    }
+
+    #[test]
+    fn recovery_marks_native_session_failed_and_preserves_workspace_tabs() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let head = store
+            .create_terminal(CreateTerminal {
+                title: "Codex".into(),
+                workspace: "/synthetic".into(),
+                size: TerminalSize { cols: 80, rows: 24 },
+                agent: Some(AgentKind::Codex),
+                command: None,
+                account_id: None,
+                model: None,
+                effort: None,
+                approval_policy: None,
+            })
+            .unwrap();
+        store
+            .set_native_session(
+                &head.id,
+                NativeSession {
+                    output_start_seq: None,
+                    runtime_id: head.id.clone(),
+                    native_id: Some("00000000-0000-4000-8000-000000000001".into()),
+                    managed: false,
+                    state: "running".into(),
+                    error: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.recover_terminals().unwrap(), 1);
+        let recovered = store.session(&head.id).unwrap();
+        assert_eq!(recovered.lifecycle, SessionLifecycle::Archived);
+        assert_eq!(recovered.status, SessionStatus::Failed);
+        assert_eq!(
+            recovered.native_session.as_ref().map(|n| n.state.as_str()),
+            Some("failed")
+        );
+        let tabs = store.workspace_tabs().unwrap();
+        assert_eq!(tabs.items.len(), 1);
+        assert_eq!(tabs.items[0].open_session_ids, vec![head.id]);
     }
 }

@@ -1299,7 +1299,11 @@ impl Terminals {
             .ok_or_else(|| Error::Invalid("此终端没有可恢复的原生对话".into()))?;
         if head.lifecycle != crate::protocol::SessionLifecycle::Archived
             || (native.native_id.is_none()
-                && !(native.managed && head.agent == crate::protocol::AgentKind::Codex))
+                && !(native.managed
+                    && matches!(
+                        head.agent,
+                        crate::protocol::AgentKind::Codex | crate::protocol::AgentKind::Claude
+                    )))
             || self.0.guard.is_none()
         {
             return Err(Error::Conflict);

@@ -62,7 +62,18 @@ impl Store {
                 self.ensure_native_available(id, native_id)?;
             }
         }
-        self.update_session_metadata_with(id, |head| head.native_session = Some(native), |_| Ok(()))
+        let closing = native.state == "archived";
+        let workspace = head.workspace.clone();
+        self.update_session_metadata_with(
+            id,
+            |head| head.native_session = Some(native),
+            |tx| {
+                if closing {
+                    Self::record_workspace_session_closed(tx, &workspace, id, now())?;
+                }
+                Ok(())
+            },
+        )
     }
 
     pub(crate) fn reset_terminal_instance(

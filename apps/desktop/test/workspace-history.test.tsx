@@ -92,4 +92,46 @@ describe("WorkspaceHistory", () => {
     expect(html).toContain('data-testid="s2"');
     expect(html).not.toContain("workspace-session-more");
   });
+
+  it("renders archived/historical sessions when expanded via Show more", async () => {
+    const { WorkspaceSessionPager } = await import("../src/renderer/src/workspace-session-pager");
+    const archivedItems: SessionInfo[] = [
+      { ...session("s1"), archived: true },
+      { ...session("s2"), archived: true },
+      { ...session("s3"), archived: true },
+    ];
+    vi.spyOn(WorkspaceSessionPager.prototype, "readSnapshot").mockReturnValue({
+      page: { items: archivedItems, total: 3, active: 0, terminal: 3, hasMore: false },
+      loading: false,
+      expanded: true,
+      error: undefined,
+    });
+    vi.stubGlobal("window", {
+      prospero: {
+        listSessions: vi.fn(async () => ({ items: archivedItems, total: 3, active: 0, terminal: 3, hasMore: false })),
+        cancelSessionPage: vi.fn(async () => {}),
+      },
+    });
+    const html = renderToStaticMarkup(
+      <WorkspaceHistory
+        workspace="/workspace"
+        name="诊断"
+        enabled={false}
+        revision="1"
+        preview={[]}
+        activeId={undefined}
+        pinned={[]}
+        unread={[]}
+        archived={["s1", "s2", "s3"]}
+        query=""
+        onTotal={() => {}}
+        renderRow={(item) => <div key={item.id} data-testid={item.id}>{item.title}</div>}
+      />,
+    );
+    expect(html).toContain('data-testid="s1"');
+    expect(html).toContain('data-testid="s2"');
+    expect(html).toContain('data-testid="s3"');
+    expect(html).toContain("收起会话");
+    vi.restoreAllMocks();
+  });
 });

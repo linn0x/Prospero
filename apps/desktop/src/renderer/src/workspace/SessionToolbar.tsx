@@ -1,7 +1,7 @@
 import { writeTerminalMousePreference } from "./TerminalMouseToggle";
 import { sessionTabName } from "./session-tab-labels";
 import { useRef, useState } from "react";
-import { Columns2, MousePointer2 } from "lucide-react";
+import { Columns2, MousePointer2, RotateCcw } from "lucide-react";
 import { DesktopIcon } from "../design-system/icons";
 import type { JsonObject, NativeTerminalState, SessionInfo } from "../../../shared/types";
 import { Button } from "../components/ui/button";
@@ -41,6 +41,7 @@ export function SessionToolbar({ session, account, unread = false, contextVisibl
       <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}><StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} /><strong>{label === project ? shortPath(session.cwd) : label}</strong>{label !== project && <small>{shortPath(session.cwd)}</small>}</div>
       <div className="pane-toolbar-actions">
         {["running", "starting", "waiting_input", "waiting_approval"].includes(session.status) && <Button variant="ghost" size="sm" disabled={busy} aria-label={t("停止当前轮次", "Stop current turn")} onClick={() => void action(() => window.prospero.interruptSession(session.id))}><DesktopIcon name="stop" />{t("停止", "Stop")}</Button>}
+        {session.kind === "pty" && ["claude", "codex"].includes(session.agent) && ["completed", "done", "died", "failed", "stopped", "cancelled", "exited", "killed"].includes(session.status) && Boolean(session.nativeSession?.nativeId || session.nativeSession?.managed) && <Button variant="ghost" size="sm" disabled={busy} aria-label={t("继续对话", "Resume chat")} onClick={() => void action(() => window.prospero.setSessionArchived(session.id, false))}><RotateCcw />{t("继续对话", "Resume")}</Button>}
         <Button variant="ghost" size="sm" aria-label={t("切换工具栏", "Toggle tools")} title={t("文件、搜索、Git 与会话工具", "Files, search, Git and session tools")} aria-pressed={contextVisible} onClick={onToggleContext}><DesktopIcon name="sidebar" />{t("工具", "Tools")}</Button>
         <Button variant="ghost" size="sm" aria-label={t("进入专注模式", "Enter focus mode")} onClick={onToggleFocus}><DesktopIcon name="expand" />{t("专注", "Focus")}</Button>
         <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label={t("会话操作", "Session actions")} />}><DesktopIcon name="more" /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>
