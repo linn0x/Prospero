@@ -315,6 +315,10 @@ impl Store {
             return Err(Error::Schema);
         }
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=8388608;")?;
+        connection.execute(
+            "DELETE FROM session_search WHERE rowid NOT IN (SELECT rowid FROM session_heads)",
+            [],
+        )?;
         connection.prepare(
             "SELECT id,created_at,lifecycle,revision,payload FROM session_heads LIMIT 0",
         )?;
@@ -425,10 +429,12 @@ impl Store {
         }
         transaction.execute("INSERT INTO session_heads(id,created_at,lifecycle,revision,payload) VALUES(?1,?2,?3,?4,?5)",
             params![session.id, session.created_at, label(session.lifecycle)?, session.revision, json])?;
+        let rowid = transaction.last_insert_rowid();
+        transaction.execute("DELETE FROM session_search WHERE rowid=?1", [rowid])?;
         transaction.execute(
             "INSERT INTO session_search(rowid,id,title,workspace) VALUES(?1,?2,?3,?4)",
             params![
-                transaction.last_insert_rowid(),
+                rowid,
                 session.id,
                 session.title,
                 session.workspace
