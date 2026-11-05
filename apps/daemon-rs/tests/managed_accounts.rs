@@ -414,17 +414,38 @@ async fn native_and_unknown_account_mutations_are_rejected() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Only Claude managed accounts are supported.
+    // Only Claude and Codex managed subscription accounts are supported.
     let (status, _) = harness
         .post(control(
             "agent.account.create",
-            serde_json::json!({"agent":"codex","name":"x"})
+            serde_json::json!({"agent":"trae","name":"x"})
                 .as_object()
                 .unwrap()
                 .clone(),
         ))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, codex_created) = harness
+        .post(control(
+            "agent.account.create",
+            serde_json::json!({"agent":"codex","name":"codex-sub"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let codex_id = created_id(&codex_created);
+    let _ = harness
+        .post(control(
+            "agent.account.delete",
+            serde_json::json!({"accountId": codex_id})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
+        .await;
 
     // Validation errors are 400. Shape checks that are not account-specific
     // use a synthetic id; per-credential checks need an existing account
@@ -816,5 +837,113 @@ async fn catalog_route_serves_managed_accounts_and_rejects_others() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    drop(harness);
+}
+
+#[tokio::test]
+async fn subscription_account_proxy_and_env_overrides() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let (_, created) = harness
+        .post(control(
+            "agent.account.create",
+            serde_json::json!({"agent":"codex","name":"codex-proxy"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
+        .await;
+    let codex_id = created_id(&created);
+
+    let (status, current) = harness
+        .post(control(
+            "agent.account.config.get",
+            serde_json::json!({"accountId": codex_id})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert_eq!(current["ok"], true);
+    let rev = current["config"]["documents"][0]["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, saved) = harness
+        .post(control(
+            "agent.account.config.set",
+            serde_json::json!({
+                "accountId": codex_id,
+                "documentId": "claude-overrides",
+                "revision": rev,
+                "proxyUrl": "http://127.0.0.1:7890",
+                "noProxy": "localhost,127.0.0.1",
+                "env": {
+                    "CUSTOM_CODEX_VAR": "enabled"
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(saved["config"]["proxyUrl"], "http://127.0.0.1:7890");
+    assert_eq!(saved["config"]["noProxy"], "localhost,127.0.0.1");
+    assert_eq!(saved["config"]["env"]["CUSTOM_CODEX_VAR"], "enabled");
+
+    // Native subscription accounts also support proxy/env configuration.
+    let (status, native_cfg) = harness
+        .post(control(
+            "agent.account.config.get",
+            serde_json::json!({"accountId": "native-claude"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{native_cfg}");
+    assert_eq!(native_cfg["ok"], true);
+    let native_rev = native_cfg["config"]["documents"][0]["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, native_saved) = harness
+        .post(control(
+            "agent.account.config.set",
+            serde_json::json!({
+                "accountId": "native-claude",
+                "documentId": "claude-overrides",
+                "revision": native_rev,
+                "proxyUrl": "socks5://127.0.0.1:1080"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{native_saved}");
+    assert_eq!(native_saved["ok"], true);
+    assert_eq!(native_saved["config"]["proxyUrl"], "socks5://127.0.0.1:1080");
+
+    let (_, listed) = harness
+        .post(control("agent.accounts.list", serde_json::Map::new()))
+        .await;
+    let codex_row = account(&listed, &codex_id).unwrap();
+    assert!(
+        codex_row["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("代理: http://127.0.0.1:7890")
+    );
+    assert!(
+        codex_row["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ENV: 1 项")
+    );
     drop(harness);
 }

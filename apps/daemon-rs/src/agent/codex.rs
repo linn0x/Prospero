@@ -1589,6 +1589,8 @@ pub(super) async fn spawn_turn(
             options.environment.clone(),
             crate::accounts::profile::codex_app_server_args(profile),
         )
+    } else if codex_home_from_environment(&options.environment).is_some() {
+        (options.environment.clone(), Vec::new())
     } else {
         let (_home, mut environment) = super::usage::native_codex_environment(data)?;
         environment.extend(options.environment.iter().cloned());
@@ -1765,6 +1767,8 @@ pub(super) async fn fork_thread(
             options.environment.clone(),
             crate::accounts::profile::codex_app_server_args(profile),
         )
+    } else if codex_home_from_environment(&options.environment).is_some() {
+        (options.environment.clone(), Vec::new())
     } else {
         let (_, mut environment) = super::usage::native_codex_environment(data)?;
         environment.extend(options.environment.iter().cloned());

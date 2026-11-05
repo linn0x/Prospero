@@ -131,16 +131,39 @@ impl Terminals {
         size: TerminalSize,
         environment: Vec<(String, String)>,
     ) -> Result<SessionHead> {
+        self.create_login_for_agent(
+            account_id,
+            crate::protocol::AgentKind::Claude,
+            title,
+            size,
+            environment,
+        )
+        .await
+    }
+
+    /// Spawns the managed subscription login flow (`claude setup-token` or
+    /// `codex login`) in a PTY rooted at the account's isolated config directory.
+    pub async fn create_login_for_agent(
+        &self,
+        account_id: &str,
+        agent: crate::protocol::AgentKind,
+        title: String,
+        size: TerminalSize,
+        environment: Vec<(String, String)>,
+    ) -> Result<SessionHead> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .ok_or_else(|| Error::Invalid("无法定位用户目录".into()))?;
-        let program = std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let (program, args) = match agent {
+            crate::protocol::AgentKind::Codex => (codex_binary(), vec!["login".into()]),
+            _ => (claude_binary(), vec!["setup-token".into()]),
+        };
         let input = CreateTerminal {
             title,
             workspace: home.to_string_lossy().into_owned(),
             size,
-            agent: Some(crate::protocol::AgentKind::Claude),
+            agent: Some(agent),
             command: None,
             account_id: None,
             model: None,
@@ -149,7 +172,7 @@ impl Terminals {
         };
         let spec = ProgramSpec {
             program,
-            args: vec!["setup-token".into()],
+            args,
             environment,
             account_id: Some(account_id.to_owned()),
         };
@@ -1567,6 +1590,27 @@ impl Terminals {
                     .await?;
                 let mut effective_model = model.clone();
                 let mut effective_effort = effort.clone();
+                if profile.is_none() {
+                    let data = self.0.database.directory().to_owned();
+                    let target_id = account_id
+                        .clone()
+                        .unwrap_or_else(|| NATIVE_CODEX_ID.to_owned());
+                    let override_defaults = tokio::task::spawn_blocking(move || {
+                        let target = crate::accounts::config::ConfigTarget {
+                            account_id: target_id,
+                            model: None,
+                            model_capabilities: None,
+                            active_sessions: 0,
+                        };
+                        crate::accounts::config::read_defaults(&data, &target).ok()
+                    })
+                    .await
+                    .map_err(|_| Error::Closed)?;
+                    if let Some((default_model, default_effort)) = override_defaults {
+                        effective_model = effective_model.or(default_model);
+                        effective_effort = effective_effort.or(default_effort);
+                    }
+                }
                 if let Some((_, home)) = environment.iter().find(|(key, _)| key == "CODEX_HOME") {
                     let config_path = PathBuf::from(home).join("config.toml");
                     let defaults = tokio::task::spawn_blocking(move || {
@@ -1744,10 +1788,42 @@ impl Terminals {
         Option<String>,
     )> {
         let Some(id) = account_id else {
-            return Ok((Vec::new(), None, None, None));
+            let data = self.0.database.directory().to_owned();
+            let (env, (default_model, default_effort)) = tokio::task::spawn_blocking(move || {
+                let env = crate::accounts::managed::native_claude_environment(&data)
+                    .unwrap_or_default();
+                let target = crate::accounts::config::ConfigTarget {
+                    account_id: crate::accounts::NATIVE_CLAUDE_ID.into(),
+                    model: None,
+                    model_capabilities: None,
+                    active_sessions: 0,
+                };
+                let defaults = crate::accounts::config::read_defaults(&data, &target)
+                    .unwrap_or((None, None));
+                (env, defaults)
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+            return Ok((env, None, default_model, default_effort));
         };
         if id == crate::accounts::NATIVE_CLAUDE_ID {
-            return Ok((Vec::new(), None, None, None));
+            let data = self.0.database.directory().to_owned();
+            let (env, (default_model, default_effort)) = tokio::task::spawn_blocking(move || {
+                let env = crate::accounts::managed::native_claude_environment(&data)
+                    .unwrap_or_default();
+                let target = crate::accounts::config::ConfigTarget {
+                    account_id: crate::accounts::NATIVE_CLAUDE_ID.into(),
+                    model: None,
+                    model_capabilities: None,
+                    active_sessions: 0,
+                };
+                let defaults = crate::accounts::config::read_defaults(&data, &target)
+                    .unwrap_or((None, None));
+                (env, defaults)
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+            return Ok((env, None, default_model, default_effort));
         }
         crate::database::validate_id(&id)?;
         let data = self.0.database.directory().to_owned();
@@ -1830,16 +1906,22 @@ impl Terminals {
                         move |store| store.managed_snapshot_row(&data, &id)
                     })
                     .await?;
-                let profile = record
-                    .api_profile
-                    .ok_or_else(|| Error::Invalid("所选账号不支持 Codex PTY".into()))?;
+                if record.agent != crate::protocol::AgentKind::Codex {
+                    return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                }
+                let Some(profile) = record.api_profile else {
+                    let env_id = record.id.clone();
+                    let env = tokio::task::spawn_blocking(move || {
+                        crate::accounts::managed::codex_subscription_environment(&data, &env_id)
+                    })
+                    .await
+                    .map_err(|_| Error::Closed)??;
+                    return Ok((env, Some(record.id), None));
+                };
                 if profile.protocol() != "openai_responses" {
                     return Err(Error::Invalid(
                         "Codex PTY 仅支持 OpenAI Responses Profile".into(),
                     ));
-                }
-                if record.agent != crate::protocol::AgentKind::Codex {
-                    return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
                 }
                 let env_id = record.id.clone();
                 let env_profile = profile.clone();

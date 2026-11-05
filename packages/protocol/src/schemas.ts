@@ -529,6 +529,9 @@ export const C2SAgentAccountConfigSetSchema = z.object({
   revision: z.string().regex(/^[a-f0-9]{64}$/),
   content: z.string().max(16_384).optional(),
   defaultEffort: AgentReasoningEffortSchema.nullable().optional(),
+  proxyUrl: z.string().max(2000).nullable().optional(),
+  noProxy: z.string().max(1000).nullable().optional(),
+  env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/), z.string().max(4096)).nullable().optional(),
 }).strict();
 
 export const AgentAccountFeatureErrorSchema = z.object({
@@ -560,6 +563,9 @@ export const AgentAccountConfigSchema = z.object({
   })).max(4),
   defaultEffort: AgentReasoningEffortSchema.optional(),
   defaultModel: z.string().min(1).max(300).optional(),
+  proxyUrl: z.string().max(2000).optional(),
+  noProxy: z.string().max(1000).optional(),
+  env: z.record(z.string(), z.string()).optional(),
   supportedEfforts: z.array(AgentReasoningEffortSchema).max(10),
   appliesTo: z.literal("new_sessions"),
   activeSessions: z.number().int().nonnegative(),

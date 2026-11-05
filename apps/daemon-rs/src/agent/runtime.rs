@@ -1041,15 +1041,16 @@ impl Agents {
                 Some(account_id) => {
                     let data = self.0.database.directory().to_owned();
                     let account_id = account_id.to_owned();
-                    let profile = self
+                    let record = self
                         .0
                         .database
                         .call_control("agent.create", move |store| {
-                            Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile)
+                            store.managed_snapshot_row(&data, &account_id)
                         })
                         .await?;
-                    match profile.as_ref().map(|profile| profile.protocol()) {
+                    match record.api_profile.as_ref().map(|profile| profile.protocol()) {
                         Some("openai_responses" | "openai_chat_completions") => {}
+                        None if record.agent == crate::protocol::AgentKind::Codex => {}
                         _ => {
                             return Err(Error::Invalid(
                                 "所选账号不支持 Codex structured runtime".into(),
@@ -1163,7 +1164,7 @@ impl Agents {
                                     "模型 Profile 禁用了工具，无法启动 Code Agent".into(),
                                 ));
                             }
-                        } else if create.agent != crate::protocol::AgentKind::Claude {
+                        } else if create.agent != record.agent {
                             return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
                         }
                         let target = crate::accounts::config::ConfigTarget {
@@ -1197,6 +1198,49 @@ impl Agents {
                         }
                         if apply_default_effort {
                             create.effort = default_effort;
+                        }
+                    } else {
+                        let target = crate::accounts::config::ConfigTarget {
+                            account_id: account_id.to_owned(),
+                            model: None,
+                            model_capabilities: None,
+                            active_sessions: 0,
+                        };
+                        if let Ok((default_model, default_effort)) =
+                            crate::accounts::config::read_defaults(&data, &target)
+                        {
+                            let resuming = create.resume.is_some();
+                            if !resuming && create.model.is_none() {
+                                create.model = default_model;
+                            }
+                            if !resuming && create.effort.is_none() {
+                                create.effort = default_effort;
+                            }
+                        }
+                    }
+                } else {
+                    let native_id = match create.agent {
+                        crate::protocol::AgentKind::Claude => Some(crate::accounts::NATIVE_CLAUDE_ID),
+                        crate::protocol::AgentKind::Codex => Some(crate::agent::NATIVE_CODEX_ID),
+                        _ => None,
+                    };
+                    if let Some(native_id) = native_id {
+                        let target = crate::accounts::config::ConfigTarget {
+                            account_id: native_id.to_owned(),
+                            model: None,
+                            model_capabilities: None,
+                            active_sessions: 0,
+                        };
+                        if let Ok((default_model, default_effort)) =
+                            crate::accounts::config::read_defaults(&data, &target)
+                        {
+                            let resuming = create.resume.is_some();
+                            if !resuming && create.model.is_none() {
+                                create.model = default_model;
+                            }
+                            if !resuming && create.effort.is_none() {
+                                create.effort = default_effort;
+                            }
                         }
                     }
                 }
@@ -1245,12 +1289,15 @@ impl Agents {
             .native_id
             .as_deref()
             .ok_or_else(|| Error::Invalid("此聊天尚无可分支的历史".into()))?;
+        let effective_env_account = run.account_id.clone().or_else(|| {
+            (run.agent == AgentKind::Claude).then(|| crate::accounts::NATIVE_CLAUDE_ID.to_owned())
+        });
         let options = TurnOptions {
             policy: run.policy,
             mode: run.mode,
             model: run.model.clone(),
             effort: run.effort.clone(),
-            environment: Self::account_environment(&self.0.database, run.account_id.clone())
+            environment: Self::account_environment(&self.0.database, effective_env_account)
                 .await?,
             api_profile: Self::account_api_profile(&self.0.database, run.account_id.clone())
                 .await?,
@@ -2252,8 +2299,11 @@ impl Agents {
             }
             return Err(error);
         }
+        let effective_env_account = run.account_id.clone().or_else(|| {
+            (run.agent == AgentKind::Claude).then(|| crate::accounts::NATIVE_CLAUDE_ID.to_owned())
+        });
         let mut environment =
-            Self::account_environment(&self.0.database, run.account_id.clone()).await?;
+            Self::account_environment(&self.0.database, effective_env_account).await?;
         if let Ok(control) = self.0.control_environment.lock()
             && let Some(control) = control.as_ref()
         {
@@ -3789,7 +3839,9 @@ impl Agents {
     /// isolated config root, so the directory reflects their own identity.
     pub async fn launch_catalog_for(&self, account_id: Option<&str>) -> Result<LaunchModelCatalog> {
         let account_id = match account_id {
-            None | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+            None | Some(crate::accounts::NATIVE_CLAUDE_ID) => {
+                Some(crate::accounts::NATIVE_CLAUDE_ID.to_owned())
+            }
             Some(id) => {
                 crate::database::validate_id(id)?;
                 let id_owned = id.to_owned();
@@ -3803,15 +3855,17 @@ impl Agents {
         let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
         // Profile accounts pin exactly one model through the profile itself;
         // never spawn the headless CLI catalog probe against their gateway.
-        if let Some(id) = account_id.as_deref() {
+        if let Some(id) = account_id.as_deref()
+            && id != crate::accounts::NATIVE_CLAUDE_ID
+        {
             let data = self.0.database.directory().to_owned();
             let id = id.to_owned();
-            let profile = self
+            let record = self
                 .0
                 .database
-                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .call(move |store| store.managed_snapshot_row(&data, &id))
                 .await?;
-            if let Some(profile) = profile {
+            if let Some(profile) = record.api_profile {
                 let efforts = profile
                     .model_capabilities
                     .as_ref()
@@ -3833,6 +3887,13 @@ impl Agents {
                     current_preset: None,
                 });
             }
+            if record.agent == AgentKind::Codex {
+                return super::usage::read_codex_models_for_account(
+                    self.0.database.directory(),
+                    &record.id,
+                )
+                .await;
+            }
         }
         let models = super::claude::fetch_launch_catalog(&environment).await?;
         let current_model = models.first().map(|model| model.id.clone());
@@ -3852,6 +3913,14 @@ impl Agents {
         let Some(id) = account_id else {
             return Ok(None);
         };
+        if matches!(
+            id.as_str(),
+            crate::accounts::NATIVE_CLAUDE_ID
+                | crate::agent::NATIVE_CODEX_ID
+                | crate::accounts::NATIVE_PI_ID
+        ) {
+            return Ok(None);
+        }
         let data = database.directory().to_owned();
         database
             .call_control("session.account_profile", move |store| {
@@ -3861,8 +3930,9 @@ impl Agents {
     }
 
     /// Private environment overrides for a session's bound account (empty for
-    /// the native environment). Profile accounts get the isolated API-key
-    /// profile environment; legacy managed accounts the OAuth/imported-key one.
+    /// the native environment unless runtime overrides are configured). Profile
+    /// accounts get the isolated API-key profile environment; managed subscription
+    /// accounts get their isolated OAuth/CLI environment.
     /// Credential files are read off the async pool.
     async fn account_environment(
         database: &crate::worker::Database,
@@ -3872,6 +3942,20 @@ impl Agents {
             return Ok(Vec::new());
         };
         let data = database.directory().to_owned();
+        if id == crate::accounts::NATIVE_CLAUDE_ID {
+            return tokio::task::spawn_blocking(move || {
+                crate::accounts::managed::native_claude_environment(&data)
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        }
+        if id == crate::agent::NATIVE_CODEX_ID || id == crate::accounts::NATIVE_PI_ID {
+            return tokio::task::spawn_blocking(move || {
+                crate::accounts::config::read_runtime_environment(&data, &id)
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        }
         let record = database
             .call_control("session.account_environment", {
                 let data = data.clone();
@@ -3886,6 +3970,9 @@ impl Agents {
                 record.agent,
                 &profile,
             ),
+            None if record.agent == crate::protocol::AgentKind::Codex => {
+                crate::accounts::managed::codex_subscription_environment(&data, &record.id)
+            }
             None => crate::accounts::managed::claude_environment(&data, &record.id, false),
         })
         .await
@@ -3926,14 +4013,17 @@ impl Agents {
         for account in snapshot
             .accounts
             .into_iter()
-            .filter(|row| row.status != crate::accounts::AccountStatus::Unavailable)
+            .filter(|row| {
+                row.status != crate::accounts::AccountStatus::Unavailable
+                    && row.id != super::usage::NATIVE_CODEX_ID
+            })
         {
             let live = sessions.iter().find(|(account_id, agent, _)| {
                 *agent == account.agent
                     && (account_id.as_deref() == Some(account.id.as_str())
                         || (account_id.is_none() && !account.managed))
             });
-            let report = if let Some((_, _, entry)) = live {
+            let mut report = if let Some((_, _, entry)) = live {
                 let report = entry.usage.lock().await.clone();
                 (report.cost_usd.is_some()
                     || report.input_tokens.is_some()
@@ -3945,6 +4035,19 @@ impl Agents {
             } else {
                 None
             };
+            if report.is_none()
+                && account.agent == crate::protocol::AgentKind::Codex
+                && account.api_profile.is_none()
+                && account.managed
+            {
+                report = super::usage::read_codex_usage_for_account(
+                    self.0.database.directory(),
+                    &account.id,
+                )
+                .await
+                .ok()
+                .flatten();
+            }
             let source = if account.api_profile.is_some()
                 || account
                     .auth_method
@@ -4192,10 +4295,20 @@ impl Agents {
                 .await;
             }
         }
+        let effective_env_account = run.account_id.clone().or_else(|| {
+            (run.agent == AgentKind::Claude).then(|| crate::accounts::NATIVE_CLAUDE_ID.to_owned())
+        });
         let environment =
-            Self::account_environment(&self.0.database, run.account_id.clone()).await?;
+            Self::account_environment(&self.0.database, effective_env_account).await?;
         // Profile sessions expose the pinned model only.
-        if let Some(id) = run.account_id.as_deref() {
+        if let Some(id) = run.account_id.as_deref()
+            && !matches!(
+                id,
+                crate::accounts::NATIVE_CLAUDE_ID
+                    | crate::agent::NATIVE_CODEX_ID
+                    | crate::accounts::NATIVE_PI_ID
+            )
+        {
             let data = self.0.database.directory().to_owned();
             let id = id.to_owned();
             let profile = self
@@ -4225,9 +4338,21 @@ impl Agents {
             }
         }
         let models = if run.agent == AgentKind::Codex {
-            super::usage::read_native_codex_models(self.0.database.directory())
-                .await?
-                .models
+            match run.account_id.as_deref() {
+                Some(acct_id) if acct_id != super::usage::NATIVE_CODEX_ID => {
+                    super::usage::read_codex_models_for_account(
+                        self.0.database.directory(),
+                        acct_id,
+                    )
+                    .await?
+                    .models
+                }
+                _ => {
+                    super::usage::read_native_codex_models(self.0.database.directory())
+                        .await?
+                        .models
+                }
+            }
         } else if run.agent == AgentKind::Pi {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             super::pi::launch_catalog(Path::new(&home), &environment)
@@ -4328,9 +4453,20 @@ impl Agents {
                 current_effort: effort,
             });
         }
-        let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
+        let effective_env_account = account_id.clone().or_else(|| {
+            (run.agent == AgentKind::Claude).then(|| crate::accounts::NATIVE_CLAUDE_ID.to_owned())
+        });
+        let environment =
+            Self::account_environment(&self.0.database, effective_env_account).await?;
         // Profile sessions expose only the pinned model and never switch.
-        if let Some(id) = account_id {
+        if let Some(id) = account_id
+            && !matches!(
+                id.as_str(),
+                crate::accounts::NATIVE_CLAUDE_ID
+                    | crate::agent::NATIVE_CODEX_ID
+                    | crate::accounts::NATIVE_PI_ID
+            )
+        {
             let data = self.0.database.directory().to_owned();
             let profile = self
                 .0
@@ -4344,9 +4480,21 @@ impl Agents {
             }
         }
         let catalog = if run.agent == AgentKind::Codex {
-            super::usage::read_native_codex_models(self.0.database.directory())
-                .await?
-                .models
+            match run.account_id.as_deref() {
+                Some(acct_id) if acct_id != super::usage::NATIVE_CODEX_ID => {
+                    super::usage::read_codex_models_for_account(
+                        self.0.database.directory(),
+                        acct_id,
+                    )
+                    .await?
+                    .models
+                }
+                _ => {
+                    super::usage::read_native_codex_models(self.0.database.directory())
+                        .await?
+                        .models
+                }
+            }
         } else if run.agent == AgentKind::Pi {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             super::pi::launch_catalog(Path::new(&home), &environment)

@@ -28,13 +28,53 @@ export class AccountRequestGate {
   }
 }
 
+export function formatEnvLines(env?: Record<string, string> | null): string {
+  if (!env) return "";
+  return Object.entries(env)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+}
+
+export function parseEnvLines(raw: string): { env: Record<string, string> | null; error?: string } {
+  const result: Record<string, string> = {};
+  const lines = raw.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) {
+      return { env: null, error: `第 ${i + 1} 行格式应为 KEY=VALUE / Line ${i + 1} must be KEY=VALUE` };
+    }
+    const key = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) {
+      return { env: null, error: `环境变量名无效: ${key} / Invalid variable name: ${key}` };
+    }
+    result[key] = value;
+  }
+  return { env: Object.keys(result).length > 0 ? result : null };
+}
+
 export function configEffortSupported(config: AgentAccountConfig, effort: string): boolean {
   return !effort || config.supportedEfforts.some(value => value === effort);
 }
 
-export function configDraftChanged(config: AgentAccountConfig | undefined, documentId: string, content: string, effort: string): boolean {
+export function configDraftChanged(
+  config: AgentAccountConfig | undefined,
+  documentId: string,
+  content: string,
+  effort: string,
+  extra?: { proxyUrl?: string; noProxy?: string; envText?: string },
+): boolean {
   const document = config?.documents.find(item => item.id === documentId);
-  return Boolean(document && (content !== document.content || effort !== (config?.defaultEffort ?? "")));
+  if (!document) return false;
+  if (content !== document.content || effort !== (config?.defaultEffort ?? "")) return true;
+  if (!extra) return false;
+  if ((extra.proxyUrl ?? "").trim() !== (config?.proxyUrl ?? "")) return true;
+  if ((extra.noProxy ?? "").trim() !== (config?.noProxy ?? "")) return true;
+  if ((extra.envText ?? "").trim() !== formatEnvLines(config?.env).trim()) return true;
+  return false;
 }
 
 export async function createManagedAccountFlow(
