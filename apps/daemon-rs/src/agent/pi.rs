@@ -329,10 +329,78 @@ fn parse_models_list(models_value: &Value, current_model: Option<&str>) -> Vec<L
     out
 }
 
+const PI_CATALOG_TTL: Duration = Duration::from_secs(300);
+
+fn pi_catalog_cache()
+-> &'static std::sync::Mutex< std::collections::HashMap<String, (std::time::Instant, LaunchModelCatalog)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, LaunchModelCatalog)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn pi_file_stamp(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{}:{mtime}", meta.len())
+        }
+        Err(_) => "-".into(),
+    }
+}
+
+fn pi_catalog_cache_key(environment: &[(String, String)]) -> String {
+    let agent_dir = environment
+        .iter()
+        .find(|(k, _)| k == "PI_CODING_AGENT_DIR")
+        .map(|(_, v)| PathBuf::from(v))
+        .or_else(|| {
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+                })
+        });
+    let dir_stamp = agent_dir
+        .as_deref()
+        .map(|dir| {
+            format!(
+                "{}|m={}|a={}|s={}",
+                dir.display(),
+                pi_file_stamp(&dir.join("models.json")),
+                pi_file_stamp(&dir.join("auth.json")),
+                pi_file_stamp(&dir.join("settings.json")),
+            )
+        })
+        .unwrap_or_else(|| "default".into());
+    let mut env_parts: Vec<String> = environment
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    env_parts.sort();
+    format!("{dir_stamp}|{}", env_parts.join(";"))
+}
+
 pub(super) async fn launch_catalog(
     workspace: &Path,
     environment: &[(String, String)],
 ) -> Result<LaunchModelCatalog> {
+    let use_cache = std::env::var_os("PROSPERO_PI_BIN").is_none();
+    let cache_key = pi_catalog_cache_key(environment);
+    if use_cache
+        && let Ok(guard) = pi_catalog_cache().lock()
+        && let Some((instant, cached)) = guard.get(&cache_key)
+        && instant.elapsed() < PI_CATALOG_TTL
+    {
+        return Ok(cached.clone());
+    }
+
     let mut command = Command::new(binary());
     command
         .args(["--mode", "rpc", "--no-session"])
@@ -427,7 +495,13 @@ pub(super) async fn launch_catalog(
 
     let _ = guard.terminate(Duration::from_secs(2)).await;
     match result {
-        Ok(inner) => inner,
+        Ok(Ok(catalog)) => {
+            if use_cache && let Ok(mut cache_guard) = pi_catalog_cache().lock() {
+                cache_guard.insert(cache_key, (std::time::Instant::now(), catalog.clone()));
+            }
+            Ok(catalog)
+        }
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(Error::Invalid("pi 模型列表读取超时".into())),
     }
 }

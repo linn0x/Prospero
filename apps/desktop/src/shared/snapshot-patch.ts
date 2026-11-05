@@ -120,22 +120,25 @@ function diffOrchestrationSnapshot(previous: OrchestrationSnapshot, next: Orches
 }
 
 function diffDaemonSnapshot(previous: DaemonSnapshot, next: DaemonSnapshot): DaemonSnapshotPatch | undefined {
+  if (previous === next) return undefined;
   const patch: DaemonSnapshotPatch = {};
   for (const key of DAEMON_KEYS) {
     if (!sameSnapshotValue(previous[key], next[key])) Object.assign(patch, { [key]: next[key] });
   }
 
-  const previousById = new Map(previous.sessions.map((session) => [session.id, session]));
-  const nextById = new Map(next.sessions.map((session) => [session.id, session]));
-  const sessionUpserts = next.sessions.filter((session) => !sameSnapshotValue(previousById.get(session.id), session));
-  const sessionRemovedIds = previous.sessions
-    .filter((session) => !nextById.has(session.id))
-    .map((session) => session.id);
-  const previousOrder = ids(previous.sessions);
-  const nextOrder = ids(next.sessions);
-  if (sessionUpserts.length > 0) patch.sessionUpserts = sessionUpserts;
-  if (sessionRemovedIds.length > 0) patch.sessionRemovedIds = sessionRemovedIds;
-  if (!sameStringArray(previousOrder, nextOrder)) patch.sessionOrder = nextOrder;
+  if (previous.sessions !== next.sessions) {
+    const previousById = new Map(previous.sessions.map((session) => [session.id, session]));
+    const nextById = new Map(next.sessions.map((session) => [session.id, session]));
+    const sessionUpserts = next.sessions.filter((session) => !sameSnapshotValue(previousById.get(session.id), session));
+    const sessionRemovedIds = previous.sessions
+      .filter((session) => !nextById.has(session.id))
+      .map((session) => session.id);
+    const previousOrder = ids(previous.sessions);
+    const nextOrder = ids(next.sessions);
+    if (sessionUpserts.length > 0) patch.sessionUpserts = sessionUpserts;
+    if (sessionRemovedIds.length > 0) patch.sessionRemovedIds = sessionRemovedIds;
+    if (!sameStringArray(previousOrder, nextOrder)) patch.sessionOrder = nextOrder;
+  }
   return Object.keys(patch).length > 0 ? patch : undefined;
 }
 

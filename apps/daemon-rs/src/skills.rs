@@ -8,6 +8,7 @@
 //! `spawn_blocking` in async contexts.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -18,6 +19,8 @@ use ts_rs::TS;
 use crate::error::{Error, Result};
 
 const SKILL_CACHE_MS: Duration = Duration::from_millis(30_000);
+const USER_SKILL_CACHE_MS: Duration = Duration::from_millis(60_000);
+const FRONTMATTER_READ_LIMIT: u64 = 8_192;
 const MAX_SKILLS: usize = 500;
 const MAX_BOUND_SKILLS: usize = 5;
 const MAX_FILE_REFERENCES: usize = 20;
@@ -107,13 +110,18 @@ fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn user_cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
+    static USER_CACHE: OnceLock<Mutex<HashMap<PathBuf, CacheEntry>>> = OnceLock::new();
+    USER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
 }
 
-fn skill_roots(cwd: &Path) -> Vec<SkillRoot> {
+fn project_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
     let mut current = cwd.to_path_buf();
     let mut priority = 0i64;
@@ -137,30 +145,54 @@ fn skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         };
         current = parent;
     }
+    roots
+}
 
-    let Some(home) = home_dir() else { return roots };
+fn user_skill_roots(home: &Path) -> Vec<SkillRoot> {
     let user = |folder: &str, scope: SkillScope, depth: usize, priority: i64| SkillRoot {
         dir: home.join(folder),
         scope,
         depth,
         priority,
     };
-    roots.push(user(".agents/skills", SkillScope::User, 5, 100));
-    roots.push(user(".codex/skills", SkillScope::Codex, 6, 110));
-    roots.push(user(".claude/skills", SkillScope::Claude, 5, 120));
-    roots.push(user(
-        ".config/opencode/skills",
-        SkillScope::OpenCode,
-        5,
-        130,
-    ));
-    roots.push(user(".opencode/skills", SkillScope::OpenCode, 5, 131));
-    roots.push(user(".grok/skills", SkillScope::Grok, 5, 135));
-    // Standalone Prospero plugin ZIPs install here; keep this ahead of the
-    // Codex cache so a user-installed plugin needs no marketplace entry.
-    roots.push(user(".prospero/plugins", SkillScope::Plugin, 8, 139));
-    roots.push(user(".codex/plugins/cache", SkillScope::Plugin, 10, 140));
-    roots
+    vec![
+        user(".agents/skills", SkillScope::User, 5, 100),
+        user(".codex/skills", SkillScope::Codex, 6, 110),
+        user(".claude/skills", SkillScope::Claude, 5, 120),
+        user(".config/opencode/skills", SkillScope::OpenCode, 5, 130),
+        user(".opencode/skills", SkillScope::OpenCode, 5, 131),
+        user(".grok/skills", SkillScope::Grok, 5, 135),
+        // Standalone Prospero plugin ZIPs install here; keep this ahead of the
+        // Codex cache so a user-installed plugin needs no marketplace entry.
+        user(".prospero/plugins", SkillScope::Plugin, 8, 139),
+        user(".codex/plugins/cache", SkillScope::Plugin, 10, 140),
+    ]
+}
+
+fn discovered_user_skills() -> Vec<DiscoveredSkill> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    {
+        let guard = user_cache().lock().unwrap();
+        if let Some(entry) = guard.get(&home)
+            && entry.at.elapsed() < USER_SKILL_CACHE_MS
+        {
+            return entry.value.clone();
+        }
+    }
+    let mut out = Vec::new();
+    for root in user_skill_roots(&home) {
+        out.extend(scan_skill_root(&root));
+    }
+    user_cache().lock().unwrap().insert(
+        home,
+        CacheEntry {
+            at: Instant::now(),
+            value: out.clone(),
+        },
+    );
+    out
 }
 
 fn parse_frontmatter(contents: &str, fallback_name: &str) -> (String, String) {
@@ -249,6 +281,13 @@ fn memchr_block_end(rest: &str) -> Option<usize> {
     None
 }
 
+fn read_frontmatter_prefix(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(1024);
+    file.take(FRONTMATTER_READ_LIMIT).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 fn scan_skill_root(root: &SkillRoot) -> Vec<DiscoveredSkill> {
     let mut out = Vec::new();
     let mut visited = HashSet::new();
@@ -256,6 +295,7 @@ fn scan_skill_root(root: &SkillRoot) -> Vec<DiscoveredSkill> {
     fn walk(
         dir: &Path,
         depth: usize,
+        needs_canonicalize: bool,
         root: &SkillRoot,
         visited: &mut HashSet<PathBuf>,
         out: &mut Vec<DiscoveredSkill>,
@@ -263,9 +303,13 @@ fn scan_skill_root(root: &SkillRoot) -> Vec<DiscoveredSkill> {
         if depth > root.depth || out.len() >= MAX_SKILLS {
             return;
         }
-        let actual = match std::fs::canonicalize(dir) {
-            Ok(path) => path,
-            Err(_) => return,
+        let actual = if needs_canonicalize {
+            match std::fs::canonicalize(dir) {
+                Ok(path) => path,
+                Err(_) => return,
+            }
+        } else {
+            dir.to_path_buf()
         };
         if !visited.insert(actual.clone()) {
             return;
@@ -274,33 +318,29 @@ fn scan_skill_root(root: &SkillRoot) -> Vec<DiscoveredSkill> {
             Ok(entries) => entries,
             Err(_) => return,
         };
-        let mut children = Vec::new();
+        let mut children: Vec<(PathBuf, bool)> = Vec::new();
         let mut skill_file: Option<PathBuf> = None;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let file_type = entry.file_type();
-            let is_file = file_type
-                .as_ref()
-                .map(|kind| kind.is_file())
-                .unwrap_or(false);
-            let is_dir = file_type
-                .as_ref()
-                .map(|kind| kind.is_dir() || kind.is_symlink())
-                .unwrap_or(false);
-            if name == "SKILL.md" && is_file {
+            let (is_file, is_dir, is_symlink) = match file_type {
+                Ok(kind) => (kind.is_file(), kind.is_dir(), kind.is_symlink()),
+                Err(_) => (false, false, false),
+            };
+            if name == "SKILL.md" && (is_file || (is_symlink && actual.join(name.as_ref()).is_file())) {
                 skill_file = Some(actual.join(name.as_ref()));
                 continue;
             }
-            if is_dir
+            if (is_dir || is_symlink)
                 && !SKIP_DIRS.contains(&name.as_ref())
                 && (!name.starts_with('.') || name == ".system")
             {
-                children.push(actual.join(name.as_ref()));
+                children.push((actual.join(name.as_ref()), is_symlink));
             }
         }
         if let Some(skill_path) = skill_file {
-            if let Ok(contents) = std::fs::read_to_string(&skill_path) {
+            if let Ok(contents) = read_frontmatter_prefix(&skill_path) {
                 let fallback = actual
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -317,15 +357,15 @@ fn scan_skill_root(root: &SkillRoot) -> Vec<DiscoveredSkill> {
             // Never descend into a skill's own references/scripts directories.
             return;
         }
-        for child in children {
-            walk(&child, depth + 1, root, visited, out);
+        for (child, is_symlink) in children {
+            walk(&child, depth + 1, is_symlink, root, visited, out);
             if out.len() >= MAX_SKILLS {
                 return;
             }
         }
     }
 
-    walk(&root.dir, 0, root, &mut visited, &mut out);
+    walk(&root.dir, 0, true, root, &mut visited, &mut out);
     out
 }
 
@@ -343,11 +383,12 @@ fn discovered_skills(cwd: &str) -> Vec<DiscoveredSkill> {
             return entry.value.clone();
         }
     }
-    let roots = skill_roots(Path::new(&key));
+    let project_roots = project_skill_roots(Path::new(&key));
     let mut all: Vec<DiscoveredSkill> = Vec::new();
-    for root in &roots {
+    for root in &project_roots {
         all.extend(scan_skill_root(root));
     }
+    all.extend(discovered_user_skills());
     // Same-name skills follow project → user → agents/plugins precedence so
     // completion never offers two identical `$name` tokens.
     all.sort_by(|a, b| {

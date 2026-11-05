@@ -1,4 +1,4 @@
-ALTER TABLE managed_accounts ADD COLUMN agent TEXT CHECK(agent IS NULL OR agent IN ('claude','codex','opencode'));
+ALTER TABLE managed_accounts ADD COLUMN agent TEXT CHECK(agent IS NULL OR agent IN ('claude','codex','opencode','pi'));
 UPDATE managed_accounts
 SET agent = CASE
     WHEN api_profile IS NULL THEN 'claude'

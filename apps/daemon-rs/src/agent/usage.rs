@@ -837,6 +837,32 @@ fn codex_models_from_response(value: &Value, models: &mut Vec<crate::agent::Laun
 }
 
 fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchModelInfo>> {
+    type CacheKey = (PathBuf, u128, u64);
+    static MODEL_FILE_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<PathBuf, (u128, u64, Vec<crate::agent::LaunchModelInfo>)>,
+        >,
+    > = std::sync::OnceLock::new();
+
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let len = meta.len();
+    let cache = MODEL_FILE_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some((cached_mtime, cached_len, models)) = guard.get(path)
+        && *cached_mtime == mtime
+        && *cached_len == len
+    {
+        return Some(models.clone());
+    }
+
+    let _key: CacheKey = (path.to_path_buf(), mtime, len);
     let raw = std::fs::read_to_string(path).ok()?;
     let parsed: Value = serde_json::from_str(&raw).ok()?;
     let rows = parsed.get("models")?.as_array()?;
@@ -905,7 +931,13 @@ fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchM
             is_default,
         });
     }
-    (!models.is_empty()).then_some(models)
+    if models.is_empty() {
+        return None;
+    }
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), (mtime, len, models.clone()));
+    }
+    Some(models)
 }
 
 fn codex_config_defaults(codex_home: &Path) -> (Option<String>, Option<String>) {
@@ -1031,7 +1063,6 @@ pub(crate) fn fast_codex_catalog_for_account(
 pub(crate) async fn read_native_codex_models(
     data: &Path,
 ) -> Result<crate::agent::LaunchModelCatalog> {
-    let (cwd, env) = native_codex_environment(data)?;
     let target = crate::accounts::config::ConfigTarget {
         account_id: NATIVE_CODEX_ID.to_owned(),
         model: None,
@@ -1040,6 +1071,31 @@ pub(crate) async fn read_native_codex_models(
     };
     let (override_model, override_effort) =
         crate::accounts::config::read_defaults(data, &target).unwrap_or((None, None));
+    if std::env::var_os("PROSPERO_CODEX_BIN").is_none()
+        && let Some(models) =
+            codex_models_from_cache_file(&shared_codex_home().join("models_cache.json"))
+    {
+        let current_model = models
+            .iter()
+            .find(|model| model.is_default)
+            .or_else(|| models.first())
+            .map(|model| model.id.clone());
+        let mut catalog = crate::agent::LaunchModelCatalog {
+            models,
+            current_model,
+            current_effort: None,
+            presets: Vec::new(),
+            current_preset: None,
+        };
+        let (config_model, config_effort) = codex_config_defaults(&shared_codex_home());
+        apply_codex_catalog_defaults(
+            &mut catalog,
+            override_model.or(config_model),
+            override_effort.or(config_effort),
+        );
+        return Ok(catalog);
+    }
+    let (cwd, env) = native_codex_environment(data)?;
     let mut catalog = read_codex_models(data, cwd, &env, &[]).await?;
     let (config_model, config_effort) = if std::env::var_os("PROSPERO_CODEX_BIN").is_none() {
         codex_config_defaults(&shared_codex_home())

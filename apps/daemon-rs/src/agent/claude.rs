@@ -134,7 +134,7 @@ const CATALOG_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Bounds a live-turn control request (model/effort switch).
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
-const CLAUDE_CATALOG_TTL: Duration = Duration::from_secs(300);
+const CLAUDE_CATALOG_TTL: Duration = Duration::from_secs(1800);
 
 fn claude_catalog_cache() -> &'static std::sync::Mutex<
     HashMap<String, (std::time::Instant, Vec<crate::agent::LaunchModelInfo>)>,

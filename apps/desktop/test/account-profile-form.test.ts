@@ -57,9 +57,9 @@ describe("desktop API profile form", () => {
   it("creates an immediate placeholder for a new login terminal", () => {
     expect(provisionalAccountLoginSession({ id: "account-1", agent: "codex", name: "Work" }, "login-1", 42)).toEqual({
       id: "login-1",
-      agent: "codex",
+      agent: "shell",
       kind: "pty",
-      title: "Work",
+      title: "Work · 登录",
       cwd: "",
       status: "starting",
       createdAt: 42,
