@@ -830,7 +830,7 @@ impl Terminals {
             )
             && spec
                 .as_ref()
-                .is_some_and(|spec| !spec.args.iter().any(|arg| arg == "setup-token"));
+                .is_some_and(|spec| !spec.args.iter().any(|arg| arg == "setup-token" || arg == "login"));
         let mut native = managed.then(|| crate::protocol::NativeSession {
             output_start_seq: None,
             runtime_id: uuid::Uuid::new_v4().to_string(),
