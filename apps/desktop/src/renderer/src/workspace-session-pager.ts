@@ -17,7 +17,8 @@ export class WorkspaceSessionPager {
   private attemptedCursor: string | undefined;
 
   constructor(private readonly api: PageApi, readonly workspace: string, private readonly queue = desktopPageRequests) {}
-  getSnapshot = (): WorkspacePageState => this.state;
+  readSnapshot(): WorkspacePageState { return this.state; }
+  getSnapshot = (): WorkspacePageState => this.readSnapshot();
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener); };
 
   setRevision(revision: string | undefined): void {

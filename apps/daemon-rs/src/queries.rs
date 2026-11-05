@@ -178,7 +178,7 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut active_check = self.connection.prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1 AND lifecycle='active' AND NOT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1))",
+            "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1 AND (lifecycle='active' OR COALESCE(json_extract(payload, '$.nativeSession.state'), '') IN ('archiving', 'failed')) AND NOT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1))",
         )?;
         let mut active_cache = std::collections::HashMap::new();
         let mut items = Vec::with_capacity(rows.len());

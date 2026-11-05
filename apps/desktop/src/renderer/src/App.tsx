@@ -439,7 +439,7 @@ type SidebarSessionHandlers = {
   onDuplicateSession: (session: SessionInfo) => void;
   onForkSession: (session: SessionInfo) => void;
   onSetUnread: (id: string, unread: boolean) => void;
-  onToggleArchive: (id: string) => void;
+  onToggleArchive: (id: string, session?: SessionInfo) => void;
 };
 
 type PinnedSessionRowProps = SidebarSessionHandlers & {
@@ -539,7 +539,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
               {pinned ? <PinOff /> : <Pin />}
               {pinned ? t("取消置顶", "Unpin") : t("置顶", "Pin")}
             </ContextMenuItem>
-            <ContextMenuItem onClick={() => onToggleArchive(session.id)}>
+            <ContextMenuItem onClick={() => onToggleArchive(session.id, session)}>
               {archived ? <ArchiveRestore /> : <Archive />}
               {archived ? t("取消归档", "Unarchive") : t("归档", "Archive")}
             </ContextMenuItem>
@@ -595,7 +595,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
         aria-label={archived ? t(`恢复 ${sessionLabel(session)}`, `Restore ${sessionLabel(session)}`) : t(`归档 ${sessionLabel(session)}`, `Archive ${sessionLabel(session)}`)}
         title={archived ? t("恢复聊天", "Restore chat") : t("归档聊天", "Archive chat")}
         onPointerDown={event => event.stopPropagation()}
-        onClick={event => { consumeSidebarAction(event); onToggleArchive(session.id); }}>
+        onClick={event => { consumeSidebarAction(event); onToggleArchive(session.id, session); }}>
         {archived ? <ArchiveRestore aria-hidden="true" /> : <Archive aria-hidden="true" />}
       </button>
     </Row>
@@ -613,6 +613,9 @@ function sidebarSessionRowEqual(
     left.agent !== right.agent ||
     left.kind !== right.kind ||
     left.historyMode !== right.historyMode ||
+    left.archived !== right.archived ||
+    left.nativeSession?.state !== right.nativeSession?.state ||
+    left.nativeSession?.nativeId !== right.nativeSession?.nativeId ||
     left.title !== right.title ||
     left.displayTitle !== right.displayTitle ||
     left.preview !== right.preview ||
@@ -1309,7 +1312,7 @@ function ShellSidebar({
     );
     const renderSession = (session: SessionInfo): ReactNode => <WorkspaceSessionRow
       key={session.id} session={session} active={view === "workspaces" && activeId === session.id}
-      unread={snapshot.unreadSessionIds.includes(session.id)} archived={snapshot.archivedSessionIds.includes(session.id)}
+      unread={snapshot.unreadSessionIds.includes(session.id)} archived={Boolean(session.archived) || snapshot.archivedSessionIds.includes(session.id)}
       onToggleArchive={onToggleArchive} pinned={snapshot.pinnedSessionIds.includes(session.id)} onOpenSession={selectSession}
       onTogglePin={onTogglePin} onRenameSession={onRenameSession} onDuplicateSession={onDuplicateSession} onForkSession={onForkSession} onSetUnread={onSetUnread}
     />;
@@ -3984,10 +3987,11 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [openNewSession]);
   const [archiveBinding, setArchiveBinding] = useState<{ session: SessionInfo; archived: boolean }>();
-  const toggleArchive = useCallback((id: string): void => {
-    const archived = !snapshotRef.current.archivedSessionIds.includes(id);
-    const session = snapshotRef.current.daemon.sessions.find(session => session.id === id);
-    if (session && needsNativeBinding(session)) { setArchiveBinding({ session, archived }); return; }
+  const toggleArchive = useCallback((id: string, passedSession?: SessionInfo): void => {
+    const session = passedSession ?? snapshotRef.current.daemon.sessions.find(item => item.id === id);
+    const currentlyArchived = Boolean(session?.archived) || snapshotRef.current.archivedSessionIds.includes(id);
+    const archived = !currentlyArchived;
+    if (session && archived && needsNativeBinding(session)) { setArchiveBinding({ session, archived }); return; }
     void window.prospero.setSessionArchived(id, archived).then(() => {
       if (archived) {
         setOpenIds(current => current.filter(item => item !== id));

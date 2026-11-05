@@ -417,6 +417,14 @@ impl Store {
             "DELETE FROM session_search WHERE rowid NOT IN (SELECT rowid FROM session_heads)",
             [],
         )?;
+        connection.execute(
+            "UPDATE session_heads \
+             SET payload = json_set(payload, '$.nativeSession.state', 'failed') \
+             WHERE lifecycle = 'archived' \
+               AND json_extract(payload, '$.status') = 'failed' \
+               AND json_extract(payload, '$.nativeSession.state') IN ('running', 'binding')",
+            [],
+        )?;
         connection.prepare(
             "SELECT id,created_at,lifecycle,revision,payload FROM session_heads LIMIT 0",
         )?;
@@ -681,7 +689,10 @@ impl Store {
         if previous.lifecycle != session.lifecycle || previous.status != session.status {
             Self::adjust_counts(&transaction, &previous, -1)?;
             Self::adjust_counts(&transaction, &session, 1)?;
-            if session.lifecycle == SessionLifecycle::Archived && previous.lifecycle != SessionLifecycle::Archived {
+            if session.lifecycle == SessionLifecycle::Archived
+                && previous.lifecycle != SessionLifecycle::Archived
+                && !(session.status == SessionStatus::Failed && session.native_session.is_some())
+            {
                 Self::record_workspace_session_closed(&transaction, &session.workspace, &session.id, timestamp)?;
             } else if session.lifecycle == SessionLifecycle::Active && previous.lifecycle != SessionLifecycle::Active {
                 Self::record_workspace_session_opened(&transaction, &session.workspace, &session.id, timestamp)?;
@@ -875,7 +886,7 @@ impl Store {
                 continue;
             }
             let valid: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1 AND lifecycle='active' AND NOT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1))",
+                "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1 AND (lifecycle='active' OR COALESCE(json_extract(payload, '$.nativeSession.state'), '') IN ('archiving', 'failed')) AND NOT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1))",
                 [&id],
                 |row| row.get(0),
             )?;
