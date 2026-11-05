@@ -8,7 +8,8 @@ pub use prospero_protocol_rs::{
     RelayRuntimeStatus, RenameSession, ResyncRequired, SessionHead, SessionKind,
     SessionLaunchOptions, SessionLifecycle, SessionLookup, SessionLookupResult, SessionPage,
     SessionQuery, SessionStatus, SessionSummary, TerminalApprovalPolicy, UpdateSession,
-    WorkspaceHead, WorkspacePage, WorkspaceQuery,
+    WorkspaceHead, WorkspacePage, WorkspaceQuery, WorkspaceTabsEntry, WorkspaceTabsList,
+    WorkspaceTabsUpdate,
 };
 
 pub use prospero_protocol_rs::{
@@ -43,6 +44,9 @@ pub fn typescript() -> String {
         WorkspaceQuery::decl(&config),
         WorkspaceHead::decl(&config),
         WorkspacePage::decl(&config),
+        WorkspaceTabsEntry::decl(&config),
+        WorkspaceTabsUpdate::decl(&config),
+        WorkspaceTabsList::decl(&config),
         SessionLookup::decl(&config),
         SessionLookupResult::decl(&config),
         ChangeEvent::decl(&config),

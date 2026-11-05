@@ -407,6 +407,21 @@ export class StateStore extends EventEmitter {
             const counts = objectValue(entry);
             return [workspace, { revision: nonNegativeInteger(counts["revision"]), total: nonNegativeInteger(counts["total"]), active: nonNegativeInteger(counts["active"]), archived: nonNegativeInteger(counts["archived"]), attention: nonNegativeInteger(counts["attention"]) }];
           })),
+          ...(status["workspaceTabs"] ? {
+            workspaceTabs: Object.fromEntries(Object.entries(objectValue(status["workspaceTabs"])).slice(0, 100).map(([workspace, entry]) => {
+              const tabs = objectValue(entry);
+              const openSessionIds = arrayValue(tabs["openSessionIds"]).filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200).slice(0, 64);
+              const activeSessionId = stringValue(tabs["activeSessionId"]);
+              const splitSessionId = stringValue(tabs["splitSessionId"]);
+              return [workspace, {
+                openSessionIds,
+                ...(activeSessionId ? { activeSessionId } : {}),
+                ...(splitSessionId ? { splitSessionId } : {}),
+                updatedAt: nonNegativeInteger(tabs["updatedAt"]),
+                revision: nonNegativeInteger(tabs["revision"]),
+              }];
+            })),
+          } : {}),
         } : {}),
         ...(running ? { pid: rawPid } : {}),
         ...(this.lastError ? { lastError: this.lastError } : {}),

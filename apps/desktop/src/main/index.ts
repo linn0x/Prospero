@@ -1023,6 +1023,25 @@ function installIpc(): void {
     if (typeof pinned !== "boolean") throw new Error("置顶状态无效");
     return store.setSessionPinned(sessionId, pinned);
   });
+  ipcMain.handle("workspace:tabs:set", async (_event, raw: unknown) => {
+    const input = requireObject(raw);
+    const workspace = typeof input["workspace"] === "string" ? input["workspace"].trim() : "";
+    if (!workspace || workspace.length > 4096) throw new Error("工作区路径无效");
+    const openSessionIds = Array.isArray(input["openSessionIds"])
+      ? input["openSessionIds"].filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200).slice(0, 64)
+      : [];
+    const activeSessionId = typeof input["activeSessionId"] === "string" && input["activeSessionId"] ? requireId(input["activeSessionId"], "活动会话") : undefined;
+    const splitSessionId = typeof input["splitSessionId"] === "string" && input["splitSessionId"] ? requireId(input["splitSessionId"], "分屏会话") : undefined;
+    if (runtime instanceof RustRuntime) {
+      return runtime.setWorkspaceTabs({
+        workspace,
+        openSessionIds,
+        ...(activeSessionId ? { activeSessionId } : {}),
+        ...(splitSessionId ? { splitSessionId } : {}),
+      });
+    }
+    return store.snapshot();
+  });
   ipcMain.handle("session:unread", (_event, rawId: unknown, unread: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof unread !== "boolean") throw new Error("会话未读状态无效");

@@ -10,12 +10,14 @@ use crate::protocol::{SessionHead, SessionStatus, UpdateSession};
 use crate::worker::Database;
 
 const NATIVE_CODEX_ID: &str = "native-codex";
+pub const MAX_ACTIVE_TERMINALS: usize = 64;
 
 struct State {
     guard: Option<PathBuf>,
     guard_hash: Option<String>,
     database: Database,
     entries: Mutex<HashMap<String, Handle>>,
+    capacity: usize,
     slots: Arc<Semaphore>,
     closed: AtomicBool,
     failed: AtomicBool,
@@ -42,21 +44,36 @@ impl Terminals {
         Self::with_guard(database, None, None)
     }
 
+    pub fn with_capacity(database: Database, capacity: usize) -> Self {
+        Self::with_guard_and_capacity(database, None, None, capacity)
+    }
+
     pub(crate) fn with_guard(
         database: Database,
         guard: Option<PathBuf>,
         guard_hash: Option<String>,
     ) -> Self {
+        Self::with_guard_and_capacity(database, guard, guard_hash, MAX_ACTIVE_TERMINALS)
+    }
+
+    pub(crate) fn with_guard_and_capacity(
+        database: Database,
+        guard: Option<PathBuf>,
+        guard_hash: Option<String>,
+        capacity: usize,
+    ) -> Self {
+        let capacity = capacity.max(1);
         Self(Arc::new(State {
             guard,
             guard_hash,
             database,
             entries: Mutex::new(HashMap::new()),
-            slots: Arc::new(Semaphore::new(16)),
+            capacity,
+            slots: Arc::new(Semaphore::new(capacity)),
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             changed: watch::channel(0).0,
-            checkpoints: Arc::new(Semaphore::new(2)),
+            checkpoints: Arc::new(Semaphore::new(4)),
             lifecycle: tokio::sync::Mutex::new(()),
             control_environment: std::sync::Mutex::new(None),
         }))
@@ -66,8 +83,12 @@ impl Terminals {
         self.0.guard.is_some()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.0.capacity
+    }
+
     pub fn count(&self) -> usize {
-        16 - self.0.slots.available_permits()
+        self.0.capacity - self.0.slots.available_permits()
     }
 
     /// Reclaims old manual Agent PTYs only when their live terminal host still
@@ -77,10 +98,11 @@ impl Terminals {
         if limit == 0 {
             return Ok(0);
         }
+        let capacity = self.0.capacity;
         let candidates = self
             .0
             .database
-            .call(move |store| store.manual_terminal_reclaim_candidates(before, 16))
+            .call(move |store| store.manual_terminal_reclaim_candidates(before, capacity))
             .await?;
         let mut reclaimed = 0;
         for id in candidates {
@@ -246,7 +268,7 @@ impl Terminals {
                 operation: "terminal.create".into(),
                 resource: "terminal_sessions".into(),
                 queue_depth: self.count(),
-                queue_capacity: 16,
+                queue_capacity: self.0.capacity,
                 side_effect_committed: Some(false),
             })
         })?;

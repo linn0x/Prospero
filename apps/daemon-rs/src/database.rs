@@ -182,6 +182,16 @@ impl Store {
             transaction.execute_batch(include_str!("agent/schema-v34.sql"))?;
             transaction.execute_batch(include_str!("orchestration/schema-v35.sql"))?;
             transaction.execute_batch(include_str!("terminal/schema-v36.sql"))?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS workspace_tabs (
+                    workspace TEXT PRIMARY KEY CHECK(length(workspace) BETWEEN 1 AND 4096),
+                    open_session_ids TEXT NOT NULL DEFAULT '[]' CHECK(length(CAST(open_session_ids AS BLOB)) <= 16384),
+                    active_session_id TEXT,
+                    split_session_id TEXT,
+                    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0)
+                ) STRICT;",
+            )?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -282,6 +292,16 @@ impl Store {
             if version <= 35 {
                 transaction.execute_batch(include_str!("terminal/schema-v36.sql"))?;
             }
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS workspace_tabs (
+                    workspace TEXT PRIMARY KEY CHECK(length(workspace) BETWEEN 1 AND 4096),
+                    open_session_ids TEXT NOT NULL DEFAULT '[]' CHECK(length(CAST(open_session_ids AS BLOB)) <= 16384),
+                    active_session_id TEXT,
+                    split_session_id TEXT,
+                    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0)
+                ) STRICT;",
+            )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -386,6 +406,7 @@ impl Store {
         let transaction = self.connection.transaction()?;
         Self::insert_session(&transaction, &session)?;
         extra(&transaction, &session)?;
+        Self::record_workspace_session_opened(&transaction, &session.workspace, &session.id, timestamp)?;
         Self::append_event(
             &transaction,
             "sessions",
@@ -556,6 +577,11 @@ impl Store {
         if previous.lifecycle != session.lifecycle || previous.status != session.status {
             Self::adjust_counts(&transaction, &previous, -1)?;
             Self::adjust_counts(&transaction, &session, 1)?;
+            if session.lifecycle == SessionLifecycle::Archived && previous.lifecycle != SessionLifecycle::Archived {
+                Self::record_workspace_session_closed(&transaction, &session.workspace, &session.id, timestamp)?;
+            } else if session.lifecycle == SessionLifecycle::Active && previous.lifecycle != SessionLifecycle::Active {
+                Self::record_workspace_session_opened(&transaction, &session.workspace, &session.id, timestamp)?;
+            }
         } else {
             for (scope, workspace) in [(0, ""), (1, session.workspace.as_str())] {
                 transaction.execute(
@@ -634,6 +660,179 @@ impl Store {
             transaction.execute("UPDATE session_counts SET total=total+?1,active=active+?2,attention=attention+?3,revision=revision+max(?1,0) WHERE scope=?4 AND workspace=?5", params![delta, delta * active, delta * attention, scope, workspace])?;
         }
         Ok(())
+    }
+
+    pub(crate) fn record_workspace_session_opened(
+        transaction: &Transaction<'_>,
+        workspace: &str,
+        session_id: &str,
+        timestamp: i64,
+    ) -> Result<()> {
+        let is_child: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1)",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if is_child {
+            return Ok(());
+        }
+        let existing: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT open_session_ids,split_session_id FROM workspace_tabs WHERE workspace=?1",
+                [workspace],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (mut ids, split_id) = match existing {
+            Some((raw, split)) => (
+                serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
+                split,
+            ),
+            None => (Vec::new(), None),
+        };
+        if !ids.iter().any(|id| id == session_id) {
+            ids.push(session_id.to_owned());
+        }
+        if ids.len() > 64 {
+            let drain = ids.len() - 64;
+            ids.drain(0..drain);
+        }
+        let encoded = serde_json::to_string(&ids)?;
+        transaction.execute(
+            "INSERT INTO workspace_tabs(workspace,open_session_ids,active_session_id,split_session_id,updated_at,revision) \
+             VALUES(?1,?2,?3,?4,?5,1) \
+             ON CONFLICT(workspace) DO UPDATE SET open_session_ids=excluded.open_session_ids,active_session_id=excluded.active_session_id,updated_at=excluded.updated_at,revision=workspace_tabs.revision+1",
+            params![workspace, encoded, session_id, split_id, timestamp],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_workspace_session_closed(
+        transaction: &Transaction<'_>,
+        workspace: &str,
+        session_id: &str,
+        timestamp: i64,
+    ) -> Result<()> {
+        let existing: Option<(String, Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT open_session_ids,active_session_id,split_session_id FROM workspace_tabs WHERE workspace=?1",
+                [workspace],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((raw, active_id, split_id)) = existing else {
+            return Ok(());
+        };
+        let mut ids = serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+        let previous_index = ids.iter().position(|id| id == session_id);
+        ids.retain(|id| id != session_id);
+        let next_active = if active_id.as_deref() == Some(session_id) {
+            previous_index
+                .and_then(|idx| ids.get(idx.saturating_sub(1)).or_else(|| ids.first()))
+                .cloned()
+        } else {
+            active_id
+                .filter(|id| ids.contains(id))
+                .or_else(|| ids.first().cloned())
+        };
+        let next_split = split_id.filter(|id| {
+            id != session_id && next_active.as_ref() != Some(id) && ids.contains(id)
+        });
+        let encoded = serde_json::to_string(&ids)?;
+        transaction.execute(
+            "UPDATE workspace_tabs SET open_session_ids=?1,active_session_id=?2,split_session_id=?3,updated_at=?4,revision=revision+1 WHERE workspace=?5",
+            params![encoded, next_active, next_split, timestamp, workspace],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_workspace_tabs(&mut self, input: WorkspaceTabsUpdate) -> Result<WorkspaceTabsEntry> {
+        validate_text(&input.workspace, 4096, false)?;
+        if input.open_session_ids.len() > 64 {
+            return Err(Error::Invalid("workspace open tabs must be at most 64".into()));
+        }
+        for id in &input.open_session_ids {
+            validate_id(id)?;
+        }
+        if let Some(id) = &input.active_session_id {
+            validate_id(id)?;
+        }
+        if let Some(id) = &input.split_session_id {
+            validate_id(id)?;
+        }
+        let timestamp = now();
+        let transaction = self.connection.transaction()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut open_session_ids = Vec::with_capacity(input.open_session_ids.len());
+        for id in input.open_session_ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let valid: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1 AND lifecycle='active' AND NOT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1))",
+                [&id],
+                |row| row.get(0),
+            )?;
+            if valid {
+                open_session_ids.push(id);
+            }
+        }
+        let mut active_session_id = input
+            .active_session_id
+            .filter(|id| open_session_ids.contains(id));
+        if active_session_id.is_none() {
+            active_session_id = open_session_ids.first().cloned();
+        }
+        let split_session_id = input
+            .split_session_id
+            .filter(|id| open_session_ids.contains(id) && active_session_id.as_ref() != Some(id));
+        let encoded = serde_json::to_string(&open_session_ids)?;
+        transaction.execute(
+            "INSERT INTO workspace_tabs(workspace,open_session_ids,active_session_id,split_session_id,updated_at,revision) \
+             VALUES(?1,?2,?3,?4,?5,1) \
+             ON CONFLICT(workspace) DO UPDATE SET open_session_ids=excluded.open_session_ids,active_session_id=excluded.active_session_id,split_session_id=excluded.split_session_id,updated_at=excluded.updated_at,revision=workspace_tabs.revision+1",
+            params![
+                input.workspace,
+                encoded,
+                active_session_id,
+                split_session_id,
+                timestamp
+            ],
+        )?;
+        let revision: i64 = transaction.query_row(
+            "SELECT revision FROM workspace_tabs WHERE workspace=?1",
+            [&input.workspace],
+            |row| row.get(0),
+        )?;
+        for (scope, workspace) in [(0, ""), (1, input.workspace.as_str())] {
+            transaction.execute(
+                "INSERT INTO session_counts(scope,workspace,total,active,attention) VALUES(?1,?2,0,0,0) ON CONFLICT DO NOTHING",
+                params![scope, workspace],
+            )?;
+            transaction.execute(
+                "UPDATE session_counts SET revision=revision+1 WHERE scope=?1 AND workspace=?2",
+                params![scope, workspace],
+            )?;
+        }
+        let entry = WorkspaceTabsEntry {
+            workspace: input.workspace.clone(),
+            open_session_ids,
+            active_session_id,
+            split_session_id,
+            updated_at: timestamp,
+            revision,
+        };
+        Self::append_event(
+            &transaction,
+            "sessions",
+            "workspace.tabs",
+            &input.workspace,
+            serde_json::to_value(&entry)?,
+        )?;
+        transaction.commit()?;
+        Ok(entry)
     }
 
     pub(crate) fn append_event(

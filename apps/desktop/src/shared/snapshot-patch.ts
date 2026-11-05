@@ -29,6 +29,7 @@ void SNAPSHOT_KEYS_ARE_EXHAUSTIVE;
 
 const DAEMON_KEYS = [
   "workspaceCounts",
+  "workspaceTabs",
   "metadataRevision",
   "running",
   "managed",

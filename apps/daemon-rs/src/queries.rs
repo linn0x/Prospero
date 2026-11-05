@@ -155,6 +155,63 @@ impl Store {
         })
     }
 
+    pub fn workspace_tabs(&self) -> Result<WorkspaceTabsList> {
+        self.read_snapshot(|| self.workspace_tabs_inner())
+    }
+
+    fn workspace_tabs_inner(&self) -> Result<WorkspaceTabsList> {
+        let latest_seq = self.session_seq()?;
+        let mut statement = self.connection.prepare_cached(
+            "SELECT workspace,open_session_ids,active_session_id,split_session_id,updated_at,revision \
+             FROM workspace_tabs ORDER BY updated_at DESC, workspace ASC LIMIT 100",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut active_check = self.connection.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?1 AND lifecycle='active' AND NOT EXISTS(SELECT 1 FROM cross_model_children WHERE child_session_id=?1))",
+        )?;
+        let mut items = Vec::with_capacity(rows.len());
+        for (workspace, raw_ids, active_id, split_id, updated_at, revision) in rows {
+            let parsed = serde_json::from_str::<Vec<String>>(&raw_ids).unwrap_or_default();
+            let mut open_session_ids = Vec::with_capacity(parsed.len());
+            let mut seen = HashSet::new();
+            for id in parsed {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let is_active: bool = active_check.query_row([&id], |row| row.get(0))?;
+                if is_active {
+                    open_session_ids.push(id);
+                }
+            }
+            let active_session_id = active_id
+                .filter(|id| open_session_ids.contains(id))
+                .or_else(|| open_session_ids.first().cloned());
+            let split_session_id = split_id.filter(|id| {
+                open_session_ids.contains(id) && active_session_id.as_ref() != Some(id)
+            });
+            items.push(WorkspaceTabsEntry {
+                workspace,
+                open_session_ids,
+                active_session_id,
+                split_session_id,
+                updated_at,
+                revision,
+            });
+        }
+        Ok(WorkspaceTabsList { items, latest_seq })
+    }
+
     pub fn lookup_sessions(&self, input: SessionLookup) -> Result<SessionLookupResult> {
         self.read_snapshot(|| self.lookup_sessions_inner(input))
     }

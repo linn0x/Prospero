@@ -465,11 +465,12 @@ export class RustRuntime {
     const refreshOrchestration = Boolean(orchCursor && (force || !this.orchestrationReady
       || this.orchestrationRetryPending || orchCursor.resyncRequired
       || orchCursor.latestSeq !== this.orchestrationSequence || Date.now() - this.orchestrationReadAt >= 2_000));
-    const [summary, active, recent, workspaces, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
+    const [summary, active, recent, workspaces, workspaceTabs, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
       client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
+      (typeof client.workspaceTabs === "function" ? client.workspaceTabs(signal) : Promise.resolve({ items: [], latestSeq: 0 })).catch(() => ({ items: [], latestSeq: 0 })),
       client.health(signal),
       client.devices(signal).catch((error: unknown) => {
         // Device rows are management UI state; a transient read failure must
@@ -530,6 +531,15 @@ export class RustRuntime {
       ...(health.relay ? { relay: health.relay as unknown as JsonObject } : {}),
       metadataRevision: `${pid}:${this.sequence}`,
       workspaceCounts: Object.fromEntries(workspaces.items.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
+      ...(workspaceTabs.items.length > 0 ? {
+        workspaceTabs: Object.fromEntries(workspaceTabs.items.map(item => [item.workspace, {
+          openSessionIds: item.openSessionIds,
+          ...(item.activeSessionId ? { activeSessionId: item.activeSessionId } : {}),
+          ...(item.splitSessionId ? { splitSessionId: item.splitSessionId } : {}),
+          updatedAt: item.updatedAt,
+          revision: item.revision,
+        }])),
+      } : {}),
       sessionSummary: { total: summary.total, active: summary.active, terminal: summary.archived, attention: summary.attention, activeLimit: 100, attentionLimit: 0, recentTerminalLimit: 100 },
       schedules: schedules as unknown as JsonObject[],
     } });
@@ -612,6 +622,20 @@ export class RustRuntime {
     const head = await client.session(id, signal);
     await client.rename(id, { revision: head.revision, title: title.trim() }, signal);
     await this.refresh(true);
+    return this.store.snapshot();
+  }
+
+  async setWorkspaceTabs(input: { workspace: string; openSessionIds: string[]; activeSessionId?: string; splitSessionId?: string }): Promise<DesktopSnapshot> {
+    const { client } = this.current();
+    if (typeof client.setWorkspaceTabs === "function") {
+      await client.setWorkspaceTabs({
+        workspace: input.workspace,
+        openSessionIds: input.openSessionIds,
+        ...(input.activeSessionId ? { activeSessionId: input.activeSessionId } : {}),
+        ...(input.splitSessionId ? { splitSessionId: input.splitSessionId } : {}),
+      }, this.controller.signal);
+      await this.refresh(true);
+    }
     return this.store.snapshot();
   }
 

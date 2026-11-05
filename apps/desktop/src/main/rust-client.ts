@@ -1,4 +1,4 @@
-import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
+import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery, WorkspaceTabsEntry, WorkspaceTabsList, WorkspaceTabsUpdate } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
 import WebSocket from "ws";
 import { setTimeout as delay } from "node:timers/promises";
@@ -345,6 +345,12 @@ export class RustClient {
     if (query.limit != null) params.set("limit", String(query.limit));
     if (query.cursor != null) params.set("cursor", query.cursor);
     return this.json(`/v1/workspaces?${params}`, { signal });
+  }
+  workspaceTabs(signal: AbortSignal | null = null): Promise<WorkspaceTabsList> {
+    return this.json("/v1/workspaces/tabs", { signal });
+  }
+  setWorkspaceTabs(input: WorkspaceTabsUpdate, signal: AbortSignal | null = null): Promise<WorkspaceTabsEntry> {
+    return this.json("/v1/workspaces/tabs", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
   lookup(ids: string[], signal: AbortSignal | null = null): Promise<SessionLookupResult> {
     if (ids.length > 100) throw new Error("Session lookup exceeds limit");
