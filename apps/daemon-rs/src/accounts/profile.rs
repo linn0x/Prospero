@@ -101,7 +101,9 @@ impl ModelCapabilities {
     }
 }
 
-const ALLOWED_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const ALLOWED_EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -605,6 +607,16 @@ fn known_codex_model(model: &str) -> Option<(i64, &'static [&'static str], &'sta
     match model {
         "glm-5.3" => Some((1_048_576, &["low", "high", "max"], "Z.ai's latest flagship model")),
         "glm-5-turbo" => Some((204_800, &[], "Agent-optimized model")),
+        "gpt-daybreak-blue-latest" => Some((
+            2_500_000,
+            &["low", "medium", "high", "xhigh", "ultra"],
+            "Daybreak Blue",
+        )),
+        "gpt-6-astra" => Some((
+            2_500_000,
+            &["low", "medium", "high", "xhigh", "ultra"],
+            "GPT-6 Astra",
+        )),
         _ => None,
     }
 }

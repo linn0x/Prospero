@@ -137,7 +137,7 @@ const API_PROFILE_TYPES = new Set([
 ]);
 const API_MODELS_TYPE = "agent.account.api.models.get";
 const ACCOUNT_CONFIG_TYPES = new Set(["agent.account.config.get", "agent.account.config.set"]);
-const ACCOUNT_CONFIG_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const ACCOUNT_CONFIG_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 /** Profile connection fields are Anthropic-only in the current Rust slice. */
 function requireProfileEndpoint(raw: unknown): string {
@@ -796,6 +796,11 @@ export class RustRuntime {
           if (input["content"] !== undefined) {
             if (typeof input["content"] !== "string" || input["content"].length > 16_384) throw new Error("配置内容过大");
             configBody["content"] = input["content"];
+          }
+          if ("defaultModel" in input) {
+            const defaultModel = input["defaultModel"];
+            if (defaultModel !== null && (typeof defaultModel !== "string" || defaultModel.length > 300 || /[\r\n\0]/.test(defaultModel))) throw new Error("默认模型格式无效");
+            configBody["defaultModel"] = defaultModel;
           }
           if ("defaultEffort" in input) {
             const effort = input["defaultEffort"];

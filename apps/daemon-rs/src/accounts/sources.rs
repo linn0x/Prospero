@@ -786,6 +786,27 @@ impl ModelSources {
             .any(|binding| binding.account_id == account_id)
     }
 
+    pub(crate) fn bound_default_effort(&self, account_id: &str) -> Option<String> {
+        let binding = self
+            .registry
+            .bindings
+            .iter()
+            .find(|binding| binding.account_id == account_id)?;
+        let route_effort = self
+            .registry
+            .sources
+            .iter()
+            .find(|source| source.id == binding.source_id)
+            .and_then(|source| {
+                source
+                    .routes
+                    .iter()
+                    .find(|route| route.id == binding.route_id)
+            })
+            .and_then(|route| route.default_effort.clone());
+        route_effort.or_else(|| binding.default_effort.clone())
+    }
+
     pub(crate) fn create(&mut self, action: SourceAction) -> Result<ModelSource> {
         let SourceAction::Create {
             operation_id,
@@ -1494,7 +1515,9 @@ impl Registry {
     }
 }
 
-const ALLOWED_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const ALLOWED_EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 fn action_ref(action: &SourceAction) -> Result<(String, i64)> {
     match action {

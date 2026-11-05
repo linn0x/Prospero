@@ -2942,7 +2942,9 @@ function NewSessionDialog({
         if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
         const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceSelection.sourceId, routeId: sourceSelection.routeId, revision: sourceSelection.revision, agent: sourceRuntimeAgent });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
-        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy }));
+        const routeEfforts = sourceChoice.route.protocol !== "openai_chat_completions" ? (sourceChoice.route.modelCapabilities?.supportedEfforts ?? []) : [];
+        const sessionEffort = (input.effort && routeEfforts.includes(input.effort) ? input.effort : undefined) ?? sourceChoice.route.defaultEffort;
+        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, ...(sessionEffort ? { effort: sessionEffort as SessionCreateInput["effort"] } : {}) }));
         rememberSourceSelection({ ...sourceSelection, agent: sourceRuntimeAgent });
       } else {
         onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
@@ -3135,7 +3137,7 @@ function NewSessionDialog({
                 </div>
               )}
               {useSource ? (
-                <SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} />
+                <SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} effort={input.effort} onEffortChange={effort => setInput({ ...input, effort: effort as SessionCreateInput["effort"] })} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} />
               ) : (
                 <>
                   {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi") && (

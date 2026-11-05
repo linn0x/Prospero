@@ -65,12 +65,13 @@ export function configDraftChanged(
   documentId: string,
   content: string,
   effort: string,
-  extra?: { proxyUrl?: string; noProxy?: string; envText?: string },
+  extra?: { defaultModel?: string; proxyUrl?: string; noProxy?: string; envText?: string },
 ): boolean {
   const document = config?.documents.find(item => item.id === documentId);
   if (!document) return false;
   if (content !== document.content || effort !== (config?.defaultEffort ?? "")) return true;
   if (!extra) return false;
+  if ((extra.defaultModel ?? "").trim() !== (config?.defaultModel ?? "")) return true;
   if ((extra.proxyUrl ?? "").trim() !== (config?.proxyUrl ?? "")) return true;
   if ((extra.noProxy ?? "").trim() !== (config?.noProxy ?? "")) return true;
   if ((extra.envText ?? "").trim() !== formatEnvLines(config?.env).trim()) return true;

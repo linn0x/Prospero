@@ -15,6 +15,7 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
   const [storedConfig, setConfig] = useState<AgentAccountConfig>();
   const [documentId, setDocumentId] = useState("");
   const [content, setContent] = useState("");
+  const [defaultModel, setDefaultModel] = useState("");
   const [effort, setEffort] = useState("");
   const [proxyUrl, setProxyUrl] = useState("");
   const [noProxy, setNoProxy] = useState("");
@@ -33,12 +34,18 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
   const config = storedConfig?.accountId === accountId ? storedConfig : undefined;
   const selected = config?.documents.find(document => document.id === documentId);
   const supportsEnvOverrides = Boolean(selected?.editableKeys.includes("proxy_url"));
+  const supportsDefaultModel = Boolean(selected?.editableKeys.includes("default_model"));
   const dirty = configDraftChanged(
     config,
     documentId,
     content,
     effort,
-    supportsEnvOverrides ? { proxyUrl, noProxy, envText } : undefined,
+    supportsEnvOverrides || supportsDefaultModel
+      ? {
+          ...(supportsDefaultModel ? { defaultModel } : {}),
+          ...(supportsEnvOverrides ? { proxyUrl, noProxy, envText } : {}),
+        }
+      : undefined,
   );
   const invalidEffort = Boolean(config && !configEffortSupported(config, effort));
   const apply = (next: AgentAccountConfig, preferredDocument = documentId) => {
@@ -46,6 +53,7 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
     setConfig(next);
     setDocumentId(document?.id ?? "");
     setContent(document?.content ?? "");
+    setDefaultModel(next.defaultModel ?? "");
     setEffort(next.defaultEffort ?? "");
     setProxyUrl(next.proxyUrl ?? "");
     setNoProxy(next.noProxy ?? "");
@@ -76,7 +84,7 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
   useLayoutEffect(() => {
     requests.invalidate();
     phase.current = undefined;
-    setConfig(undefined); setDocumentId(""); setContent(""); setEffort("");
+    setConfig(undefined); setDocumentId(""); setContent(""); setDefaultModel(""); setEffort("");
     setProxyUrl(""); setNoProxy(""); setEnvText("");
     setError(undefined); setSaved(false); setDiscard(undefined); setRaw(false); setConflicted(false);
     void load("");
@@ -103,11 +111,13 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
         setError({ code: "unsupported", message: "Configuration saving unavailable" });
         return;
       }
+      const trimmedModel = defaultModel.trim();
       const trimmedProxy = proxyUrl.trim();
       const trimmedNoProxy = noProxy.trim();
       const result = await window.prospero.setAccountConfig({
         accountId, documentId: selected.id, revision: selected.revision,
         ...(content !== selected.content ? { content } : {}),
+        ...(supportsDefaultModel && trimmedModel !== (config?.defaultModel ?? "") ? { defaultModel: trimmedModel || null } : {}),
         ...(effort !== (config?.defaultEffort ?? "") ? { defaultEffort: effort ? effort as AgentReasoningEffort : null } : {}),
         ...(supportsEnvOverrides && trimmedProxy !== (config?.proxyUrl ?? "") ? { proxyUrl: trimmedProxy || null } : {}),
         ...(supportsEnvOverrides && trimmedNoProxy !== (config?.noProxy ?? "") ? { noProxy: trimmedNoProxy || null } : {}),
@@ -145,6 +155,19 @@ export function AdvancedConfigEditor({ accountId, name, onClose, onSaved }: { ac
             }}>{config.documents.map(document => <NativeSelectOption key={document.id} value={document.id}>{document.label} · {document.format.toUpperCase()}</NativeSelectOption>)}</NativeSelect>
           </Field>
           {selected && <>
+            {supportsDefaultModel && (
+              <Field>
+                <FieldLabel htmlFor="account-default-model">{t("默认模型 (Default Model)", "Default model")}</FieldLabel>
+                <Input
+                  id="account-default-model"
+                  value={defaultModel}
+                  placeholder="gpt-daybreak-blue-latest / gpt-6-astra / fable[1m]"
+                  disabled={Boolean(busy) || !selected.writable}
+                  onChange={event => { setDefaultModel(event.target.value); setSaved(false); }}
+                />
+                <FieldDescription>{t("新会话默认选中的模型 ID，留空则跟随 CLI 本地默认配置。", "Default model ID for new sessions; leave empty to use the CLI default.")}</FieldDescription>
+              </Field>
+            )}
             <Field><FieldLabel htmlFor="account-default-effort">{t("默认推理强度", "Default reasoning effort")}</FieldLabel>
               <NativeSelect id="account-default-effort" value={effort} aria-invalid={invalidEffort} aria-describedby={invalidEffort ? "account-config-effort-warning" : undefined} disabled={Boolean(busy) || !selected.writable} onChange={event => { setEffort(event.target.value); setSaved(false); }}>
                 <NativeSelectOption value="">{t("使用模型默认值", "Use model default")}</NativeSelectOption>

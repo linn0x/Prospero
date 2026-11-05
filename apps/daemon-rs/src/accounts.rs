@@ -211,6 +211,8 @@ pub(crate) enum AccountControl {
         document_id: String,
         revision: String,
         content: Option<String>,
+        #[serde(rename = "defaultModel", default)]
+        default_model: Option<Option<String>>,
         #[serde(rename = "defaultEffort", default)]
         default_effort: Option<Option<String>>,
         #[serde(rename = "proxyUrl", default)]

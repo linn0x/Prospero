@@ -878,6 +878,8 @@ async fn subscription_account_proxy_and_env_overrides() {
                 "accountId": codex_id,
                 "documentId": "claude-overrides",
                 "revision": rev,
+                "defaultModel": "gpt-daybreak-blue-latest",
+                "defaultEffort": "ultra",
                 "proxyUrl": "http://127.0.0.1:7890",
                 "noProxy": "localhost,127.0.0.1",
                 "env": {
@@ -891,6 +893,11 @@ async fn subscription_account_proxy_and_env_overrides() {
         .await;
     assert_eq!(status, StatusCode::OK, "{saved}");
     assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(
+        saved["config"]["defaultModel"],
+        "gpt-daybreak-blue-latest"
+    );
+    assert_eq!(saved["config"]["defaultEffort"], "ultra");
     assert_eq!(saved["config"]["proxyUrl"], "http://127.0.0.1:7890");
     assert_eq!(saved["config"]["noProxy"], "localhost,127.0.0.1");
     assert_eq!(saved["config"]["env"]["CUSTOM_CODEX_VAR"], "enabled");

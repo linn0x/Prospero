@@ -5946,15 +5946,43 @@ async fn account_config(
             ));
         }
         let catalog = if target.model.is_none() {
+            let data = api.database.directory().to_owned();
+            let account_id = target.account_id.clone();
             if account_agent == crate::protocol::AgentKind::Codex {
-                codex_launch_catalog(api, Some(&target.account_id))
+                if std::env::var_os("PROSPERO_CODEX_BIN").is_some() {
+                    codex_launch_catalog(api, Some(&account_id))
+                        .await
+                        .ok()
+                        .or_else(|| {
+                            Some(crate::agent::fast_codex_catalog_for_account(
+                                &data,
+                                &account_id,
+                            ))
+                        })
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        crate::agent::fast_codex_catalog_for_account(&data, &account_id)
+                    })
                     .await
                     .ok()
-            } else {
+                }
+            } else if std::env::var_os("PROSPERO_CLAUDE_BIN").is_some() {
                 api.agents
-                    .launch_catalog_for(Some(&target.account_id))
+                    .launch_catalog_for(Some(&account_id))
                     .await
                     .ok()
+                    .or_else(|| {
+                        Some(crate::agent::fast_claude_catalog_for_account(
+                            &data,
+                            &account_id,
+                        ))
+                    })
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    crate::agent::fast_claude_catalog_for_account(&data, &account_id)
+                })
+                .await
+                .ok()
             }
         } else {
             None
@@ -5970,6 +5998,7 @@ async fn account_config(
                 document_id,
                 revision,
                 content,
+                default_model,
                 default_effort,
                 proxy_url,
                 no_proxy,
@@ -5979,6 +6008,7 @@ async fn account_config(
                 let document_id = document_id.clone();
                 let revision = revision.clone();
                 let content = content.clone();
+                let default_model = default_model.clone();
                 let default_effort = default_effort.clone();
                 let proxy_url = proxy_url.clone();
                 let no_proxy = no_proxy.clone();
@@ -5992,6 +6022,7 @@ async fn account_config(
                             &document_id,
                             &revision,
                             content.as_deref(),
+                            default_model,
                             default_effort,
                             proxy_url,
                             no_proxy,

@@ -8,8 +8,8 @@ import { useLocale } from "../locale";
 import { defaultSourceSelection, sourceRouteLabel, rememberedSourceSelection, selectedSourceRoute, sourceRouteSupportsAgent, type SourceRuntimeAgent, type SourceSelection } from "./source-state";
 import "./model-sources.css";
 
-export function SourceSelector({ sources, loading, error, value, agent, onChange, onRefresh, disabled }: {
-  sources: ModelSource[]; loading: boolean; error: string | undefined; value: SourceSelection | undefined; agent?: SourceRuntimeAgent; onChange: (value: SourceSelection | undefined) => void; onRefresh: () => void; disabled: boolean;
+export function SourceSelector({ sources, loading, error, value, agent, effort, onEffortChange, onChange, onRefresh, disabled }: {
+  sources: ModelSource[]; loading: boolean; error: string | undefined; value: SourceSelection | undefined; agent?: SourceRuntimeAgent; effort?: string | undefined; onEffortChange?: ((value: string | undefined) => void) | undefined; onChange: (value: SourceSelection | undefined) => void; onRefresh: () => void; disabled: boolean;
 }) {
   const { t } = useLocale();
   const preferred = useRef(rememberedSourceSelection());
@@ -23,6 +23,8 @@ export function SourceSelector({ sources, loading, error, value, agent, onChange
   }, [agent, sources, value, loading]);
   const source = sources.find(item => item.id === value?.sourceId);
   const selection = selectedSourceRoute(sources, value, agent);
+  const supportedEfforts = selection?.route.protocol !== "openai_chat_completions" ? (selection?.route.modelCapabilities?.supportedEfforts ?? []) : [];
+  const activeEffort = effort && supportedEfforts.includes(effort) ? effort : selection?.route.defaultEffort;
   return <div className="model-source-selector">
     <div className="model-source-selector-fields">
       <Field>
@@ -44,10 +46,21 @@ export function SourceSelector({ sources, loading, error, value, agent, onChange
           {source?.routes.map(route => <NativeSelectOption key={route.id} value={route.id} disabled={!route.enabled || route.modelCapabilities?.tools === false || !sourceRouteSupportsAgent(route, agent)}>{sourceRouteLabel(route)}</NativeSelectOption>)}
         </NativeSelect>
       </Field>
+      {selection && supportedEfforts.length > 0 && onEffortChange && (
+        <Field>
+          <div className="flex items-center justify-between gap-2 min-h-6">
+            <FieldLabel htmlFor="session-source-effort">{t("推理强度", "Reasoning effort")}</FieldLabel>
+          </div>
+          <NativeSelect id="session-source-effort" disabled={disabled || loading} value={effort && supportedEfforts.includes(effort) ? effort : ""} onChange={event => onEffortChange(event.target.value || undefined)}>
+            <NativeSelectOption value="">{selection.route.defaultEffort ? `${t("路由默认", "Route default")} (${selection.route.defaultEffort})` : t("使用模型默认值", "Use model default")}</NativeSelectOption>
+            {supportedEfforts.map(level => <NativeSelectOption key={level} value={level}>{level}</NativeSelectOption>)}
+          </NativeSelect>
+        </Field>
+      )}
     </div>
     {error && <p role="alert">{error}</p>}
     {selection && <div className="session-auth-status-bar">
-      <span>{t("协议：", "Protocol: ")}{accountApiProtocolLabel(selection.route.protocol)} · {t("模型：", "Model: ")}<code>{selection.route.model}</code> · {t("凭据：", "Key: ")}{selection.source.credentials.find(item => item.id === selection.route.credentialId)?.name}{selection.route.defaultEffort ? ` · ${selection.route.defaultEffort}` : ""}</span>
+      <span>{t("协议：", "Protocol: ")}{accountApiProtocolLabel(selection.route.protocol)} · {t("模型：", "Model: ")}<code>{selection.route.model}</code>{selection.route.modelCapabilities?.contextWindow ? ` · ${t("上下文：", "Context: ")}${selection.route.modelCapabilities.contextWindow.toLocaleString()}` : ""} · {t("凭据：", "Key: ")}{selection.source.credentials.find(item => item.id === selection.route.credentialId)?.name}{activeEffort ? ` · ${activeEffort}` : ""}</span>
     </div>}
     {source && value && source.revision !== value.revision && <p role="alert">{t("模型源已更新，请确认后使用新配置。", "The source changed. Confirm before using its new configuration.")}<Button variant="ghost" size="sm" disabled={disabled} onClick={() => onChange(defaultSourceSelection([source], value, agent))}>{t("使用新配置", "Use updated configuration")}</Button></p>}
     {!loading && !sources.some(item => item.enabled && item.routes.some(route => route.enabled)) && <p className="text-xs text-muted-foreground">{t("请在“账号与模型源”页面的 API 模型源中添加并启用模型。", "Add a source and enable models on the Accounts & model sources page.")}</p>}

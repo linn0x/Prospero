@@ -141,6 +141,26 @@ describe("model source selection and IPC", () => {
     expect(html).toContain("Shared key");
     expect(html).toContain("model-b");
     expect(html).not.toContain('type="password"');
+
+    const withEffortAndContext: ModelSource = {
+      ...source,
+      routes: [
+        source.routes[0]!,
+        {
+          ...source.routes[1]!,
+          defaultEffort: "xhigh",
+          modelCapabilities: {
+            contextWindow: 2500000,
+            supportedEfforts: ["low", "medium", "high", "xhigh", "ultra"],
+          },
+        },
+      ],
+    };
+    const effortHtml = renderToStaticMarkup(<SourceSelector sources={[withEffortAndContext]} loading={false} error={undefined} value={defaultSourceSelection([withEffortAndContext], undefined, "codex")} agent="codex" effort="ultra" onEffortChange={() => {}} disabled={false} onChange={() => {}} onRefresh={() => {}} />);
+    expect(effortHtml).toContain('id="session-source-effort"');
+    expect(effortHtml).toContain("Route default (xhigh)");
+    expect(effortHtml).toContain("2,500,000");
+    expect(effortHtml).toContain("ultra");
   });
 
   it("keeps OpenCode and Pi available in the shared model source session runtime selector", () => {
