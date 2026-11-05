@@ -20,7 +20,7 @@ export function AccountsPane({ snapshot, onOpenSession, onUseModelSource }: { sn
   const { t } = useLocale();
   const actions = useAccountActions(snapshot, onOpenSession);
   const [dimension, setDimension] = useState<"subscriptions" | "sources">("subscriptions");
-  const [providerFilter, setProviderFilter] = useState<"all" | "codex" | "claude">("all");
+  const [providerFilter, setProviderFilter] = useState<"all" | "codex" | "claude" | "agy">("all");
   const [showLegacyApi, setShowLegacyApi] = useState(false);
   const [editing, setEditing] = useState<JsonObject>();
   const [configuring, setConfiguring] = useState<JsonObject>();
@@ -39,6 +39,7 @@ export function AccountsPane({ snapshot, onOpenSession, onUseModelSource }: { sn
   const edited = editing ? snapshot.accounts.find(account => account["id"] === editing["id"]) ?? editing : undefined;
   const codexCount = subscriptionAccounts.filter(account => accountEngine(account) === "codex").length;
   const claudeCount = subscriptionAccounts.filter(account => accountEngine(account) === "claude").length;
+  const agyCount = subscriptionAccounts.filter(account => accountEngine(account) === "agy").length;
   return <div className="page accounts-page">
     <header className="page-header">
       <div>
@@ -70,6 +71,9 @@ export function AccountsPane({ snapshot, onOpenSession, onUseModelSource }: { sn
             </Button>
             <Button variant={providerFilter === "claude" ? "secondary" : "outline"} size="sm" aria-pressed={providerFilter === "claude"} onClick={() => setProviderFilter("claude")}>
               <AgentLogo agent="claude" size={14} />Claude ({claudeCount})
+            </Button>
+            <Button variant={providerFilter === "agy" ? "secondary" : "outline"} size="sm" aria-pressed={providerFilter === "agy"} onClick={() => setProviderFilter("agy")}>
+              <AgentLogo agent="agy" size={14} />Antigravity ({agyCount})
             </Button>
             {legacyApiAccounts.length > 0 && (
               <Button variant={showLegacyApi ? "secondary" : "ghost"} size="sm" aria-pressed={showLegacyApi} onClick={() => setShowLegacyApi(current => !current)}>

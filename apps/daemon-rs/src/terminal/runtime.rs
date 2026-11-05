@@ -831,22 +831,37 @@ impl Terminals {
             && spec
                 .as_ref()
                 .is_some_and(|spec| !spec.args.iter().any(|arg| arg == "setup-token" || arg == "login"));
-        let mut native = managed.then(|| crate::protocol::NativeSession {
-            output_start_seq: None,
-            runtime_id: uuid::Uuid::new_v4().to_string(),
-            native_id: restored
+        let mut native = if managed {
+            Some(crate::protocol::NativeSession {
+                output_start_seq: None,
+                runtime_id: uuid::Uuid::new_v4().to_string(),
+                native_id: restored
+                    .as_ref()
+                    .and_then(|head| head.native_session.as_ref())
+                    .and_then(|native| native.native_id.clone()),
+                managed: true,
+                state: if restored.is_some() {
+                    "resuming"
+                } else {
+                    "binding"
+                }
+                .into(),
+                error: None,
+            })
+        } else {
+            restored
                 .as_ref()
                 .and_then(|head| head.native_session.as_ref())
-                .and_then(|native| native.native_id.clone()),
-            managed: true,
-            state: if restored.is_some() {
-                "resuming"
-            } else {
-                "binding"
-            }
-            .into(),
-            error: None,
-        });
+                .and_then(|native| native.native_id.clone())
+                .map(|native_id| crate::protocol::NativeSession {
+                    output_start_seq: None,
+                    runtime_id: uuid::Uuid::new_v4().to_string(),
+                    native_id: Some(native_id),
+                    managed: false,
+                    state: "running".into(),
+                    error: None,
+                })
+        };
         let base_seq = if let Some(head) = &restored {
             let id = head.id.clone();
             self.0
@@ -899,7 +914,7 @@ impl Terminals {
                     // Explicit program (managed-account login): no shell, no
                     // guard, private env overrides only.
                     let mut command = if let (Some(native), Some(binding), Some(launcher)) =
-                        (&native, &binding, &launcher)
+                        (native.as_ref().filter(|n| n.managed), &binding, &launcher)
                     {
                         let mut command = portable_pty::CommandBuilder::new(launcher);
                         command.args([
@@ -920,6 +935,11 @@ impl Terminals {
                     } else {
                         let mut command = portable_pty::CommandBuilder::new(&spec.program);
                         command.args(&spec.args);
+                        if let Some(id) = native.as_ref().and_then(|n| n.native_id.as_deref()) {
+                            if agent == "agy" {
+                                command.args(["--conversation", id]);
+                            }
+                        }
                         command
                     };
                     for (key, value) in &spec.environment {
@@ -1174,6 +1194,14 @@ impl Terminals {
                 })
                 .await
                 .map_err(|_| Error::Closed)??
+            }
+            crate::protocol::AgentKind::Agy => {
+                crate::agent::conversations::search_agy_conversations(
+                    head.account_id,
+                    query,
+                    Some(50),
+                )
+                .await?
             }
             _ => return Err(Error::Invalid("此终端不支持原生会话绑定".into())),
         };
@@ -1519,7 +1547,13 @@ impl Terminals {
         };
         let model = normalize_selection(input.model.as_ref(), 160, "模型无效")?;
         let effort = normalize_selection(input.effort.as_ref(), 80, "思考强度无效")?;
-        if effort.is_some() && model.is_none() && agent != crate::protocol::AgentKind::Codex {
+        if effort.is_some()
+            && model.is_none()
+            && !matches!(
+                agent,
+                crate::protocol::AgentKind::Codex | crate::protocol::AgentKind::Agy
+            )
+        {
             return Err(Error::Invalid("推理强度必须和启动模型一起指定".into()));
         }
         match (agent, input.command.as_deref()) {
@@ -1755,6 +1789,39 @@ impl Terminals {
                     args,
                     environment,
                     account_id,
+                }))
+            }
+            (crate::protocol::AgentKind::Agy, None) => {
+                match input.account_id.as_deref() {
+                    None | Some(crate::accounts::NATIVE_AGY_ID) => {}
+                    Some(_) => {
+                        return Err(Error::Invalid(
+                            "Antigravity (agy) 仅支持本机 Antigravity 订阅账号".into(),
+                        ));
+                    }
+                }
+                input.model = model.clone();
+                input.effort = effort.clone();
+                let mut args = match policy {
+                    crate::protocol::TerminalApprovalPolicy::Strict => Vec::new(),
+                    crate::protocol::TerminalApprovalPolicy::Standard => {
+                        vec!["--mode".into(), "accept-edits".into()]
+                    }
+                    crate::protocol::TerminalApprovalPolicy::Yolo => {
+                        vec!["--dangerously-skip-permissions".into()]
+                    }
+                };
+                if let Some(model) = model {
+                    args.extend(["--model".into(), model]);
+                }
+                if let Some(effort) = effort {
+                    args.extend(["--effort".into(), effort]);
+                }
+                Ok(Some(ProgramSpec {
+                    program: crate::agent::agy::binary(),
+                    args,
+                    environment: Vec::new(),
+                    account_id: Some(crate::accounts::NATIVE_AGY_ID.into()),
                 }))
             }
             (crate::protocol::AgentKind::Grok, None) => {

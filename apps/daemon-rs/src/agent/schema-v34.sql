@@ -1,6 +1,6 @@
 UPDATE session_heads
 SET payload = json_patch(payload, (
-    SELECT json_object('accountId', COALESCE(account_id, CASE agent WHEN 'codex' THEN 'native-codex' WHEN 'claude' THEN 'native-claude' END), 'model', model, 'effort', effort,
+    SELECT json_object('accountId', COALESCE(account_id, CASE agent WHEN 'codex' THEN 'native-codex' WHEN 'claude' THEN 'native-claude' WHEN 'agy' THEN 'native-agy' END), 'model', model, 'effort', effort,
         'approvalPolicy', CASE approval_policy WHEN 'auto' THEN 'yolo' ELSE 'standard' END)
     FROM agent_runs WHERE session_id = session_heads.id
 ))

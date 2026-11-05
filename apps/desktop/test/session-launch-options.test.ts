@@ -72,14 +72,19 @@ describe("session launch options", () => {
       { id: "native-codex", agent: "codex", name: "Local", isDefault: false, status: "signed_in" },
       { id: "work-codex", agent: "codex", name: "Work", isDefault: true, status: "signed_in", apiProfile: { baseUrl: "https://example.com", model: "custom" } },
       { id: "native-claude", agent: "claude", name: "Claude", isDefault: true, status: "signed_in" },
+      { id: "native-agy", agent: "agy", name: "Antigravity 订阅", isDefault: true, status: "signed_in" },
     ];
 
     expect(sessionLaunchAccounts(accounts, "codex").map((account) => account.id)).toEqual([
       "native-codex",
       "work-codex",
     ]);
+    expect(sessionLaunchAccounts(accounts, "agy").map((account) => account.id)).toEqual([
+      "native-agy",
+    ]);
     expect(defaultSessionLaunchAccountId(accounts, "codex")).toBe("work-codex");
     expect(defaultSessionLaunchAccountId(accounts, "claude")).toBe("native-claude");
+    expect(defaultSessionLaunchAccountId(accounts, "agy")).toBe("native-agy");
     expect(defaultSessionLaunchAccountId(accounts, "shell")).toBeUndefined();
   });
 

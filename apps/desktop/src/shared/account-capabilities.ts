@@ -13,8 +13,9 @@ function record(value: unknown): JsonObject {
 }
 
 export function accountEngine(account: JsonObject): string {
-  if (typeof account["engine"] === "string" && ["codex", "claude", "opencode", "pi"].includes(account["engine"])) return account["engine"];
+  if (typeof account["engine"] === "string" && ["codex", "claude", "opencode", "pi", "agy"].includes(account["engine"])) return account["engine"];
   if (account["agent"] === "pi") return "pi";
+  if (account["agent"] === "agy") return "agy";
   return record(account["apiProfile"])["protocol"] === "openai_chat_completions"
     ? "opencode" : typeof account["agent"] === "string" ? account["agent"] : "codex";
 }

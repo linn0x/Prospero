@@ -1,4 +1,4 @@
-export type AgentKind = "codex" | "claude" | "opencode" | "pi" | "deepseek" | "grok" | "trae" | "shell" | "custom";
+export type AgentKind = "codex" | "claude" | "opencode" | "pi" | "agy" | "deepseek" | "grok" | "trae" | "shell" | "custom";
 export type SessionKind = "structured" | "pty";
 export type SessionLifecycle = "active" | "archived";
 export type SessionStatus = "idle" | "starting" | "running" | "waiting_permission" | "waiting_input" | "completed" | "failed";

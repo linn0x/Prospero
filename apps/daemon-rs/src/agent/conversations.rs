@@ -486,6 +486,185 @@ pub(crate) async fn search_pi_conversations(
         .map_err(|_| Error::Closed)?
 }
 
+fn file_uri_to_path(uri: &str) -> Option<String> {
+    let raw = uri.trim().strip_prefix("file://")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(raw.len());
+    let src = raw.as_bytes();
+    let mut idx = 0;
+    while idx < src.len() {
+        if src[idx] == b'%'
+            && idx + 2 < src.len()
+            && let Ok(hex) = std::str::from_utf8(&src[idx + 1..idx + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            bytes.push(byte);
+            idx += 3;
+            continue;
+        }
+        bytes.push(src[idx]);
+        idx += 1;
+    }
+    String::from_utf8(bytes).ok().filter(|path| !path.trim().is_empty())
+}
+
+fn extract_agy_cwd(workspace_uris: Option<&str>, fallback_cwd: &str) -> String {
+    if let Some(raw) = workspace_uris
+        && let Ok(uris) = serde_json::from_str::<Vec<String>>(raw)
+    {
+        for uri in uris {
+            if let Some(path) = file_uri_to_path(&uri) {
+                return path;
+            }
+        }
+    }
+    fallback_cwd.to_owned()
+}
+
+pub(crate) fn search_agy_dbs(
+    db_paths: &[PathBuf],
+    query: &str,
+    requested_limit: Option<usize>,
+) -> Result<Vec<ResumableConversation>> {
+    if query.chars().count() > MAX_QUERY_CHARS || query.chars().any(char::is_control) {
+        return Err(Error::Invalid("对话搜索词无效".into()));
+    }
+    let limit = requested_limit.unwrap_or(20).clamp(1, MAX_RESULTS);
+    let fallback = home_dir()
+        .unwrap_or_else(|_| PathBuf::from("/"))
+        .to_string_lossy()
+        .into_owned();
+    let needle = query.trim().to_lowercase();
+    let mut by_id = std::collections::BTreeMap::<String, ResumableConversation>::new();
+
+    for db_path in db_paths {
+        let Ok(metadata) = std::fs::metadata(db_path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let fallback_updated_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or_else(crate::database::now);
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            continue;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT conversation_id, title, preview, workspace_uris, CAST(last_modified_time AS TEXT) \
+             FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 200",
+        ) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        }) else {
+            continue;
+        };
+
+        for row in rows.flatten() {
+            let (id, title_opt, preview_opt, workspace_uris, last_modified) = row;
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let title_raw = title_opt.unwrap_or_default();
+            let preview_raw = preview_opt.unwrap_or_default();
+            let display_title = trim_chars(
+                if title_raw.trim().is_empty() {
+                    if preview_raw.trim().is_empty() {
+                        "Antigravity 对话"
+                    } else {
+                        preview_raw.trim()
+                    }
+                } else {
+                    title_raw.trim()
+                },
+                500,
+            );
+            let preview = (!preview_raw.trim().is_empty()).then(|| trim_chars(preview_raw.trim(), 4_000));
+            let cwd = extract_agy_cwd(workspace_uris.as_deref(), &fallback);
+            if !needle.is_empty() {
+                let matches = [
+                    display_title.as_str(),
+                    preview_raw.trim(),
+                    cwd.trim(),
+                    id,
+                ]
+                .iter()
+                .any(|value| value.to_lowercase().contains(&needle));
+                if !matches {
+                    continue;
+                }
+            }
+            let normalized_ts = last_modified
+                .as_deref()
+                .map(|raw| raw.trim().replace(' ', "T"));
+            let parsed_ts = normalized_ts
+                .as_deref()
+                .and_then(chrono_like_parse_millis);
+            let updated_at = parsed_ts.unwrap_or(fallback_updated_at);
+            let candidate = ResumableConversation {
+                id: trim_chars(id, 256),
+                agent: AgentKind::Agy,
+                title: display_title,
+                preview,
+                cwd: trim_chars(&cwd, 4096),
+                created_at: parsed_ts,
+                updated_at,
+            };
+            match by_id.get(&candidate.id) {
+                Some(existing) if existing.updated_at >= candidate.updated_at => {}
+                _ => {
+                    by_id.insert(candidate.id.clone(), candidate);
+                }
+            }
+        }
+    }
+
+    let mut results = by_id.into_values().collect::<Vec<_>>();
+    results.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
+    results.truncate(limit);
+    Ok(results)
+}
+
+pub(crate) async fn search_agy_conversations(
+    account_id: Option<String>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<ResumableConversation>> {
+    match account_id.as_deref() {
+        None | Some(crate::accounts::NATIVE_AGY_ID) => {}
+        Some(_) => {
+            return Err(Error::Invalid(
+                "Antigravity (agy) 仅支持本机 Antigravity 订阅对话搜索".into(),
+            ));
+        }
+    }
+    let home = home_dir()?;
+    let db_paths = vec![
+        home.join(".gemini/antigravity/conversation_summaries.db"),
+        home.join(".gemini/antigravity-cli/conversation_summaries.db"),
+    ];
+    tokio::task::spawn_blocking(move || search_agy_dbs(&db_paths, &query, limit))
+        .await
+        .map_err(|_| Error::Closed)?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

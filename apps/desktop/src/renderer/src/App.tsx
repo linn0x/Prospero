@@ -2746,7 +2746,8 @@ function NewSessionDialog({
   const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
   const rememberedSource = useMemo(() => rememberedSourceSelection(), []);
   const initialAgent = initialDraft?.input.agent ?? initialSource?.agent ?? rememberedSource?.agent ?? rememberedLaunchAgent();
-  const [useSource, setUseSource] = useState(() => initialDraft?.useSource ?? (sourceSupported && Boolean(initialSource || rememberedSource)));
+  const supportsInitialModelSource = initialAgent === "codex" || initialAgent === "claude" || initialAgent === "opencode" || initialAgent === "pi";
+  const [useSource, setUseSource] = useState(() => supportsInitialModelSource && (initialDraft?.useSource ?? (sourceSupported && Boolean(initialSource || rememberedSource))));
   const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialDraft?.sourceSelection ?? initialSource ?? (rememberedSource ? { ...rememberedSource, revision: 0 } : undefined));
   const sourceState = useModelSources(sourceSupported && useSource);
   const [input, setInput] = useState<SessionCreateInput>(initialDraft?.input ?? {
@@ -2757,7 +2758,7 @@ function NewSessionDialog({
     accountId: initialAgent === "opencode" && rememberedLaunchKind(initialAgent) === "pty" ? undefined : defaultSessionLaunchAccountId(independentAccounts, initialAgent),
   });
   const [terminalApprovalPolicy, setTerminalApprovalPolicy] = useState<SessionCreateInput["approvalPolicy"]>(
-    initialDraft?.input.kind === "pty" && (initialDraft.input.agent === "codex" || initialDraft.input.agent === "claude")
+    initialDraft?.input.kind === "pty" && (initialDraft.input.agent === "codex" || initialDraft.input.agent === "claude" || initialDraft.input.agent === "agy")
       ? initialDraft.input.approvalPolicy
       : "yolo",
   );
@@ -2798,9 +2799,9 @@ function NewSessionDialog({
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
   const selectedKind: SessionCreateInput["kind"] = useSource ? (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi" ? "structured" : input.kind) : requiresStructured ? "structured" : input.kind;
-  const managedAgentTerminal = selectedKind === "pty" && (input.agent === "codex" || input.agent === "claude");
+  const managedAgentTerminal = selectedKind === "pty" && (input.agent === "codex" || input.agent === "claude" || input.agent === "agy");
   const selectedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : input.approvalPolicy;
-  const supportsApprovalPolicy = selectedKind === "structured" || input.agent === "codex" || input.agent === "claude";
+  const supportsApprovalPolicy = selectedKind === "structured" || input.agent === "codex" || input.agent === "claude" || input.agent === "agy";
   const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? (input.agent !== "opencode" || selectedKind === "pty"));
   const selectedWorkspace = launchWorkspaces.find(
     (workspace) => workspace.path === input.cwd,
@@ -2840,6 +2841,7 @@ function NewSessionDialog({
   const supportsStructured = [
     "codex",
     "claude",
+    "agy",
     "deepseek",
     "opencode",
     "pi",
@@ -2850,6 +2852,7 @@ function NewSessionDialog({
     (selectedAccount?.capabilities?.modelSelection ?? true) &&
     (input.agent === "codex" ||
       input.agent === "claude" ||
+      input.agent === "agy" ||
       input.agent === "deepseek" ||
       input.agent === "pi");
   useEffect(() => {
@@ -2872,7 +2875,7 @@ function NewSessionDialog({
     const catalogKey = JSON.stringify([input.agent, input.accountId, input.kind, launchModelsRetry]);
     if (launchCatalogKey.current === catalogKey) return;
     let cancelled = false;
-    const agent = input.agent as "codex" | "claude" | "deepseek" | "opencode" | "pi";
+    const agent = input.agent as "codex" | "claude" | "agy" | "deepseek" | "opencode" | "pi";
     const accountId = input.accountId;
     const kind = input.kind;
     setLaunchModels([]);
@@ -3081,6 +3084,7 @@ function NewSessionDialog({
               >
                 <NativeSelectOption value="codex">Codex</NativeSelectOption>
                 <NativeSelectOption value="claude">Claude</NativeSelectOption>
+                <NativeSelectOption value="agy">Antigravity (agy)</NativeSelectOption>
                 <NativeSelectOption value="pi">Pi</NativeSelectOption>
                 <NativeSelectOption value="opencode">OpenCode</NativeSelectOption>
                 <NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption>
@@ -3103,7 +3107,7 @@ function NewSessionDialog({
                   setInput({
                     ...input,
                     kind,
-                    ...(!useSource && kind === "pty" && input.agent !== "pi"
+                    ...(!useSource && kind === "pty" && input.agent !== "pi" && input.agent !== "agy"
                       ? { model: undefined, effort: undefined }
                       : {}),
                   });
@@ -3122,7 +3126,7 @@ function NewSessionDialog({
               {!useSource && requiresStructured && <FieldDescription>{t("当前账号仅支持对话会话。", "This account supports conversation sessions only.")}</FieldDescription>}
             </Field>
           </div>
-          {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" || input.agent === "deepseek") && (
+          {(input.agent === "codex" || input.agent === "claude" || input.agent === "agy" || input.agent === "opencode" || input.agent === "pi" || input.agent === "deepseek") && (
             <div className="session-auth-card">
               <div className="session-auth-card-head">
                 <span className="session-auth-card-title">{t("模型与认证来源", "Model & authentication source")}</span>
@@ -3144,7 +3148,7 @@ function NewSessionDialog({
                 <SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} effort={input.effort} onEffortChange={effort => setInput({ ...input, effort: effort as SessionCreateInput["effort"] })} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} />
               ) : (
                 <>
-                  {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi") && (
+                  {(input.agent === "codex" || input.agent === "claude" || input.agent === "agy" || input.agent === "opencode" || input.agent === "pi") && (
                     <Field>
                       <FieldLabel htmlFor="session-account">
                         {t("订阅账号", "Subscription account")}
@@ -3177,7 +3181,7 @@ function NewSessionDialog({
                       </NativeSelect>
                       <FieldDescription>
                         {selectedAccount
-                          ? selectedAccount.apiProfileError ?? (selectedAccount.apiProfile ? `${t("模型", "Model")} · ${text(selectedAccount.apiProfile["model"])}` : `● ${status(selectedAccount.status)}`)
+                          ? selectedAccount.apiProfileError ?? (selectedAccount.apiProfile ? `${t("模型", "Model")} · ${text(selectedAccount.apiProfile["model"])}` : `● ${status(selectedAccount.status)}${input.agent === "agy" ? ` · ${t("专属使用本机 Antigravity 订阅", "Exclusively uses local Antigravity subscription")}` : ""}`)
                           : input.agent === "opencode" ? t("使用本机 OpenCode 的登录和模型配置。", "Use the local OpenCode login and model configuration.") : t("在“账号与模型源”页面的订阅管理中添加或登录官方订阅。", "Add or sign in to a subscription from Accounts & model sources.")}
                       </FieldDescription>
                     </Field>
@@ -4055,6 +4059,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       const supportedAgents: SessionCreateInput["agent"][] = [
         "codex",
         "claude",
+        "agy",
         "deepseek",
         "opencode",
         "pi",
@@ -4075,7 +4080,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           : "standard";
       const kind =
         session.kind === "structured" &&
-        ["codex", "claude", "deepseek", "opencode", "pi"].includes(agent)
+        ["codex", "claude", "agy", "deepseek", "opencode", "pi"].includes(agent)
           ? "structured"
           : "pty";
       const accountState = duplicateSessionAccountState(snapshotRef.current.accounts, session);

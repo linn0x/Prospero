@@ -1,0 +1,766 @@
+//! Direct Antigravity (`agy`) CLI driver.
+//!
+//! Runs `agy -p <prompt> --output-format stream-json` per turn using the local
+//! Antigravity subscription session (`~/.gemini/antigravity-cli` / Keychain).
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use base64::Engine;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+
+use super::claude::{AdapterEvent, TurnOptions};
+use super::lifecycle::{ChildGuard, ProcessLifecycle, Quiescence, await_child_exit};
+use super::store::{ApprovalPolicy, PermissionMode};
+use super::{LaunchModelCatalog, LaunchModelInfo};
+use crate::error::{Error, Result};
+use crate::orchestration::reliability::ControlEffectState;
+
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(1800);
+const CATALOG_CMD_TIMEOUT: Duration = Duration::from_secs(6);
+
+pub(crate) fn binary() -> String {
+    if let Ok(explicit) = std::env::var("PROSPERO_AGY_BIN") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let candidate = home.join(".local/bin/agy");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "agy".to_owned()
+}
+
+fn supported_efforts() -> Vec<String> {
+    vec![
+        "low".into(),
+        "medium".into(),
+        "high".into(),
+        "xhigh".into(),
+        "max".into(),
+    ]
+}
+
+fn infer_default_effort(model_id: &str) -> String {
+    if model_id.ends_with("-low") {
+        "low".into()
+    } else if model_id.ends_with("-high") {
+        "high".into()
+    } else {
+        "medium".into()
+    }
+}
+
+pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
+    let entries = [
+        ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)", true),
+        ("gemini-4-argon-high", "Gemini 4 Argon (High)", false),
+        ("gemini-4-argon-low", "Gemini 4 Argon (Low)", false),
+        ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", false),
+        ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)", false),
+        ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)", false),
+        ("claude-opus-5-5-high", "Claude Opus 5.5 (High)", false),
+        ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)", false),
+        ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)", false),
+        ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)", false),
+        ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)", false),
+        ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)", false),
+        ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", false),
+    ];
+    let efforts = supported_efforts();
+    entries
+        .into_iter()
+        .map(|(id, label, is_default)| LaunchModelInfo {
+            id: id.into(),
+            label: label.into(),
+            description: Some("Antigravity 订阅模型".into()),
+            supported_efforts: efforts.clone(),
+            default_effort: Some(infer_default_effort(id)),
+            is_default,
+        })
+        .collect()
+}
+
+pub(crate) fn parse_models_output(output: &str) -> Vec<LaunchModelInfo> {
+    let efforts = supported_efforts();
+    let mut models = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("Available models")
+            || trimmed.starts_with("Usage:")
+        {
+            continue;
+        }
+        // Each row looks like: `  gemini-4-argon-high              Gemini 4 Argon (High)`
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let Some(id) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            continue;
+        }
+        let label = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id);
+        models.push(LaunchModelInfo {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            description: Some("Antigravity 订阅模型".into()),
+            supported_efforts: efforts.clone(),
+            default_effort: Some(infer_default_effort(id)),
+            is_default: id == "gemini-4-argon-medium",
+        });
+    }
+    if !models.is_empty() && !models.iter().any(|model| model.is_default) {
+        models[0].is_default = true;
+    }
+    models
+}
+
+fn catalog_cache() -> &'static Mutex<Option<(Instant, Vec<LaunchModelInfo>)>> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, Vec<LaunchModelInfo>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn refresh_catalog_in_background() {
+    static REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REFRESHING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut command = Command::new(binary());
+        command
+            .arg("models")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if let Ok(Ok(output)) = tokio::time::timeout(CATALOG_CMD_TIMEOUT, command.output()).await
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let parsed = parse_models_output(&stdout);
+            if !parsed.is_empty()
+                && let Ok(mut guard) = catalog_cache().lock()
+            {
+                *guard = Some((Instant::now(), parsed));
+            }
+        }
+        REFRESHING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+pub(crate) async fn launch_catalog() -> Result<LaunchModelCatalog> {
+    let models = {
+        let cached = catalog_cache()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        match cached {
+            Some((updated_at, models)) if updated_at.elapsed() < CATALOG_CACHE_TTL => models,
+            Some((_, models)) => {
+                refresh_catalog_in_background();
+                models
+            }
+            None => {
+                refresh_catalog_in_background();
+                fallback_models()
+            }
+        }
+    };
+    let default_model = models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| models.first());
+    let current_model = default_model.map(|model| model.id.clone());
+    let current_effort = default_model.and_then(|model| model.default_effort.clone());
+    Ok(LaunchModelCatalog {
+        models,
+        presets: Vec::new(),
+        current_preset: None,
+        current_model,
+        current_effort,
+    })
+}
+
+pub(super) struct AgyTurn {
+    events: Option<mpsc::Receiver<AdapterEvent>>,
+    lifecycle: ProcessLifecycle,
+    interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AgyTurn {
+    pub(super) fn take_events(&mut self) -> Option<mpsc::Receiver<AdapterEvent>> {
+        self.events.take()
+    }
+
+    pub(super) async fn interrupt(&self) -> ControlEffectState {
+        self.interrupted
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.lifecycle.request_termination().await
+    }
+
+    pub(super) async fn kill(&self) -> ControlEffectState {
+        self.interrupted
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.lifecycle.request_termination().await
+    }
+
+    pub(super) fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle.clone()
+    }
+}
+
+pub(super) async fn spawn_turn(
+    workspace: &str,
+    prompt: &str,
+    attachments: &[crate::agent::AttachmentInput],
+    native_id: Option<&str>,
+    options: &TurnOptions,
+) -> Result<AgyTurn> {
+    let mut temp_files = Vec::new();
+    for (idx, attachment) in attachments.iter().enumerate() {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&attachment.data_b64) {
+            let ext = match attachment.mime_type.as_str() {
+                "image/png" => "png",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                _ => "jpg",
+            };
+            let file_path = std::env::temp_dir().join(format!(
+                "prospero-agy-att-{}-{idx}.{ext}",
+                uuid::Uuid::new_v4()
+            ));
+            if tokio::fs::write(&file_path, bytes).await.is_ok() {
+                temp_files.push(file_path);
+            }
+        }
+    }
+
+    let effective_prompt = if prompt.trim().is_empty() && !temp_files.is_empty() {
+        "Please inspect the attached image(s)."
+    } else {
+        prompt
+    };
+
+    let mut command = Command::new(binary());
+    command
+        .args(["-p", effective_prompt, "--output-format", "stream-json"])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(false);
+
+    for (key, value) in &options.environment {
+        command.env(key, value);
+    }
+    if let Some(id) = native_id.map(str::trim).filter(|id| !id.is_empty()) {
+        command.args(["--conversation", id]);
+    }
+    if let Some(model) = options.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        command.args(["--model", model]);
+    }
+    if let Some(effort) = options.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        command.args(["--effort", effort]);
+    }
+    if options.mode == PermissionMode::Plan {
+        command.args(["--mode", "plan"]);
+    } else if options.policy == ApprovalPolicy::Auto {
+        command.arg("--dangerously-skip-permissions");
+    } else {
+        command.args(["--mode", "accept-edits"]);
+    }
+    for file_path in &temp_files {
+        command.arg("-f").arg(file_path);
+    }
+
+    super::lifecycle::configure_process_group(&mut command);
+    let child = command.spawn().map_err(|err| {
+        Error::Invalid(format!("无法启动 Antigravity CLI (agy): {err}"))
+    })?;
+    let mut guard = ChildGuard::new(child)?;
+    let lifecycle = guard.lifecycle();
+    let stdout = guard.child_mut().stdout.take().ok_or(Error::Closed)?;
+    let stderr = guard.child_mut().stderr.take().ok_or(Error::Closed)?;
+
+    let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
+    let reader_lifecycle = lifecycle.clone();
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_interrupted = interrupted.clone();
+    let (mut child, _) = guard.into_child();
+
+    tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let mut buf = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if buf.len() < 20 {
+                    buf.push(line);
+                }
+            }
+            buf.join("\n")
+        });
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut translator = AgyTranslator::default();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            for outgoing in translator.feed(&message) {
+                if events_tx.send(outgoing).await.is_err() {
+                    reader_lifecycle.request_termination().await;
+                    await_child_exit(&mut child, &reader_lifecycle).await;
+                    cleanup_temp_files(&temp_files).await;
+                    return;
+                }
+            }
+            if translator.finished {
+                let _ = reader_lifecycle.request_termination().await;
+                break;
+            }
+        }
+
+        if !translator.finished {
+            reader_lifecycle.request_termination().await;
+        }
+        let quiescence = await_child_exit(&mut child, &reader_lifecycle).await;
+        let stderr_text = stderr_task.await.unwrap_or_default();
+        cleanup_temp_files(&temp_files).await;
+
+        let interrupted = reader_interrupted.load(std::sync::atomic::Ordering::Acquire)
+            && !translator.finished;
+        let wait_error = match quiescence {
+            Quiescence::Confirmed | Quiescence::DirectChildExited if translator.finished || interrupted => None,
+            Quiescence::Confirmed | Quiescence::DirectChildExited => {
+                let detail = stderr_text.trim();
+                if !detail.is_empty() {
+                    Some(format!("Antigravity CLI 执行异常: {detail}"))
+                } else {
+                    Some("Antigravity CLI 事件流在返回结果前结束".into())
+                }
+            }
+            Quiescence::Unknown => Some("Antigravity CLI 进程组退出状态未知".into()),
+        };
+
+        let _ = events_tx
+            .send(AdapterEvent::Finish {
+                interrupted,
+                error: translator.error.or(wait_error),
+                cost_usd: None,
+                input_tokens: translator.input_tokens,
+                output_tokens: translator.output_tokens,
+                diffs: Vec::new(),
+            })
+            .await;
+    });
+
+    Ok(AgyTurn {
+        events: Some(events_rx),
+        lifecycle,
+        interrupted,
+    })
+}
+
+async fn cleanup_temp_files(files: &[PathBuf]) {
+    for path in files {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+#[derive(Default)]
+struct AgyTranslator {
+    native_id_emitted: bool,
+    assistant_text: String,
+    thinking_by_step: HashMap<i64, String>,
+    text_by_step: HashMap<i64, String>,
+    started_tools: HashSet<String>,
+    finished_tools: HashSet<String>,
+    finished: bool,
+    error: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+impl AgyTranslator {
+    fn feed(&mut self, message: &Value) -> Vec<AdapterEvent> {
+        let mut out = Vec::new();
+        let event_kind = message
+            .get("event")
+            .or_else(|| message.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        if let Some(cid) = message
+            .get("conversation_id")
+            .or_else(|| message.get("conversationId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.emit_native_id(cid, &mut out);
+        }
+
+        match event_kind {
+            "init" => {
+                if let Some(cid) = message
+                    .get("init")
+                    .and_then(|init| {
+                        init.get("conversation_id")
+                            .or_else(|| init.get("conversationId"))
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    self.emit_native_id(cid, &mut out);
+                }
+            }
+            "step_update" => {
+                if let Some(step) = message.get("step_update").or_else(|| message.get("stepUpdate"))
+                {
+                    self.feed_step_update(step, &mut out);
+                }
+            }
+            "result" => {
+                if let Some(result) = message.get("result") {
+                    self.feed_result(result, &mut out);
+                } else {
+                    self.feed_result(message, &mut out);
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn emit_native_id(&mut self, cid: &str, out: &mut Vec<AdapterEvent>) {
+        if !self.native_id_emitted {
+            self.native_id_emitted = true;
+            out.push(AdapterEvent::NativeId(cid.to_owned()));
+        }
+    }
+
+    fn feed_step_update(&mut self, step: &Value, out: &mut Vec<AdapterEvent>) {
+        if let Some(cid) = step
+            .get("conversation_id")
+            .or_else(|| step.get("conversationId"))
+            .or_else(|| step.get("cascade_id"))
+            .or_else(|| step.get("cascadeId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.emit_native_id(cid, out);
+        }
+
+        let step_index = step
+            .get("step_index")
+            .or_else(|| step.get("stepIndex"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let step_type = step
+            .get("step_type")
+            .or_else(|| step.get("stepType"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let source = step.get("source").and_then(Value::as_str).unwrap_or("");
+        let state = step.get("state").and_then(Value::as_str).unwrap_or("");
+
+        // Thinking delta or full thinking text
+        if let Some(thinking_delta) = step
+            .get("thinking_delta")
+            .or_else(|| step.get("thinkingDelta"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            let entry = self.thinking_by_step.entry(step_index).or_default();
+            entry.push_str(thinking_delta);
+            out.push(AdapterEvent::Thinking {
+                subagent: None,
+                text: entry.clone(),
+            });
+        } else if let Some(thinking) = step
+            .get("thinking")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            let entry = self.thinking_by_step.entry(step_index).or_default();
+            if entry != thinking {
+                *entry = thinking.to_owned();
+                out.push(AdapterEvent::Thinking {
+                    subagent: None,
+                    text: entry.clone(),
+                });
+            }
+        }
+
+        // Assistant text delta or full text (skip user_input echoes)
+        let is_user_step = step_type.eq_ignore_ascii_case("user_input")
+            || source.eq_ignore_ascii_case("SOURCE_USER")
+            || source.eq_ignore_ascii_case("user");
+        if !is_user_step {
+            if let Some(text_delta) = step
+                .get("text_delta")
+                .or_else(|| step.get("textDelta"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                let entry = self.text_by_step.entry(step_index).or_default();
+                entry.push_str(text_delta);
+                self.assistant_text.push_str(text_delta);
+                out.push(AdapterEvent::Text {
+                    subagent: None,
+                    text: self.assistant_text.clone(),
+                });
+            } else if let Some(text) = step
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                let prev = self.text_by_step.insert(step_index, text.to_owned());
+                if prev.as_deref() != Some(text) {
+                    self.assistant_text = self
+                        .text_by_step
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    out.push(AdapterEvent::Text {
+                        subagent: None,
+                        text: self.assistant_text.clone(),
+                    });
+                }
+            }
+        }
+
+        // Tool calls / results inside step_update
+        if let Some((tool_name, summary)) = extract_step_tool(step, step_type) {
+            let call_id = format!("agy-step-{step_index}-{tool_name}");
+            let is_done = state.contains("DONE") || state.contains("COMPLETE");
+            let is_error = state.contains("ERROR") || state.contains("FAIL");
+            if !self.started_tools.contains(&call_id) {
+                self.started_tools.insert(call_id.clone());
+                out.push(AdapterEvent::ToolCall {
+                    subagent: None,
+                    call_id: call_id.clone(),
+                    name: tool_name.clone(),
+                    summary: summary.clone(),
+                    diff: None,
+                });
+            }
+            if (is_done || is_error) && !self.finished_tools.contains(&call_id) {
+                self.finished_tools.insert(call_id.clone());
+                out.push(AdapterEvent::ToolResult {
+                    subagent: None,
+                    call_id,
+                    name: tool_name,
+                    summary,
+                    error: is_error,
+                    diff: None,
+                    has_more: false,
+                });
+            }
+        }
+    }
+
+    fn feed_result(&mut self, result: &Value, out: &mut Vec<AdapterEvent>) {
+        if let Some(cid) = result
+            .get("conversation_id")
+            .or_else(|| result.get("conversationId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.emit_native_id(cid, out);
+        }
+
+        if let Some(usage) = result.get("usage") {
+            self.input_tokens = usage
+                .get("input_tokens")
+                .or_else(|| usage.get("inputTokens"))
+                .and_then(Value::as_i64);
+            self.output_tokens = usage
+                .get("output_tokens")
+                .or_else(|| usage.get("outputTokens"))
+                .and_then(Value::as_i64);
+        }
+
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("SUCCESS");
+        let response = result
+            .get("response")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+
+        if status.eq_ignore_ascii_case("ERROR") || status.eq_ignore_ascii_case("FAILED") {
+            let err_msg = result
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(if !response.is_empty() {
+                    response
+                } else {
+                    "Antigravity CLI 返回错误状态"
+                });
+            self.error = Some(err_msg.to_owned());
+        } else if !response.is_empty() && self.assistant_text.trim() != response {
+            self.assistant_text = response.to_owned();
+            out.push(AdapterEvent::Text {
+                subagent: None,
+                text: self.assistant_text.clone(),
+            });
+        }
+
+        self.finished = true;
+    }
+}
+
+fn extract_step_tool(step: &Value, step_type: &str) -> Option<(String, String)> {
+    let candidates = [
+        ("run_command", "runCommand", "Bash"),
+        ("view_file", "viewFile", "Read"),
+        ("edit_file", "editFile", "Edit"),
+        ("create_file", "createFile", "Write"),
+        ("delete_file", "deleteFile", "Delete"),
+        ("list_directory", "listDirectory", "Ls"),
+        ("find_file", "findFile", "Find"),
+        ("search_directory", "searchDirectory", "Grep"),
+        ("search_web", "searchWeb", "WebSearch"),
+        ("read_url_content", "readUrlContent", "WebFetch"),
+        ("mcp_tool", "mcpTool", "MCP"),
+        ("custom_tool", "customTool", "Tool"),
+        ("skill_lookup", "skillLookup", "Skill"),
+        ("invoke_subagent", "invokeSubagent", "Subagent"),
+    ];
+    for (snake, camel, display_name) in candidates {
+        if let Some(payload) = step.get(snake).or_else(|| step.get(camel)) {
+            let summary = summarize_tool_payload(payload, display_name);
+            return Some((display_name.to_owned(), summary));
+        }
+    }
+    if !step_type.is_empty()
+        && !matches!(
+            step_type,
+            "user_input" | "planner_response" | "thinking" | "text"
+        )
+    {
+        return Some((step_type.to_owned(), step_type.to_owned()));
+    }
+    None
+}
+
+fn summarize_tool_payload(payload: &Value, fallback: &str) -> String {
+    for key in [
+        "command_line",
+        "commandLine",
+        "command",
+        "file_path",
+        "filePath",
+        "path",
+        "directory_path",
+        "directoryPath",
+        "query",
+        "url",
+        "tool_name",
+        "toolName",
+        "skill_name",
+        "skillName",
+        "summary",
+    ] {
+        if let Some(val) = payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return val.chars().take(240).collect();
+        }
+    }
+    fallback.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_agy_models_table_output() {
+        let sample = "\
+Available models (13):
+
+  gemini-4-argon-high              Gemini 4 Argon (High)
+  gemini-4-argon-medium            Gemini 4 Argon (Medium)
+  claude-opus-5-5-high             Claude Opus 5.5 (High)
+
+Usage: agy --model <id> [prompt]
+";
+        let models = parse_models_output(sample);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "gemini-4-argon-high");
+        assert_eq!(models[0].label, "Gemini 4 Argon (High)");
+        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
+        assert!(!models[0].is_default);
+        assert_eq!(models[1].id, "gemini-4-argon-medium");
+        assert!(models[1].is_default);
+    }
+
+    #[test]
+    fn translates_stream_json_init_step_and_result() {
+        let mut translator = AgyTranslator::default();
+        let init: Value = serde_json::from_str(
+            r#"{"event":"init","conversation_id":"f54fdff9-fc4a-4cf8-8cf8-be185b18c06c","init":{"model":"MODEL_PLACEHOLDER_M47","cwd":"/private/tmp"}}"#,
+        )
+        .unwrap();
+        let events = translator.feed(&init);
+        assert!(matches!(
+            events.as_slice(),
+            [AdapterEvent::NativeId(id)] if id == "f54fdff9-fc4a-4cf8-8cf8-be185b18c06c"
+        ));
+
+        let result: Value = serde_json::from_str(
+            r#"{"event":"result","result":{"conversation_id":"f54fdff9-fc4a-4cf8-8cf8-be185b18c06c","status":"SUCCESS","response":"PONG","duration_seconds":2.5,"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        )
+        .unwrap();
+        let events = translator.feed(&result);
+        assert!(matches!(
+            events.as_slice(),
+            [AdapterEvent::Text { subagent: None, text }] if text == "PONG"
+        ));
+        assert!(translator.finished);
+        assert_eq!(translator.input_tokens, Some(10));
+        assert_eq!(translator.output_tokens, Some(5));
+    }
+}

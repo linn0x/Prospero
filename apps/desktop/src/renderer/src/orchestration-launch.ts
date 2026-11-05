@@ -3,6 +3,7 @@ import type { JsonObject } from "../../shared/types";
 export type OrchestrationWorkerAgent =
   | "codex"
   | "claude"
+  | "agy"
   | "deepseek"
   | "opencode"
   | "pi";
@@ -15,7 +16,7 @@ export type OrchestrationLaunchSelection = {
 
 function accountParams(selection: OrchestrationLaunchSelection): JsonObject {
   if (
-    (selection.agent === "codex" || selection.agent === "claude" || selection.agent === "opencode" || selection.agent === "pi") &&
+    (selection.agent === "codex" || selection.agent === "claude" || selection.agent === "agy" || selection.agent === "opencode" || selection.agent === "pi") &&
     selection.accountId?.trim()
   ) {
     return { accountId: selection.accountId.trim() };

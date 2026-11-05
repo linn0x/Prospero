@@ -256,15 +256,15 @@ function assertStructuredClaudeWorker(params: JsonObject): void {
   }
 }
 
-function workerAgent(params: JsonObject): "claude" | "codex" | "deepseek" | "opencode" | "pi" {
+function workerAgent(params: JsonObject): "claude" | "codex" | "deepseek" | "opencode" | "pi" | "agy" {
   const agent = params["agent"] ?? "claude";
-  if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi") throw new Error("Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode/Pi");
+  if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi" && agent !== "agy") throw new Error("Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode/Pi/Antigravity");
   return agent;
 }
 
-function automationAgent(params: JsonObject): "claude" | "codex" | "deepseek" | "opencode" | "pi" {
+function automationAgent(params: JsonObject): "claude" | "codex" | "deepseek" | "opencode" | "pi" | "agy" {
   const agent = params["agent"] ?? "claude";
-  if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi") throw new Error("Rust 自动执行当前仅支持 Claude/Codex/DeepSeek/OpenCode/Pi worker");
+  if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi" && agent !== "agy") throw new Error("Rust 自动执行当前仅支持 Claude/Codex/DeepSeek/OpenCode/Pi/Antigravity worker");
   return agent;
 }
 
