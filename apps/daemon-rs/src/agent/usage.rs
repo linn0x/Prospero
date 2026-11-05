@@ -367,9 +367,14 @@ async fn read_codex_usage_with_env(
 ) -> Result<Option<UsageReport>> {
     let mut rpc = CodexRpc::start(data, cwd, env).await?;
     let result = async {
-        let identity = rpc
-            .request("account/read", json!({ "refreshToken": true }))
+        let mut identity = rpc
+            .request("account/read", json!({ "refreshToken": false }))
             .await?;
+        if identity.get("account").is_none_or(|value| value.is_null()) {
+            identity = rpc
+                .request("account/read", json!({ "refreshToken": true }))
+                .await?;
+        }
         if identity.get("account").is_none_or(|value| value.is_null()) {
             return Ok(None);
         }

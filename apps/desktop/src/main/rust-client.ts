@@ -226,11 +226,11 @@ export class RustClient {
   agentQueues(signal: AbortSignal | null = null): Promise<AgentQueues> {
     return this.json("/v1/agent-sessions/queues", { signal });
   }
-  usage(sid?: string, signal: AbortSignal | null = null): Promise<UsageResult> {
+  usage(sid?: string, signal: AbortSignal | null = null, timeoutMs = 25_000): Promise<UsageResult> {
     const params = new URLSearchParams();
     if (sid !== undefined) params.set("sid", id(sid));
     const suffix = params.size ? `?${params}` : "";
-    return this.json(`/v1/usage${suffix}`, { signal });
+    return this.json(`/v1/usage${suffix}`, { signal, timeoutMs });
   }
   agentQueueRemove(value: string, queueId: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/queue/${id(queueId)}/remove`, { method: "POST", signal });

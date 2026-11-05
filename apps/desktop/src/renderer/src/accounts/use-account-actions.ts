@@ -32,16 +32,18 @@ export function useAccountActions(snapshot: DesktopSnapshot, onOpenSession: (id:
     loadingRef.current = true;
     const token = ++generation.current;
     setLoading(true); setRefreshError("");
+    void loadAccountUsage(force).then(next => {
+      if (alive.current && generation.current === token) setUsage(next);
+    }).catch(() => {
+      // Usage quota telemetry is optional and may depend on slow upstream CLI
+      // calls; do not fail or block the accounts list when usage times out.
+    });
     try {
-      const results = await Promise.allSettled([
-        window.prospero.accountAction({ type: "agent.accounts.list", requestId: crypto.randomUUID() }),
-        loadAccountUsage(force),
-      ]);
+      const result = await window.prospero.accountAction({ type: "agent.accounts.list", requestId: crypto.randomUUID() });
       if (!alive.current || generation.current !== token) return;
-      if (results[1].status === "fulfilled") setUsage(results[1].value);
-      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => reportError(result.reason));
-      if (results[0].status === "fulfilled" && results[0].value["ok"] === false) failures.push(t("无法读取账号列表，请重试。", "Unable to read the account list. Retry."));
-      setRefreshError(failures.join(" · "));
+      if (result["ok"] === false) setRefreshError(t("无法读取账号列表，请重试。", "Unable to read the account list. Retry."));
+    } catch (reason) {
+      if (alive.current && generation.current === token) setRefreshError(reportError(reason));
     } finally {
       if (alive.current && generation.current === token) { loadingRef.current = false; setLoading(false); }
     }

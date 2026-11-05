@@ -4039,6 +4039,7 @@ impl Agents {
                 && account.agent == crate::protocol::AgentKind::Codex
                 && account.api_profile.is_none()
                 && account.managed
+                && account.status == crate::accounts::AccountStatus::SignedIn
             {
                 report = super::usage::read_codex_usage_for_account(
                     self.0.database.directory(),

@@ -583,7 +583,16 @@ export class RustRuntime {
         await this.refresh();
         if (this.orchestrationRetryPending) delay = 2000;
       }
-    } catch { delay = 2000; }
+    } catch {
+      delay = 2000;
+      if (!this.managed && !this.controller.signal.aborted) {
+        const reattached = await this.process.attach().catch(() => undefined);
+        if (reattached) {
+          this.connection = reattached;
+          await this.refresh().catch(() => {});
+        }
+      }
+    }
     finally { this.schedule(delay); }
   }
 
@@ -775,7 +784,7 @@ export class RustRuntime {
           accountId: requireManagedAccountId(input["accountId"]),
         };
         if (type === "agent.account.config.set") {
-          const documentId = input["documentId"];
+          const documentId = input["documentId"] ?? "claude-overrides";
           if (typeof documentId !== "string" || !/^[a-z][a-z0-9-]{0,79}$/.test(documentId)) throw new Error("配置文档 ID 无效");
           const revision = input["revision"];
           if (typeof revision !== "string" || !/^[a-f0-9]{64}$/.test(revision)) throw new Error("配置版本无效");
@@ -789,6 +798,21 @@ export class RustRuntime {
             const effort = input["defaultEffort"];
             if (effort !== null && (typeof effort !== "string" || !ACCOUNT_CONFIG_EFFORTS.has(effort))) throw new Error("默认推理强度无效");
             configBody["defaultEffort"] = effort;
+          }
+          if ("proxyUrl" in input) {
+            const proxyUrl = input["proxyUrl"];
+            if (proxyUrl !== null && (typeof proxyUrl !== "string" || proxyUrl.length > 2000)) throw new Error("代理地址格式无效");
+            configBody["proxyUrl"] = proxyUrl;
+          }
+          if ("noProxy" in input) {
+            const noProxy = input["noProxy"];
+            if (noProxy !== null && (typeof noProxy !== "string" || noProxy.length > 1000)) throw new Error("NO_PROXY 格式无效");
+            configBody["noProxy"] = noProxy;
+          }
+          if ("env" in input) {
+            const env = input["env"];
+            if (env !== null && (typeof env !== "object" || Array.isArray(env))) throw new Error("自定义环境变量格式无效");
+            configBody["env"] = env;
           }
         }
         const config = await this.current().client.accountFeature(configBody, signal, init.timeoutMs ?? 35_000);
@@ -840,8 +864,8 @@ export class RustRuntime {
           body["scope"] = input["scope"];
         }
       } else if (type === "agent.account.create") {
-        if (input["agent"] !== "claude") throw new Error("Rust 当前仅支持 Claude 托管账号");
-        body["agent"] = "claude";
+        if (input["agent"] !== "claude" && input["agent"] !== "codex") throw new Error("Rust 当前仅支持 Claude 或 Codex 托管账号");
+        body["agent"] = input["agent"];
         body["name"] = requireAccountName(input["name"]);
       } else {
         const accountId = requireManagedAccountId(input["accountId"]);
