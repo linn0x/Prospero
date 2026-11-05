@@ -2889,7 +2889,7 @@ function NewSessionDialog({
 }) {
   const { t, status } = useLocale();
   const [tab, setTab] = useState(initialTab);
-  const independentAccounts = useMemo(() => snapshot.accounts.filter(account => !account.modelSource), [snapshot.accounts]);
+  const independentAccounts = useMemo(() => snapshot.accounts.filter(account => !account.modelSource && !account["apiProfile"] && !account["apiProfileError"]), [snapshot.accounts]);
   const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
   const rememberedSource = useMemo(() => rememberedSourceSelection(), []);
   const initialAgent = initialDraft?.input.agent ?? initialSource?.agent ?? rememberedSource?.agent ?? rememberedLaunchAgent();
