@@ -3,7 +3,7 @@
 //! Runs `agy -p <prompt> --output-format stream-json` per turn using the local
 //! Antigravity subscription session (`~/.gemini/antigravity-cli` / Keychain).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::claude::{AdapterEvent, TurnOptions};
 use super::lifecycle::{ChildGuard, ProcessLifecycle, Quiescence, await_child_exit};
-use super::store::{ApprovalPolicy, PermissionMode};
+use super::store::PermissionMode;
 use super::{LaunchModelCatalog, LaunchModelInfo};
 use crate::error::{Error, Result};
 use crate::orchestration::reliability::ControlEffectState;
@@ -290,10 +290,11 @@ pub(super) async fn spawn_turn(
     }
     if options.mode == PermissionMode::Plan {
         command.args(["--mode", "plan"]);
-    } else if options.policy == ApprovalPolicy::Auto {
-        command.arg("--dangerously-skip-permissions");
     } else {
-        command.args(["--mode", "accept-edits"]);
+        // Headless `agy -p --output-format stream-json` has no interactive stdin
+        // permission channel; without `--dangerously-skip-permissions`, tool calls
+        // block indefinitely waiting for terminal approval.
+        command.arg("--dangerously-skip-permissions");
     }
     for file_path in &temp_files {
         command.arg("-f").arg(file_path);
@@ -401,8 +402,8 @@ async fn cleanup_temp_files(files: &[PathBuf]) {
 struct AgyTranslator {
     native_id_emitted: bool,
     assistant_text: String,
-    thinking_by_step: HashMap<i64, String>,
-    text_by_step: HashMap<i64, String>,
+    thinking_by_step: BTreeMap<i64, String>,
+    text_by_step: BTreeMap<i64, String>,
     started_tools: HashSet<String>,
     finished_tools: HashSet<String>,
     finished: bool,
@@ -505,9 +506,16 @@ impl AgyTranslator {
         {
             let entry = self.thinking_by_step.entry(step_index).or_default();
             entry.push_str(thinking_delta);
+            let combined = self
+                .thinking_by_step
+                .values()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n\n");
             out.push(AdapterEvent::Thinking {
                 subagent: None,
-                text: entry.clone(),
+                text: combined,
             });
         } else if let Some(thinking) = step
             .get("thinking")
@@ -517,9 +525,16 @@ impl AgyTranslator {
             let entry = self.thinking_by_step.entry(step_index).or_default();
             if entry != thinking {
                 *entry = thinking.to_owned();
+                let combined = self
+                    .thinking_by_step
+                    .values()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 out.push(AdapterEvent::Thinking {
                     subagent: None,
-                    text: entry.clone(),
+                    text: combined,
                 });
             }
         }
@@ -537,11 +552,19 @@ impl AgyTranslator {
             {
                 let entry = self.text_by_step.entry(step_index).or_default();
                 entry.push_str(text_delta);
-                self.assistant_text.push_str(text_delta);
-                out.push(AdapterEvent::Text {
-                    subagent: None,
-                    text: self.assistant_text.clone(),
-                });
+                self.assistant_text = self
+                    .text_by_step
+                    .values()
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !self.assistant_text.is_empty() {
+                    out.push(AdapterEvent::Text {
+                        subagent: None,
+                        text: self.assistant_text.clone(),
+                    });
+                }
             } else if let Some(text) = step
                 .get("text")
                 .and_then(Value::as_str)
@@ -552,19 +575,22 @@ impl AgyTranslator {
                     self.assistant_text = self
                         .text_by_step
                         .values()
+                        .filter(|s| !s.trim().is_empty())
                         .cloned()
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    out.push(AdapterEvent::Text {
-                        subagent: None,
-                        text: self.assistant_text.clone(),
-                    });
+                    if !self.assistant_text.is_empty() {
+                        out.push(AdapterEvent::Text {
+                            subagent: None,
+                            text: self.assistant_text.clone(),
+                        });
+                    }
                 }
             }
         }
 
         // Tool calls / results inside step_update
-        if let Some((tool_name, summary)) = extract_step_tool(step, step_type) {
+        if let Some((tool_name, call_summary, result_summary)) = extract_step_tool(step, step_type) {
             let call_id = format!("agy-step-{step_index}-{tool_name}");
             let is_done = state.contains("DONE") || state.contains("COMPLETE");
             let is_error = state.contains("ERROR") || state.contains("FAIL");
@@ -574,7 +600,7 @@ impl AgyTranslator {
                     subagent: None,
                     call_id: call_id.clone(),
                     name: tool_name.clone(),
-                    summary: summary.clone(),
+                    summary: call_summary,
                     diff: None,
                 });
             }
@@ -584,7 +610,7 @@ impl AgyTranslator {
                     subagent: None,
                     call_id,
                     name: tool_name,
-                    summary,
+                    summary: result_summary,
                     error: is_error,
                     diff: None,
                     has_more: false,
@@ -648,7 +674,32 @@ impl AgyTranslator {
     }
 }
 
-fn extract_step_tool(step: &Value, step_type: &str) -> Option<(String, String)> {
+fn extract_step_tool(step: &Value, step_type: &str) -> Option<(String, String, String)> {
+    let tool_info = step.get("tool_info").or_else(|| step.get("toolInfo"));
+    let raw_tool_name = step
+        .get("tool_name")
+        .or_else(|| step.get("toolName"))
+        .and_then(Value::as_str)
+        .or_else(|| tool_info.and_then(|info| info.get("name")).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(raw_name) = raw_tool_name {
+        let display_name = normalize_agy_tool_name(raw_name);
+        let params = tool_info
+            .and_then(|info| info.get("parameters").or_else(|| info.get("args")))
+            .unwrap_or(step);
+        let call_summary = summarize_tool_payload(params, &display_name);
+        let result_summary = tool_info
+            .and_then(|info| info.get("output").or_else(|| info.get("error")))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(240).collect::<String>())
+            .unwrap_or_else(|| call_summary.clone());
+        return Some((display_name, call_summary, result_summary));
+    }
+
     let candidates = [
         ("run_command", "runCommand", "Bash"),
         ("view_file", "viewFile", "Read"),
@@ -668,36 +719,71 @@ fn extract_step_tool(step: &Value, step_type: &str) -> Option<(String, String)> 
     for (snake, camel, display_name) in candidates {
         if let Some(payload) = step.get(snake).or_else(|| step.get(camel)) {
             let summary = summarize_tool_payload(payload, display_name);
-            return Some((display_name.to_owned(), summary));
+            return Some((display_name.to_owned(), summary.clone(), summary));
         }
     }
     if !step_type.is_empty()
         && !matches!(
             step_type,
-            "user_input" | "planner_response" | "thinking" | "text"
+            "user_input" | "agent_response" | "planner_response" | "thinking" | "text"
         )
     {
-        return Some((step_type.to_owned(), step_type.to_owned()));
+        return Some((
+            step_type.to_owned(),
+            step_type.to_owned(),
+            step_type.to_owned(),
+        ));
     }
     None
 }
 
+fn normalize_agy_tool_name(raw_name: &str) -> String {
+    match raw_name {
+        "run_command" | "send_command_input" | "command_status" => "Bash".into(),
+        "read_file" | "view_file" | "read_resource" => "Read".into(),
+        "edit_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" => {
+            "Edit".into()
+        }
+        "write_file" | "write_to_file" | "create_file" => "Write".into(),
+        "grep_search" | "search_directory" => "Grep".into(),
+        "find_by_name" | "find_file" => "Find".into(),
+        "list_dir" | "list_directory" | "list_resources" => "Ls".into(),
+        "search_web" | "search_marketplace" => "WebSearch".into(),
+        "read_url_content" => "WebFetch".into(),
+        "call_mcp_tool" | "mcp_tool" => "MCP".into(),
+        "invoke_subagent" | "manage_subagents" | "browser_subagent" => "Subagent".into(),
+        other => other.to_owned(),
+    }
+}
+
 fn summarize_tool_payload(payload: &Value, fallback: &str) -> String {
     for key in [
+        "CommandLine",
         "command_line",
         "commandLine",
         "command",
+        "Path",
+        "TargetFile",
+        "FilePath",
         "file_path",
         "filePath",
         "path",
+        "DirectoryPath",
+        "SearchPath",
         "directory_path",
         "directoryPath",
+        "Query",
+        "Pattern",
         "query",
+        "Url",
         "url",
+        "toolSummary",
         "tool_name",
         "toolName",
         "skill_name",
         "skillName",
+        "Role",
+        "Prompt",
         "summary",
     ] {
         if let Some(val) = payload
@@ -762,5 +848,51 @@ Usage: agy --model <id> [prompt]
         assert!(translator.finished);
         assert_eq!(translator.input_tokens, Some(10));
         assert_eq!(translator.output_tokens, Some(5));
+    }
+
+    #[test]
+    fn translates_tool_call_and_agent_response_steps() {
+        let mut translator = AgyTranslator::default();
+        let step1: Value = serde_json::from_str(
+            r#"{"event":"step_update","step_update":{"conversation_id":"0339b39c","step_index":1,"state":"DONE","step_type":"agent_response","duration_seconds":1.0}}"#,
+        )
+        .unwrap();
+        let events = translator.feed(&step1);
+        assert!(matches!(
+            events.as_slice(),
+            [AdapterEvent::NativeId(id)] if id == "0339b39c"
+        ));
+
+        let tool_active: Value = serde_json::from_str(
+            r#"{"event":"step_update","step_update":{"conversation_id":"0339b39c","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"EndLine":5,"Path":"/workspace/Prospero/Cargo.toml","StartLine":1}}}}"#,
+        )
+        .unwrap();
+        let events = translator.feed(&tool_active);
+        assert!(matches!(
+            events.as_slice(),
+            [AdapterEvent::ToolCall { name, summary, .. }]
+                if name == "Read" && summary == "/workspace/Prospero/Cargo.toml"
+        ));
+
+        let tool_done: Value = serde_json::from_str(
+            r#"{"event":"step_update","step_update":{"conversation_id":"0339b39c","step_index":2,"state":"DONE","step_type":"tool","tool_name":"read_file","duration_seconds":0.11,"tool_info":{"name":"read_file","parameters":{"EndLine":5,"Path":"/workspace/Prospero/Cargo.toml","StartLine":1},"output":"21 lines, 362 bytes"}}}"#,
+        )
+        .unwrap();
+        let events = translator.feed(&tool_done);
+        assert!(matches!(
+            events.as_slice(),
+            [AdapterEvent::ToolResult { name, summary, error: false, .. }]
+                if name == "Read" && summary == "21 lines, 362 bytes"
+        ));
+
+        let step3: Value = serde_json::from_str(
+            r#"{"event":"step_update","step_update":{"conversation_id":"0339b39c","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}"#,
+        )
+        .unwrap();
+        let events = translator.feed(&step3);
+        assert!(matches!(
+            events.as_slice(),
+            [AdapterEvent::Text { subagent: None, text }] if text == "OK"
+        ));
     }
 }
