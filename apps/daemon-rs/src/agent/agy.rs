@@ -3,7 +3,6 @@
 //! Runs `agy -p <prompt> --output-format stream-json` per turn using the local
 //! Antigravity subscription session (`~/.gemini/antigravity-cli` / Keychain).
 
-use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -18,6 +17,7 @@ use tokio::sync::mpsc;
 use super::claude::{AdapterEvent, TurnOptions};
 use super::lifecycle::{ChildGuard, ProcessLifecycle, Quiescence, await_child_exit};
 use super::store::PermissionMode;
+use super::turn_stream::TurnStreamStateMachine;
 use super::{LaunchModelCatalog, LaunchModelInfo};
 use crate::error::{Error, Result};
 use crate::orchestration::reliability::ControlEffectState;
@@ -345,13 +345,13 @@ pub(super) async fn spawn_turn(
                     return;
                 }
             }
-            if translator.finished {
+            if translator.is_result_received() {
                 let _ = reader_lifecycle.request_termination().await;
                 break;
             }
         }
 
-        if !translator.finished {
+        if !translator.is_result_received() {
             reader_lifecycle.request_termination().await;
         }
         let quiescence = await_child_exit(&mut child, &reader_lifecycle).await;
@@ -359,9 +359,13 @@ pub(super) async fn spawn_turn(
         cleanup_temp_files(&temp_files).await;
 
         let interrupted = reader_interrupted.load(std::sync::atomic::Ordering::Acquire)
-            && !translator.finished;
+            && !translator.is_result_received();
         let wait_error = match quiescence {
-            Quiescence::Confirmed | Quiescence::DirectChildExited if translator.finished || interrupted => None,
+            Quiescence::Confirmed | Quiescence::DirectChildExited
+                if translator.is_result_received() || interrupted =>
+            {
+                None
+            }
             Quiescence::Confirmed | Quiescence::DirectChildExited => {
                 let detail = stderr_text.trim();
                 if !detail.is_empty() {
@@ -373,16 +377,11 @@ pub(super) async fn spawn_turn(
             Quiescence::Unknown => Some("Antigravity CLI 进程组退出状态未知".into()),
         };
 
-        let _ = events_tx
-            .send(AdapterEvent::Finish {
-                interrupted,
-                error: translator.error.or(wait_error),
-                cost_usd: None,
-                input_tokens: translator.input_tokens,
-                output_tokens: translator.output_tokens,
-                diffs: Vec::new(),
-            })
-            .await;
+        for outgoing in translator.finalize(interrupted, wait_error) {
+            if events_tx.send(outgoing).await.is_err() {
+                break;
+            }
+        }
     });
 
     Ok(AgyTurn {
@@ -400,19 +399,18 @@ async fn cleanup_temp_files(files: &[PathBuf]) {
 
 #[derive(Default)]
 struct AgyTranslator {
-    native_id_emitted: bool,
-    assistant_text: String,
-    thinking_by_step: BTreeMap<i64, String>,
-    text_by_step: BTreeMap<i64, String>,
-    started_tools: HashSet<String>,
-    finished_tools: HashSet<String>,
-    finished: bool,
-    error: Option<String>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
+    sm: TurnStreamStateMachine,
 }
 
 impl AgyTranslator {
+    fn is_result_received(&self) -> bool {
+        self.sm.is_result_received()
+    }
+
+    fn finalize(&mut self, interrupted: bool, wait_error: Option<String>) -> Vec<AdapterEvent> {
+        self.sm.finalize(interrupted, wait_error, Vec::new())
+    }
+
     fn feed(&mut self, message: &Value) -> Vec<AdapterEvent> {
         let mut out = Vec::new();
         let event_kind = message
@@ -428,7 +426,7 @@ impl AgyTranslator {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            self.emit_native_id(cid, &mut out);
+            self.sm.observe_native_id(cid, &mut out);
         }
 
         match event_kind {
@@ -443,7 +441,7 @@ impl AgyTranslator {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    self.emit_native_id(cid, &mut out);
+                    self.sm.observe_native_id(cid, &mut out);
                 }
             }
             "step_update" => {
@@ -464,13 +462,6 @@ impl AgyTranslator {
         out
     }
 
-    fn emit_native_id(&mut self, cid: &str, out: &mut Vec<AdapterEvent>) {
-        if !self.native_id_emitted {
-            self.native_id_emitted = true;
-            out.push(AdapterEvent::NativeId(cid.to_owned()));
-        }
-    }
-
     fn feed_step_update(&mut self, step: &Value, out: &mut Vec<AdapterEvent>) {
         if let Some(cid) = step
             .get("conversation_id")
@@ -481,7 +472,7 @@ impl AgyTranslator {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            self.emit_native_id(cid, out);
+            self.sm.observe_native_id(cid, out);
         }
 
         let step_index = step
@@ -504,39 +495,14 @@ impl AgyTranslator {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            let entry = self.thinking_by_step.entry(step_index).or_default();
-            entry.push_str(thinking_delta);
-            let combined = self
-                .thinking_by_step
-                .values()
-                .filter(|s| !s.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            out.push(AdapterEvent::Thinking {
-                subagent: None,
-                text: combined,
-            });
+            self.sm
+                .append_step_thinking(step_index, thinking_delta, None, out);
         } else if let Some(thinking) = step
             .get("thinking")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            let entry = self.thinking_by_step.entry(step_index).or_default();
-            if entry != thinking {
-                *entry = thinking.to_owned();
-                let combined = self
-                    .thinking_by_step
-                    .values()
-                    .filter(|s| !s.is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                out.push(AdapterEvent::Thinking {
-                    subagent: None,
-                    text: combined,
-                });
-            }
+            self.sm.set_step_thinking(step_index, thinking, None, out);
         }
 
         // Assistant text delta or full text (skip user_input echoes)
@@ -550,42 +516,13 @@ impl AgyTranslator {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
-                let entry = self.text_by_step.entry(step_index).or_default();
-                entry.push_str(text_delta);
-                self.assistant_text = self
-                    .text_by_step
-                    .values()
-                    .filter(|s| !s.trim().is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if !self.assistant_text.is_empty() {
-                    out.push(AdapterEvent::Text {
-                        subagent: None,
-                        text: self.assistant_text.clone(),
-                    });
-                }
+                self.sm.append_step_text(step_index, text_delta, None, out);
             } else if let Some(text) = step
                 .get("text")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
-                let prev = self.text_by_step.insert(step_index, text.to_owned());
-                if prev.as_deref() != Some(text) {
-                    self.assistant_text = self
-                        .text_by_step
-                        .values()
-                        .filter(|s| !s.trim().is_empty())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    if !self.assistant_text.is_empty() {
-                        out.push(AdapterEvent::Text {
-                            subagent: None,
-                            text: self.assistant_text.clone(),
-                        });
-                    }
-                }
+                self.sm.set_step_text(step_index, text, None, out);
             }
         }
 
@@ -594,27 +531,19 @@ impl AgyTranslator {
             let call_id = format!("agy-step-{step_index}-{tool_name}");
             let is_done = state.contains("DONE") || state.contains("COMPLETE");
             let is_error = state.contains("ERROR") || state.contains("FAIL");
-            if !self.started_tools.contains(&call_id) {
-                self.started_tools.insert(call_id.clone());
-                out.push(AdapterEvent::ToolCall {
-                    subagent: None,
-                    call_id: call_id.clone(),
-                    name: tool_name.clone(),
-                    summary: call_summary,
-                    diff: None,
-                });
-            }
-            if (is_done || is_error) && !self.finished_tools.contains(&call_id) {
-                self.finished_tools.insert(call_id.clone());
-                out.push(AdapterEvent::ToolResult {
-                    subagent: None,
-                    call_id,
-                    name: tool_name,
-                    summary: result_summary,
-                    error: is_error,
-                    diff: None,
-                    has_more: false,
-                });
+            self.sm
+                .begin_tool_call(&call_id, &tool_name, &call_summary, None, None, out);
+            if is_done || is_error {
+                self.sm.finish_tool_call(
+                    &call_id,
+                    &tool_name,
+                    &result_summary,
+                    is_error,
+                    None,
+                    None,
+                    false,
+                    out,
+                );
             }
         }
     }
@@ -627,18 +556,19 @@ impl AgyTranslator {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            self.emit_native_id(cid, out);
+            self.sm.observe_native_id(cid, out);
         }
 
         if let Some(usage) = result.get("usage") {
-            self.input_tokens = usage
+            let input_tokens = usage
                 .get("input_tokens")
                 .or_else(|| usage.get("inputTokens"))
                 .and_then(Value::as_i64);
-            self.output_tokens = usage
+            let output_tokens = usage
                 .get("output_tokens")
                 .or_else(|| usage.get("outputTokens"))
                 .and_then(Value::as_i64);
+            self.sm.record_usage(None, input_tokens, output_tokens);
         }
 
         let status = result
@@ -661,16 +591,12 @@ impl AgyTranslator {
                 } else {
                     "Antigravity CLI 返回错误状态"
                 });
-            self.error = Some(err_msg.to_owned());
-        } else if !response.is_empty() && self.assistant_text.trim() != response {
-            self.assistant_text = response.to_owned();
-            out.push(AdapterEvent::Text {
-                subagent: None,
-                text: self.assistant_text.clone(),
-            });
+            self.sm.record_error(err_msg);
+        } else if !response.is_empty() {
+            self.sm.set_final_text(response, None, out);
         }
 
-        self.finished = true;
+        self.sm.mark_result_received();
     }
 }
 
@@ -845,9 +771,18 @@ Usage: agy --model <id> [prompt]
             events.as_slice(),
             [AdapterEvent::Text { subagent: None, text }] if text == "PONG"
         ));
-        assert!(translator.finished);
-        assert_eq!(translator.input_tokens, Some(10));
-        assert_eq!(translator.output_tokens, Some(5));
+        assert!(translator.is_result_received());
+        let final_events = translator.finalize(false, None);
+        assert!(matches!(
+            final_events.as_slice(),
+            [AdapterEvent::Finish {
+                interrupted: false,
+                error: None,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                ..
+            }]
+        ));
     }
 
     #[test]

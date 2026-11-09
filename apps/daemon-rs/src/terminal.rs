@@ -33,6 +33,23 @@ mod replay;
 pub mod screen;
 pub mod session;
 
+/// Explicit state machine for PTY activity and idle-prompt reclamation.
+/// Guarantees `Busy`, `IdlePrompt`, and `Exited` are mutually exclusive by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtyActivityPhase {
+    Quiet,
+    Busy {
+        busy_since: i64,
+        last_activity_at: i64,
+    },
+    IdlePrompt {
+        since: i64,
+    },
+    Exited {
+        exit_code: Option<u32>,
+    },
+}
+
 pub struct Output {
     screen: screen::Screen,
     initial_size: TerminalSize,
@@ -43,11 +60,7 @@ pub struct Output {
     replay: replay::Replay,
     replay_failed: bool,
     query_carry: Vec<u8>,
-    exited: bool,
-    exit_code: Option<u32>,
-    busy_since: Option<i64>,
-    last_activity_at: Option<i64>,
-    idle_prompt_since: Option<i64>,
+    activity_phase: PtyActivityPhase,
     activity_version: u64,
 }
 
@@ -83,13 +96,33 @@ impl Output {
             seq: base_seq,
             base_seq,
             query_carry: Vec::new(),
-            exited: false,
-            exit_code: None,
-            busy_since: None,
-            last_activity_at: None,
-            idle_prompt_since: None,
+            activity_phase: PtyActivityPhase::Quiet,
             activity_version: 0,
         })
+    }
+
+    const fn is_exited(&self) -> bool {
+        matches!(self.activity_phase, PtyActivityPhase::Exited { .. })
+    }
+
+    const fn exit_code(&self) -> Option<u32> {
+        match self.activity_phase {
+            PtyActivityPhase::Exited { exit_code } => exit_code,
+            _ => None,
+        }
+    }
+
+    fn transition_activity(&mut self, next: PtyActivityPhase) {
+        if self.activity_phase != next {
+            let bump_version = !matches!(
+                (self.activity_phase, next),
+                (PtyActivityPhase::Quiet, PtyActivityPhase::Exited { .. })
+            );
+            self.activity_phase = next;
+            if bump_version {
+                self.activity_version = self.activity_version.wrapping_add(1);
+            }
+        }
     }
 
     fn push(&mut self, event: TerminalEvent, bytes: usize) {
@@ -125,41 +158,50 @@ impl Output {
     }
 
     fn mark_activity(&mut self, now: i64) {
-        if self.exited {
-            return;
-        }
-        let changed = self.busy_since.is_none()
-            || self.last_activity_at != Some(now)
-            || self.idle_prompt_since.is_some();
-        self.busy_since.get_or_insert(now);
-        self.last_activity_at = Some(now);
-        self.idle_prompt_since = None;
-        if changed {
-            self.activity_version = self.activity_version.wrapping_add(1);
-        }
+        let next = match self.activity_phase {
+            PtyActivityPhase::Exited { .. } => return,
+            PtyActivityPhase::Busy { busy_since, .. } => PtyActivityPhase::Busy {
+                busy_since,
+                last_activity_at: now,
+            },
+            PtyActivityPhase::Quiet | PtyActivityPhase::IdlePrompt { .. } => {
+                PtyActivityPhase::Busy {
+                    busy_since: now,
+                    last_activity_at: now,
+                }
+            }
+        };
+        self.transition_activity(next);
     }
 
     fn activity(&mut self, now: i64) -> TerminalActivity {
-        if self.exited
-            || self
-                .last_activity_at
-                .is_some_and(|last| now.saturating_sub(last) >= ACTIVITY_IDLE_MS)
+        if let PtyActivityPhase::Busy {
+            last_activity_at, ..
+        } = self.activity_phase
+            && now.saturating_sub(last_activity_at) >= ACTIVITY_IDLE_MS
         {
             self.clear_activity();
         }
+        let (busy_since, last_activity_at, idle_prompt_since, exited) = match self.activity_phase {
+            PtyActivityPhase::Quiet => (None, None, None, false),
+            PtyActivityPhase::Busy {
+                busy_since,
+                last_activity_at,
+            } => (Some(busy_since), Some(last_activity_at), None, false),
+            PtyActivityPhase::IdlePrompt { since } => (None, None, Some(since), false),
+            PtyActivityPhase::Exited { .. } => (None, None, None, true),
+        };
         TerminalActivity {
             version: self.activity_version,
-            busy_since: self.busy_since,
-            last_activity_at: self.last_activity_at,
-            idle_prompt_since: self.idle_prompt_since,
-            exited: self.exited,
+            busy_since,
+            last_activity_at,
+            idle_prompt_since,
+            exited,
         }
     }
 
     fn set_exited(&mut self, exit_code: Option<u32>) {
-        self.exited = true;
-        self.exit_code = exit_code;
-        self.clear_activity();
+        self.transition_activity(PtyActivityPhase::Exited { exit_code });
     }
 
     fn update_output_activity(&mut self, bytes: &[u8]) {
@@ -176,26 +218,19 @@ impl Output {
     }
 
     fn mark_idle_prompt(&mut self, now: i64) {
-        let changed = self.busy_since.is_some()
-            || self.last_activity_at.is_some()
-            || self.idle_prompt_since.is_none();
-        self.busy_since = None;
-        self.last_activity_at = None;
-        self.idle_prompt_since.get_or_insert(now);
-        if changed {
-            self.activity_version = self.activity_version.wrapping_add(1);
-        }
+        let next = match self.activity_phase {
+            PtyActivityPhase::Exited { .. } => return,
+            PtyActivityPhase::IdlePrompt { since } => PtyActivityPhase::IdlePrompt { since },
+            PtyActivityPhase::Quiet | PtyActivityPhase::Busy { .. } => {
+                PtyActivityPhase::IdlePrompt { since: now }
+            }
+        };
+        self.transition_activity(next);
     }
 
     fn clear_activity(&mut self) {
-        if self.busy_since.is_some()
-            || self.last_activity_at.is_some()
-            || self.idle_prompt_since.is_some()
-        {
-            self.busy_since = None;
-            self.last_activity_at = None;
-            self.idle_prompt_since = None;
-            self.activity_version = self.activity_version.wrapping_add(1);
+        if !self.is_exited() {
+            self.transition_activity(PtyActivityPhase::Quiet);
         }
     }
 
@@ -328,8 +363,8 @@ impl Output {
             },
             resync_required: after < floor || after > self.seq,
             events,
-            exited: self.exited,
-            exit_code: self.exit_code,
+            exited: self.is_exited(),
+            exit_code: self.exit_code(),
         })
     }
 }
@@ -504,7 +539,7 @@ impl Terminal {
                 .0
                 .output
                 .lock()
-                .is_ok_and(|output| output.seq != after || output.exited)
+                .is_ok_and(|output| output.seq != after || output.is_exited())
             {
                 return;
             }
@@ -516,7 +551,7 @@ impl Terminal {
 
     pub(crate) fn checkpoint(&self, after: Option<i64>) -> Result<Option<Archive>> {
         let output = self.0.output.lock().map_err(|_| Error::Closed)?;
-        if after.is_none() && !output.exited {
+        if after.is_none() && !output.is_exited() {
             return Err(Error::Conflict);
         }
         if after == Some(output.seq) {
@@ -534,7 +569,7 @@ impl Terminal {
                 seq: page.next_seq,
                 latest_seq: page.latest_seq,
                 events: page.events,
-                exit_code: output.exit_code,
+                exit_code: output.exit_code(),
             }));
         }
         let floor = output.seq - output.events.len() as i64;
@@ -551,7 +586,7 @@ impl Terminal {
                 .skip((start - floor) as usize)
                 .map(|(event, _)| event.clone())
                 .collect(),
-            exit_code: output.exit_code,
+            exit_code: output.exit_code(),
         }))
     }
     pub fn snapshot(&self) -> Result<Option<TerminalSnapshot>> {
@@ -593,7 +628,7 @@ impl Terminal {
                 .0
                 .output
                 .lock()
-                .is_ok_and(|output| output.activity_version != version || output.exited)
+                .is_ok_and(|output| output.activity_version != version || output.is_exited())
             {
                 return;
             }
@@ -720,7 +755,7 @@ impl Terminal {
         let mut changed = self.0.changed.clone();
         loop {
             changed.borrow_and_update();
-            if self.0.output.lock().is_ok_and(|output| output.exited) {
+            if self.0.output.lock().is_ok_and(|output| output.is_exited()) {
                 return;
             }
             if changed.changed().await.is_err() {

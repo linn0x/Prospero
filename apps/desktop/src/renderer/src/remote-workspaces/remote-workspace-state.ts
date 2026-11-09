@@ -1,7 +1,7 @@
 import type { SessionInfo } from "../../../shared/types";
 import { normalizedRemoteCwd, type RemoteWorkspaceOpenResult } from "../../../shared/remote-workspaces";
+import { isSessionEndedStatus } from "../../../shared/session-state";
 
-const ended = new Set(["completed", "done", "died", "failed", "killed", "cancelled", "error"]);
 const storageKey = "prospero.remoteWorkspaceSelection.v1";
 
 export class RemoteWorkspaceOpenQueue {
@@ -17,7 +17,7 @@ export class RemoteWorkspaceOpenQueue {
 }
 
 export function remoteShellEnded(session: Pick<SessionInfo, "status">): boolean {
-  return ended.has(session.status);
+  return isSessionEndedStatus(session.status);
 }
 
 export function remoteDirectoryKey(cwd: string): string {

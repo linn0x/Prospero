@@ -52,7 +52,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const term = new Terminal({ cols: 120, rows: 36, scrollback: 3000, disableStdin: true, allowProposedApi: true,
       fontSize: settingsRef.current.terminalFontSize, fontFamily: terminalFontFamilyWithFallbacks(settingsRef.current.terminalFontFamily),
-      cursorBlink: !motion.matches, cursorStyle: "bar", lineHeight: TERMINAL_LINE_HEIGHT, letterSpacing: 0, fontWeight: "400", fontWeightBold: "700", minimumContrastRatio: 4.5,
+      cursorBlink: !motion.matches, cursorStyle: "bar", lineHeight: TERMINAL_LINE_HEIGHT, letterSpacing: 0, fontWeight: "400", fontWeightBold: "700", minimumContrastRatio: 1, drawBoldTextInBrightColors: false,
       smoothScrollDuration: 0,
       rightClickSelectsWord: true, macOptionClickForcesSelection: window.prospero.platform === "darwin",
       linkHandler: { allowNonHttpProtocols: true, activate: openRemoteTerminalExternalUrl },

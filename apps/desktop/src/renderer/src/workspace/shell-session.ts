@@ -1,13 +1,13 @@
 import type { DesktopApi, SessionInfo } from "../../../shared/types";
+import { isSessionEndedStatus } from "../../../shared/session-state";
 
 const STORAGE_KEY = "prospero.dockShells.v1";
 const requests = new Map<string, Promise<SessionInfo>>();
 const shells = new Map<string, string>();
 const LIMIT = 32;
-const ended = new Set(["done", "completed", "failed", "cancelled", "exited", "killed", "stopped"]);
 
 export function shellIsLive(session: SessionInfo): boolean {
-  return session.agent === "shell" && session.kind === "pty" && !ended.has(session.status);
+  return session.agent === "shell" && session.kind === "pty" && !isSessionEndedStatus(session.status);
 }
 
 function readShells(): void {

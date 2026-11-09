@@ -7,11 +7,13 @@ import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../shared/terminal-typography";
+import { PROSPERO_TERMINAL_THEME, terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../shared/terminal-typography";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { SessionInfo } from "../../shared/types";
+import { isReadOnlyTerminalStatus } from "../../shared/session-state";
 import { EXTERNAL_URL_REGEX, normalizeExternalUrl } from "../../shared/external-url";
+import { deriveTerminalViewPhase } from "./terminal-view-state";
 import { displayError, isMissingSessionError, isUnrecoverableTerminalError, reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
@@ -134,11 +136,11 @@ export function getTerminalEmptyFrameDelay(elapsedMs: number, eventStream = fals
 }
 
 export function terminalSessionIsReadOnly(status: string): boolean {
-  return ["idle", "completed", "done", "died", "failed", "stopped", "cancelled", "exited", "killed"].includes(status);
+  return isReadOnlyTerminalStatus(status);
 }
 
 export function terminalStreamCanControl(state: Pick<TerminalStreamState, "connected" | "syncing" | "controller" | "readOnly" | "exited">, status: string): boolean {
-  return !terminalSessionIsReadOnly(status) && state.connected && !state.syncing && state.controller && !state.readOnly && !state.exited;
+  return deriveTerminalViewPhase({ mode: "native", sessionStatus: status, state }) === "controlling";
 }
 
 export function canDeliverTerminalInteraction(
@@ -442,9 +444,9 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
       lineHeight: TERMINAL_LINE_HEIGHT,
       letterSpacing: 0,
       scrollback: 10_000,
-      minimumContrastRatio: 4.5,
+      minimumContrastRatio: 1,
       customGlyphs: true,
-      drawBoldTextInBrightColors: true,
+      drawBoldTextInBrightColors: false,
       rescaleOverlappingGlyphs: true,
       smoothScrollDuration: 0,
       fastScrollSensitivity: 4,
@@ -457,16 +459,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
         allowNonHttpProtocols: true,
         activate: openTerminalExternalUrl,
       },
-      theme: {
-        background: "#16171a", foreground: "#e6e8ee", cursor: "#e6e8ee",
-        cursorAccent: "#16171a", selectionBackground: "#2c3e66",
-        selectionInactiveBackground: "#232d45", scrollbarSliderBackground: "#8ba9ff33",
-        scrollbarSliderHoverBackground: "#8ba9ff55", scrollbarSliderActiveBackground: "#8ba9ff77",
-        black: "#131417", brightBlack: "#4b4e58", red: "#e16767", brightRed: "#f48585",
-        green: "#58b99a", brightGreen: "#74ceaf", yellow: "#f0b45a", brightYellow: "#f5c57c",
-        blue: "#8ba9ff", brightBlue: "#a2baff", magenta: "#c49bff", brightMagenta: "#d4b5ff",
-        cyan: "#6bc5e8", brightCyan: "#89d4f0", white: "#c8ccd4", brightWhite: "#ececef",
-      },
+      theme: PROSPERO_TERMINAL_THEME,
     });
     configureRustTerminalUnicode(terminal);
     const fit = new FitAddon();

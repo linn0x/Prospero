@@ -1,3 +1,5 @@
+import { PROSPERO_TERMINAL_THEME } from "../../../shared/terminal-typography";
+
 export function remoteInputBase64(data: string): string {
   const bytes = new TextEncoder().encode(data);
   let binary = "";
@@ -71,13 +73,28 @@ export class RemoteTerminalBuffer {
 }
 
 export function remoteTerminalTheme(style: Pick<CSSStyleDeclaration, "getPropertyValue">) {
-  const color = (name: string) => style.getPropertyValue(name).trim();
+  const color = (name: string, fallback: string) => style.getPropertyValue(name).trim() || fallback;
   return {
-    background: color("--surface-sunken"), foreground: color("--foreground"), cursor: color("--foreground"),
-    cursorAccent: color("--surface-sunken"), selectionBackground: color("--selection"),
-    black: color("--surface-0"), brightBlack: color("--faint"), red: color("--danger"), brightRed: color("--danger"),
-    green: color("--success"), brightGreen: color("--success"), yellow: color("--warning"), brightYellow: color("--warning"),
-    blue: color("--primary"), brightBlue: color("--primary"), magenta: color("--review"), brightMagenta: color("--review"),
-    cyan: color("--cyan"), brightCyan: color("--cyan"), white: color("--foreground-muted"), brightWhite: color("--foreground"),
+    background: color("--surface-sunken", PROSPERO_TERMINAL_THEME.background),
+    foreground: color("--foreground", PROSPERO_TERMINAL_THEME.foreground),
+    cursor: color("--foreground", PROSPERO_TERMINAL_THEME.cursor),
+    cursorAccent: color("--surface-sunken", PROSPERO_TERMINAL_THEME.cursorAccent),
+    selectionBackground: color("--selection", PROSPERO_TERMINAL_THEME.selectionBackground),
+    black: color("--surface-0", PROSPERO_TERMINAL_THEME.black),
+    brightBlack: color("--faint", PROSPERO_TERMINAL_THEME.brightBlack),
+    red: color("--danger", PROSPERO_TERMINAL_THEME.red),
+    brightRed: color("--danger", PROSPERO_TERMINAL_THEME.brightRed),
+    green: color("--success", PROSPERO_TERMINAL_THEME.green),
+    brightGreen: color("--success", PROSPERO_TERMINAL_THEME.brightGreen),
+    yellow: color("--warning", PROSPERO_TERMINAL_THEME.yellow),
+    brightYellow: color("--warning", PROSPERO_TERMINAL_THEME.brightYellow),
+    blue: color("--primary", PROSPERO_TERMINAL_THEME.blue),
+    brightBlue: color("--primary", PROSPERO_TERMINAL_THEME.brightBlue),
+    magenta: color("--review", PROSPERO_TERMINAL_THEME.magenta),
+    brightMagenta: color("--review", PROSPERO_TERMINAL_THEME.brightMagenta),
+    cyan: color("--cyan", PROSPERO_TERMINAL_THEME.cyan),
+    brightCyan: color("--cyan", PROSPERO_TERMINAL_THEME.brightCyan),
+    white: color("--foreground-muted", PROSPERO_TERMINAL_THEME.white),
+    brightWhite: color("--foreground", PROSPERO_TERMINAL_THEME.brightWhite),
   };
 }

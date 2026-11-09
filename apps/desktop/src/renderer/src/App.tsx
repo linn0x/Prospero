@@ -1,4 +1,5 @@
 import { NativeSessionBindingDialog, needsNativeBinding } from "./NativeSessionBindingDialog";
+import { isSessionEndedStatus } from "../../shared/session-state";
 import { ArchivedChatsDialog } from "./ArchivedChatsDialog";
 import { chatBranchDisabledReason } from "./workspace/chat-branch";
 import { scheduleDeferredRequest } from "./deferred-request";
@@ -689,8 +690,7 @@ function DaemonAgentsCard({
   loading: boolean;
 }) {
   const { t, status } = useLocale();
-  const terminalStates = new Set(["done", "died", "failed", "error", "cancelled", "completed"]);
-  const online = snapshot.daemon.sessions.filter((session) => !terminalStates.has(session.status));
+  const online = snapshot.daemon.sessions.filter((session) => !isSessionEndedStatus(session.status));
   const agents = [...new Set(online.map((session) => session.agent))];
   return (
     <Card size="sm" className="border-0 bg-transparent shadow-none ring-0">
@@ -2860,9 +2860,9 @@ function NewSessionDialog({
     setInput((current) => current.kind === "structured" ? current : { ...current, kind: "structured" });
   }, [requiresStructured]);
   useEffect(() => {
-    if (!useSource || sourceState.loading || sourceState.error) return;
+    if (!useSource || sourceState.loading || sourceState.sources.length === 0) return;
     setSourceSelection((current) => selectedSourceRoute(sourceState.sources, current, sourceRuntimeAgent) ? current : defaultSourceSelection(sourceState.sources, current, sourceRuntimeAgent));
-  }, [sourceRuntimeAgent, sourceState.sources, sourceState.loading, sourceState.error, useSource]);
+  }, [sourceRuntimeAgent, sourceState.sources, sourceState.loading, useSource]);
   useEffect(() => {
     if (!open || !supportsLaunchModels) {
       launchCatalogKey.current = undefined;
@@ -2947,12 +2947,12 @@ function NewSessionDialog({
     try {
       if (useSource) {
         if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
-        const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceSelection.sourceId, routeId: sourceSelection.routeId, revision: sourceSelection.revision, agent: sourceRuntimeAgent });
+        const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
         const routeEfforts = sourceChoice.route.protocol !== "openai_chat_completions" ? (sourceChoice.route.modelCapabilities?.supportedEfforts ?? []) : [];
         const sessionEffort = (input.effort && routeEfforts.includes(input.effort) ? input.effort : undefined) ?? sourceChoice.route.defaultEffort;
         onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, ...(sessionEffort ? { effort: sessionEffort as SessionCreateInput["effort"] } : {}) }));
-        rememberSourceSelection({ ...sourceSelection, agent: sourceRuntimeAgent });
+        rememberSourceSelection({ sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
       } else {
         onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
         rememberSourceSelection(undefined);

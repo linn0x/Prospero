@@ -1,4 +1,4 @@
-import { C2SModelSourceActionSchema, S2CModelSourceResultSchema, type ModelSourceAction } from "@prospero/protocol";
+import { AgentAccountSchema, C2SModelSourceActionSchema, S2CModelSourceResultSchema, type ModelSourceAction } from "@prospero/protocol";
 
 export function modelSourceRequest(value: unknown, requestId: string) {
   const parsed = C2SModelSourceActionSchema.safeParse({ type: "model.source.action", requestId, action: value });
@@ -7,7 +7,16 @@ export function modelSourceRequest(value: unknown, requestId: string) {
 }
 
 export function modelSourceResult(value: unknown, requestId?: string, action?: ModelSourceAction["kind"]) {
-  const parsed = S2CModelSourceResultSchema.safeParse(value);
+  const normalized =
+    value && typeof value === "object" && !Array.isArray(value) && Array.isArray((value as Record<string, unknown>)["accounts"])
+      ? {
+          ...(value as Record<string, unknown>),
+          accounts: ((value as Record<string, unknown>)["accounts"] as unknown[]).filter(
+            (account) => AgentAccountSchema.safeParse(account).success,
+          ),
+        }
+      : value;
+  const parsed = S2CModelSourceResultSchema.safeParse(normalized);
   if (!parsed.success || requestId !== undefined && parsed.data.requestId !== requestId) throw new Error("模型源响应无效 / Invalid model source response");
   if (parsed.data.ok && parsed.data.error || !parsed.data.ok && !parsed.data.error) throw new Error("模型源响应状态无效 / Invalid model source result status");
   if (parsed.data.ok && action) {

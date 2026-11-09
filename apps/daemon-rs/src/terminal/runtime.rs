@@ -492,7 +492,7 @@ impl Terminals {
                     .await
                     .is_ok_and(|head| {
                         head.native_session
-                            .is_some_and(|native| native.state == "archiving")
+                            .is_some_and(|native| native.is_archiving())
                     })
                 {
                     let _ = runtime.archive(&sid, None).await;
@@ -956,6 +956,7 @@ impl Terminals {
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
             command.env("CLICOLOR", "1");
+            command.env("COLORFGBG", "15;0");
             command.env("TERM_PROGRAM", "Prospero");
             command.env_remove("NO_COLOR");
             if command

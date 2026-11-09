@@ -56,6 +56,72 @@ pub enum SessionStatus {
     Failed,
 }
 
+impl SessionStatus {
+    pub const fn is_active_turn(self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
+
+    pub const fn is_waiting_user(self) -> bool {
+        matches!(self, Self::WaitingPermission | Self::WaitingInput)
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+
+    pub const fn is_read_only_pty(self) -> bool {
+        matches!(self, Self::Idle | Self::Completed | Self::Failed)
+    }
+}
+
+/// Explicit state machine for a session's native CLI conversation binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSessionState {
+    Unbound,
+    Binding,
+    Resuming,
+    Running,
+    Archiving,
+    Archived,
+    Failed,
+}
+
+impl NativeSessionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unbound => "unbound",
+            Self::Binding => "binding",
+            Self::Resuming => "resuming",
+            Self::Running => "running",
+            Self::Archiving => "archiving",
+            Self::Archived => "archived",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "unbound" => Some(Self::Unbound),
+            "binding" => Some(Self::Binding),
+            "resuming" => Some(Self::Resuming),
+            "running" => Some(Self::Running),
+            "archiving" => Some(Self::Archiving),
+            "archived" => Some(Self::Archived),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    pub const fn is_transitioning(self) -> bool {
+        matches!(self, Self::Binding | Self::Resuming | Self::Archiving)
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Archived | Self::Failed)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeSession {
@@ -67,6 +133,25 @@ pub struct NativeSession {
     pub managed: bool,
     pub state: String,
     pub error: Option<String>,
+}
+
+impl NativeSession {
+    pub fn parsed_state(&self) -> Option<NativeSessionState> {
+        NativeSessionState::from_wire(&self.state)
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.parsed_state() == Some(NativeSessionState::Archived)
+    }
+
+    pub fn is_archiving(&self) -> bool {
+        self.parsed_state() == Some(NativeSessionState::Archiving)
+    }
+
+    pub fn transition(&mut self, next: NativeSessionState, error: Option<String>) {
+        self.state = next.as_str().into();
+        self.error = error;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -98,6 +183,22 @@ pub struct SessionHead {
     pub updated_at: i64,
     #[ts(type = "number")]
     pub revision: i64,
+}
+
+impl SessionHead {
+    pub fn is_login_session(&self) -> bool {
+        self.title.ends_with(" · 登录")
+    }
+
+    pub fn needs_native_binding(&self) -> bool {
+        !self.is_login_session()
+            && self.kind == SessionKind::Pty
+            && matches!(self.agent, AgentKind::Claude | AgentKind::Codex | AgentKind::Agy)
+            && self
+                .native_session
+                .as_ref()
+                .is_none_or(|native| native.native_id.is_none() && !native.managed)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]

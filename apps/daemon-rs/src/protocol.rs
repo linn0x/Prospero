@@ -4,12 +4,12 @@ pub use prospero_protocol_rs::{
     API_VERSION, AgentKind, CONTENT_CHUNK_BYTES, ChangeEvent, ControlEffectState, CreateSession,
     DATABASE_QUEUE_CAPACITY, DatabaseHealth, DriverError, DriverErrorCategory, DriverPhase,
     EVENT_RETENTION, EventPage, EventQuery, Health, HealthPersistence, MAX_EVENT_BYTES,
-    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, NativeSession, RelayConnectionState, RelayRuntimeDeviceStatus,
-    RelayRuntimeStatus, RenameSession, ResyncRequired, SessionHead, SessionKind,
-    SessionLaunchOptions, SessionLifecycle, SessionLookup, SessionLookupResult, SessionPage,
-    SessionQuery, SessionStatus, SessionSummary, TerminalApprovalPolicy, UpdateSession,
-    WorkspaceHead, WorkspacePage, WorkspaceQuery, WorkspaceTabsEntry, WorkspaceTabsList,
-    WorkspaceTabsUpdate,
+    MAX_PAGE_BYTES, MAX_PAGE_ITEMS, NativeSession, NativeSessionState, RelayConnectionState,
+    RelayRuntimeDeviceStatus, RelayRuntimeStatus, RenameSession, ResyncRequired, SessionHead,
+    SessionKind, SessionLaunchOptions, SessionLifecycle, SessionLookup, SessionLookupResult,
+    SessionPage, SessionQuery, SessionStatus, SessionSummary, TerminalApprovalPolicy,
+    UpdateSession, WorkspaceHead, WorkspacePage, WorkspaceQuery, WorkspaceTabsEntry,
+    WorkspaceTabsList, WorkspaceTabsUpdate,
 };
 
 pub use prospero_protocol_rs::{

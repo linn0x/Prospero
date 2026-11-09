@@ -8,6 +8,7 @@ pub(crate) mod pi;
 pub(crate) mod agy;
 mod runtime;
 mod store;
+mod turn_stream;
 pub(crate) mod usage;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -147,6 +148,67 @@ pub struct CrossModelCheck {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossModelChildStatus {
+    Starting,
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl CrossModelChildStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "starting" => Some(Self::Starting),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "stopped" => Some(Self::Stopped),
+            _ => None,
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+    }
+
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        match (self, next) {
+            (Self::Starting, Self::Running | Self::Completed | Self::Failed | Self::Stopped) => {
+                true
+            }
+            (Self::Running, Self::Completed | Self::Failed | Self::Stopped) => true,
+            (Self::Completed | Self::Failed | Self::Stopped, Self::Starting) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossModelDeliveryPhase {
+    NotTerminal,
+    PendingFanIn,
+    DeliveredToParent {
+        delivered_at: Option<i64>,
+    },
+    AcknowledgedByParent {
+        delivered_at: Option<i64>,
+        acknowledged_at: Option<i64>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
@@ -172,6 +234,34 @@ pub struct CrossModelChild {
     pub created_at: i64,
     #[ts(type = "number")]
     pub updated_at: i64,
+}
+
+impl CrossModelChild {
+    pub fn parsed_status(&self) -> Option<CrossModelChildStatus> {
+        CrossModelChildStatus::from_wire(&self.status)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.parsed_status()
+            .is_some_and(CrossModelChildStatus::is_terminal)
+    }
+
+    pub fn delivery_phase(&self) -> CrossModelDeliveryPhase {
+        if !self.is_terminal() {
+            CrossModelDeliveryPhase::NotTerminal
+        } else if self.summary_acknowledged {
+            CrossModelDeliveryPhase::AcknowledgedByParent {
+                delivered_at: self.summary_delivered_at,
+                acknowledged_at: self.summary_acknowledged_at,
+            }
+        } else if self.summary_delivered {
+            CrossModelDeliveryPhase::DeliveredToParent {
+                delivered_at: self.summary_delivered_at,
+            }
+        } else {
+            CrossModelDeliveryPhase::PendingFanIn
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

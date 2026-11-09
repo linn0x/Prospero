@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useReducer, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Columns2, Files, FolderKanban, FolderPlus, Plus, X } from "lucide-react";
 import type { DesktopSnapshot, NativeTerminalState, SessionInfo } from "../../../shared/types";
@@ -15,6 +15,17 @@ import { workspaceChromeVisible } from "../workspace-sidebar-state";
 import { ContextDock } from "./ContextDock";
 import { clampDockWidth, DOCK_DEFAULT_WIDTH, DOCK_MIN_WIDTH, workspaceDockLayout, openDockTool, sessionDockState, supportsTrajectory, readDockPreferences, updateDockPreferences, writeDockPreferences, type DockState } from "./dock-state";
 import { DockSlot } from "./DockSlot";
+import {
+  clampSplitRatio,
+  initialSplitLayoutState,
+  reduceSplitLayout,
+  resolveEffectiveFocusedSessionId,
+  resolveSplitPeerId,
+  SPLIT_RATIO_DEFAULT,
+  SPLIT_RATIO_MAX,
+  SPLIT_RATIO_MIN,
+  SPLIT_STACKED_BREAKPOINT,
+} from "./pane-layout-state";
 import { SessionToolbar } from "./SessionToolbar";
 import { NativeTerminalPane, supportsNativeTerminal } from "../NativeTerminalPane";
 import { retainTerminalIds } from "./retained-terminals";
@@ -239,50 +250,43 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus, 
 export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, onFocusedSessionChange, focus }: { active?: boolean; snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onFocusedSessionChange?: (id: string | undefined) => void; onActivate: (id: string) => void; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; onMissingSession: (id: string) => void; focus: boolean }) {
   const { t } = useLocale();
   const session = snapshot.daemon.sessions.find(item => item.id === activeId);
-  const [splitId, setSplitId] = useState<string>();
-  const [focusedId, setFocusedId] = useState(activeId);
-  const [ratio, setRatio] = useState(50);
-  const [stacked, setStacked] = useState(false);
+  const [splitLayout, dispatchSplitLayout] = useReducer(reduceSplitLayout, activeId, initialSplitLayoutState);
+  const { focusedId, ratio, stacked } = splitLayout;
   const [splitResizing, setSplitResizing] = useState(false);
   const stack = useRef<HTMLDivElement>(null);
   const splitResizerRef = useRef<HTMLDivElement>(null);
   const splitDragFrame = useRef<number | undefined>(undefined);
   const ratioRef = useRef(ratio);
   ratioRef.current = ratio;
-  const previousActive = useRef(activeId);
   const drag = useRef<{ pointer: number; ratio: number } | undefined>(undefined);
   useEffect(() => () => { if (splitDragFrame.current !== undefined) cancelAnimationFrame(splitDragFrame.current); }, []);
   const candidates = openIds.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty" && id !== activeId)).filter((item): item is SessionInfo => Boolean(item));
-  const peerId = splitId === activeId ? previousActive.current : splitId;
+  const peerId = resolveSplitPeerId(splitLayout, activeId);
   const splitSession = session?.kind === "pty" ? candidates.find(item => item.id === peerId) : undefined;
   const [recentTerminals, setRecentTerminals] = useState<string[]>([]);
   const retained = retainTerminalIds(retainTerminalIds(recentTerminals, splitSession?.id), session?.kind === "pty" ? session.id : undefined);
   if (retained.length !== recentTerminals.length || retained.some((id, index) => id !== recentTerminals[index])) setRecentTerminals(retained);
   const terminalSessions = retained.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty")).filter((item): item is SessionInfo => Boolean(item));
   useEffect(() => {
-    const previous = previousActive.current;
-    previousActive.current = activeId;
-    setSplitId(current => current === activeId ? previous : current);
-    setFocusedId(activeId);
+    dispatchSplitLayout({ type: "sync_active", activeId });
   }, [activeId]);
   useEffect(() => {
-    if (focusedId === activeId || focusedId === splitSession?.id) return;
-    setFocusedId(splitSession?.id ?? activeId);
+    dispatchSplitLayout({ type: "reconcile_visible", splitSessionId: splitSession?.id });
   }, [activeId, focusedId, splitSession?.id]);
   useEffect(() => {
     const element = stack.current;
     if (!element) return;
-    const measure = (): void => setStacked(element.clientWidth < 900);
+    const measure = (): void => dispatchSplitLayout({ type: "set_stacked", stacked: element.clientWidth < SPLIT_STACKED_BREAKPOINT });
     const observer = new ResizeObserver(measure);
     observer.observe(element);
     measure();
     return () => observer.disconnect();
   }, []);
   useEffect(() => {
-    onFocusedSessionChange?.(active ? focusedId === splitSession?.id ? focusedId : activeId : undefined);
+    onFocusedSessionChange?.(resolveEffectiveFocusedSessionId({ active, activeId, focusedId, splitSessionId: splitSession?.id }));
   }, [active, activeId, focusedId, splitSession?.id, onFocusedSessionChange]);
   const focusSession = (id: string): void => {
-    setFocusedId(id);
+    dispatchSplitLayout({ type: "focus_session", sessionId: id });
     onFocusedSessionChange?.(id);
     if (snapshot.unreadSessionIds.includes(id)) void window.prospero.setSessionUnread(id, false);
   };
@@ -290,7 +294,7 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
     splitResizerRef.current?.setAttribute("aria-valuenow", String(Math.round(next)));
     stack.current?.style.setProperty(stacked ? "grid-template-rows" : "grid-template-columns", `${next}fr 6px ${100 - next}fr`);
   };
-  const closeSplit = (): void => { setSplitId(undefined); setFocusedId(activeId); };
+  const closeSplit = (): void => { dispatchSplitLayout({ type: "close_split" }); };
   const endDrag = (event: PointerEvent<HTMLDivElement>, cancel: boolean): void => {
     const current = drag.current;
     if (!current || current.pointer !== event.pointerId) return;
@@ -302,24 +306,24 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
     const nextRatio = cancel ? current.ratio : ratioRef.current;
     ratioRef.current = nextRatio;
     applySplitRatio(nextRatio);
-    setRatio(nextRatio);
+    dispatchSplitLayout({ type: "set_ratio", ratio: nextRatio });
     setSplitResizing(false);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
   return <div className="workspace-view workspace-view-single workspace-multipane" data-split-resizing={splitResizing || undefined}>
     {session?.kind === "pty" && splitSession && <div className="workspace-split-controls">
       <span className="workspace-split-label"><Columns2 />{t("分屏", "Split view")}</span>
-      {splitSession && <><NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => setSplitId(event.target.value)}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect><Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button></>}
+      {splitSession && <><NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => dispatchSplitLayout({ type: "open_split", splitId: event.target.value })}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect><Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button></>}
     </div>}
     <div ref={stack} className={cn("workspace-session-stack", splitSession && "is-split", stacked && "is-stacked")} style={splitSession ? { [stacked ? "gridTemplateRows" : "gridTemplateColumns"]: `${ratio}fr 6px ${100 - ratio}fr` } : undefined}>
       {terminalSessions.map(item => {
         const primary = item.id === activeId;
         const visible = active && (primary || item.id === splitSession?.id);
         return <div key={item.id} className="workspace-session-slot" data-position={primary ? "primary" : "secondary"} data-focused={focusedId === item.id || undefined} inert={!visible} aria-hidden={!visible} style={visible ? undefined : { position: "absolute", inset: 0, visibility: "hidden", pointerEvents: "none" }} onPointerDownCapture={() => visible && focusSession(item.id)} onFocusCapture={() => visible && focusSession(item.id)}>
-          <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => setSplitId(candidates[0]?.id) : undefined} session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
+          <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
         </div>;
       })}
-      {splitSession && <div ref={splitResizerRef} className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => setRatio(50)} onPointerDown={event => {
+      {splitSession && <div ref={splitResizerRef} className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={SPLIT_RATIO_MIN} aria-valuemax={SPLIT_RATIO_MAX} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => dispatchSplitLayout({ type: "set_ratio", ratio: SPLIT_RATIO_DEFAULT })} onPointerDown={event => {
         if (event.button !== 0) return;
         event.preventDefault();
         drag.current = { pointer: event.pointerId, ratio };
@@ -330,7 +334,7 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
       }} onPointerMove={event => {
         if (drag.current?.pointer !== event.pointerId || !stack.current) return;
         const rect = stack.current.getBoundingClientRect();
-        const next = Math.max(25, Math.min(75, 100 * (stacked ? (event.clientY - rect.top) / rect.height : (event.clientX - rect.left) / rect.width)));
+        const next = clampSplitRatio(100 * (stacked ? (event.clientY - rect.top) / rect.height : (event.clientX - rect.left) / rect.width));
         ratioRef.current = next;
         splitResizerRef.current?.setAttribute("aria-valuenow", String(Math.round(next)));
         if (splitDragFrame.current === undefined) {
@@ -347,14 +351,14 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onNe
           }
           ratioRef.current = drag.current.ratio;
           applySplitRatio(drag.current.ratio);
-          setRatio(drag.current.ratio);
+          dispatchSplitLayout({ type: "set_ratio", ratio: drag.current.ratio });
           setSplitResizing(false);
           drag.current = undefined;
           event.preventDefault();
           return;
         }
-        const next = event.key === "Home" ? 25 : event.key === "End" ? 75 : ["ArrowLeft", "ArrowUp"].includes(event.key) ? ratio - 5 : ["ArrowRight", "ArrowDown"].includes(event.key) ? ratio + 5 : undefined;
-        if (next !== undefined) { event.preventDefault(); setRatio(Math.max(25, Math.min(75, next))); }
+        const next = event.key === "Home" ? SPLIT_RATIO_MIN : event.key === "End" ? SPLIT_RATIO_MAX : ["ArrowLeft", "ArrowUp"].includes(event.key) ? ratio - 5 : ["ArrowRight", "ArrowDown"].includes(event.key) ? ratio + 5 : undefined;
+        if (next !== undefined) { event.preventDefault(); dispatchSplitLayout({ type: "set_ratio", ratio: next }); }
       }} />}
       {session?.kind !== "pty" && <WorkspaceSession key={session?.id ?? "empty"} active={active} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} />}
     </div>

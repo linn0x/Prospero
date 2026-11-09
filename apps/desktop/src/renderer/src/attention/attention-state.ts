@@ -1,9 +1,9 @@
 import type { DesktopSnapshot, JsonObject, SessionInfo } from "../../../shared/types";
+import { isSessionEndedStatus } from "../../../shared/session-state";
 
 export type AttentionKind = "approvals" | "questions" | "issues";
 export type AttentionFilter = "all" | AttentionKind;
 const string = (value: unknown): string => typeof value === "string" ? value.trim() : "";
-const ended = new Set(["done", "completed", "failed", "died", "exited", "cancelled"]);
 const newest = (field: string) => (a: JsonObject, b: JsonObject) => (Number(b[field]) || 0) - (Number(a[field]) || 0);
 
 export function pendingRequests(session: SessionInfo, kind: "approvals" | "questions"): number {
@@ -20,7 +20,7 @@ export function attentionSummary(snapshot: DesktopSnapshot) {
   const activeRun = (item: JsonObject) => string(runs.get(string(item.runId))?.status) === "active";
   const gates = snapshot.orchestration.gates.filter(gate => activeRun(gate) && gate.status === "pending").sort(newest("createdAt"));
   const tasks = snapshot.orchestration.tasks.filter(task => activeRun(task) && ["failed", "blocked"].includes(string(task.status))).sort(newest("updatedAt"));
-  const live = snapshot.daemon.sessions.filter(session => !ended.has(session.status));
+  const live = snapshot.daemon.sessions.filter(session => !isSessionEndedStatus(session.status));
   const approvalSessions = live.filter(session => pendingRequests(session, "approvals") > 0);
   const questionSessions = live.filter(session => pendingRequests(session, "questions") > 0);
   const counts = {

@@ -62,7 +62,7 @@ impl Store {
                 self.ensure_native_available(id, native_id)?;
             }
         }
-        let closing = native.state == "archived";
+        let closing = native.is_archived();
         let workspace = head.workspace.clone();
         self.update_session_metadata_with(
             id,

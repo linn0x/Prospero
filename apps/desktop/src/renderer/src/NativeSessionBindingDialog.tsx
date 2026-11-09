@@ -7,10 +7,9 @@ import { Input } from "./components/ui/input";
 import { reportError } from "./state";
 import { useLocale } from "./locale";
 
-export function needsNativeBinding(session: SessionInfo): boolean {
-  if (session.title?.endsWith(" · 登录")) return false;
-  return session.kind === "pty" && ["claude", "codex", "agy"].includes(session.agent) && !session.nativeSession?.managed && !session.nativeSession?.nativeId;
-}
+import { needsNativeBinding } from "../../shared/session-state";
+
+export { needsNativeBinding };
 
 export function NativeSessionBindingDialog({ session, archived, onClose, onDone }: { session: SessionInfo; archived: boolean; onClose(): void; onDone(session: SessionInfo): void }) {
   const { t } = useLocale();

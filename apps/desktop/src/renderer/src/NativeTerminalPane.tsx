@@ -1,14 +1,20 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { isReadOnlyTerminalStatus } from "../../shared/session-state";
 import type { NativeTerminalState, SessionInfo } from "../../shared/types";
 import { useLocale } from "./locale";
 import { notify } from "./notifications/notifications";
 import { displayError } from "./state";
 import { terminalAgentImageReference } from "./terminal-agent-input";
+import {
+  canPasteIntoTerminal,
+  deriveTerminalViewPhase,
+  isNativeDisconnectedBannerVisible,
+  terminalViewHostStateAttr,
+} from "./terminal-view-state";
 const TerminalPane = lazy(() => import("./TerminalPane").then(module => ({ default: module.TerminalPane })));
-const READ_ONLY_TERMINAL_STATUSES = new Set(["idle", "completed", "done", "died", "failed", "stopped", "cancelled", "exited", "killed"]);
 
 export function supportsNativeTerminal(session: SessionInfo): boolean {
-  return window.prospero.platform === "darwin" && session.kind === "pty" && session.terminalMode === "events" && !READ_ONLY_TERMINAL_STATUSES.has(session.status);
+  return window.prospero.platform === "darwin" && session.kind === "pty" && session.terminalMode === "events" && !isReadOnlyTerminalStatus(session.status);
 }
 
 const OVERLAY_SELECTORS = [
@@ -83,15 +89,21 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
   activeRef.current = active;
   focusedRef.current = focused;
   stateRef.current = state;
-  const statusMessage = state.exited
-    ? t("会话已结束，只读", "Session ended, read only")
-    : state.syncing
-      ? t("正在连接终端", "Connecting terminal")
-      : !state.connected
-        ? t("终端已断开", "Terminal disconnected")
-        : state.readOnly || !state.controller
-          ? t("正在观察终端，只读", "Observing terminal, read only")
-          : t("终端已连接", "Terminal connected");
+  const viewPhase = deriveTerminalViewPhase({
+    mode,
+    sessionStatus: session.status,
+    state,
+  });
+  const statusMessage =
+    viewPhase === "exited"
+      ? t("会话已结束，只读", "Session ended, read only")
+      : viewPhase === "probing" || viewPhase === "connecting"
+        ? t("正在连接终端", "Connecting terminal")
+        : viewPhase === "disconnected"
+          ? t("终端已断开", "Terminal disconnected")
+          : viewPhase === "observing"
+            ? t("正在观察终端，只读", "Observing terminal, read only")
+            : t("终端已连接", "Terminal connected");
   const notifyNativeIssue = useCallback((message: string, kind: "error" | "warning" = "error"): void => {
     if (!message.trim() || /^(?:busy|terminal busy|controller busy|lease busy|terminal_stream_busy|controller_busy|lease_busy|繁忙|终端繁忙)$/i.test(message.trim())) return;
     notify({ kind, title: t("本地终端", "Native terminal"), message, key: `native-terminal:${session.id}:${message}` });
@@ -251,16 +263,24 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
       notifyNativeIssue(t("此终端暂不支持图片粘贴，请保存图片后使用文件路径", "Image paste is unavailable in this terminal; save the image and use its file path"), "warning");
       return;
     }
-    const current = stateRef.current;
-    if (!activeRef.current || !focusedRef.current || !current.connected || !current.controller || current.readOnly || current.exited) {
+    const currentPhase = deriveTerminalViewPhase({
+      mode: "native",
+      sessionStatus: sessionRef.current.status,
+      state: stateRef.current,
+    });
+    if (!canPasteIntoTerminal({ active: activeRef.current, focused: focusedRef.current, phase: currentPhase })) {
       notifyNativeIssue(t("终端为只读，请请求控制后再粘贴图片", "The terminal is read-only; request control before pasting an image"), "warning");
       return;
     }
     try {
       const { path } = await window.prospero.saveTerminalClipboardImage(session.id);
       const reference = terminalAgentImageReference(session.agent, path);
-      const latest = stateRef.current;
-      if (!activeRef.current || !focusedRef.current || !latest.connected || !latest.controller || latest.readOnly || latest.exited) {
+      const latestPhase = deriveTerminalViewPhase({
+        mode: "native",
+        sessionStatus: sessionRef.current.status,
+        state: stateRef.current,
+      });
+      if (!canPasteIntoTerminal({ active: activeRef.current, focused: focusedRef.current, phase: latestPhase })) {
         notifyNativeIssue(t("图片已保存；回到此终端后可重新粘贴", "Image saved; return to this terminal and paste again"), "warning");
         return;
       }
@@ -416,7 +436,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
       <button type="button" disabled={!searchText} aria-label={t("下一个", "Next")} onClick={() => searchText && nativeId.current !== undefined && void window.prospero.nativeTerminal.searchStep(nativeId.current, "next").catch(() => undefined)}>↓</button>
       <button type="button" aria-label={t("关闭查找", "Close find")} onClick={closeSearch}>×</button>
     </div>
-    {nativeIdValue === undefined && !state.connected && !state.syncing && !state.exited && (
+    {isNativeDisconnectedBannerVisible(viewPhase, nativeIdValue) && (
       <div className="native-terminal-disconnected-banner" role="status">
         <span>{lastNativeError.current ?? t("原生终端连接已断开", "Native terminal disconnected")}</span>
         <div className="native-terminal-disconnected-actions">
@@ -425,6 +445,6 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
         </div>
       </div>
     )}
-    <div ref={host} className="native-terminal-host" data-native-id={nativeIdValue} data-native-state={state.connected ? "connected" : state.syncing ? "syncing" : state.exited ? "exited" : "disconnected"} tabIndex={-1} onPointerDownCapture={() => { pendingFocus.current = true; scheduleBounds(); }} />
+    <div ref={host} className="native-terminal-host" data-native-id={nativeIdValue} data-native-state={terminalViewHostStateAttr(viewPhase)} tabIndex={-1} onPointerDownCapture={() => { pendingFocus.current = true; scheduleBounds(); }} />
   </section>;
 }

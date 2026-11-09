@@ -269,10 +269,7 @@ impl Store {
             crate::database::validate_id(parent_session_id)?;
         }
         if let Some(status) = status
-            && !matches!(
-                status,
-                "starting" | "running" | "completed" | "failed" | "stopped"
-            )
+            && super::CrossModelChildStatus::from_wire(status).is_none()
         {
             return Err(Error::Invalid("跨模型子任务状态无效".into()));
         }
@@ -318,7 +315,7 @@ impl Store {
         if current.parent_session_id != parent_session_id {
             return Err(Error::NotFound);
         }
-        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+        if !current.is_terminal() {
             return Err(Error::Conflict);
         }
         let head = self.session(child_session_id)?;
@@ -348,7 +345,7 @@ impl Store {
         if current.parent_session_id != parent_session_id {
             return Err(Error::NotFound);
         }
-        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+        if !current.is_terminal() {
             return Err(Error::Conflict);
         }
         let head = self.session(child_session_id)?;
@@ -415,9 +412,11 @@ impl Store {
         if task_turn <= 0 {
             return Err(Error::Invalid("跨模型子任务轮次无效".into()));
         }
-        if !matches!(status, "completed" | "failed" | "stopped") {
+        let Some(target_status) = super::CrossModelChildStatus::from_wire(status)
+            .filter(|status| status.is_terminal())
+        else {
             return Err(Error::Invalid("跨模型子任务状态无效".into()));
-        }
+        };
         if let Some(result) = result {
             // Final answers are multiline Markdown in the normal case.  Do
             // not run the strict single-line user-input validator here: it
@@ -431,12 +430,12 @@ impl Store {
         if self.cross_model_child_task_turn(child_session_id)? != task_turn {
             return Err(Error::Conflict);
         }
-        if matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+        if current.is_terminal() {
             return Ok(current);
         }
         let updated = self.connection.execute(
             "UPDATE cross_model_children SET status=?1,result=?2,updated_at=?3 WHERE child_session_id=?4 AND task_turn=?5 AND status IN ('starting','running')",
-            params![status,result,crate::database::now(),child_session_id,task_turn],
+            params![target_status.as_str(),result,crate::database::now(),child_session_id,task_turn],
         )?;
         if updated != 1 {
             return Err(Error::Conflict);
@@ -964,7 +963,7 @@ impl Store {
         if current.parent_session_id != parent_session_id {
             return Err(Error::NotFound);
         }
-        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+        if !current.is_terminal() {
             return Err(Error::Conflict);
         }
         if !current.summary_delivered {
@@ -989,7 +988,7 @@ impl Store {
         if current.parent_session_id != parent_session_id {
             return Err(Error::NotFound);
         }
-        if !matches!(current.status.as_str(), "completed" | "failed" | "stopped") {
+        if !current.is_terminal() {
             return Err(Error::Conflict);
         }
         let now = crate::database::now();
