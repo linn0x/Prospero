@@ -10,8 +10,10 @@ const command = args[0] ?? "install";
 const runtimeRoot = path.dirname(fileURLToPath(import.meta.url));
 const label = valueArg("--label") ?? "ai.prospero.daemon.rust";
 const uid = process.getuid?.() ?? Number(execFileSync("id", ["-u"], { encoding: "utf8" }).trim());
-const domain = `user/${uid}`;
+const hasGuiSession = tryRun("launchctl", ["print", `gui/${uid}`]).status === 0;
+const domain = hasGuiSession ? `gui/${uid}` : `user/${uid}`;
 const service = `${domain}/${label}`;
+const allServices = [`gui/${uid}/${label}`, `user/${uid}/${label}`];
 const launchAgents = path.join(homedir(), "Library", "LaunchAgents");
 const plist = path.join(launchAgents, `${label}.plist`);
 const dataDir = path.resolve(valueArg("--data-dir") ?? path.join(homedir(), "Library", "Application Support", "Prospero Rust", "daemon"));
@@ -84,7 +86,10 @@ ${Object.entries(environment).map(([key, value]) => `    <key>${xml(key)}</key>\
   <key>WorkingDirectory</key>
   <string>${xml(homedir())}</string>
   <key>LimitLoadToSessionType</key>
-  <string>Background</string>
+  <array>
+    <string>Aqua</string>
+    <string>Background</string>
+  </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -109,9 +114,11 @@ function install() {
   mkdirSync(logDir, { recursive: true });
   writeFileSync(plist, plistBody(), { encoding: "utf8", mode: 0o600 });
   chmodSync(plist, 0o600);
-  tryRun("launchctl", ["bootout", service]);
+  for (const candidate of allServices) {
+    tryRun("launchctl", ["bootout", candidate]);
+  }
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    if (tryRun("launchctl", ["print", service]).status !== 0) break;
+    if (allServices.every((candidate) => tryRun("launchctl", ["print", candidate]).status !== 0)) break;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
     if (attempt === 49) throw new Error(`Timed out unloading ${service}`);
   }
@@ -123,7 +130,9 @@ function install() {
 }
 
 function uninstall() {
-  tryRun("launchctl", ["bootout", service]);
+  for (const candidate of allServices) {
+    tryRun("launchctl", ["bootout", candidate]);
+  }
   rmSync(plist, { force: true });
   print({ ok: true, label, plist, service });
 }

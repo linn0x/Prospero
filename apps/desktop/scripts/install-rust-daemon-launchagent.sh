@@ -7,7 +7,11 @@ if [ "$#" -gt 0 ]; then shift; fi
 runtime_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 label="ai.prospero.daemon.rust"
 uid="$(id -u)"
-domain="user/$uid"
+if launchctl print "gui/$uid" >/dev/null 2>&1; then
+  domain="gui/$uid"
+else
+  domain="user/$uid"
+fi
 service="$domain/$label"
 launch_agents="$HOME/Library/LaunchAgents"
 plist="$launch_agents/$label.plist"
@@ -66,7 +70,10 @@ emit_plist() {
     printf '%s\n' '  <key>WorkingDirectory</key>'
     printf '  <string>%s</string>\n' "$(xml_escape "$HOME")"
     printf '%s\n' '  <key>LimitLoadToSessionType</key>'
-    printf '%s\n' '  <string>Background</string>'
+    printf '%s\n' '  <array>'
+    printf '%s\n' '    <string>Aqua</string>'
+    printf '%s\n' '    <string>Background</string>'
+    printf '%s\n' '  </array>'
     printf '%s\n' '  <key>RunAtLoad</key>'
     printf '%s\n' '  <true/>'
     printf '%s\n' '  <key>KeepAlive</key>'
@@ -93,7 +100,7 @@ write_plist() {
 
 wait_unloaded() {
   tries=0
-  while launchctl print "$service" >/dev/null 2>&1; do
+  while launchctl print "gui/$uid/$label" >/dev/null 2>&1 || launchctl print "user/$uid/$label" >/dev/null 2>&1; do
     tries=$((tries + 1))
     [ "$tries" -lt 50 ] || { echo "timed out unloading $service" >&2; exit 1; }
     sleep 0.1
@@ -108,7 +115,8 @@ case "$command" in
   install|restart)
     [ -x "$binary" ] || { echo "missing Rust daemon binary: $binary" >&2; exit 1; }
     write_plist
-    launchctl bootout "$service" >/dev/null 2>&1 || true
+    launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+    launchctl bootout "user/$uid/$label" >/dev/null 2>&1 || true
     wait_unloaded
     launchctl bootstrap "$domain" "$plist"
     launchctl enable "$service"
@@ -118,7 +126,8 @@ case "$command" in
     print_json
     ;;
   uninstall)
-    launchctl bootout "$service" >/dev/null 2>&1 || true
+    launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+    launchctl bootout "user/$uid/$label" >/dev/null 2>&1 || true
     rm -f "$plist"
     print_json
     ;;

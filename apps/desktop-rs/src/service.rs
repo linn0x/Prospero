@@ -304,6 +304,21 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_domain_and_service() -> (String, String, [String; 2]) {
+    let uid = unsafe { libc::getuid() };
+    let gui_domain = format!("gui/{uid}");
+    let user_domain = format!("user/{uid}");
+    let domain = if run_program("launchctl", &["print", &gui_domain]).is_ok() {
+        gui_domain.clone()
+    } else {
+        user_domain.clone()
+    };
+    let service = format!("{domain}/{LABEL}");
+    let all = [format!("{gui_domain}/{LABEL}"), format!("{user_domain}/{LABEL}")];
+    (domain, service, all)
+}
+
+#[cfg(target_os = "macos")]
 fn install() -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
     let daemon = daemon_binary()?;
@@ -321,9 +336,10 @@ fn install() -> Result<String, String> {
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
     fs::rename(&temporary, &plist).map_err(|error| error.to_string())?;
-    let service = format!("user/{}/{LABEL}", unsafe { libc::getuid() });
-    let domain = format!("user/{}", unsafe { libc::getuid() });
-    launchctl_bootout_and_wait(&service);
+    let (domain, service, all_services) = macos_domain_and_service();
+    for candidate in &all_services {
+        launchctl_bootout_and_wait(candidate);
+    }
     launchctl_bootstrap(
         &domain,
         &service,
@@ -340,8 +356,10 @@ fn install() -> Result<String, String> {
 fn uninstall() -> Result<String, String> {
     let user_home = user_home()?;
     let plist = user_home.join(format!("Library/LaunchAgents/{LABEL}.plist"));
-    let service = format!("user/{}/{LABEL}", unsafe { libc::getuid() });
-    let _ = run_program("launchctl", &["bootout", &service]);
+    let (_, service, all_services) = macos_domain_and_service();
+    for candidate in &all_services {
+        let _ = run_program("launchctl", &["bootout", candidate]);
+    }
     if plist.exists() {
         fs::remove_file(&plist).map_err(|error| error.to_string())?;
     }
@@ -350,7 +368,7 @@ fn uninstall() -> Result<String, String> {
 
 #[cfg(target_os = "macos")]
 fn start() -> Result<String, String> {
-    let service = format!("user/{}/{LABEL}", unsafe { libc::getuid() });
+    let (_, service, _) = macos_domain_and_service();
     if run_program("launchctl", &["kickstart", &service]).is_err() {
         return install();
     }
@@ -359,7 +377,7 @@ fn start() -> Result<String, String> {
 
 #[cfg(target_os = "macos")]
 fn status() -> Result<String, String> {
-    let service = format!("user/{}/{LABEL}", unsafe { libc::getuid() });
+    let (_, service, _) = macos_domain_and_service();
     run_program("launchctl", &["print", &service])
 }
 
@@ -395,7 +413,7 @@ fn launchctl_bootstrap(domain: &str, service: &str, plist: &str) -> Result<Strin
 fn launchd_plist(daemon: &Path, data: &Path, home: &Path, logs: &Path) -> String {
     let environment = launchd_environment(&service_environment(daemon, data, home));
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>start</string><string>--home</string><string>{}</string></array>\n<key>EnvironmentVariables</key><dict>{}</dict>\n<key>WorkingDirectory</key><string>{}</string>\n<key>LimitLoadToSessionType</key><string>Background</string>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string><key>Umask</key><integer>63</integer>\n</dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>start</string><string>--home</string><string>{}</string></array>\n<key>EnvironmentVariables</key><dict>{}</dict>\n<key>WorkingDirectory</key><string>{}</string>\n<key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string><key>Umask</key><integer>63</integer>\n</dict></plist>\n",
         xml(&daemon.display().to_string()),
         xml(&data.display().to_string()),
         environment,
