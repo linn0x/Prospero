@@ -433,17 +433,16 @@ fn profile_model_catalog(
     profile: crate::accounts::ApiProfile,
     current_effort: Option<String>,
 ) -> AgentModelCatalog {
+    let supported_efforts = crate::accounts::profile::profile_supported_efforts(&profile);
+    let current_effort =
+        crate::accounts::profile::normalize_profile_effort(&profile, current_effort.as_deref());
     let current = profile.model.clone();
     AgentModelCatalog {
         models: vec![super::LaunchModelInfo {
             id: profile.model.clone(),
             label: profile.model,
             description: None,
-            supported_efforts: profile
-                .model_capabilities
-                .as_ref()
-                .and_then(|caps| caps.supported_efforts.clone())
-                .unwrap_or_default(),
+            supported_efforts,
             default_effort: None,
             is_default: true,
         }],
@@ -1236,6 +1235,12 @@ impl Agents {
                         }
                         if apply_default_effort {
                             create.effort = default_effort;
+                        }
+                        if let Some(profile) = record.api_profile.as_ref() {
+                            create.effort = crate::accounts::profile::normalize_profile_effort(
+                                profile,
+                                create.effort.as_deref(),
+                            );
                         }
                     } else {
                         let target = crate::accounts::config::ConfigTarget {
@@ -2350,11 +2355,17 @@ impl Agents {
         if let Some(execution) = self.0.execution_environment.lock().await.get(id) {
             environment.extend(execution.iter().cloned());
         }
+        let effort = api_profile.as_ref().map_or_else(
+            || run.effort.clone(),
+            |profile| {
+                crate::accounts::profile::normalize_profile_effort(profile, run.effort.as_deref())
+            },
+        );
         let options = TurnOptions {
             policy: run.policy,
             mode: run.mode,
             model: run.model.clone(),
-            effort: run.effort.clone(),
+            effort,
             environment,
             api_profile,
             agent_preset: run.agent_preset.clone(),
@@ -3856,11 +3867,7 @@ impl Agents {
                 .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
                 .await?;
             if let Some(profile) = profile {
-                let efforts = profile
-                    .model_capabilities
-                    .as_ref()
-                    .and_then(|caps| caps.supported_efforts.clone())
-                    .unwrap_or_default();
+                let efforts = crate::accounts::profile::profile_supported_efforts(&profile);
                 let model = profile.model.clone();
                 return Ok(LaunchModelCatalog {
                     models: vec![LaunchModelInfo {
@@ -3917,11 +3924,7 @@ impl Agents {
                 .call(move |store| store.managed_snapshot_row(&data, &id))
                 .await?;
             if let Some(profile) = record.api_profile {
-                let efforts = profile
-                    .model_capabilities
-                    .as_ref()
-                    .and_then(|caps| caps.supported_efforts.clone())
-                    .unwrap_or_default();
+                let efforts = crate::accounts::profile::profile_supported_efforts(&profile);
                 let model = profile.model.clone();
                 return Ok(LaunchModelCatalog {
                     models: vec![LaunchModelInfo {

@@ -988,20 +988,35 @@ async fn select_model(
     if provider.is_empty() || model_id.is_empty() {
         return Err(Error::Invalid("DeepSeek 模型 ID 格式无效".into()));
     }
+    let normalized_effort = crate::accounts::profile::normalize_known_model_effort(model_id, effort);
     let mut payload = serde_json::Map::new();
     payload.insert("sessionId".into(), json!(session_id));
     payload.insert("provider".into(), json!(provider));
     payload.insert("model".into(), json!(model_id));
-    if let Some(effort) = effort {
+    if let Some(effort) = normalized_effort.as_deref() {
         payload.insert("reasoningEffort".into(), json!(effort));
     }
-    call_rpc(
+    match call_rpc(
         client,
         base_url,
         "session.selectModel",
-        Value::Object(payload),
+        Value::Object(payload.clone()),
     )
     .await
+    {
+        Ok(value) => Ok(value),
+        Err(error) if payload.remove("reasoningEffort").is_some() => {
+            call_rpc(
+                client,
+                base_url,
+                "session.selectModel",
+                Value::Object(payload),
+            )
+            .await
+            .or(Err(error))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn read_catalog(

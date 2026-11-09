@@ -560,7 +560,13 @@ pub(super) fn spawn_turn(
     if let Some(model) = &options.model {
         command.args(["--model", model]);
     }
-    if let Some(effort) = &options.effort {
+    let effective_effort = options.api_profile.as_ref().map_or_else(
+        || options.effort.clone(),
+        |profile| {
+            crate::accounts::profile::normalize_profile_effort(profile, options.effort.as_deref())
+        },
+    );
+    if let Some(effort) = &effective_effort {
         command.args(["--effort", effort]);
     }
     super::lifecycle::configure_process_group(&mut command);

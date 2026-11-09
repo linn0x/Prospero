@@ -419,6 +419,11 @@ fn claude_session_environment(
     secret: &str,
 ) -> Vec<(String, String)> {
     let caps = profile.model_capabilities.as_ref();
+    let context_window = caps
+        .and_then(|c| c.context_window)
+        .or_else(|| known_codex_model(&profile.model).map(|(context, _, _)| context));
+    let reasoning_disabled = caps.and_then(|c| c.reasoning) == Some(false)
+        || known_codex_model(&profile.model).is_some_and(|(_, efforts, _)| efforts.is_empty());
     let mut environment = vec![
         ("ANTHROPIC_API_KEY".into(), secret.to_owned()),
         ("ANTHROPIC_AUTH_TOKEN".into(), String::new()),
@@ -434,13 +439,14 @@ fn claude_session_environment(
         ("CLAUDE_CODE_USE_VERTEX".into(), String::new()),
         ("CLAUDE_CODE_USE_FOUNDRY".into(), String::new()),
         ("CLAUDE_CODE_USE_GATEWAY".into(), String::new()),
+        ("CLAUDE_CODE_EFFORT_LEVEL".into(), String::new()),
         (
             "CLAUDE_CONFIG_DIR".into(),
             root.to_string_lossy().into_owned(),
         ),
         (
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(),
-            caps.and_then(|c| c.context_window)
+            context_window
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
         ),
@@ -452,7 +458,7 @@ fn claude_session_environment(
         ),
         (
             "MAX_THINKING_TOKENS".into(),
-            if caps.and_then(|c| c.reasoning) == Some(false) {
+            if reasoning_disabled {
                 "0".into()
             } else {
                 String::new()
@@ -460,7 +466,11 @@ fn claude_session_environment(
         ),
         (
             "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT".into(),
-            String::new(),
+            if context_window.is_some() {
+                "1".into()
+            } else {
+                String::new()
+            },
         ),
         ("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), String::new()),
         ("DISABLE_COMPACT".into(), String::new()),
@@ -481,7 +491,7 @@ fn claude_session_environment(
         .and_then(|url| url.host_str().map(|host| host != "api.anthropic.com"))
         .unwrap_or(false)
     {
-        prepare_claude_config(root);
+        prepare_claude_config(root, secret);
         environment.push((
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
             "1".into(),
@@ -577,18 +587,23 @@ pub(crate) fn codex_app_server_args(profile: &ApiProfile) -> Vec<String> {
             toml_string(&format!("PROSPERO_API_HEADER_{index}"))
         ));
     }
-    if let Some(caps) = profile.model_capabilities.as_ref() {
-        if let Some(context) = caps.context_window {
+    let context_window = profile
+        .model_capabilities
+        .as_ref()
+        .and_then(|caps| caps.context_window)
+        .or_else(|| known_codex_model(&profile.model).map(|(context, _, _)| context));
+    if let Some(context) = context_window {
+        args.push("-c".into());
+        args.push(format!("model_context_window={context}"));
+    }
+    if let Some(caps) = profile.model_capabilities.as_ref()
+        && let Some(reasoning) = caps.reasoning
+    {
+        args.push("-c".into());
+        args.push(format!("model_supports_reasoning_summaries={reasoning}"));
+        if !reasoning {
             args.push("-c".into());
-            args.push(format!("model_context_window={context}"));
-        }
-        if let Some(reasoning) = caps.reasoning {
-            args.push("-c".into());
-            args.push(format!("model_supports_reasoning_summaries={reasoning}"));
-            if !reasoning {
-                args.push("-c".into());
-                args.push("model_reasoning_summary=\"none\"".into());
-            }
+            args.push("model_reasoning_summary=\"none\"".into());
         }
     }
     args
@@ -602,9 +617,18 @@ fn toml_string(value: &str) -> String {
 pub(crate) const CODEX_MODEL_CATALOG: &str = "prospero-models.json";
 
 /// Published model metadata for endpoints whose vendors document a Codex
-/// catalog (Zhipu GLM Coding Plan). Route capabilities take precedence.
-fn known_codex_model(model: &str) -> Option<(i64, &'static [&'static str], &'static str)> {
-    match model {
+/// catalog (Zhipu GLM Coding Plan, DeepSeek, Seed, GPT gateways). Route
+/// capabilities take precedence.
+pub(crate) fn known_codex_model(
+    model: &str,
+) -> Option<(i64, &'static [&'static str], &'static str)> {
+    let lower = model.trim().to_ascii_lowercase();
+    let (slug, has_1m) = match lower.strip_suffix("[1m]") {
+        Some(base) => (base.trim(), true),
+        None => (lower.as_str(), false),
+    };
+    let slug = slug.rsplit('/').next().unwrap_or(slug);
+    match slug {
         "glm-5.3" => Some((1_048_576, &["low", "high", "max"], "Z.ai's latest flagship model")),
         "glm-5-turbo" => Some((204_800, &[], "Agent-optimized model")),
         "gpt-daybreak-blue-latest" => Some((
@@ -613,12 +637,145 @@ fn known_codex_model(model: &str) -> Option<(i64, &'static [&'static str], &'sta
             "Daybreak Blue",
         )),
         "gpt-6-astra" => Some((
-            2_500_000,
+            if has_1m { 1_000_000 } else { 2_500_000 },
             &["low", "medium", "high", "xhigh", "ultra"],
             "GPT-6 Astra",
         )),
+        "gpt-6.1-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5"
+        | "gpt-5.4" | "gpt-5.2" => Some((
+            if has_1m { 1_000_000 } else { 400_000 },
+            &["low", "medium", "high", "xhigh"],
+            "OpenAI reasoning model",
+        )),
+        "deepseek-v4-flash" | "deepseek-v4.1-flash" | "deepseek-flash" => Some((
+            if has_1m { 1_000_000 } else { 128_000 },
+            &["low", "medium", "high"],
+            "DeepSeek V4 Flash",
+        )),
+        "deepseek-v4-pro" | "deepseek-pro" => Some((
+            if has_1m { 1_000_000 } else { 128_000 },
+            &["low", "medium", "high"],
+            "DeepSeek V4 Pro",
+        )),
+        "deepseek-reasoner" | "deepseek-r1" => Some((
+            if has_1m { 1_000_000 } else { 128_000 },
+            &["low", "medium", "high"],
+            "DeepSeek Reasoner",
+        )),
+        "deepseek-chat" | "deepseek-v3" | "deepseek-v3.2" => Some((
+            if has_1m { 1_000_000 } else { 128_000 },
+            &[],
+            "DeepSeek Chat",
+        )),
+        "seed-code" | "seed-evolving" | "doubao-seed-evolving" => Some((
+            if has_1m { 1_000_000 } else { 256_000 },
+            &["low", "medium", "high"],
+            "Seed Coding model",
+        )),
+        _ if has_1m => Some((
+            1_000_000,
+            &["low", "medium", "high"],
+            "Prospero 1M model source",
+        )),
         _ => None,
     }
+}
+
+fn effort_rank(effort: &str) -> Option<usize> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => Some(0),
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        "max" => Some(6),
+        "ultra" => Some(7),
+        _ => None,
+    }
+}
+
+fn clamp_effort_to_supported(effort: &str, supported: &[String]) -> Option<String> {
+    if supported.is_empty() {
+        return None;
+    }
+    let trimmed = effort.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(exact) = supported
+        .iter()
+        .find(|item| item.eq_ignore_ascii_case(trimmed))
+    {
+        return Some(exact.clone());
+    }
+    let target_rank = effort_rank(trimmed)?;
+    if target_rank == 0 {
+        return None;
+    }
+    supported
+        .iter()
+        .filter_map(|item| effort_rank(item).map(|rank| (rank, item)))
+        .filter(|(rank, _)| *rank <= target_rank)
+        .max_by_key(|(rank, _)| *rank)
+        .or_else(|| {
+            supported
+                .iter()
+                .filter_map(|item| effort_rank(item).map(|rank| (rank, item)))
+                .min_by_key(|(rank, _)| *rank)
+        })
+        .map(|(_, item)| item.clone())
+        .or_else(|| supported.last().cloned())
+}
+
+/// Supported reasoning efforts for an API profile, preferring explicit route
+/// capabilities and falling back to published model metadata when omitted.
+pub(crate) fn profile_supported_efforts(profile: &ApiProfile) -> Vec<String> {
+    let caps = profile.model_capabilities.as_ref();
+    if caps.and_then(|c| c.reasoning) == Some(false) {
+        return Vec::new();
+    }
+    if let Some(efforts) = caps.and_then(|c| c.supported_efforts.clone()) {
+        return efforts;
+    }
+    known_codex_model(&profile.model)
+        .map(|(_, efforts, _)| efforts.iter().map(|e| (*e).to_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// Normalizes or clamps a requested reasoning effort against a known model slug.
+pub(crate) fn normalize_known_model_effort(model: &str, effort: Option<&str>) -> Option<String> {
+    let effort = effort?.trim();
+    if effort.is_empty() {
+        return None;
+    }
+    let Some((_, known_efforts, _)) = known_codex_model(model) else {
+        return Some(effort.to_owned());
+    };
+    let supported: Vec<String> = known_efforts.iter().map(|e| (*e).to_owned()).collect();
+    clamp_effort_to_supported(effort, &supported)
+}
+
+/// Normalizes or clamps a requested reasoning effort against an API profile's
+/// capabilities and known model metadata so unsupported levels (e.g. `max` or
+/// `xhigh` on a model that only supports `low`/`medium`/`high`, or any effort
+/// on a `reasoning: false` model) never cause CLI or gateway warnings/errors.
+pub(crate) fn normalize_profile_effort(
+    profile: &ApiProfile,
+    effort: Option<&str>,
+) -> Option<String> {
+    let effort = effort?.trim();
+    if effort.is_empty() {
+        return None;
+    }
+    let caps = profile.model_capabilities.as_ref();
+    if caps.and_then(|c| c.reasoning) == Some(false) {
+        return None;
+    }
+    if let Some(supported) = caps.and_then(|c| c.supported_efforts.as_ref()) {
+        return clamp_effort_to_supported(effort, supported);
+    }
+    normalize_known_model_effort(&profile.model, Some(effort))
 }
 
 /// Codex warns "Model metadata … not found" and falls back to generic limits for
@@ -706,9 +863,10 @@ pub(crate) fn install_codex_model_catalog(root: &std::path::Path, profile: &ApiP
     Ok(())
 }
 
-/// Ensures `<root>/.claude.json` records completed onboarding so a profile
-/// session never opens first-run flows against a third-party endpoint.
-fn prepare_claude_config(root: &std::path::Path) {
+/// Ensures `<root>/.claude.json` records completed onboarding and approves the
+/// profile API key suffix so a profile session never opens first-run or
+/// custom-API-key confirmation prompts against a third-party endpoint.
+fn prepare_claude_config(root: &std::path::Path, secret: &str) {
     use std::io::Write;
     let path = root.join(".claude.json");
     let mut config = match std::fs::read_to_string(&path) {
@@ -721,10 +879,46 @@ fn prepare_claude_config(root: &std::path::Path) {
         }
         Err(_) => return,
     };
-    if config.get("hasCompletedOnboarding") == Some(&serde_json::Value::Bool(true)) {
+    let key_suffix: String = {
+        let chars: Vec<char> = secret.trim().chars().collect();
+        let start = chars.len().saturating_sub(20);
+        chars[start..].iter().collect()
+    };
+    let onboarding_done =
+        config.get("hasCompletedOnboarding") == Some(&serde_json::Value::Bool(true));
+    let key_approved = key_suffix.is_empty()
+        || config
+            .get("customApiKeyResponses")
+            .and_then(|v| v.get("approved"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(|item| item.as_str() == Some(&key_suffix)));
+    if onboarding_done && key_approved {
         return;
     }
     config["hasCompletedOnboarding"] = serde_json::Value::Bool(true);
+    if !key_suffix.is_empty() {
+        let responses = config
+            .as_object_mut()
+            .expect("config is object")
+            .entry("customApiKeyResponses")
+            .or_insert_with(|| serde_json::json!({ "approved": [], "rejected": [] }));
+        if !responses.is_object() {
+            *responses = serde_json::json!({ "approved": [], "rejected": [] });
+        }
+        let obj = responses.as_object_mut().expect("responses is object");
+        let approved = obj
+            .entry("approved")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(arr) = approved.as_array_mut() {
+            if !arr.iter().any(|item| item.as_str() == Some(&key_suffix)) {
+                arr.push(serde_json::Value::String(key_suffix));
+            }
+        } else {
+            *approved = serde_json::json!([key_suffix]);
+        }
+        obj.entry("rejected")
+            .or_insert_with(|| serde_json::json!([]));
+    }
     let Ok(body) = serde_json::to_vec_pretty(&config) else {
         return;
     };
@@ -880,6 +1074,60 @@ mod tests {
         assert_eq!(
             endpoint(&ftp, "/v1/messages").unwrap(),
             "ftp://gateway.example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn deepseek_and_1m_models_build_catalog_and_clamp_effort() {
+        let ds_flash = codex_profile("DeepSeek-V4.1-Flash", None);
+        let catalog = codex_model_catalog(&ds_flash).expect("known deepseek model");
+        assert_eq!(catalog["models"][0]["slug"], "DeepSeek-V4.1-Flash");
+        assert_eq!(catalog["models"][0]["context_window"], 128_000);
+        assert_eq!(
+            normalize_profile_effort(&ds_flash, Some("max")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            normalize_profile_effort(&ds_flash, Some("xhigh")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            normalize_profile_effort(&ds_flash, Some("medium")).as_deref(),
+            Some("medium")
+        );
+
+        let ds_1m = codex_profile("DeepSeek-V4-Flash[1m]", None);
+        let catalog_1m = codex_model_catalog(&ds_1m).expect("known 1m model");
+        assert_eq!(catalog_1m["models"][0]["context_window"], 1_000_000);
+
+        let ds_chat = codex_profile("deepseek-chat", None);
+        assert_eq!(normalize_profile_effort(&ds_chat, Some("high")), None);
+
+        let root = tempfile::tempdir().unwrap();
+        let env = claude_session_environment(
+            root.path(),
+            &ApiProfile {
+                model: "deepseek-v4-flash".into(),
+                ..profile(Some("anthropic"))
+            },
+            "test-secret-1234567890abcdef1234567890",
+        );
+        assert!(env.contains(&(
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(),
+            "128000".into()
+        )));
+        assert!(env.contains(&(
+            "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT".into(),
+            "1".into()
+        )));
+        assert!(env.contains(&("CLAUDE_CODE_EFFORT_LEVEL".into(), String::new())));
+        let claude_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(claude_json["hasCompletedOnboarding"], true);
+        assert_eq!(
+            claude_json["customApiKeyResponses"]["approved"],
+            serde_json::json!(["7890abcdef1234567890"])
         );
     }
 }

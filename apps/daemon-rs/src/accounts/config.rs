@@ -516,6 +516,13 @@ fn supported_efforts(
             .model_capabilities
             .as_ref()
             .and_then(|caps| caps.supported_efforts.clone())
+            .or_else(|| {
+                target
+                    .model
+                    .as_deref()
+                    .and_then(super::profile::known_codex_model)
+                    .map(|(_, efforts, _)| efforts.iter().map(|s| (*s).to_owned()).collect())
+            })
             .unwrap_or_default()
     } else {
         let model = overrides

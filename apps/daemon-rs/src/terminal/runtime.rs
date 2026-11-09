@@ -1170,7 +1170,7 @@ impl Terminals {
                 .await?
             }
             crate::protocol::AgentKind::Claude => {
-                let (environment, _, _, _) = self
+                let (environment, _, _, _, _) = self
                     .resolve_claude_terminal_account(head.account_id)
                     .await?;
                 let config = environment
@@ -1589,14 +1589,21 @@ impl Terminals {
                 Ok(Some(shell_command(command)?))
             }
             (crate::protocol::AgentKind::Claude, None) => {
-                let (mut environment, account_id, default_model, default_effort) = self
+                let (mut environment, account_id, default_model, default_effort, profile) = self
                     .resolve_claude_terminal_account(input.account_id.clone())
                     .await?;
                 let effective_model = model.or(default_model);
-                let effective_effort = if input.effort.is_some() {
+                let raw_effort = if input.effort.is_some() {
                     effort
                 } else {
                     default_effort
+                };
+                let effective_effort = match profile.as_ref() {
+                    Some(profile) => crate::accounts::profile::normalize_profile_effort(
+                        profile,
+                        raw_effort.as_deref(),
+                    ),
+                    None => raw_effort,
                 };
                 input.model = effective_model.clone();
                 input.effort = effective_effort.clone();
@@ -1682,6 +1689,12 @@ impl Terminals {
                         effective_effort = effective_effort.or(default_effort);
                     }
                 }
+                if let Some(profile) = profile.as_ref() {
+                    effective_effort = crate::accounts::profile::normalize_profile_effort(
+                        profile,
+                        effective_effort.as_deref(),
+                    );
+                }
                 input.model = effective_model.clone();
                 input.effort = effective_effort.clone();
                 let mut args = match policy {
@@ -1762,8 +1775,15 @@ impl Terminals {
                     .resolve_pi_terminal_account(input.account_id.clone())
                     .await?;
                 let effective_model = model.or_else(|| profile.as_ref().map(|p| p.model.clone()));
+                let effective_effort = match profile.as_ref() {
+                    Some(profile) => crate::accounts::profile::normalize_profile_effort(
+                        profile,
+                        effort.as_deref(),
+                    ),
+                    None => effort,
+                };
                 input.model = effective_model.clone();
-                input.effort = effort.clone();
+                input.effort = effective_effort.clone();
                 let mut args = Vec::new();
                 if let Some(model) = effective_model {
                     let model_arg = if profile.is_some() && !model.contains('/') {
@@ -1773,7 +1793,7 @@ impl Terminals {
                     };
                     args.extend(["--model".into(), model_arg]);
                 }
-                if let Some(effort) = effort {
+                if let Some(effort) = effective_effort {
                     let level = match effort.trim() {
                         "none" | "off" => "off",
                         "minimal" => "minimal",
@@ -1865,6 +1885,7 @@ impl Terminals {
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<crate::accounts::ApiProfile>,
     )> {
         let Some(id) = account_id else {
             let data = self.0.database.directory().to_owned();
@@ -1883,7 +1904,7 @@ impl Terminals {
             })
             .await
             .map_err(|_| Error::Closed)?;
-            return Ok((env, None, default_model, default_effort));
+            return Ok((env, None, default_model, default_effort, None));
         };
         if id == crate::accounts::NATIVE_CLAUDE_ID {
             let data = self.0.database.directory().to_owned();
@@ -1902,8 +1923,8 @@ impl Terminals {
             })
             .await
             .map_err(|_| Error::Closed)?;
-            return Ok((env, None, default_model, default_effort));
-        }
+            return Ok((env, None, default_model, default_effort, None));
+        };
         crate::database::validate_id(&id)?;
         let data = self.0.database.directory().to_owned();
         let record = self
@@ -1943,6 +1964,7 @@ impl Terminals {
         let account_id = record.id.clone();
         let env_id = account_id.clone();
         let agent = record.agent;
+        let profile = record.api_profile.clone();
         let env = tokio::task::spawn_blocking(move || match record.api_profile {
             Some(profile) => crate::accounts::managed::profile_account_environment(
                 &data, &env_id, agent, &profile,
@@ -1951,7 +1973,7 @@ impl Terminals {
         })
         .await
         .map_err(|_| Error::Closed)??;
-        Ok((env, Some(account_id), default_model, default_effort))
+        Ok((env, Some(account_id), default_model, default_effort, profile))
     }
 
     async fn resolve_codex_terminal_account(
