@@ -130,6 +130,128 @@ async fn bind(
     }
 }
 
+const MAX_WS_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_PASSTHROUGH_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STDIO_LINE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_JSON_STRING_BYTES: usize = 256 * 1024;
+
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientParams {
+    thread_id: Option<String>,
+    ephemeral: Option<bool>,
+    thread_source: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClientMessage {
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    params: ClientParams,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ServerThread {
+    id: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ServerResult {
+    #[serde(default)]
+    thread: Option<ServerThread>,
+}
+
+#[derive(serde::Deserialize)]
+struct ServerReply {
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default)]
+    method: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    error: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    result: Option<ServerResult>,
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn truncate_utf8_middle(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    const NOTICE: &str = "\n...[原生会话输出过大，已截断 / oversized output truncated]...\n";
+    let budget = max_bytes.saturating_sub(NOTICE.len());
+    let head_budget = (budget * 2) / 3;
+    let tail_budget = budget.saturating_sub(head_budget);
+    let head_end = floor_char_boundary(text, head_budget);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(tail_budget));
+    if head_end >= tail_start {
+        text.truncate(floor_char_boundary(text, max_bytes));
+        return;
+    }
+    let mut compacted = String::with_capacity(head_end + NOTICE.len() + (text.len() - tail_start));
+    compacted.push_str(&text[..head_end]);
+    compacted.push_str(NOTICE);
+    compacted.push_str(&text[tail_start..]);
+    *text = compacted;
+}
+
+fn compact_json_strings(value: &mut Value, max_string_bytes: usize) {
+    match value {
+        Value::String(text) => truncate_utf8_middle(text, max_string_bytes),
+        Value::Array(items) => {
+            for item in items {
+                compact_json_strings(item, max_string_bytes);
+            }
+        }
+        Value::Object(map) => {
+            for entry in map.values_mut() {
+                compact_json_strings(entry, max_string_bytes);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn compact_oversized_rpc_line(line: &mut String) -> Result<()> {
+    if line.len() <= MAX_PASSTHROUGH_FRAME_BYTES {
+        return Ok(());
+    }
+    let mut value: Value = serde_json::from_str(line)?;
+    for limit in [MAX_JSON_STRING_BYTES, 32 * 1024, 4 * 1024] {
+        compact_json_strings(&mut value, limit);
+        let serialized = serde_json::to_string(&value)?;
+        if serialized.len() <= MAX_PASSTHROUGH_FRAME_BYTES {
+            *line = serialized;
+            return Ok(());
+        }
+        *line = serialized;
+    }
+    Ok(())
+}
+
 async fn upgrade(
     State(state): State<LaunchState>,
     headers: HeaderMap,
@@ -141,7 +263,8 @@ async fn upgrade(
     let Ok(permit) = state.connections.clone().try_acquire_owned() else {
         return StatusCode::CONFLICT.into_response();
     };
-    ws.max_message_size(16 * 1024 * 1024)
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
             if let Err(error) = bridge(socket, state.clone()).await {
@@ -223,15 +346,15 @@ async fn bridge(mut socket: WebSocket, state: LaunchState) -> Result<()> {
         loop {
             let mut bytes = Vec::new();
             let result = (&mut output)
-                .take(16 * 1024 * 1024 + 1)
+                .take((MAX_STDIO_LINE_BYTES + 1) as u64)
                 .read_until(b'\n', &mut bytes)
                 .await;
             if matches!(result, Ok(0)) {
                 break;
             }
             let line = match result {
-                Ok(_) if bytes.len() <= 16 * 1024 * 1024 => String::from_utf8(bytes)
-                    .map_err(|_| Error::Invalid("无效的原生会话响应".into())),
+                Ok(_) if bytes.len() <= MAX_STDIO_LINE_BYTES => Ok(String::from_utf8(bytes)
+                    .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())),
                 Ok(_) => Err(Error::Invalid("原生会话响应过大".into())),
                 Err(error) => Err(error.into()),
             };
@@ -254,17 +377,18 @@ async fn bridge(mut socket: WebSocket, state: LaunchState) -> Result<()> {
                         Some(Ok(Message::Close(_))) | None => break,
                         _ => return Err(Error::Closed),
                     };
-                    let value: Value = serde_json::from_str(&text)?;
-                    if matches!(value["method"].as_str(), Some("turn/start" | "turn/steer")) {
-                        let id = value["params"]["threadId"].as_str().ok_or(Error::Closed)?;
+                    let message: ClientMessage = serde_json::from_str(&text)?;
+                    if matches!(message.method.as_deref(), Some("turn/start" | "turn/steer")) {
+                        let id = message.params.thread_id.as_deref().ok_or(Error::Closed)?;
                         let (cwd, durable) = threads.get(id).ok_or_else(|| Error::Invalid("原生对话身份未确认".into()))?;
                         if *durable { state.claim(id, cwd)?; }
                     }
-                    if matches!(value["method"].as_str(), Some("thread/start" | "thread/resume" | "thread/fork")) {
+                    if let Some(method @ ("thread/start" | "thread/resume" | "thread/fork")) = message.method.as_deref() {
                         if pending.len() >= 64 { return Err(Error::Busy); }
-                        let durable = value["params"]["ephemeral"].as_bool() != Some(true)
-                            && value["params"]["threadSource"].as_str().is_none_or(|source| source == "user");
-                        pending.insert(value["id"].to_string(), (value["method"].as_str().unwrap().to_owned(), durable));
+                        let id = message.id.ok_or(Error::Closed)?;
+                        let durable = message.params.ephemeral != Some(true)
+                            && message.params.thread_source.as_deref().is_none_or(|source| source == "user");
+                        pending.insert(id.to_string(), (method.to_owned(), durable));
                     }
                     input.write_all(text.as_bytes()).await?;
                     input.write_all(b"\n").await?;
@@ -272,17 +396,29 @@ async fn bridge(mut socket: WebSocket, state: LaunchState) -> Result<()> {
                 }
                 line = received.recv() => {
                     let Some(line) = line else { break; };
-                    let line = line?;
-                    let value: Value = serde_json::from_str(&line)?;
-                    if value.get("method").is_none() && let Some((method, durable)) = pending.remove(&value["id"].to_string()) && value.get("error").is_none() {
-                        let thread = &value["result"]["thread"];
-                        let id = thread["id"].as_str().ok_or(Error::Closed)?;
-                        let cwd = thread["cwd"].as_str().unwrap_or(&state.cwd);
-                        if threads.len() >= 256 && let Some(old) = threads.keys().next().cloned() { threads.remove(&old); }
-                        threads.insert(id.into(), (cwd.into(), durable));
-                        if durable && method != "thread/start" { state.claim(id, cwd)?; }
+                    let mut line = line?;
+                    if !pending.is_empty() {
+                        let reply: ServerReply = serde_json::from_str(&line)?;
+                        if reply.method.is_none()
+                            && let Some(id) = reply.id
+                            && let Some((method, durable)) = pending.remove(&id.to_string())
+                            && reply.error.is_none()
+                        {
+                            let thread = reply
+                                .result
+                                .and_then(|result| result.thread)
+                                .ok_or(Error::Closed)?;
+                            let id = thread.id.as_deref().ok_or(Error::Closed)?;
+                            let cwd = thread.cwd.as_deref().unwrap_or(&state.cwd);
+                            if threads.len() >= 256 && let Some(old) = threads.keys().next().cloned() { threads.remove(&old); }
+                            threads.insert(id.into(), (cwd.into(), durable));
+                            if durable && method != "thread/start" { state.claim(id, cwd)?; }
+                        }
                     }
-                    socket.send(Message::Text(line.trim_end().to_owned().into())).await.map_err(|_| Error::Closed)?;
+                    compact_oversized_rpc_line(&mut line)?;
+                    let trimmed_len = line.trim_end_matches(['\r', '\n']).len();
+                    line.truncate(trimmed_len);
+                    socket.send(Message::Text(line.into())).await.map_err(|_| Error::Closed)?;
                 }
             }
         }
@@ -548,6 +684,54 @@ mod tests {
             "--permission-mode <mode> (choices: manual, acceptEdits)",
         );
         assert_eq!(claude, ["--permission-mode", "manual"]);
+    }
+
+    #[test]
+    fn oversized_rpc_lines_compact_large_string_fields_while_preserving_thread_identity() {
+        let huge_output = "中文输出-abc123\n".repeat(600_000);
+        let thread_id = uuid::Uuid::new_v4().to_string();
+        let mut line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "thread": {
+                    "id": thread_id,
+                    "cwd": "/tmp/workspace",
+                    "turns": [
+                        {
+                            "items": [
+                                {
+                                    "type": "commandExecution",
+                                    "aggregatedOutput": huge_output,
+                                    "stdout": huge_output,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+        assert!(line.len() > MAX_PASSTHROUGH_FRAME_BYTES);
+
+        let reply: ServerReply = serde_json::from_str(&line).unwrap();
+        assert!(reply.method.is_none());
+        assert!(reply.error.is_none());
+        let parsed_thread = reply.result.unwrap().thread.unwrap();
+        assert_eq!(parsed_thread.id.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(parsed_thread.cwd.as_deref(), Some("/tmp/workspace"));
+
+        compact_oversized_rpc_line(&mut line).unwrap();
+        assert!(line.len() <= MAX_PASSTHROUGH_FRAME_BYTES);
+        let compacted: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(compacted["result"]["thread"]["id"].as_str(), Some(thread_id.as_str()));
+        let compacted_output = compacted["result"]["thread"]["turns"][0]["items"][0]
+            ["aggregatedOutput"]
+            .as_str()
+            .unwrap();
+        assert!(compacted_output.contains("oversized output truncated"));
+        assert!(compacted_output.starts_with("中文输出-abc123\n"));
+        assert!(compacted_output.ends_with("中文输出-abc123\n"));
     }
 }
 

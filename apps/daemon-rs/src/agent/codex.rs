@@ -25,7 +25,7 @@ use crate::orchestration::reliability::ControlEffectState;
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const APP_SERVER_LEASE_VERSION: i64 = 2;
 
 type StderrTail = Arc<Mutex<String>>;
