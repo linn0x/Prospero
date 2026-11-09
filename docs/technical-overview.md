@@ -609,4 +609,5 @@ npm run test:e2e -w @prospero/relay  # 需要 Docker
 - `docs/orchestration-handoff.md` / `docs/orchestration-plan.md` —— 编排契约与规划
 - `docs/esaytree.md` —— esaytree 工作树隔离设计
 - `docs/relay-design.md` / `docs/relay-security-audit.md` / `docs/relay-release.md` —— relay 契约、审计与交付状态
+- `docs/explicit-state-machines-and-tui-theme.md` —— P0/P1/P2 显式状态机架构（会话、原生绑定、模型源 SWR、跨模型子代理投递、PTY 活跃度、Agent 事件流、终端视图相位、分屏布局）与 TUI 统一深色碳素调色板规范
 - `docs/mobile-ux/`、`docs/voice-input-plan.md`、`docs/android-plan.md`、`docs/m1-plan.md` —— 各专题
