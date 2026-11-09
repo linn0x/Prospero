@@ -1059,6 +1059,13 @@ impl Agents {
                     ));
                 }
             }
+            let (normalized_model, normalized_effort, _) =
+                super::agy::resolve_cli_model_and_effort(
+                    input.model.as_deref(),
+                    input.effort.as_deref(),
+                );
+            input.model = normalized_model;
+            input.effort = normalized_effort;
         }
         if input.agent == crate::protocol::AgentKind::Pi
             && input.mode.as_deref() == Some("plan")
@@ -4470,13 +4477,21 @@ impl Agents {
         } else {
             super::claude::fetch_launch_catalog(&environment).await?
         };
-        let current_model = run
-            .model
+        let (run_model, run_effort) = if run.agent == AgentKind::Agy {
+            let (m, e, _) = super::agy::resolve_cli_model_and_effort(
+                run.model.as_deref(),
+                run.effort.as_deref(),
+            );
+            (m, e)
+        } else {
+            (run.model, run.effort)
+        };
+        let current_model = run_model
             .or_else(|| models.first().map(|model| model.id.clone()));
         Ok(AgentModelCatalog {
             models,
             current_model,
-            current_effort: run.effort,
+            current_effort: run_effort,
         })
     }
 
@@ -4614,6 +4629,17 @@ impl Agents {
             super::agy::launch_catalog().await?.models
         } else {
             super::claude::fetch_launch_catalog(&environment).await?
+        };
+        let (model, effort) = if run.agent == AgentKind::Agy
+            && catalog.iter().all(|entry| entry.id != model)
+        {
+            let (base, suffix_effort) = super::agy::split_model_effort_suffix(&model);
+            (
+                base.to_owned(),
+                effort.or_else(|| suffix_effort.map(str::to_owned)),
+            )
+        } else {
+            (model, effort)
         };
         let selected = catalog
             .iter()

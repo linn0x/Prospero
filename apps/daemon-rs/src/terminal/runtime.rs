@@ -1801,8 +1801,13 @@ impl Terminals {
                         ));
                     }
                 }
-                input.model = model.clone();
-                input.effort = effort.clone();
+                let (resolved_model, resolved_effort, model_effort_args) =
+                    crate::agent::agy::resolve_cli_model_and_effort(
+                        model.as_deref(),
+                        effort.as_deref(),
+                    );
+                input.model = resolved_model;
+                input.effort = resolved_effort;
                 let mut args = match policy {
                     crate::protocol::TerminalApprovalPolicy::Strict => Vec::new(),
                     crate::protocol::TerminalApprovalPolicy::Standard => {
@@ -1812,12 +1817,7 @@ impl Terminals {
                         vec!["--dangerously-skip-permissions".into()]
                     }
                 };
-                if let Some(model) = model {
-                    args.extend(["--model".into(), model]);
-                }
-                if let Some(effort) = effort {
-                    args.extend(["--effort".into(), effort]);
-                }
+                args.extend(model_effort_args);
                 Ok(Some(ProgramSpec {
                     program: crate::agent::agy::binary(),
                     args,
