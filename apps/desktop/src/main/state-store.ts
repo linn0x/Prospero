@@ -421,7 +421,7 @@ export class StateStore extends EventEmitter {
         running,
         managed: running && rawPid === this.managedPid,
         fullAccess: running && booleanValue(status["fullAccess"]),
-        starting: this.starting,
+        starting: !running && this.starting,
         startupProgress: this.startupProgress,
         startupStage: this.startupStage,
         port,

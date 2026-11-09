@@ -1895,6 +1895,7 @@ async fn read_notifications(
     let mut last_text: Option<String> = None;
     let mut last_input_tokens: Option<i64> = None;
     let mut last_output_tokens: Option<i64> = None;
+    let mut in_flight_tools = super::turn_stream::InFlightTools::default();
     let mut sent_finish = false;
     loop {
         let mut line = String::new();
@@ -1905,12 +1906,14 @@ async fn read_notifications(
             break;
         }
         if line.len() > MAX_LINE_BYTES {
+            let error = diagnostic_message(&state.diagnostics, "codex response too large").await;
+            for event in in_flight_tools.drain_unfinished(&error) {
+                let _ = events.send(event).await;
+            }
             let _ = events
                 .send(AdapterEvent::Finish {
                     interrupted: false,
-                    error: Some(
-                        diagnostic_message(&state.diagnostics, "codex response too large").await,
-                    ),
+                    error: Some(error),
                     cost_usd: None,
                     input_tokens: last_input_tokens,
                     output_tokens: last_output_tokens,
@@ -1969,6 +1972,9 @@ async fn read_notifications(
                                         })
                                         .await;
                                 } else {
+                                    for event in in_flight_tools.drain_unfinished(&text) {
+                                        let _ = events.send(event).await;
+                                    }
                                     let _ = events
                                         .send(AdapterEvent::Finish {
                                             interrupted: false,
@@ -1991,6 +1997,9 @@ async fn read_notifications(
         }
         if let Some(error) = message.get("error") {
             let text = rpc_error_message(None, error, &state.diagnostics).await;
+            for event in in_flight_tools.drain_unfinished(&text) {
+                let _ = events.send(event).await;
+            }
             let _ = events
                 .send(AdapterEvent::Finish {
                     interrupted: false,
@@ -2146,6 +2155,11 @@ async fn read_notifications(
                 }
                 if let Some((tool, summary)) = tool_start_summary(&item_type, &item) {
                     let diff = codex_file_changes(&item).into_iter().next();
+                    in_flight_tools.record_start_with_subagent(
+                        agent_id.as_deref(),
+                        &item_id,
+                        &tool,
+                    );
                     let _ = events
                         .send(AdapterEvent::ToolCall {
                             subagent: agent_id.clone(),
@@ -2229,6 +2243,7 @@ async fn read_notifications(
                         futures_current_turn(&state.current_turn)
                             .unwrap_or_else(|| "codex-tool".into())
                     });
+                    in_flight_tools.record_result_with_subagent(agent_id.as_deref(), &item_id);
                     let changes = codex_file_changes(&item);
                     let diff = changes
                         .first()
@@ -2277,10 +2292,19 @@ async fn read_notifications(
                 let diffs = aggregate_diffs
                     .take()
                     .unwrap_or_else(|| turn_diffs.values().cloned().collect());
+                let error = failed.then(|| format!("Codex turn {status}"));
+                let reason = if interrupted {
+                    "工具调用已中断"
+                } else {
+                    error.as_deref().unwrap_or("工具调用未返回结果")
+                };
+                for event in in_flight_tools.drain_unfinished(reason) {
+                    let _ = events.send(event).await;
+                }
                 let _ = events
                     .send(AdapterEvent::Finish {
                         interrupted,
-                        error: failed.then(|| format!("Codex turn {status}")),
+                        error,
                         cost_usd: None,
                         input_tokens: last_input_tokens,
                         output_tokens: last_output_tokens,
@@ -2296,6 +2320,9 @@ async fn read_notifications(
     if !sent_finish {
         let message = diagnostic_message(&state.diagnostics, "codex stream closed").await;
         fail_pending_responses(&state.responses, message.clone()).await;
+        for event in in_flight_tools.drain_unfinished(&message) {
+            let _ = events.send(event).await;
+        }
         let _ = events
             .send(AdapterEvent::Finish {
                 interrupted: false,

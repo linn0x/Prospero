@@ -8,7 +8,7 @@ const MAX_PENDING_OUTPUT_FRAMES = 1024;
 const MAX_CONTROL_FRAMES_PER_TURN = 256;
 const OPEN_TIMEOUT_MS = 7_000;
 type StreamSocket = Pick<WebSocket, "bufferedAmount" | "send" | "close" | "on" | "once"> & { terminate?: () => void };
-type Attachment = { port: MessagePortMain; socket: StreamSocket; closed: boolean; attached: boolean; pendingInput: number; pendingWireBytes: number; inputOperations: Map<number, number>; pendingOutput: number; outputFrames: Array<{ sequence: number; bytes: number }>; controlFramesThisTurn: number; controlReset: ReturnType<typeof setImmediate> | undefined };
+type Attachment = { port: MessagePortMain; socket: StreamSocket; closed: boolean; attached: boolean; pendingInput: number; pendingWireBytes: number; inputOperations: Map<number, number>; pendingOutput: number; outputFrames: Array<{ sequence: number; bytes: number }>; preAttachFrames: ArrayBuffer[]; controlFramesThisTurn: number; controlReset: ReturnType<typeof setImmediate> | undefined };
 
 /** Main-process-only credential bridge. The renderer receives only a MessagePort. */
 export class TerminalStreamBridge {
@@ -18,7 +18,7 @@ export class TerminalStreamBridge {
   async open(contents: WebContents, sessionId: string, requestId: string): Promise<void> {
     const socket = this.openSocket(sessionId);
     const { port1, port2 } = new MessageChannelMain();
-    const attachment: Attachment = { port: port1, socket, closed: false, attached: false, pendingInput: 0, pendingWireBytes: 0, inputOperations: new Map(), pendingOutput: 0, outputFrames: [], controlFramesThisTurn: 0, controlReset: undefined };
+    const attachment: Attachment = { port: port1, socket, closed: false, attached: false, pendingInput: 0, pendingWireBytes: 0, inputOperations: new Map(), pendingOutput: 0, outputFrames: [], preAttachFrames: [], controlFramesThisTurn: 0, controlReset: undefined };
     // Register before the handshake: window teardown also aborts connecting sockets.
     this.bind(contents.id, attachment);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -43,7 +43,10 @@ export class TerminalStreamBridge {
     });
   }
 
-  closeAll(contents: WebContents): void { for (const item of [...(this.attachments.get(contents.id) ?? [])]) this.close(contents.id, item); }
+  closeAll(contents?: WebContents): void {
+    if (contents) { this.closeAllForId(contents.id); return; }
+    for (const contentsId of [...this.attachments.keys()]) this.closeAllForId(contentsId);
+  }
   closeAllForId(contentsId: number): void { for (const item of [...(this.attachments.get(contentsId) ?? [])]) this.close(contentsId, item); }
   private bind(contentsId: number, attachment: Attachment): void {
     const entries = this.attachments.get(contentsId) ?? new Set<Attachment>();
@@ -65,8 +68,19 @@ export class TerminalStreamBridge {
         if (attachment.controlFramesThisTurn > MAX_CONTROL_FRAMES_PER_TURN) throw new Error("Terminal stream control queue is full");
         if (!attachment.controlReset) attachment.controlReset = setImmediate(() => { attachment.controlFramesThisTurn = 0; attachment.controlReset = undefined; });
       }
-      attachment.port.postMessage(encodeTerminalFrame(frame));
+      const encoded = encodeTerminalFrame(frame);
+      if (!attachment.attached) {
+        if (attachment.preAttachFrames.length >= MAX_PENDING_OUTPUT_FRAMES) throw new Error("Terminal stream output queue is full");
+        attachment.preAttachFrames.push(encoded);
+        return;
+      }
+      this.pumpOutput(attachment);
+      attachment.port.postMessage(encoded);
     } catch { this.close(contentsId, attachment); }
+  }
+  private pumpOutput(attachment: Attachment): void {
+    if (!attachment.attached || attachment.closed) return;
+    while (attachment.preAttachFrames.length > 0) attachment.port.postMessage(attachment.preAttachFrames.shift()!);
   }
   private forwardInput(contentsId: number, attachment: Attachment, value: unknown): void {
     if (attachment.closed) return;
@@ -90,6 +104,7 @@ export class TerminalStreamBridge {
         attachment.pendingWireBytes = Math.max(0, attachment.pendingWireBytes - bytes.byteLength);
         if (error) this.close(contentsId, attachment);
       });
+      if (frame.kind === TerminalStreamKind.Attach) this.pumpOutput(attachment);
     } catch { this.close(contentsId, attachment); }
   }
   private acknowledgeOutput(attachment: Attachment, sequence: number): void {

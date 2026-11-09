@@ -4207,14 +4207,29 @@ impl Store {
         validate_id(asset_id)?;
         let tx = self.connection.transaction()?;
         let asset = Self::asset_row(&tx, asset_id)?;
+        // Active worktrees bound to a live dispatch retain their ownership
+        // lifecycle state while still recording the latest git inspection snapshot.
         // A path that is still missing after an explicit cleanup is expected;
         // keep the `cleaned` state instead of reporting a user-caused loss.
+        let has_live_dispatch: bool = match asset.dispatch_id.as_deref() {
+            Some(dispatch_id) => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orch_dispatches WHERE id=?1 AND state IN ('starting','running'))",
+                [dispatch_id],
+                |row| row.get(0),
+            )?,
+            None => false,
+        };
         let state = if asset.cleanup.is_some() && inspection.state == WorktreeAssetState::Missing {
             WorktreeAssetState::Cleaned
+        } else if asset.state == WorktreeAssetState::Active
+            && has_live_dispatch
+            && inspection.state != WorktreeAssetState::Missing
+        {
+            WorktreeAssetState::Active
         } else {
             inspection.state
         };
-        let last_error = if state == WorktreeAssetState::Unknown {
+        let last_error = if inspection.state == WorktreeAssetState::Unknown {
             inspection.message.clone()
         } else {
             asset.last_error

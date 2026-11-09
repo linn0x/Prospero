@@ -199,6 +199,7 @@ export class RustProcess {
   }
 
   async completeDeferredUpgrade(timeoutMs = 20_000): Promise<RustConnection | undefined> {
+    if (this.starting || this.stopping) return this.connection;
     const connection = this.connection;
     this.expectedBuildId = this.readBinaryBuildId();
     if (!connection?.upgradeDeferred || !this.expectedBuildId) return connection;

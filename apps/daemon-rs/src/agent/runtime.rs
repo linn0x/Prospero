@@ -396,6 +396,18 @@ struct Handle {
     steerable: AtomicBool,
 }
 
+impl Handle {
+    async fn derived_running_status(&self) -> SessionStatus {
+        if !self.replies.lock().await.is_empty() {
+            SessionStatus::WaitingPermission
+        } else if !self.questions.lock().await.is_empty() {
+            SessionStatus::WaitingInput
+        } else {
+            SessionStatus::Running
+        }
+    }
+}
+
 /// Pending AskUserQuestion: the blocking CLI reply plus the map from public
 /// question ids (`q1`) back to the native question text used in the answer.
 struct QuestionPending {
@@ -778,8 +790,7 @@ impl Agents {
                     &report,
                     crate::terminal::INPUT_BYTES,
                 );
-                let (last, leading) = chunks.split_last().expect("fan-in stream is non-empty");
-                for chunk in leading {
+                for chunk in chunks {
                     host.input(TerminalInput {
                         data_b64: BASE64_STANDARD.encode(chunk),
                     })
@@ -788,18 +799,6 @@ impl Agents {
                 if let Some(claim_id) = cross_model_claim_id.as_deref() {
                     self.mark_cross_model_fan_in_delivered(parent_session_id, claim_id)
                         .await?;
-                }
-                if let Err(error) = host
-                    .input(TerminalInput {
-                        data_b64: BASE64_STANDARD.encode(last),
-                    })
-                    .await
-                {
-                    if let Some(claim_id) = cross_model_claim_id.as_deref() {
-                        self.rollback_cross_model_fan_in_delivery(parent_session_id, claim_id)
-                            .await;
-                    }
-                    return Err(error);
                 }
                 Ok(if cross_model_claim_id.is_some() {
                     ParentReportDelivery::Delivered
@@ -3290,7 +3289,8 @@ impl Agents {
                         failure = Some(error.to_string());
                         break;
                     }
-                    if let Err(error) = self.set_status(&id, SessionStatus::WaitingInput).await {
+                    let next_status = handle.derived_running_status().await;
+                    if let Err(error) = self.set_status(&id, next_status).await {
                         if !matches!(error, Error::Closed) {
                             self.0.failed.store(true, Ordering::Release);
                         }
@@ -3596,6 +3596,7 @@ impl Agents {
             .remove(request_id)
             .ok_or(Error::NotFound)?;
         let record_id = handle.records.lock().await.remove(request_id);
+        let next_status = handle.derived_running_status().await;
         // The translator's reply task owns the control_response frame.
         let _ = reply.send(allow);
         drop(guard);
@@ -3611,7 +3612,7 @@ impl Agents {
                 result?;
             }
         }
-        self.set_status(id, SessionStatus::Running).await?;
+        self.set_status(id, next_status).await?;
         Ok(())
     }
 
@@ -3642,8 +3643,8 @@ impl Agents {
             .records
             .lock()
             .await
-            .get(&format!("q:{request_id}"))
-            .cloned();
+            .remove(&format!("q:{request_id}"));
+        let next_status = handle.derived_running_status().await;
         let native = answers
             .into_iter()
             .filter_map(|answer| {
@@ -3670,7 +3671,7 @@ impl Agents {
                 result?;
             }
         }
-        self.set_status(id, SessionStatus::Running).await?;
+        self.set_status(id, next_status).await?;
         Ok(())
     }
 
@@ -5153,11 +5154,15 @@ impl Agents {
             .database
             .call(move |store| {
                 let head = store.session(&sid)?;
-                if let Some(mut native) = head
-                    .native_session
-                    .filter(|native| native.state == "archiving")
-                {
-                    native.native_id = store.agent_run(&sid)?.native_id;
+                let lifecycle = head.lifecycle;
+                let run_native_id = store.agent_run(&sid)?.native_id;
+                if let Some(mut native) = head.native_session.filter(|native| {
+                    native.state == "archiving"
+                        || (lifecycle == SessionLifecycle::Archived
+                            && native.state == "failed"
+                            && (native.native_id.is_some() || run_native_id.is_some()))
+                }) {
+                    native.native_id = run_native_id.or(native.native_id);
                     native.state = "archived".into();
                     native.error = None;
                     store.set_native_session(&sid, native)?;
@@ -5722,6 +5727,66 @@ mod persistence_tests {
             .await
             .unwrap();
         assert_eq!(responsibilities, 0);
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finish_close_converges_timed_out_failed_archive_native_state() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let head = agents
+            .create(CreateAgentSession {
+                agent: AgentKind::Claude,
+                title: "timed out archive".into(),
+                workspace: root.path().to_string_lossy().into_owned(),
+                auto_approve: false,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id: None,
+                resume: None,
+            })
+            .await
+            .unwrap();
+        let session_id = head.id.clone();
+        database
+            .call_control("test.archive_timed_out", move |store| {
+                store.begin_agent_turn(&session_id)?;
+                store.set_agent_native_id(&session_id, 1, "native-session-1")?;
+                store.set_native_session(
+                    &session_id,
+                    NativeSession {
+                        output_start_seq: None,
+                        runtime_id: session_id.clone(),
+                        native_id: Some("native-session-1".into()),
+                        managed: true,
+                        state: "failed".into(),
+                        error: Some("Timed out".into()),
+                    },
+                )?;
+                store.archive_agent_session_for_stop(&session_id, true)?;
+                store.clear_agent_execution_unknown(&session_id)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            agents
+                .release_confirmed_archived_idle(&head.id)
+                .await
+                .unwrap()
+        );
+        let current = database
+            .read("test.archived_session", move |store| store.session(&head.id))
+            .await
+            .unwrap();
+        let native = current.native_session.unwrap();
+        assert_eq!(native.state, "archived");
+        assert_eq!(native.native_id.as_deref(), Some("native-session-1"));
+        assert_eq!(native.error, None);
         database.shutdown().await.unwrap();
     }
 }

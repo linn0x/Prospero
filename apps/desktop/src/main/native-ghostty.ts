@@ -51,6 +51,8 @@ type NativeSession = {
   readOnlyInputFailureNotified: boolean;
   streamSocket: WebSocket;
   bounds: Omit<GhosttySurfaceUpdate, "focus" | "preserveGrid">;
+  surfacePhase: "pre_surface" | "mounted";
+  pendingError?: string;
   surfaceReady: boolean;
   daemonGrid?: { columns: number; rows: number };
   desiredGrid?: { columns: number; rows: number };
@@ -101,12 +103,25 @@ export class NativeGhosttyManager {
     private readonly appPath: string,
     private readonly openSocket: (sessionId: string) => WebSocket,
     private readonly supportsSession: (sessionId: string) => Promise<boolean>,
-    private readonly publishState: (id: number, state: TerminalStreamState) => void,
-    private readonly publishError: (id: number, message: string) => void,
+    private readonly onState: (id: number, state: TerminalStreamState) => void,
+    private readonly onError: (id: number, message: string) => void,
     private readonly publishShortcut: (id: number, action: "toggle-focus" | "project-search" | "terminal-search") => void,
     private readonly publishFocus: (id: number, focused: boolean) => void,
-  private readonly publishPasteImage: (id: number) => boolean,
+    private readonly publishPasteImage: (id: number) => boolean,
   ) {}
+
+  private publishState(session: NativeSession): void {
+    if (session.surfacePhase !== "mounted") return;
+    this.onState(session.id, session.controllerState);
+  }
+
+  private publishError(session: NativeSession, message: string): void {
+    if (session.surfacePhase !== "mounted") {
+      session.pendingError = message;
+      return;
+    }
+    this.onError(session.id, message);
+  }
 
   availability(): { available: boolean; reason?: string } {
     if (process.env["PROSPERO_NATIVE_GHOSTTY"] === "0") return { available: false, reason: "Native Ghostty is disabled" };
@@ -251,11 +266,11 @@ export class NativeGhosttyManager {
             if (state.connected && state.controller && !state.exited) sessionRef.readOnlyInputFailureNotified = false;
             if (state.connected && state.controller && !state.exited) this.flushResizeRequest(sessionRef);
             if (wasSyncing && state.connected && !state.syncing) this.restoreSurfaceBounds(sessionRef);
+            this.publishState(sessionRef);
           }
-          this.publishState(id ?? ghosttySessionId, state);
         },
-        onError: message => this.publishError(id ?? ghosttySessionId, message),
-        onHistoryGap: message => this.publishError(id ?? ghosttySessionId, message),
+        onError: message => { if (sessionRef) this.publishError(sessionRef, message); },
+        onHistoryGap: message => { if (sessionRef) this.publishError(sessionRef, message); },
       });
       controller = terminalController;
       const operations = new NativeTerminalOperationQueue((operation: NativeTerminalOperation) => {
@@ -269,6 +284,7 @@ export class NativeGhosttyManager {
         preSurfaceBuffers: [], preSurfaceBytes: 0,
         filter: queryFilter, pendingAcks, controller: terminalController, operations, controllerState: { connected: false, syncing: true, readOnly: true, exited: false, controller: false }, controllerAttached: false, readOnlyInputFailureNotified: false, resizeRequestActive: false, busyInputNotified: false, inputQueueFullNotified: false,
         streamSocket, bounds: { x: 0, y: 0, width: 0, height: 0, visible: true }, closing: false,
+        surfacePhase: "pre_surface",
         surfaceReady: false,
       };
       id = ghosttySessionId;
@@ -302,7 +318,7 @@ export class NativeGhosttyManager {
               if (!session.controllerState.connected || !session.controllerState.controller || session.controllerState.exited) {
                 if (!session.readOnlyInputFailureNotified) {
                   session.readOnlyInputFailureNotified = true;
-                  this.publishError(session.id, "Terminal input is disabled while this session is read-only");
+                  this.publishError(session, "Terminal input is disabled while this session is read-only");
                 }
               } else void session.operations.enqueueInput(frame.payload).then(() => {
                 session.busyInputNotified = false;
@@ -313,16 +329,16 @@ export class NativeGhosttyManager {
                 if (/\bbusy\b/i.test(message)) {
                   if (session.busyInputNotified) return;
                   session.busyInputNotified = true;
-                  this.publishError(session.id, "The terminal was busy; this input was not accepted or replayed. Send it again when ready.");
+                  this.publishError(session, "The terminal was busy; this input was not accepted or replayed. Send it again when ready.");
                   return;
                 }
                 if (/operation queue is full/i.test(message)) {
                   if (session.inputQueueFullNotified) return;
                   session.inputQueueFullNotified = true;
-                  this.publishError(session.id, "The terminal input queue is full; this input was not accepted. Wait, then send it again.");
+                  this.publishError(session, "The terminal input queue is full; this input was not accepted. Wait, then send it again.");
                   return;
                 }
-                this.publishError(session.id, message);
+                this.publishError(session, message);
               });
             }
             else if (frame.kind === "R") {
@@ -394,6 +410,7 @@ export class NativeGhosttyManager {
         session.id = surfaceId; this.sessions.set(surfaceId, session); owned.add(surfaceId);
         id = surfaceId;
       }
+      session.surfacePhase = "mounted";
       session.surfaceReady = true;
       this.setReadOnly(session, true);
       if (!session.peer) {
@@ -417,7 +434,12 @@ export class NativeGhosttyManager {
         session.preSurfaceBytes = 0;
       }
       if (session.daemonGrid) this.setAuthoritativeGrid(session, session.daemonGrid.columns, session.daemonGrid.rows);
-      this.publishState(surfaceId, session.controllerState);
+      this.publishState(session);
+      if (session.pendingError !== undefined) {
+        const pendingError = session.pendingError;
+        delete session.pendingError;
+        this.publishError(session, pendingError);
+      }
       return surfaceId;
     } catch (error) {
       if (id !== undefined) this.close(id);
@@ -497,10 +519,10 @@ export class NativeGhosttyManager {
   private failSession(id: number, message: string): void {
     const session = this.sessions.get(id);
     if (!session) return;
-    this.publishError(id, message);
+    this.publishError(session, message);
     const disconnected: TerminalStreamState = { ...session.controllerState, connected: false, syncing: false, controller: false, readOnly: true };
     session.controllerState = disconnected;
-    this.publishState(id, disconnected);
+    this.publishState(session);
     this.close(id);
   }
 
@@ -562,7 +584,7 @@ export class NativeGhosttyManager {
     }
     if (!session.surfaceReady) return;
     try { this.loadAddon().setGrid?.(session.id, columns, rows); }
-    catch (error) { this.publishError(session.id, error instanceof Error ? error.message : String(error)); }
+    catch (error) { this.publishError(session, error instanceof Error ? error.message : String(error)); }
     this.flushResizeRequest(session);
   }
 
@@ -589,7 +611,7 @@ export class NativeGhosttyManager {
         session.resizeRetryTimer.unref?.();
       } else {
         if (session.desiredGrid?.columns === sent.columns && session.desiredGrid.rows === sent.rows) delete session.desiredGrid;
-        this.publishError(session.id, message);
+        this.publishError(session, message);
       }
     }).finally(() => {
       session.resizeRequestActive = false;
@@ -599,12 +621,12 @@ export class NativeGhosttyManager {
 
   private setReadOnly(session: NativeSession, readOnly: boolean): void {
     try { this.loadAddon().setReadOnly?.(session.id, readOnly); }
-    catch (error) { this.publishError(session.id, error instanceof Error ? error.message : String(error)); }
+    catch (error) { this.publishError(session, error instanceof Error ? error.message : String(error)); }
   }
 
   private restoreSurfaceBounds(session: NativeSession): void {
     if (session.bounds.width <= 0 || session.bounds.height <= 0) return;
     try { this.loadAddon().update(session.id, session.bounds); }
-    catch (error) { this.publishError(session.id, error instanceof Error ? error.message : String(error)); }
+    catch (error) { this.publishError(session, error instanceof Error ? error.message : String(error)); }
   }
 }

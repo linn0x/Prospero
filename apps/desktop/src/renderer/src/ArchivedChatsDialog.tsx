@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArchiveRestore } from 'lucide-react';
 import type { SessionInfo } from '../../shared/types';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from './components/ui/dialog';
@@ -19,7 +19,14 @@ export function ArchivedChatsDialog({ ids, onClose, onOpen }: { ids: string[]; o
   const [binding, setBinding] = useState<SessionInfo>();
   const [retry, setRetry] = useState(0);
   const key = ids.join(",");
+  const previousKey = useRef(key);
   useEffect(() => {
+    const keyChanged = previousKey.current !== key;
+    previousKey.current = key;
+    if (keyChanged && cursor !== undefined) {
+      setCursor(undefined);
+      return;
+    }
     let cancelled = false;
     setLoading(true); setError(undefined);
     void window.prospero.listSessions({ terminal: true, ...(cursor ? {cursor} : {}), limit: 100 }).then(page => {

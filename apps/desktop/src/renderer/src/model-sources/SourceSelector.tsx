@@ -24,7 +24,7 @@ export function SourceSelector({ sources, loading, error, value, agent, effort, 
   const source = sources.find(item => item.id === value?.sourceId);
   const selection = selectedSourceRoute(sources, value, agent);
   const supportedEfforts = selection?.route.protocol !== "openai_chat_completions" ? (selection?.route.modelCapabilities?.supportedEfforts ?? []) : [];
-  const activeEffort = effort && supportedEfforts.includes(effort) ? effort : selection?.route.defaultEffort;
+  const activeEffort = effort && supportedEfforts.some(level => level === effort) ? effort : selection?.route.defaultEffort;
   return <div className="model-source-selector">
     <div className="model-source-selector-fields">
       <Field>
@@ -51,7 +51,7 @@ export function SourceSelector({ sources, loading, error, value, agent, effort, 
           <div className="flex items-center justify-between gap-2 min-h-6">
             <FieldLabel htmlFor="session-source-effort">{t("推理强度", "Reasoning effort")}</FieldLabel>
           </div>
-          <NativeSelect id="session-source-effort" disabled={disabled || loading} value={effort && supportedEfforts.includes(effort) ? effort : ""} onChange={event => onEffortChange(event.target.value || undefined)}>
+          <NativeSelect id="session-source-effort" disabled={disabled || loading} value={effort && supportedEfforts.some(level => level === effort) ? effort : ""} onChange={event => onEffortChange(event.target.value || undefined)}>
             <NativeSelectOption value="">{selection.route.defaultEffort ? `${t("路由默认", "Route default")} (${selection.route.defaultEffort})` : t("使用模型默认值", "Use model default")}</NativeSelectOption>
             {supportedEfforts.map(level => <NativeSelectOption key={level} value={level}>{level}</NativeSelectOption>)}
           </NativeSelect>

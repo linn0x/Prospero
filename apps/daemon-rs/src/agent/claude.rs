@@ -665,14 +665,27 @@ pub(super) fn spawn_turn(
             }
             Quiescence::Unknown => Some("Claude executor process group exit is unknown".into()),
         };
+        let finish_error = if translator.aborted {
+            None
+        } else {
+            translator.error.or(wait_error)
+        };
+        let reason = if translator.interrupted {
+            "工具调用已中断"
+        } else {
+            finish_error
+                .as_deref()
+                .unwrap_or("Claude event stream closed before tool result")
+        };
+        for event in translator.in_flight_tools.drain_unfinished(reason) {
+            if events_tx.send(event).await.is_err() {
+                return;
+            }
+        }
         events_tx
             .send(AdapterEvent::Finish {
                 interrupted: translator.interrupted,
-                error: if translator.aborted {
-                    None
-                } else {
-                    translator.error.or(wait_error)
-                },
+                error: finish_error,
                 cost_usd: translator.cost_usd,
                 input_tokens: translator.input_tokens,
                 output_tokens: translator.output_tokens,
@@ -847,6 +860,7 @@ struct Translator {
     /// only carry the block index; ownership comes from the parent id).
     block_owners: HashMap<u32, String>,
     tool_names: HashMap<String, String>,
+    in_flight_tools: super::turn_stream::InFlightTools,
     /// Native task/tool-use ids -> public subagent id (mirrors the legacy
     /// adapter's taskAgents map).
     task_agents: HashMap<String, String>,
@@ -979,6 +993,11 @@ impl Translator {
                                 .unwrap_or("tool")
                                 .to_owned();
                             self.tool_names.insert(call_id.to_owned(), name.clone());
+                            self.in_flight_tools.record_start_with_subagent(
+                                agent.as_deref(),
+                                call_id,
+                                &name,
+                            );
                             let summary = block.get("input").map(tool_summary).unwrap_or_default();
                             out.push(AdapterEvent::ToolCall {
                                 subagent: agent.clone(),
@@ -1023,6 +1042,8 @@ impl Translator {
                                 ),
                                 _ => String::new(),
                             };
+                            self.in_flight_tools
+                                .record_result_with_subagent(agent.as_deref(), &call_id);
                             out.push(AdapterEvent::ToolResult {
                                 subagent: agent.clone(),
                                 name: self
@@ -1148,6 +1169,12 @@ impl Translator {
                         .unwrap_or_else(|| "agent run failed".to_owned());
                     self.error = Some(detail);
                 }
+                let reason = if self.interrupted {
+                    "工具调用已中断"
+                } else {
+                    self.error.as_deref().unwrap_or("工具调用未返回结果")
+                };
+                out.extend(self.in_flight_tools.drain_unfinished(reason));
             }
             _ => {}
         }

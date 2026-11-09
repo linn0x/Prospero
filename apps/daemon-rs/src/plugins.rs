@@ -430,7 +430,10 @@ impl PluginServiceSupervisor {
                 }
                 if let Ok(Some(state)) = self.0.store.get(&plugin.name, &service.id)
                     && state.config_key == service.config_key
-                    && state.status == PluginServiceStatus::Exited
+                    && matches!(
+                        state.status,
+                        PluginServiceStatus::Exited | PluginServiceStatus::Failed
+                    )
                 {
                     if state.next_restart_at.is_some() {
                         self.schedule_restart(plugin.name.clone(), service.id.clone(), state);
@@ -462,7 +465,7 @@ impl PluginServiceSupervisor {
                     };
                     let restart = restart_schedule(&base, &self.0.policy);
                     let state = state_now(PluginServiceState {
-                        status: PluginServiceStatus::Exited,
+                        status: PluginServiceStatus::Failed,
                         restart_count: restart.0,
                         next_restart_at: restart.1,
                         restart_window_started_at: restart.2,
@@ -1010,7 +1013,10 @@ impl PluginServiceSupervisor {
                 _ => return,
             };
             if current.mode != PluginServiceMode::Auto
-                || current.status != PluginServiceStatus::Exited
+                || !matches!(
+                    current.status,
+                    PluginServiceStatus::Exited | PluginServiceStatus::Failed
+                )
                 || current.next_restart_at != Some(next)
             {
                 return;
@@ -1021,7 +1027,7 @@ impl PluginServiceSupervisor {
             {
                 let restart = restart_schedule(&current, &supervisor.0.policy);
                 let failed = state_now(PluginServiceState {
-                    status: PluginServiceStatus::Exited,
+                    status: PluginServiceStatus::Failed,
                     last_error: Some(error.to_string()),
                     restart_count: restart.0,
                     next_restart_at: restart.1,
@@ -2137,12 +2143,47 @@ fn same_runtime(state: &PluginServiceState, runtime: &Runtime) -> bool {
         && state.status == PluginServiceStatus::Running
 }
 
+fn service_health_fields(
+    state: &PluginServiceState,
+) -> (
+    crate::protocol::RuntimeHealthStatus,
+    Vec<String>,
+    Vec<String>,
+) {
+    let degraded = state.status == PluginServiceStatus::Failed
+        || state.health == PluginServiceHealth::Unhealthy;
+    let degraded_reasons = if degraded {
+        state
+            .last_error
+            .clone()
+            .or_else(|| state.health_error.clone())
+            .or_else(|| Some("service_unhealthy".into()))
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let recent_errors = state
+        .health_error
+        .iter()
+        .chain(state.last_error.iter())
+        .cloned()
+        .collect();
+    let runtime_health = if degraded {
+        crate::protocol::RuntimeHealthStatus::Degraded
+    } else {
+        crate::protocol::RuntimeHealthStatus::Healthy
+    };
+    (runtime_health, degraded_reasons, recent_errors)
+}
+
 fn view_for(
     store: &PluginServiceStore,
     plugin: &ProsperoPluginManifest,
     service: &PluginServiceManifest,
     state: PluginServiceState,
 ) -> PluginServiceView {
+    let (runtime_health, degraded_reasons, recent_errors) = service_health_fields(&state);
     PluginServiceView {
         plugin_id: state.plugin_id,
         service_id: state.service_id,
@@ -2160,9 +2201,9 @@ fn view_for(
         restart_count: state.restart_count,
         next_restart_at: state.next_restart_at,
         config_key: state.config_key,
-        runtime_health: crate::protocol::RuntimeHealthStatus::Healthy,
-        degraded_reasons: Vec::new(),
-        recent_errors: Vec::new(),
+        runtime_health,
+        degraded_reasons,
+        recent_errors,
         configured: true,
         plugin_root: Some(plugin.root.clone()),
         command: Some(service.command.clone()),
@@ -2173,6 +2214,7 @@ fn view_for(
 
 fn orphan_view(store: &PluginServiceStore, state: PluginServiceState) -> PluginServiceView {
     let log_files = store.log_files(&state.plugin_id, &state.service_id);
+    let (runtime_health, degraded_reasons, recent_errors) = service_health_fields(&state);
     PluginServiceView {
         plugin_id: state.plugin_id,
         service_id: state.service_id,
@@ -2190,9 +2232,9 @@ fn orphan_view(store: &PluginServiceStore, state: PluginServiceState) -> PluginS
         restart_count: state.restart_count,
         next_restart_at: state.next_restart_at,
         config_key: state.config_key,
-        runtime_health: crate::protocol::RuntimeHealthStatus::Healthy,
-        degraded_reasons: Vec::new(),
-        recent_errors: Vec::new(),
+        runtime_health,
+        degraded_reasons,
+        recent_errors,
         configured: false,
         plugin_root: None,
         command: None,

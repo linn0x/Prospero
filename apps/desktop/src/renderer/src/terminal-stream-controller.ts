@@ -120,6 +120,12 @@ export class TerminalStreamController {
   acquire(takeover: boolean): Promise<void> { return this.operation(TerminalStreamKind.Acquire, { takeover }); }
   release(): Promise<void> { return this.operation(TerminalStreamKind.Release, new Uint8Array()); }
 
+  failOpen(): void {
+    if (this.disposed) return;
+    this.state = { ...this.state, connected: false, syncing: false, controller: false };
+    this.publish();
+  }
+
   close(): void {
     this.disposed = true;
     this.attachmentGeneration += 1;

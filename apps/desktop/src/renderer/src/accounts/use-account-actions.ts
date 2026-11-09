@@ -22,7 +22,7 @@ export function useAccountActions(snapshot: DesktopSnapshot, onOpenSession: (id:
   const loadingRef = useRef(false);
   const generation = useRef(0);
   const alive = useRef(true);
-  const refresh = useCallback(async (force = false) => {
+  const refresh = useCallback(async (force = false, background = false) => {
     if (loadingRef.current) return;
     if (!current.current.daemon.running) {
       setLoading(false);
@@ -31,7 +31,8 @@ export function useAccountActions(snapshot: DesktopSnapshot, onOpenSession: (id:
     }
     loadingRef.current = true;
     const token = ++generation.current;
-    setLoading(true); setRefreshError("");
+    if (!background) setLoading(true);
+    setRefreshError("");
     void loadAccountUsage(force).then(next => {
       if (alive.current && generation.current === token) setUsage(next);
     }).catch(() => {
@@ -61,15 +62,20 @@ export function useAccountActions(snapshot: DesktopSnapshot, onOpenSession: (id:
     return () => clearTimeout(timer);
   }, [notice]);
   const perform = async (key: string, action: () => Promise<void>, failureMessage?: string) => {
-    if (busyRef.current || loadingRef.current) return false;
+    if (busyRef.current) return false;
     if (!current.current.daemon.running) {
       setError({ key, message: t("启动本地服务后可管理账号。", "Start the local service to manage accounts.") });
       return false;
     }
+    if (loadingRef.current) {
+      generation.current += 1;
+      loadingRef.current = false;
+      setLoading(false);
+    }
     busyRef.current = key; setBusy(key); setError(undefined); setNotice("");
     try {
       await action();
-      if (alive.current) void refresh();
+      if (alive.current) void refresh(false, true);
       return true;
     } catch (reason) {
       if (alive.current) setError({ key, message: failureMessage ?? reportError(reason) });

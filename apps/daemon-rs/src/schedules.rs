@@ -300,6 +300,7 @@ struct State {
     agents: Agents,
     closed: AtomicBool,
     inflight: Mutex<HashSet<String>>,
+    write_lock: std::sync::Mutex<()>,
     parsed: std::sync::Mutex<ParsedSchedules>,
     changed: watch::Sender<u64>,
 }
@@ -319,6 +320,7 @@ impl Schedules {
             agents,
             closed: AtomicBool::new(false),
             inflight: Mutex::new(HashSet::new()),
+            write_lock: std::sync::Mutex::new(()),
             parsed: std::sync::Mutex::new(ParsedSchedules::default()),
             changed: watch::channel(0).0,
         }))
@@ -456,6 +458,7 @@ impl Schedules {
     }
 
     pub fn update(&self, input: ScheduleUpdate) -> Result<ScheduledAgentTask> {
+        let _guard = self.0.write_lock.lock().map_err(|_| Error::Closed)?;
         let current = self.get(&input.id)?;
         let now = now();
         let rrule_changed = input.rrule.is_some();
@@ -482,6 +485,7 @@ impl Schedules {
             task.next_run_at = next_run_after(&task.rrule, now)?;
         }
         self.write(&task)?;
+        drop(_guard);
         self.publish();
         Ok(task)
     }
@@ -664,13 +668,15 @@ impl Schedules {
         session_id: Option<String>,
         error: Option<String>,
     ) -> Result<ScheduledAgentTask> {
-        let mut updated = task.clone();
+        let _guard = self.0.write_lock.lock().map_err(|_| Error::Closed)?;
+        let mut updated = self.read(&task.id)?.unwrap_or_else(|| task.clone());
         updated.last_run_at = Some(timestamp);
         updated.next_run_at = next_run_after(&updated.rrule, timestamp)?;
         updated.updated_at = now();
         updated.last_session_id = session_id.or(updated.last_session_id);
         updated.last_error = error.map(|value| value.chars().take(MAX_ERROR_CHARS).collect());
         self.write(&updated)?;
+        drop(_guard);
         self.publish();
         Ok(updated)
     }

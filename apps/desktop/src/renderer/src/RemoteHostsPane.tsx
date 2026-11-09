@@ -59,10 +59,13 @@ export default function RemoteHostsPane({ settings = { terminalFontFamily: "mono
       if (!sid && available[0]) setSid(available[0].id);
       return;
     }
-    selectedRef.current = hostId; setSelected(hostId); setSid(undefined); setSessions([]); setStatus(t("连接中…", "Connecting…")); setConnected(false);
+    const connectingStatus = t("连接中…", "Connecting…");
+    selectedRef.current = hostId; setSelected(hostId); setSid(undefined); setSessions([]); setStatus(connectingStatus); setConnected(false);
     await window.prospero.connectRemoteHost(hostId);
     const available = await window.prospero.listRemoteShells(hostId);
+    if (selectedRef.current !== hostId) return;
     setSessions(available); setConnected(true);
+    setStatus((current) => current === connectingStatus ? t("已连接", "Connected") : current);
     if (available[0]) setSid(available[0].id);
     else setSid(await window.prospero.createRemoteShell(hostId, cwd.trim() || undefined));
   };

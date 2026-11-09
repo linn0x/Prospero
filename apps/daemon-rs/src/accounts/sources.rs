@@ -552,6 +552,14 @@ pub(crate) struct BoundRoute {
     pub secret: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SyncedBinding {
+    pub account_id: String,
+    pub account_name: String,
+    pub profile: ApiProfile,
+    pub secret: String,
+}
+
 pub struct ModelSources {
     root: PathBuf,
     file: PathBuf,
@@ -1097,9 +1105,109 @@ impl ModelSources {
         }
         self.registry.sources[index].revision += 1;
         self.registry.sources[index].updated_at = crate::database::now();
+        self.sync_source_bindings(&source_id)?;
         let source = self.registry.sources[index].clone();
         self.save()?;
         Ok(enrich_source_view(source))
+    }
+
+    fn sync_source_bindings(&mut self, source_id: &str) -> Result<()> {
+        let index = self.source_index(source_id)?;
+        let source = self.registry.sources[index].clone();
+        let mut updates = Vec::new();
+        for (binding_index, binding) in self.registry.bindings.iter().enumerate() {
+            if binding.source_id != source_id {
+                continue;
+            }
+            let Some(route) = source
+                .routes
+                .iter()
+                .find(|route| route.id == binding.route_id)
+            else {
+                continue;
+            };
+            let Some(endpoint) = source
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.protocol == route.protocol)
+            else {
+                continue;
+            };
+            let Some(info) = source
+                .credentials
+                .iter()
+                .find(|credential| credential.id == route.credential_id)
+            else {
+                continue;
+            };
+            let profile = route_profile(endpoint, route)?;
+            updates.push((
+                binding_index,
+                source.revision,
+                source.name.clone(),
+                if binding.legacy {
+                    binding.route_name.clone()
+                } else {
+                    route.name.clone()
+                },
+                info.id.clone(),
+                info.revision,
+                profile,
+                route.default_effort.clone(),
+            ));
+        }
+        for (
+            binding_index,
+            revision,
+            source_name,
+            route_name,
+            credential_id,
+            credential_revision,
+            profile,
+            default_effort,
+        ) in updates
+        {
+            let binding = &mut self.registry.bindings[binding_index];
+            binding.revision = revision;
+            binding.source_name = source_name;
+            binding.route_name = route_name;
+            binding.credential_id = credential_id;
+            binding.credential_revision = credential_revision;
+            binding.profile = profile;
+            binding.default_effort = default_effort;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn synced_bindings_for_source(&self, source_id: &str) -> Vec<SyncedBinding> {
+        let mut synced = Vec::new();
+        for binding in &self.registry.bindings {
+            if binding.source_id != source_id {
+                continue;
+            }
+            let Ok(secret) = self.credential_secret(
+                &binding.source_id,
+                &binding.credential_id,
+                binding.credential_revision,
+            ) else {
+                continue;
+            };
+            let account_name = if binding.legacy {
+                binding.route_name.chars().take(80).collect()
+            } else {
+                format!("{} / {}", binding.source_name, binding.route_name)
+                    .chars()
+                    .take(80)
+                    .collect()
+            };
+            synced.push(SyncedBinding {
+                account_id: binding.account_id.clone(),
+                account_name,
+                profile: binding.profile.clone(),
+                secret: secret.to_owned(),
+            });
+        }
+        synced
     }
 
     pub(crate) fn bind(

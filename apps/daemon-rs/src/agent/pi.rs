@@ -673,6 +673,7 @@ pub(super) async fn spawn_turn(
         let mut accumulated_thinking = String::new();
         let mut needs_paragraph_break = false;
         let mut tool_args: HashMap<String, Value> = HashMap::new();
+        let mut in_flight_tools = super::turn_stream::InFlightTools::default();
         let mut total_input_tokens: i64 = 0;
         let mut total_output_tokens: i64 = 0;
         let mut total_cost_usd: f64 = 0.0;
@@ -884,6 +885,7 @@ pub(super) async fn spawn_turn(
                     let args = frame.get("args").cloned().unwrap_or(Value::Null);
                     let summary = tool_summary(&args);
                     tool_args.insert(call_id.clone(), args);
+                    in_flight_tools.record_start(&call_id, &name);
                     let _ = events_tx
                         .send(AdapterEvent::ToolCall {
                             subagent: None,
@@ -913,6 +915,7 @@ pub(super) async fn spawn_turn(
                         .unwrap_or(false);
                     let result = frame.get("result").cloned().unwrap_or(Value::Null);
                     let args = tool_args.remove(&call_id).unwrap_or(Value::Null);
+                    in_flight_tools.record_result(&call_id);
                     let summary = extract_tool_result_text(&result);
                     let diff = extract_tool_diff(&args, &result);
                     if let Some(d) = &diff {
@@ -1095,14 +1098,23 @@ pub(super) async fn spawn_turn(
             Quiescence::Unknown => Some("Pi 进程组退出状态未知".into()),
         };
 
+        let finish_error = if aborted {
+            None
+        } else {
+            turn_error.or(wait_error)
+        };
+        let reason = if interrupted {
+            "工具调用已中断"
+        } else {
+            finish_error.as_deref().unwrap_or("工具调用未返回结果")
+        };
+        for event in in_flight_tools.drain_unfinished(reason) {
+            let _ = events_tx.send(event).await;
+        }
         let _ = events_tx
             .send(AdapterEvent::Finish {
                 interrupted,
-                error: if aborted {
-                    None
-                } else {
-                    turn_error.or(wait_error)
-                },
+                error: finish_error,
                 cost_usd: has_cost.then_some(total_cost_usd),
                 input_tokens: has_usage.then_some(total_input_tokens),
                 output_tokens: has_usage.then_some(total_output_tokens),

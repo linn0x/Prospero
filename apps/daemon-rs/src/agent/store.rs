@@ -95,6 +95,7 @@ pub(crate) type ClaimedCrossModelCheck = (super::CrossModelCheck, String);
 
 const CROSS_MODEL_REPORT_BYTES: usize = 60_000;
 const CROSS_MODEL_REPORT_CHILDREN: usize = 100;
+const CROSS_MODEL_FAN_IN_CLAIM_LEASE_MILLIS: i64 = 60_000;
 // Timeline metadata is capped at 8192 bytes after JSON escaping. Keep enough
 // headroom for quotes/backslashes expanding to two bytes plus the remaining
 // subagent-card fields.
@@ -528,18 +529,35 @@ impl Store {
         parent_session_id: &str,
     ) -> Result<Option<CrossModelFanIn>> {
         crate::database::validate_id(parent_session_id)?;
-        let pending: i64 = self.connection.query_row(
+        let now = crate::database::now();
+        let expired_before = now.saturating_sub(CROSS_MODEL_FAN_IN_CLAIM_LEASE_MILLIS);
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM agent_message_queue WHERE session_id=?1 AND cross_model_claim_id IN ( \
+                 SELECT summary_claim_id FROM cross_model_children \
+                 WHERE parent_session_id=?1 AND summary_delivered=0 AND summary_claim_id IS NOT NULL \
+                 AND (summary_claimed_at IS NULL OR summary_claimed_at<=?2) \
+             )",
+            params![parent_session_id, expired_before],
+        )?;
+        transaction.execute(
+            "UPDATE cross_model_children SET summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 \
+             WHERE parent_session_id=?2 AND summary_delivered=0 AND summary_claim_id IS NOT NULL \
+             AND (summary_claimed_at IS NULL OR summary_claimed_at<=?3)",
+            params![now, parent_session_id, expired_before],
+        )?;
+        let pending: i64 = transaction.query_row(
             "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND status IN ('starting','running')",
             [parent_session_id], |row| row.get(0),
         )?;
-        let undelivered: i64 = self.connection.query_row(
+        let undelivered: i64 = transaction.query_row(
             "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND summary_claim_id IS NULL AND status IN ('completed','failed','stopped')",
             [parent_session_id], |row| row.get(0),
         )?;
         if undelivered == 0 {
+            transaction.commit()?;
             return Ok(None);
         }
-        let transaction = self.connection.transaction()?;
         let mut rows = Vec::new();
         {
             let mut statement = transaction.prepare(
@@ -938,16 +956,20 @@ impl Store {
         if let Some(parent) = after_parent {
             crate::database::validate_id(parent)?;
         }
+        let expired_before =
+            crate::database::now().saturating_sub(CROSS_MODEL_FAN_IN_CLAIM_LEASE_MILLIS);
         let mut statement = self.connection.prepare(
             "SELECT c.parent_session_id FROM cross_model_children c \
              JOIN session_heads h ON h.id=c.parent_session_id \
              WHERE h.lifecycle='active' AND (?1 IS NULL OR c.parent_session_id>?1) \
              GROUP BY c.parent_session_id \
-             HAVING sum(c.summary_delivered=0 AND c.summary_claim_id IS NULL AND c.status IN ('completed','failed','stopped'))>0 \
+             HAVING sum(c.summary_delivered=0 AND (c.summary_claim_id IS NULL OR c.summary_claimed_at IS NULL OR c.summary_claimed_at<=?3) AND c.status IN ('completed','failed','stopped'))>0 \
              ORDER BY c.parent_session_id LIMIT ?2",
         )?;
         statement
-            .query_map(params![after_parent, limit], |row| row.get(0))?
+            .query_map(params![after_parent, limit, expired_before], |row| {
+                row.get(0)
+            })?
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(Error::from)
     }
@@ -970,10 +992,14 @@ impl Store {
             return Err(Error::Conflict);
         }
         let now = crate::database::now();
-        self.connection.execute(
-            "UPDATE cross_model_children SET summary_acknowledged=1,summary_acknowledged_at=?1,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3",
-            params![now, parent_session_id, child_session_id],
+        let expired_before = now.saturating_sub(CROSS_MODEL_FAN_IN_CLAIM_LEASE_MILLIS);
+        let changed = self.connection.execute(
+            "UPDATE cross_model_children SET summary_acknowledged=1,summary_acknowledged_at=?1,updated_at=?1 WHERE parent_session_id=?2 AND child_session_id=?3 AND summary_delivered=1 AND NOT (summary_claim_id IS NOT NULL AND summary_delivered=0 AND summary_claimed_at>?4)",
+            params![now, parent_session_id, child_session_id, expired_before],
         )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
         self.cross_model_child(child_session_id)
     }
 
@@ -3132,5 +3158,63 @@ mod tests {
                 .body,
             TimelineBody::PermissionRequest { resolved: true, .. }
         ));
+    }
+
+    #[test]
+    fn expired_fan_in_claim_lease_is_reclaimable_and_cleans_unconsumed_queue_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = active_child_session(&mut store, "parent");
+        let child = active_child_session(&mut store, "child");
+        store
+            .register_cross_model_child(&child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .complete_cross_model_child(&child, 1, "completed", Some("done"))
+            .unwrap();
+
+        let first = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(first.children, vec![(child.clone(), 1)]);
+        assert!(store.pending_cross_model_fan_in_parents().unwrap().is_empty());
+        assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
+        assert!(matches!(
+            store.acknowledge_cross_model_child(&parent, &child),
+            Err(Error::Conflict)
+        ));
+
+        store
+            .enqueue_message(
+                &parent,
+                &QueuedRow {
+                    id: "queued-fan-in".into(),
+                    kind: "queue".into(),
+                    text: first.report.clone(),
+                    created_at: crate::database::now(),
+                    attachments: Vec::new(),
+                    cross_model_claim_id: Some(first.claim_id.clone()),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.message_queue(&parent).unwrap().len(), 1);
+
+        let expired_at =
+            crate::database::now().saturating_sub(CROSS_MODEL_FAN_IN_CLAIM_LEASE_MILLIS + 1);
+        store
+            .connection
+            .execute(
+                "UPDATE cross_model_children SET summary_claimed_at=?1 WHERE child_session_id=?2",
+                params![expired_at, child],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.pending_cross_model_fan_in_parents().unwrap(),
+            vec![parent.clone()]
+        );
+        let reclaimed = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_ne!(reclaimed.claim_id, first.claim_id);
+        assert_eq!(reclaimed.children, vec![(child.clone(), 1)]);
+        assert!(store.message_queue(&parent).unwrap().is_empty());
     }
 }

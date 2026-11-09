@@ -1381,10 +1381,13 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
 
 fn remote_session_info(head: SessionHead) -> JsonValue {
     let archived = head.lifecycle == SessionLifecycle::Archived
-        && head
-            .native_session
-            .as_ref()
-            .is_none_or(|native| !matches!(native.state.as_str(), "archiving" | "failed"));
+        && head.native_session.as_ref().is_none_or(|native| {
+            if head.kind == SessionKind::Structured {
+                native.state != "archiving"
+            } else {
+                !matches!(native.state.as_str(), "archiving" | "failed")
+            }
+        });
     let mut value = json!({
         "id": head.id,
         "archived": archived,
@@ -4290,6 +4293,7 @@ async fn device_revoke(
     if pairing::revoke_device(api.database.directory(), &id)?.is_none() {
         return Err(ApiError(Error::NotFound));
     }
+    api.relay_status.notify();
     api.publish();
     Ok(Json(DeviceRevoked { ok: true, id }))
 }
@@ -4364,6 +4368,7 @@ async fn pairing_create(
         let _ = pairing::revoke_device(home, &pairing::device_id(&device));
         return Err(ApiError(error));
     }
+    api.relay_status.notify();
     api.publish();
     Ok(Json(PairingCreated {
         device: device_view(&issued),
@@ -4460,6 +4465,7 @@ async fn relay_update(
         &devices,
         api.dev_mode,
     ));
+    api.relay_status.notify();
     api.publish();
     Ok(Json(relay_view(&api)?))
 }
@@ -5314,7 +5320,55 @@ async fn model_sources_route(
                             sources.create(action)?;
                         }
                         _ => {
-                            let _ = sources.change(action, &known)?;
+                            let source = sources.change(action, &known)?;
+                            for synced in sources.synced_bindings_for_source(&source.id) {
+                                if let Ok(record) = store.managed_account(&synced.account_id) {
+                                    let profile_json = serde_json::to_string(&synced.profile)?;
+                                    let connection_changed =
+                                        record.api_profile.as_ref() != Some(&synced.profile);
+                                    let root =
+                                        crate::accounts::managed::profile_account_root_for_agent(
+                                            &data,
+                                            &synced.account_id,
+                                            record.agent,
+                                        )?;
+                                    let secret_changed =
+                                        crate::accounts::managed::read_credential(&root)?
+                                            .map(|cred| cred.secret != synced.secret)
+                                            .unwrap_or(true);
+                                    if secret_changed {
+                                        crate::accounts::managed::write_credential(
+                                            &root,
+                                            &crate::accounts::managed::Credential {
+                                                kind:
+                                                    crate::accounts::managed::CredentialKind::ApiKey,
+                                                secret: synced.secret,
+                                            },
+                                        )?;
+                                    }
+                                    if connection_changed || secret_changed {
+                                        store.connection.execute(
+                                            "UPDATE managed_accounts SET name=?1,updated_at=?2,api_profile=?3,api_validation=NULL,api_validation_revision=NULL,api_engine_validation=NULL,api_engine_validation_revision=NULL WHERE id=?4",
+                                            rusqlite::params![
+                                                synced.account_name,
+                                                crate::database::now(),
+                                                profile_json,
+                                                synced.account_id
+                                            ],
+                                        )?;
+                                    } else if record.name != synced.account_name {
+                                        store.connection.execute(
+                                            "UPDATE managed_accounts SET name=?1,updated_at=?2,api_profile=?3 WHERE id=?4",
+                                            rusqlite::params![
+                                                synced.account_name,
+                                                crate::database::now(),
+                                                profile_json,
+                                                synced.account_id
+                                            ],
+                                        )?;
+                                    }
+                                }
+                            }
                         }
                     }
                     Ok(sources.list())

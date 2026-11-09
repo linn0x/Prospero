@@ -66,20 +66,13 @@ impl Default for TurnStreamStateMachine {
 }
 
 impl TurnStreamStateMachine {
+    #[cfg(test)]
     pub fn phase(&self) -> TurnPhase {
         self.phase
     }
 
     pub fn is_result_received(&self) -> bool {
         self.result_received
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.phase == TurnPhase::Finished
-    }
-
-    pub fn assistant_text(&self) -> &str {
-        &self.assistant_text
     }
 
     pub fn observe_native_id(&mut self, id: &str, out: &mut Vec<AdapterEvent>) {
@@ -383,9 +376,119 @@ impl TurnStreamStateMachine {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlightTool {
+    subagent: Option<String>,
+    call_id: String,
+    name: String,
+}
+
+/// Tracks in-flight tool calls in insertion order so non-`agy` turn streams can
+/// settle any unfinished tool calls with `AdapterEvent::ToolResult { error: true }`
+/// before emitting `AdapterEvent::Finish`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct InFlightTools {
+    entries: Vec<InFlightTool>,
+}
+
+impl InFlightTools {
+    pub fn record_start(&mut self, id: &str, name: &str) {
+        self.record_start_with_subagent(None, id, name);
+    }
+
+    pub fn record_start_with_subagent(&mut self, subagent: Option<&str>, id: &str, name: &str) {
+        if id.is_empty() {
+            return;
+        }
+        let normalized_name = if name.is_empty() { "tool" } else { name };
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.call_id == id && entry.subagent.as_deref() == subagent)
+        {
+            existing.name = normalized_name.to_owned();
+            return;
+        }
+        self.entries.push(InFlightTool {
+            subagent: subagent.map(str::to_owned),
+            call_id: id.to_owned(),
+            name: normalized_name.to_owned(),
+        });
+    }
+
+    pub fn record_result(&mut self, id: &str) {
+        self.record_result_with_subagent(None, id);
+    }
+
+    pub fn record_result_with_subagent(&mut self, subagent: Option<&str>, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        self.entries.retain(|entry| {
+            !(entry.call_id == id
+                && (subagent.is_none() || entry.subagent.as_deref() == subagent))
+        });
+    }
+
+    pub fn drain_unfinished(&mut self, reason: &str) -> Vec<AdapterEvent> {
+        let summary = if reason.trim().is_empty() {
+            "工具调用未返回结果".to_owned()
+        } else {
+            reason.to_owned()
+        };
+        self.entries
+            .drain(..)
+            .map(|entry| AdapterEvent::ToolResult {
+                subagent: entry.subagent,
+                call_id: entry.call_id,
+                name: entry.name,
+                summary: summary.clone(),
+                error: true,
+                diff: None,
+                has_more: false,
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_flight_tools_drains_unfinished_in_order() {
+        let mut tools = InFlightTools::default();
+        tools.record_start("call-1", "Bash");
+        tools.record_start_with_subagent(Some("sub-1"), "call-2", "Read");
+        tools.record_start("call-3", "Edit");
+        tools.record_result("call-1");
+
+        let drained = tools.drain_unfinished("turn interrupted");
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(
+            &drained[0],
+            AdapterEvent::ToolResult {
+                subagent: Some(sub),
+                call_id,
+                name,
+                summary,
+                error: true,
+                ..
+            } if sub == "sub-1" && call_id == "call-2" && name == "Read" && summary == "turn interrupted"
+        ));
+        assert!(matches!(
+            &drained[1],
+            AdapterEvent::ToolResult {
+                subagent: None,
+                call_id,
+                name,
+                summary,
+                error: true,
+                ..
+            } if call_id == "call-3" && name == "Edit" && summary == "turn interrupted"
+        ));
+        assert!(tools.drain_unfinished("again").is_empty());
+    }
 
     #[test]
     fn emits_native_id_once_and_settles_open_tools_on_finalize() {

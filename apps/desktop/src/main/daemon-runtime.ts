@@ -46,6 +46,8 @@ export class DaemonRuntime {
   private elevatedManaged = false;
   private stopping = false;
   private restarting = false;
+  private startingPromise: Promise<{ ok: boolean; error?: string }> | undefined;
+  private stoppingPromise: Promise<{ ok: boolean; error?: string }> | undefined;
 
   constructor(private readonly store: StateStore) {}
 
@@ -54,6 +56,15 @@ export class DaemonRuntime {
   }
 
   async start(): Promise<{ ok: boolean; error?: string }> {
+    while (this.stoppingPromise) await this.stoppingPromise;
+    if (this.startingPromise) return this.startingPromise;
+    this.startingPromise = this.startInternal().finally(() => {
+      this.startingPromise = undefined;
+    });
+    return this.startingPromise;
+  }
+
+  private async startInternal(): Promise<{ ok: boolean; error?: string }> {
     if (this.store.snapshot().daemon.running || this.managed) return { ok: true };
     this.store.setStartupProgress(6, "检查 daemon 运行环境");
     const runtime = this.locateRuntime();
@@ -150,7 +161,15 @@ export class DaemonRuntime {
     return { ok: true };
   }
 
-  async stop(): Promise<{ ok: boolean; error?: string }> {
+  stop(): Promise<{ ok: boolean; error?: string }> {
+    if (this.stoppingPromise) return this.stoppingPromise;
+    this.stoppingPromise = this.stopInternal().finally(() => {
+      this.stoppingPromise = undefined;
+    });
+    return this.stoppingPromise;
+  }
+
+  private async stopInternal(): Promise<{ ok: boolean; error?: string }> {
     if (this.elevatedManaged && this.store.snapshot().daemon.running) {
       this.stopping = true;
       try {

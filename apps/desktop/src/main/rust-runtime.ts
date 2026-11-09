@@ -348,13 +348,13 @@ export class RustRuntime {
   private orchestrationConnection: string | undefined;
   private nextDevicesPollAt = 0;
   private slowMetadataReadAt = 0;
-  private cachedHealth: Awaited<ReturnType<RustDaemonClient["health"]>> | undefined;
+  private cachedHealth: Awaited<ReturnType<RustConnection["client"]["health"]>> | undefined;
   private cachedDevices: { items: unknown[] } | undefined;
   private cachedSchedules: unknown[] | undefined;
   private ready = false;
   private readonly terminalRecovery: TerminalRecovery;
   flushTerminalRecovery(): Promise<void> { return this.terminalRecovery.flush(); }
-  private terminalWrites = new Map<string, { count: number; bytes: number; failed: boolean; tail: Promise<void> }>();
+  private terminalWrites = new Map<string, { count: number; bytes: number; tail: Promise<void> }>();
 
   constructor(private readonly store: StateStore, binary: string, directory: string, env?: Record<string, string>) {
     this.terminalRecovery = new TerminalRecovery(resolvePath(directory, "desktop-recovery"));
@@ -584,7 +584,7 @@ export class RustRuntime {
   private async poll(): Promise<void> {
     let delay = 500;
     try {
-      if (this.process.upgradePending) {
+      if (this.process.upgradePending && !this.starting && !this.stopping) {
         const connection = await this.process.completeDeferredUpgrade();
         if (connection && !connection.upgradeDeferred) {
           this.connection = connection;
@@ -752,15 +752,15 @@ export class RustRuntime {
     if (data.length > 1_398_104) throw new Error("终端输入无效或超过 1 MiB");
     const bytes = Buffer.from(data, "base64");
     if (!bytes.length || bytes.length > 1024 * 1024 || bytes.toString("base64") !== data) throw new Error("终端输入无效或超过 1 MiB");
-    const { client } = this.current();
-    const queue = this.terminalWrites.get(id) ?? { count: 0, bytes: 0, failed: false, tail: Promise.resolve() };
+    this.current();
+    const queue = this.terminalWrites.get(id) ?? { count: 0, bytes: 0, tail: Promise.resolve() };
     if (queue.count >= 32 || queue.bytes + bytes.length > 1024 * 1024) throw new Error("终端输入队列已满");
     this.terminalWrites.set(id, queue); queue.count++; queue.bytes += bytes.length;
     const job = queue.tail.then(async () => {
-      if (queue.failed) throw new Error("之前的终端输入未完成，请检查会话状态");
+      const { client } = this.current();
       for (let offset = 0; offset < bytes.length; offset += 8192) await client.terminalInput(id, bytes.subarray(offset, offset + 8192), signal);
     });
-    queue.tail = job.catch(() => { queue.failed = true; });
+    queue.tail = job.catch(() => {});
     try { await job; } finally {
       queue.count--; queue.bytes -= bytes.length;
       if (!queue.count) this.terminalWrites.delete(id);

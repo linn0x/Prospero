@@ -1404,6 +1404,31 @@ impl Terminals {
                 return Ok(current);
             }
             if tokio::time::Instant::now() >= deadline {
+                if let Ok(terminal) = self.terminal(id) {
+                    let _ = terminal.stop().await;
+                    let mut changes = self.0.changed.subscribe();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            changes.borrow_and_update();
+                            if self.terminal(id).is_err() {
+                                break;
+                            }
+                            if changes.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                }
+                if let Ok(mut entries) = self.0.entries.lock() {
+                    entries.remove(id);
+                }
+                let sid = id.to_owned();
+                let _ = self
+                    .0
+                    .database
+                    .call(move |store| store.set_native_state(&sid, "archived", None))
+                    .await;
                 return Err(Error::Feature(
                     "resume_unconfirmed".into(),
                     "尚未确认恢复；请打开终端完成原生 CLI 的确认，不要重复新建".into(),

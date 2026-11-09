@@ -418,6 +418,7 @@ async fn run_events(loop_state: EventLoop) {
     let mut text_by_message: HashMap<String, (String, String)> = HashMap::new();
     let mut usage_by_turn: HashMap<i64, (i64, i64)> = HashMap::new();
     let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut in_flight_tools = super::turn_stream::InFlightTools::default();
     while let Some(frame) = socket.next().await {
         let text = match frame {
             Ok(Message::Text(text)) => text.to_string(),
@@ -476,6 +477,7 @@ async fn run_events(loop_state: EventLoop) {
                     &mut text_by_message,
                     &mut usage_by_turn,
                     &mut tool_names,
+                    &mut in_flight_tools,
                     event,
                 )
                 .await
@@ -488,10 +490,14 @@ async fn run_events(loop_state: EventLoop) {
         }
     }
     if !seen_finish {
+        let reason = "DeepSeek Harness 事件连接已关闭";
+        for event in in_flight_tools.drain_unfinished(reason) {
+            let _ = events.send(event).await;
+        }
         let _ = events
             .send(AdapterEvent::Finish {
                 interrupted: false,
-                error: Some("DeepSeek Harness 事件连接已关闭".into()),
+                error: Some(reason.into()),
                 cost_usd: None,
                 input_tokens: None,
                 output_tokens: None,
@@ -627,6 +633,7 @@ async fn consume_event(
     text_by_message: &mut HashMap<String, (String, String)>,
     usage_by_turn: &mut HashMap<i64, (i64, i64)>,
     tool_names: &mut HashMap<String, String>,
+    in_flight_tools: &mut super::turn_stream::InFlightTools,
     event: Value,
 ) -> bool {
     let typ = event
@@ -733,6 +740,7 @@ async fn consume_event(
                 .take(128)
                 .collect::<String>();
             tool_names.insert(call_id.clone(), name.clone());
+            in_flight_tools.record_start(&call_id, &name);
             let _ = events
                 .send(AdapterEvent::ToolCall {
                     subagent: None,
@@ -754,6 +762,7 @@ async fn consume_event(
                     .unwrap_or(""),
                 "deepseek-tool",
             );
+            in_flight_tools.record_result(&call_id);
             let output = content_text(
                 record(&message)
                     .get("content")
@@ -801,6 +810,14 @@ async fn consume_event(
                         .unwrap_or_else(|| json!("DeepSeek Harness 运行失败")),
                 )
             });
+            let drain_reason = if interrupted {
+                "工具调用已中断"
+            } else {
+                error.as_deref().unwrap_or("工具调用未返回结果")
+            };
+            for event in in_flight_tools.drain_unfinished(drain_reason) {
+                let _ = events.send(event).await;
+            }
             let _ = events
                 .send(AdapterEvent::Finish {
                     interrupted,
@@ -1552,6 +1569,7 @@ mod tests {
         let mut text_by_message = HashMap::new();
         let mut usage_by_turn = HashMap::new();
         let mut tool_names = HashMap::new();
+        let mut in_flight_tools = super::super::turn_stream::InFlightTools::default();
 
         assert!(
             !consume_event(
@@ -1560,6 +1578,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"turn/start","data":{"turn":2}})
             )
             .await
@@ -1571,6 +1590,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"assistant/chunk","data":{"turn":2,"step":1,"chunk":{"type":"text-delta","text":"hello"}}})
             )
             .await
@@ -1582,6 +1602,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"assistant/message","data":{"turn":2,"step":1,"message":{"id":"msg:unsafe","content":[{"type":"reasoning","text":"think"},{"type":"text","text":"hello world"}]},"usage":{"inputTokens":3,"outputTokens":5}}})
             )
             .await
@@ -1593,6 +1614,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"turn/end","data":{"turn":2,"reason":{"kind":"completed"}}})
             )
             .await
@@ -1626,6 +1648,7 @@ mod tests {
         let mut text_by_message = HashMap::new();
         let mut usage_by_turn = HashMap::new();
         let mut tool_names = HashMap::new();
+        let mut in_flight_tools = super::super::turn_stream::InFlightTools::default();
 
         assert!(
             !consume_event(
@@ -1634,6 +1657,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"turn/start","data":{"turn":4}})
             )
             .await
@@ -1645,6 +1669,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"assistant/delta","data":{"turn":4,"step":0,"chunk":{"type":"text_delta","content":"stream"}}})
             )
             .await
@@ -1656,6 +1681,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"message/delta","data":{"turn":4,"step":0,"deltaType":"reasoning_delta","delta":"think"}})
             )
             .await
@@ -1667,6 +1693,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"assistant/final","data":{"turn":4,"step":0,"message":{"id":"assistant-alt","content":[{"type":"reasoning","content":"final thought"},{"type":"output_text","content":"final answer"}]},"usage":{"inputTokens":11,"outputTokens":7}}})
             )
             .await
@@ -1678,6 +1705,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"message","data":{"turn":4,"step":0,"id":"plain-id","output_text":"plain answer","usage":{"inputTokens":1,"outputTokens":2}}})
             )
             .await
@@ -1689,6 +1717,7 @@ mod tests {
                 &mut text_by_message,
                 &mut usage_by_turn,
                 &mut tool_names,
+                &mut in_flight_tools,
                 json!({"type":"turn/end","data":{"turn":4,"reason":{"kind":"completed"}}})
             )
             .await

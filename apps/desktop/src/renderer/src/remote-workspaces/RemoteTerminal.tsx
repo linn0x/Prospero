@@ -110,7 +110,13 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     const unsubscribe = window.prospero.subscribeRemoteShell(event => {
       if (event.hostId !== hostId || disposed) return;
       const message = event.message;
-      if (message.type === "remote.connected") { connectedRef.current = true; updateInput(); fitTerminal(); return; }
+      if (message.type === "remote.connected") {
+        connectedRef.current = true;
+        setError("");
+        if (!attached && !snapshotRequested) requestSnapshot();
+        else { updateInput(); fitTerminal(); }
+        return;
+      }
       if (message.type === "remote.closed" || message.type === "remote.reconnecting") { connectedRef.current = false; updateInput(); return; }
       if (message.sid !== sid) return;
       try {

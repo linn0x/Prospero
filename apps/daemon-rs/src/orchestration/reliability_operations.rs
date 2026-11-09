@@ -1013,6 +1013,28 @@ async fn persist_host_result(
                 if !proven { enqueue_cleanup_stop(tx, &command.identity, &command.operation_id, "account snapshot rejected before execution")?; }
                 tx.execute("UPDATE orch_worker_starts SET phase='failed',error='account snapshot rejected before execution',error_code='account_snapshot_invalid',updated_at=?2 WHERE operation_id=?1 AND phase='delivering'", params![command.operation_id, now()])?;
             }
+            if !account_rejected && operation.kind == OperationKind::Start && state == OperationState::Failed {
+                let parsed_receipt = result.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+                let start_error_code = parsed_receipt
+                    .as_ref()
+                    .and_then(|body| body.get("code").and_then(|v| v.as_str()))
+                    .map(|code| code.to_ascii_lowercase())
+                    .unwrap_or_else(|| "host_command_rejected".into());
+                let start_error = parsed_receipt
+                    .as_ref()
+                    .and_then(|body| {
+                        body.get("message")
+                            .or_else(|| body.get("error"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .map(str::to_owned)
+                    .or_else(|| result.map(str::to_owned))
+                    .unwrap_or_else(|| "Host rejected command; process state requires explicit reconciliation".into());
+                tx.execute(
+                    "UPDATE orch_worker_starts SET phase='failed',error=?2,error_code=?3,updated_at=?4 WHERE operation_id=?1 AND phase='delivering'",
+                    params![command.operation_id, start_error, start_error_code, now()],
+                )?;
+            }
             if !account_rejected && (state == OperationState::OutcomeUnknown || (state == OperationState::Failed && matches!(command.kind,HostCommandKind::Start|HostCommandKind::Stop))) {
                 schedule_recovery(tx,&NewRecoveryJob { job_id:stable_id("execution-recovery",&command.identity.attempt_id),kind:"execution".into(),object_id:command.identity.attempt_id.clone(),owner:"reliability-dispatcher".into(),next_check_at:next,detail:None,created_at:now() })?;
                 execution_state=match command.kind { HostCommandKind::Start=>Some(ExecutionState::StartUnknown),HostCommandKind::Stop=>Some(ExecutionState::StopUnknown),_=>None };
@@ -1337,7 +1359,6 @@ fn cancel_planned_start_tx(tx: &rusqlite::Transaction<'_>, stop: &HostCommand) -
         ),
         verified_at: now(),
     };
-    tx.execute("UPDATE orch_executions SET state='planned',updated_at=?2 WHERE attempt_id=?1 AND state='stop_requested'",params![stop.identity.attempt_id,now()])?;
     confirm_exit_tx(tx, &stop.identity, &proof, Some(&stop.operation_id))?;
     tx.execute("UPDATE orch_host_commands SET state='rejected',effect_state='failed',receipt=?2,updated_at=?3 WHERE command_id=?1",params![command_id,"cancelled before start dispatch",now()])?;
     let original = get_operation_tx(tx, &operation_id)?;

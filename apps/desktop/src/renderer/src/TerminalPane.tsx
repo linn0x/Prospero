@@ -892,7 +892,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
       if (!alive) return;
       if (!result.supported) { controller.close(); streamControllerRef.current = undefined; setStreamMode("legacy"); }
       else setStreamMode("stream");
-    }).catch(reason => { if (alive) { setConnectionError(displayError(reason)); setStreamMode("stream"); } });
+    }).catch(reason => { if (alive) { controller.failOpen(); setConnectionError(displayError(reason)); setStreamMode("stream"); } });
     return () => {
       alive = false;
       window.removeEventListener("message", receivePort);
@@ -1145,11 +1145,13 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
         setHasPresentedFrame(false);
         setRequiresFreshReload(false);
         setConnectionError(undefined);
+        setSyncing(true);
         setStreamReconnectNonce(value => value + 1);
       });
       return;
     }
     setConnectionError(undefined);
+    setSyncing(true);
     setStreamReconnectNonce(value => value + 1);
   };
 

@@ -845,6 +845,7 @@ function ShellSidebar({
   const [searchLimit, setSearchLimit] = useState(SIDEBAR_SEARCH_PAGE_SIZE);
   const [pinnedPage, setPinnedPage] = useState<SessionPage>();
   const [pinnedLoading, setPinnedLoading] = useState(false);
+  const pinnedGeneration = useRef(0);
   const [projectLimit, setProjectLimit] = useState(
     SIDEBAR_PROJECT_PREVIEW_LIMIT,
   );
@@ -999,6 +1000,7 @@ function ShellSidebar({
     [pinnedSessionKey],
   );
   useEffect(() => {
+    const generation = ++pinnedGeneration.current;
     if (snapshot.pinnedSessionIds.length === 0) {
       setPinnedPage(undefined);
       setPinnedLoading(false);
@@ -1013,15 +1015,15 @@ function ShellSidebar({
         limit: SIDEBAR_PINNED_PREVIEW_LIMIT,
       })
       .then((page) => {
-        if (!cancelled) setPinnedPage(page);
+        if (!cancelled && pinnedGeneration.current === generation) setPinnedPage(page);
       })
       .catch(() => {
         // The bounded live snapshot still provides pinned active/recent rows
         // while the daemon is reconnecting.
-        if (!cancelled) setPinnedPage(undefined);
+        if (!cancelled && pinnedGeneration.current === generation) setPinnedPage(undefined);
       })
       .finally(() => {
-        if (!cancelled) setPinnedLoading(false);
+        if (!cancelled && pinnedGeneration.current === generation) setPinnedLoading(false);
       });
     return () => {
       cancelled = true;
@@ -1199,6 +1201,7 @@ function ShellSidebar({
   const hiddenProjectCount = Math.max(0, sortedProjects.length - visibleProjects.length);
   const loadMorePinned = useCallback(() => {
     if (!pinnedPage?.nextCursor || pinnedLoading) return;
+    const generation = pinnedGeneration.current;
     setPinnedLoading(true);
     setPinnedLimit((current) => current + SIDEBAR_PINNED_PREVIEW_LIMIT);
     void window.prospero
@@ -1207,7 +1210,8 @@ function ShellSidebar({
         cursor: pinnedPage.nextCursor,
         limit: SIDEBAR_PINNED_PREVIEW_LIMIT,
       })
-      .then((next) =>
+      .then((next) => {
+        if (pinnedGeneration.current !== generation) return;
         setPinnedPage((current) =>
           current
             ? {
@@ -1215,9 +1219,12 @@ function ShellSidebar({
                 items: [...current.items, ...next.items],
               }
             : next,
-        ),
-      )
-      .finally(() => setPinnedLoading(false));
+        );
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (pinnedGeneration.current === generation) setPinnedLoading(false);
+      });
   }, [pinnedLoading, pinnedPage?.nextCursor, pinnedSessionRequestIds]);
   const loadMoreSearch = useCallback(() => {
     if (
@@ -2950,7 +2957,7 @@ function NewSessionDialog({
         const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
         const routeEfforts = sourceChoice.route.protocol !== "openai_chat_completions" ? (sourceChoice.route.modelCapabilities?.supportedEfforts ?? []) : [];
-        const sessionEffort = (input.effort && routeEfforts.includes(input.effort) ? input.effort : undefined) ?? sourceChoice.route.defaultEffort;
+        const sessionEffort = (input.effort && routeEfforts.some(level => level === input.effort) ? input.effort : undefined) ?? sourceChoice.route.defaultEffort;
         onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, ...(sessionEffort ? { effort: sessionEffort as SessionCreateInput["effort"] } : {}) }));
         rememberSourceSelection({ sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
       } else {
@@ -3651,6 +3658,25 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [initialSessionDraft, setInitialSessionDraft] = useState<SessionCreateDraft>();
   const [newSessionProject, setNewSessionProject] = useState<string>();
   const [newSessionSource, setNewSessionSource] = useState<SourceSelection>();
+  const readyAccountCount = useMemo(
+    () => snapshot.accounts.filter((account) => account["status"] === "ready" || account["status"] === "signed_in").length,
+    [snapshot.accounts],
+  );
+  const previousAccountCountRef = useRef(snapshot.accounts.length);
+  const previousReadyAccountCountRef = useRef(readyAccountCount);
+  useEffect(() => {
+    const accountAdded = snapshot.accounts.length > previousAccountCountRef.current;
+    const accountBecameReady = readyAccountCount > previousReadyAccountCountRef.current;
+    previousAccountCountRef.current = snapshot.accounts.length;
+    previousReadyAccountCountRef.current = readyAccountCount;
+    if (!pendingSessionDraft || (!accountAdded && !accountBecameReady)) return;
+    setInitialSessionDraft(pendingSessionDraft);
+    setNewSessionProject(pendingSessionDraft.input.cwd);
+    setNewSessionSource(undefined);
+    setCreateTab("session");
+    setPendingSessionDraft(undefined);
+    setNewSessionOpen(true);
+  }, [pendingSessionDraft, readyAccountCount, snapshot.accounts.length]);
   const [runTargetId, setRunTargetId] = useState<string>();
   const [taskTargetId, setTaskTargetId] = useState<string>();
   const [editingProject, setEditingProject] = useState<string>();
@@ -4180,8 +4206,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
 
-        <div className={cn("main-viewport", pendingSessionDraft && view === "providers" && "has-session-draft")} style={{ position: "relative" }}>
-          {pendingSessionDraft && view === "providers" && <div className="session-draft-banner" role="region" aria-label={t("待继续的新建会话", "Pending session draft")}>
+        <div className={cn("main-viewport", pendingSessionDraft && (view === "providers" || view === "workspaces") && "has-session-draft")} style={{ position: "relative" }}>
+          {pendingSessionDraft && (view === "providers" || view === "workspaces") && <div className="session-draft-banner" role="region" aria-label={t("待继续的新建会话", "Pending session draft")}>
             <div><strong>{t("配置完成后继续创建会话", "Continue creating your session after setup")}</strong><p title={pendingSessionDraft.input.cwd}>{pendingSessionDraft.input.cwd}</p></div>
             <Button size="sm" onClick={() => {
               setInitialSessionDraft(pendingSessionDraft);

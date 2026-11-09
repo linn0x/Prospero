@@ -802,14 +802,23 @@ impl RelayHostClient {
         &self,
         timeouts: RelayTimeouts,
     ) -> Result<RelayHostSession> {
+        validate_relay_url(&self.url, true)?;
+        let endpoint = relay_endpoint(&self.url, RELAY_HOST_PATH)?;
+        let control =
+            connect_relay_socket(endpoint, MAX_RELAY_CONTROL_FRAME_BYTES, timeouts.auth).await?;
+        self.handshake_on_socket(control, timeouts).await
+    }
+
+    async fn handshake_on_socket(
+        &self,
+        mut control: RelayDataStream,
+        timeouts: RelayTimeouts,
+    ) -> Result<RelayHostSession> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
         validate_relay_url(&self.url, true)?;
         let route_id = derive_relay_route_id(&self.host_secret)?;
-        let endpoint = relay_endpoint(&self.url, RELAY_HOST_PATH)?;
-        let mut control =
-            connect_relay_socket(endpoint, MAX_RELAY_CONTROL_FRAME_BYTES, timeouts.auth).await?;
         control
             .send(Message::Text(
                 serde_json::to_string(&host_auth_frame(&self.host_secret)?)?.into(),
@@ -1370,6 +1379,7 @@ pub struct RelayStatusHandle {
     home: PathBuf,
     started_at: i64,
     status: Arc<Mutex<Option<RelayRuntimeStatus>>>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1393,6 +1403,7 @@ impl RelayStatusHandle {
             home: home.into(),
             started_at: crate::database::now(),
             status: Arc::new(Mutex::new(None)),
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -1400,6 +1411,10 @@ impl RelayStatusHandle {
         if let Ok(mut current) = self.status.lock() {
             *current = Some(status);
         }
+    }
+
+    pub fn notify(&self) {
+        self.notify.notify_waiters();
     }
 
     pub fn get(&self) -> Option<RelayRuntimeStatus> {
@@ -1548,7 +1563,7 @@ pub async fn run_relay_supervisor(
                     0,
                     crate::database::now(),
                 ));
-                if wait_or_stop(options.config_poll, &mut stopping).await {
+                if wait_or_stop(options.config_poll, &status.notify, &mut stopping).await {
                     return;
                 }
                 attempts = 0;
@@ -1564,7 +1579,13 @@ pub async fn run_relay_supervisor(
                     0,
                     crate::database::now(),
                 ));
-                if wait_or_stop(reconnect_delay(attempts, options.timeouts), &mut stopping).await {
+                if wait_or_stop(
+                    reconnect_delay(attempts, options.timeouts),
+                    &status.notify,
+                    &mut stopping,
+                )
+                .await
+                {
                     return;
                 }
                 attempts = attempts.saturating_add(1);
@@ -1580,12 +1601,46 @@ pub async fn run_relay_supervisor(
             0,
             crate::database::now(),
         ));
+        let control = match relay_endpoint(&target.url, RELAY_HOST_PATH) {
+            Ok(endpoint) => {
+                connect_relay_socket(
+                    endpoint,
+                    MAX_RELAY_CONTROL_FRAME_BYTES,
+                    options.timeouts.auth,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let control = match control {
+            Ok(control) => control,
+            Err(_) => {
+                set_relay_error(&status, &target, "relay network");
+                if wait_or_stop(
+                    reconnect_delay(attempts, options.timeouts),
+                    &status.notify,
+                    &mut stopping,
+                )
+                .await
+                {
+                    return;
+                }
+                attempts = attempts.saturating_add(1);
+                continue;
+            }
+        };
         let mut journal = RelayGenerationJournal::load(&home);
         let generation = match journal.next_generation(&target.route_id) {
             Ok(generation) => generation,
             Err(_) => {
                 set_relay_error(&status, &target, "relay state");
-                if wait_or_stop(reconnect_delay(attempts, options.timeouts), &mut stopping).await {
+                if wait_or_stop(
+                    reconnect_delay(attempts, options.timeouts),
+                    &status.notify,
+                    &mut stopping,
+                )
+                .await
+                {
                     return;
                 }
                 attempts = attempts.saturating_add(1);
@@ -1598,11 +1653,17 @@ pub async fn run_relay_supervisor(
             target.devices.clone(),
             generation,
         );
-        let mut session = match client.connect_once_with_timeouts(options.timeouts).await {
+        let mut session = match client.handshake_on_socket(control, options.timeouts).await {
             Ok(session) => session,
             Err(_) => {
                 set_relay_error(&status, &target, "relay network");
-                if wait_or_stop(reconnect_delay(attempts, options.timeouts), &mut stopping).await {
+                if wait_or_stop(
+                    reconnect_delay(attempts, options.timeouts),
+                    &status.notify,
+                    &mut stopping,
+                )
+                .await
+                {
                     return;
                 }
                 attempts = attempts.saturating_add(1);
@@ -1634,6 +1695,11 @@ pub async fn run_relay_supervisor(
                         break None;
                     }
                 }
+                _ = status.notify.notified() => {
+                    if !relay_target_unchanged(&home, dev_mode, &target) {
+                        break None;
+                    }
+                }
                 _ = poll.tick() => {
                     if !relay_target_unchanged(&home, dev_mode, &target) {
                         break None;
@@ -1646,7 +1712,13 @@ pub async fn run_relay_supervisor(
         }
         if disconnected.is_some() {
             set_relay_error(&status, &target, "relay network");
-            if wait_or_stop(reconnect_delay(attempts, options.timeouts), &mut stopping).await {
+            if wait_or_stop(
+                reconnect_delay(attempts, options.timeouts),
+                &status.notify,
+                &mut stopping,
+            )
+            .await
+            {
                 return;
             }
             attempts = attempts.saturating_add(1);
@@ -1768,9 +1840,14 @@ fn reconnect_delay(attempt: u32, timeouts: RelayTimeouts) -> Duration {
         .min(timeouts.max_reconnect)
 }
 
-async fn wait_or_stop(delay: Duration, stopping: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+async fn wait_or_stop(
+    delay: Duration,
+    notify: &tokio::sync::Notify,
+    stopping: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(delay) => false,
+        _ = notify.notified() => false,
         changed = stopping.changed() => changed.is_err() || *stopping.borrow(),
     }
 }

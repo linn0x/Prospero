@@ -90,7 +90,9 @@ if (SMOKE_TEST) app.disableHardwareAcceleration();
 
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
-let quitting = false;
+type QuitLifecycleState = "running" | "confirming_unload" | "tearing_down";
+let quitState: QuitLifecycleState = "running";
+const isQuitting = (): boolean => quitState !== "running";
 let previousPendingInteractions = 0;
 const sessionViewControllers = new Map<string, AbortController>();
 const sessionPageRequests = new RequestRegistry();
@@ -156,7 +158,7 @@ function switchBackend(next: "rust" | "legacy", previous: ReturnType<StateStore[
   store.appendLog(`[desktop] switching daemon backend to ${next}; relaunch required\n`);
   store.flushLogs();
   app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--require-rust-backend") });
-  quitting = true;
+  quitState = "tearing_down";
   app.exit(0);
 }
 const legacyProjection = new LegacyOrchestrationProjection(
@@ -406,7 +408,7 @@ function createWindow(): BrowserWindow {
   window.webContents.on("will-prevent-unload", event => {
     const choice = dialog.showMessageBoxSync(window, { type: "warning", title: "尚未保存的修改 / Unsaved changes", message: "文件编辑尚未保存，是否丢弃并继续？\nDiscard unsaved file edits and continue?", buttons: ["取消 / Cancel", "丢弃 / Discard"], defaultId: 0, cancelId: 0, noLink: true });
     if (choice === 1) event.preventDefault();
-    else quitting = false;
+    else quitState = "running";
   });
   if (SMOKE_TEST) {
     window.setOpacity(0);
@@ -432,17 +434,18 @@ function createWindow(): BrowserWindow {
   window.on("resize", () => scheduleWindowStateSave(window));
   window.on("close", (event) => {
     persistWindowState(window);
-    if (!quitting && store.settingsSnapshot().minimizeToTray) {
+    if (!isQuitting() && store.settingsSnapshot().minimizeToTray) {
       event.preventDefault();
       window.hide();
     }
   });
   window.on("closed", () => {
+    const shouldQuitApp = !isQuitting() && !store.settingsSnapshot().minimizeToTray;
     terminalStreamBridge.closeAllForId(contents.id);
     nativeGhosttyManager.closeAllForContents(contents.id);
     if (mainWindow === window) mainWindow = undefined;
-    if (!quitting && !store.settingsSnapshot().minimizeToTray) {
-      quitting = true;
+    teardownDesktopSubsystems();
+    if (shouldQuitApp) {
       app.quit();
     }
   });
@@ -509,7 +512,7 @@ function refreshTrayMenu(): void {
     { label: "启动 daemon", click: () => void runtime.start() },
     { label: "重启 daemon", click: () => void runtime.restart(), enabled: runtime.managed },
     { type: "separator" },
-    { label: "退出", click: () => { quitting = true; app.quit(); } },
+    { label: "退出", click: () => { quitState = "confirming_unload"; app.quit(); } },
   ]));
 }
 
@@ -876,7 +879,7 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
   }
   if (smoke) {
     process.stdout.write("Prospero desktop smoke test passed\n");
-    quitting = true;
+    quitState = "tearing_down";
     tray?.destroy();
     tray = undefined;
     window.destroy();
@@ -1629,7 +1632,14 @@ function installIpc(): void {
   });
 }
 
-app.on("before-quit", () => { quitting = true; remoteShellManager.close(); nativeGhosttyManager.closeAll(); if (mainWindow) terminalStreamBridge.closeAll(mainWindow.webContents); });
+function teardownDesktopSubsystems(): void {
+  quitState = "tearing_down";
+  remoteShellManager.close();
+  nativeGhosttyManager.closeAll();
+  terminalStreamBridge.closeAll();
+}
+
+app.on("before-quit", () => { if (quitState !== "tearing_down") quitState = "confirming_unload"; });
 app.on("window-all-closed", () => { /* The window close handler applies the background-running preference. */ });
 app.on("activate", () => {
   showMainWindow();
@@ -1671,7 +1681,7 @@ void app.whenReady().then(async () => {
   if (REQUIRE_RUST_BACKEND && !RUST_BACKEND) throw new Error("Rust backend is required for this run");
   if (SELF_CHECK) {
     runSelfCheck();
-    quitting = true;
+    quitState = "tearing_down";
     app.exit(0);
     return;
   }
@@ -1701,7 +1711,7 @@ void app.whenReady().then(async () => {
       store.flushLogs();
       recordBackendRollback(RUNTIME_SWITCH_PATH, "rust", reason);
       app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--require-rust-backend") });
-      quitting = true;
+      quitState = "tearing_down";
       app.exit(0);
       return;
     }
@@ -1716,17 +1726,18 @@ void app.whenReady().then(async () => {
   const detail = error instanceof Error ? error.stack ?? error.message : String(error);
   try { store.appendLog(`[desktop] startup failed: ${detail}\n`); store.flushLogs(); } catch { /* Preserve the original startup failure. */ }
   process.stderr.write(`Prospero desktop startup failed: ${detail}\n`);
-  quitting = true;
+  quitState = "tearing_down";
   app.exit(1);
 });
 
 app.on("will-quit", (event) => {
+  teardownDesktopSubsystems();
   sessionPageRequests.cancelAll();
   legacyProjection.stop();
   if (runtime.managed || runtime instanceof RustRuntime) {
     event.preventDefault();
     const flush = runtime instanceof RustRuntime ? runtime.flushTerminalRecovery() : Promise.resolve();
     void flush.catch(() => undefined).then(() => runtime.managed ? runtime.stop() : undefined)
-      .finally(() => { quitting = true; app.exit(0); });
+      .finally(() => { quitState = "tearing_down"; app.exit(0); });
   }
 });

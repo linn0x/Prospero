@@ -3,7 +3,7 @@ import { DesktopIcon, type DesktopIconName } from "../design-system/icons";
 import { useLocale } from "../locale";
 import { nextSettingsCategory, settingsCategories, type SettingsCategory } from "./settings-state";
 
-const icons: Record<SettingsCategory, DesktopIconName> = { general: "settings", appearance: "appearance", accounts: "accounts", terminal: "terminal", runtime: "server", relay: "relay" };
+const icons: Record<SettingsCategory, DesktopIconName> = { general: "settings", appearance: "appearance", terminal: "terminal", runtime: "server", relay: "relay" };
 
 export function SettingsNav({ active, onChange }: { active: SettingsCategory; onChange: (category: SettingsCategory) => void }) {
   const { t } = useLocale();

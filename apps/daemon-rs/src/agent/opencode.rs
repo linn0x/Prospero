@@ -545,6 +545,7 @@ async fn run_events(mut loop_state: EventLoop) {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut tool_names = HashMap::new();
+    let mut in_flight_tools = super::turn_stream::InFlightTools::default();
     let mut input_tokens = None;
     let mut output_tokens = None;
     let mut cost_usd = None;
@@ -583,6 +584,7 @@ async fn run_events(mut loop_state: EventLoop) {
                     auto_approve: loop_state.auto_approve,
                 },
                 &mut tool_names,
+                &mut in_flight_tools,
                 &mut input_tokens,
                 &mut output_tokens,
                 &mut cost_usd,
@@ -599,11 +601,15 @@ async fn run_events(mut loop_state: EventLoop) {
         }
     }
     if !finished {
+        let reason = "OpenCode 事件流已关闭";
+        for event in in_flight_tools.drain_unfinished(reason) {
+            let _ = loop_state.events.send(event).await;
+        }
         let _ = loop_state
             .events
             .send(AdapterEvent::Finish {
                 interrupted: false,
-                error: Some("OpenCode 事件流已关闭".into()),
+                error: Some(reason.into()),
                 cost_usd,
                 input_tokens,
                 output_tokens,
@@ -617,6 +623,7 @@ async fn run_events(mut loop_state: EventLoop) {
 async fn consume_event(
     context: EventContext<'_>,
     tool_names: &mut HashMap<String, String>,
+    in_flight_tools: &mut super::turn_stream::InFlightTools,
     input_tokens: &mut Option<i64>,
     output_tokens: &mut Option<i64>,
     cost_usd: &mut Option<f64>,
@@ -664,13 +671,15 @@ async fn consume_event(
                 "opencode-tool",
             );
             let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
-            tool_names.insert(call_id.clone(), tool.to_owned());
+            let name: String = tool.chars().take(128).collect();
+            tool_names.insert(call_id.clone(), name.clone());
+            in_flight_tools.record_start(&call_id, &name);
             let _ = context
                 .events
                 .send(AdapterEvent::ToolCall {
                     subagent: None,
                     call_id,
-                    name: tool.chars().take(128).collect(),
+                    name,
                     summary: summarize(data.get("input").cloned().unwrap_or(Value::Null)),
                     diff: None,
                 })
@@ -681,6 +690,7 @@ async fn consume_event(
                 data.get("callID").and_then(Value::as_str).unwrap_or(""),
                 "opencode-tool",
             );
+            in_flight_tools.record_result(&call_id);
             let failed = typ == "session.next.tool.failed";
             let raw = data
                 .get(if failed { "error" } else { "structured" })
@@ -727,11 +737,15 @@ async fn consume_event(
                 .await
                 .is_err()
                 {
+                    let reason = "OpenCode 审批回复失败";
+                    for event in in_flight_tools.drain_unfinished(reason) {
+                        let _ = context.events.send(event).await;
+                    }
                     let _ = context
                         .events
                         .send(AdapterEvent::Finish {
                             interrupted: false,
-                            error: Some("OpenCode 审批回复失败".into()),
+                            error: Some(reason.into()),
                             cost_usd: *cost_usd,
                             input_tokens: *input_tokens,
                             output_tokens: *output_tokens,
@@ -793,6 +807,9 @@ async fn consume_event(
             *input_tokens = tokens.get("input").and_then(Value::as_i64);
             *output_tokens = tokens.get("output").and_then(Value::as_i64);
             *cost_usd = data.get("cost").and_then(Value::as_f64);
+            for event in in_flight_tools.drain_unfinished("工具调用未返回结果") {
+                let _ = context.events.send(event).await;
+            }
             let _ = context
                 .events
                 .send(AdapterEvent::Finish {
@@ -807,11 +824,15 @@ async fn consume_event(
             return true;
         }
         "session.next.step.failed" | "session.error" => {
+            let error_msg = summarize(data.get("error").cloned().unwrap_or(Value::Null));
+            for event in in_flight_tools.drain_unfinished(&error_msg) {
+                let _ = context.events.send(event).await;
+            }
             let _ = context
                 .events
                 .send(AdapterEvent::Finish {
                     interrupted: false,
-                    error: Some(summarize(data.get("error").cloned().unwrap_or(Value::Null))),
+                    error: Some(error_msg),
                     cost_usd: *cost_usd,
                     input_tokens: *input_tokens,
                     output_tokens: *output_tokens,
@@ -1135,6 +1156,7 @@ mod tests {
         let base_url = format!("http://{address}");
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let mut tools = HashMap::new();
+        let mut in_flight_tools = super::super::turn_stream::InFlightTools::default();
         let mut input = None;
         let mut output = None;
         let mut cost = None;
@@ -1148,6 +1170,7 @@ mod tests {
                     auto_approve: false,
                 },
                 &mut tools,
+                &mut in_flight_tools,
                 &mut input,
                 &mut output,
                 &mut cost,
@@ -1181,6 +1204,7 @@ mod tests {
         let client = reqwest::Client::new();
         let (tx, mut rx) = mpsc::channel(16);
         let mut tools = HashMap::new();
+        let mut in_flight_tools = super::super::turn_stream::InFlightTools::default();
         let mut input = None;
         let mut output = None;
         let mut cost = None;
@@ -1195,6 +1219,7 @@ mod tests {
                     auto_approve: false,
                 },
                 &mut tools,
+                &mut in_flight_tools,
                 &mut input,
                 &mut output,
                 &mut cost,
@@ -1212,6 +1237,7 @@ mod tests {
                     auto_approve: false,
                 },
                 &mut tools,
+                &mut in_flight_tools,
                 &mut input,
                 &mut output,
                 &mut cost,
@@ -1229,6 +1255,7 @@ mod tests {
                     auto_approve: false,
                 },
                 &mut tools,
+                &mut in_flight_tools,
                 &mut input,
                 &mut output,
                 &mut cost,
@@ -1246,6 +1273,7 @@ mod tests {
                     auto_approve: false,
                 },
                 &mut tools,
+                &mut in_flight_tools,
                 &mut input,
                 &mut output,
                 &mut cost,

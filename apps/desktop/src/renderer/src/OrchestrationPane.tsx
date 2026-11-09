@@ -446,6 +446,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const detailedBoardState = detailedTaskId ? taskBoardStates.get(detailedTaskId) : undefined;
   const openDelivery = (dispatch: JsonObject | undefined, task: JsonObject | undefined, success: boolean): void => {
     if (!dispatch || !["starting", "running"].includes(text(dispatch["state"]))) return;
+    closeTaskDetail();
     setDelivery({ dispatchId: text(dispatch["id"]), success, taskTitle: text(task?.["title"]) });
     setDeliveryOutcome("");
     setDeliveryError(undefined);
@@ -597,25 +598,25 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       </DialogContent>
     </Dialog>
 
-    <Dialog open={saveTemplateOpen} onOpenChange={(open) => { setSaveTemplateOpen(open); if (!open) setSaveTemplateError(undefined); }}>
+    <Dialog open={saveTemplateOpen} onOpenChange={(open) => { if (busy) return; setSaveTemplateOpen(open); if (!open) setSaveTemplateError(undefined); }}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader><DialogTitle>{t("保存工作流模板", "Save workflow template")}</DialogTitle><DialogDescription>{t("保存当前 Run 的任务、依赖关系和 Skills，不保存运行状态或会话。", "Save tasks, dependencies, and skills from this run without runtime state or sessions.")}</DialogDescription></DialogHeader>
         <FieldGroup><Field><FieldLabel htmlFor="template-name">{t("模板名称", "Template name")}</FieldLabel><Input id="template-name" maxLength={120} value={templateName} onChange={(event) => setTemplateName(event.target.value)} autoFocus /></Field><Field><FieldLabel htmlFor="template-description">{t("说明", "Description")}</FieldLabel><Textarea id="template-description" maxLength={500} rows={3} value={templateDescription} onChange={(event) => setTemplateDescription(event.target.value)} placeholder={t("何时使用这个模板", "When to use this template")} /><FieldDescription>{runTasks.length} {t("个任务会被保存", "tasks will be saved")}</FieldDescription></Field></FieldGroup>
         {saveTemplateError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法保存模板", "Unable to save template")}</AlertTitle><AlertDescription>{saveTemplateError}</AlertDescription></Alert>}
-        <DialogFooter><Button variant="outline" onClick={() => { setSaveTemplateOpen(false); setSaveTemplateError(undefined); }}>{t("取消", "Cancel")}</Button><Button disabled={!templateName.trim() || busy === "template-save"} onClick={() => void saveRunTemplate()}><Save data-icon="inline-start" />{t("保存模板", "Save template")}</Button></DialogFooter>
+        <DialogFooter><Button variant="outline" disabled={busy === "template-save"} onClick={() => { if (busy) return; setSaveTemplateOpen(false); setSaveTemplateError(undefined); }}>{t("取消", "Cancel")}</Button><Button disabled={!templateName.trim() || busy === "template-save"} onClick={() => void saveRunTemplate()}><Save data-icon="inline-start" />{t("保存模板", "Save template")}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
 
-    <Dialog open={Boolean(selectedTemplate)} onOpenChange={(open) => { if (!open) { setSelectedTemplate(undefined); setTemplateRunError(undefined); } }}>
+    <Dialog open={Boolean(selectedTemplate)} onOpenChange={(open) => { if (busy) return; if (!open) { setSelectedTemplate(undefined); setTemplateRunError(undefined); } }}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader><DialogTitle>{selectedTemplate?.name}</DialogTitle><DialogDescription>{t("为这次运行填写可验收的最终目标，模板中的 DAG 与 Skills 会被复制到新 Run。", "Enter a verifiable outcome for this run. The template DAG and skills will be copied into a new run.")}</DialogDescription></DialogHeader>
         <Field><FieldLabel htmlFor="template-objective">{t("本次目标", "Run objective")}</FieldLabel><Textarea id="template-objective" maxLength={20_000} rows={4} value={templateObjective} onChange={(event) => setTemplateObjective(event.target.value)} autoFocus placeholder={t("描述这一次要交付的具体结果", "Describe the concrete result to deliver this time")} /><FieldDescription>{selectedTemplate?.nodes.length ?? 0} {t("个任务将被创建", "tasks will be created")}</FieldDescription></Field>
         {templateRunError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法运行模板", "Unable to run template")}</AlertTitle><AlertDescription>{templateRunError}</AlertDescription></Alert>}
-        <DialogFooter><Button variant="outline" onClick={() => { setSelectedTemplate(undefined); setTemplateRunError(undefined); }}>{t("取消", "Cancel")}</Button><Button disabled={!templateObjective.trim() || busy === "template-run"} onClick={() => void runTemplate()}><Rocket data-icon="inline-start" />{t("从模板运行", "Run from template")}</Button></DialogFooter>
+        <DialogFooter><Button variant="outline" disabled={busy === "template-run"} onClick={() => { if (busy) return; setSelectedTemplate(undefined); setTemplateRunError(undefined); }}>{t("取消", "Cancel")}</Button><Button disabled={!templateObjective.trim() || busy === "template-run"} onClick={() => void runTemplate()}><Rocket data-icon="inline-start" />{t("从模板运行", "Run from template")}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
 
-    <Dialog open={Boolean(abandonRun)} onOpenChange={(open) => { if (!open) { setAbandonRun(undefined); setAbandonError(undefined); } }}>
+    <Dialog open={Boolean(abandonRun)} onOpenChange={(open) => { if (busy) return; if (!open) { setAbandonRun(undefined); setAbandonError(undefined); } }}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader><DialogTitle>{t("放弃这个运行？", "Abandon this run?")}</DialogTitle><DialogDescription>{t("运行会停止继续派发任务，已有记录仍会保留。", "The run will stop dispatching tasks, while its history remains available.")}</DialogDescription></DialogHeader>
         <p className="truncate text-sm font-medium" title={abandonRun?.objective}>{abandonRun?.objective}</p>
@@ -624,7 +625,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       </DialogContent>
     </Dialog>
 
-    <Dialog open={Boolean(delivery)} onOpenChange={(open) => { if (!open) { setDelivery(undefined); setDeliveryError(undefined); } }}>
+    <Dialog open={Boolean(delivery)} onOpenChange={(open) => { if (busy) return; if (!open) { setDelivery(undefined); setDeliveryError(undefined); } }}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader><DialogTitle>{delivery?.success ? t("人工交付：任务完成", "Manual delivery: task done") : t("人工交付：任务失败", "Manual delivery: task failed")}</DialogTitle><DialogDescription>{t("如果 worker 没有自行回报，请根据会话中的最终回复记录交付结果。", "If the worker did not self-report, record the result from its final reply.")}</DialogDescription></DialogHeader>
         {delivery && <p className="truncate text-sm font-medium" title={delivery.taskTitle}>{delivery.taskTitle}</p>}
@@ -634,7 +635,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       </DialogContent>
     </Dialog>
 
-    <Dialog open={showCreate} onOpenChange={(open) => { setShowCreate(open); if (!open) setCreateError(undefined); }}>
+    <Dialog open={showCreate} onOpenChange={(open) => { if (busy) return; setShowCreate(open); if (!open) setCreateError(undefined); }}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader><DialogTitle>{t("创建目标任务图", "Create goal graph")}</DialogTitle><DialogDescription>{t("每行一个任务，默认按顺序建立依赖；Skill 会冻结到每个 worker。", "Enter one task per line. Dependencies follow the listed order and skills are pinned to each worker.")}</DialogDescription></DialogHeader>
         <FieldGroup>
@@ -647,7 +648,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
         <DialogFooter><Button variant="outline" disabled={Boolean(busy)} onClick={() => { setShowCreate(false); setCreateError(undefined); }}>{t("取消", "Cancel")}</Button><Button onClick={() => void createGraph()} disabled={!objective.trim() || Boolean(busy)}><CircleDot data-icon="inline-start" />{busy === "create" ? t("正在创建…", "Creating…") : t("创建目标与 DAG", "Create goal and DAG")}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
-    <Dialog open={showTaskCreate} onOpenChange={(open) => { setShowTaskCreate(open); if (!open) setTaskCreateError(undefined); }}>
+    <Dialog open={showTaskCreate} onOpenChange={(open) => { if (busy) return; setShowTaskCreate(open); if (!open) setTaskCreateError(undefined); }}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader><DialogTitle>{t("添加任务", "Add task")}</DialogTitle><DialogDescription>{t("选择前置任务和 Skill，daemon 会校验 DAG 并冻结 Skill 来源。", "Choose dependencies and skills. The daemon validates the DAG and pins skill sources.")}</DialogDescription></DialogHeader>
         <FieldGroup>

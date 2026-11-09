@@ -111,13 +111,17 @@ export class RemoteShellManager {
 
   async listShells(hostId: string): Promise<SessionInfo[]> {
     await this.connected(hostId);
-    return [...this.clients.get(hostId)!.catalog.values()].slice(0, 128);
+    const connection = this.clients.get(hostId)!;
+    this.reconcileCreatedSessions(connection, connection.catalog.values(), true);
+    return [...connection.catalog.values()].slice(0, 128);
   }
 
   async listWorkspaceShells(hostId: string, cwd: string): Promise<SessionInfo[]> {
     await this.connected(hostId);
+    const connection = this.clients.get(hostId)!;
+    this.reconcileCreatedSessions(connection, connection.catalog.values(), true);
     const target = normalizedRemoteCwd(cwd);
-    return [...this.clients.get(hostId)!.catalog.values()].filter(session => {
+    return [...connection.catalog.values()].filter(session => {
       try { return session.agent === "shell" && normalizedRemoteCwd(session.cwd) === target; } catch { return false; }
     }).slice(0, 128);
   }
@@ -130,7 +134,7 @@ export class RemoteShellManager {
       const timer = setTimeout(() => {
         connection.pendingBrowse = undefined;
         reject(new Error("远程目录读取超时，请重试 / Remote directory request timed out"));
-        connection.client.close();
+        if (connection.sessions.size === 0 && !connection.pendingCreate) connection.client.close();
       }, 10_000);
       connection.pendingBrowse = { path: request.path, root: request.root, resolve, reject, timer };
       try { connection.client.listWorkspace(request.path, request.root); }
@@ -285,13 +289,29 @@ export class RemoteShellManager {
     }
   }
 
+  private reconcileCreatedSessions(connection: RemoteConnection, sessions: Iterable<SessionInfo>, clearMissing = false): void {
+    const activeShellCwds = new Set<string>();
+    for (const session of sessions) {
+      if (session.agent !== "shell" || session.kind !== "pty" || TERMINAL_SESSION_STATUSES.has(session.status)) continue;
+      activeShellCwds.add(session.cwd);
+      try { activeShellCwds.add(normalizedRemoteCwd(session.cwd)); } catch {}
+    }
+    for (const cwd of [...connection.uncertainCreates.keys()]) {
+      let normalized = cwd;
+      try { if (cwd) normalized = normalizedRemoteCwd(cwd); } catch {}
+      if (activeShellCwds.has(cwd) || activeShellCwds.has(normalized) || (clearMissing && !connection.pendingCreate)) {
+        connection.uncertainCreates.delete(cwd);
+      }
+    }
+  }
+
   private startConnect(hostId: string, connection: RemoteConnection, initial: boolean): Promise<{ name: string; sessions: number }> {
     const connecting = connection.client.connect()
       .then((hello) => {
         if (connection.intentionalClose || this.clients.get(hostId) !== connection) { connection.client.close(); throw new Error("连接已取消"); }
         connection.reconnectAttempt = 0;
         connection.catalog = new Map(hello.sessions.filter((session) => session.kind === "pty" && !TERMINAL_SESSION_STATUSES.has(session.status)).map((session) => [session.id, session]));
-        for (const cwd of connection.uncertainCreates.keys()) if ([...connection.catalog.values()].some(session => session.agent === "shell" && session.cwd === cwd)) connection.uncertainCreates.delete(cwd);
+        this.reconcileCreatedSessions(connection, connection.catalog.values(), false);
         if (connection.reconnectTimer) {
           clearTimeout(connection.reconnectTimer);
           connection.reconnectTimer = undefined;

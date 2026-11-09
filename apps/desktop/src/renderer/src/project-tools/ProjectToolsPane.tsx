@@ -18,6 +18,8 @@ import { GitPanel } from "./GitPanel";
 import { SearchPanel } from "./SearchPanel";
 import { fileName, getProjectFileRequest, parentPath, subscribeProjectFileRequests, tabId, type PreviewTab } from "./tool-state";
 
+type ConfirmIntent = { kind: "close"; id: string } | { kind: "action"; action: ExplorerAction };
+
 export function ProjectToolsPane({ root, mode, active, tabsHost, onActivate, onDocumentTabs }: { root: string; mode: ProjectTool; active: boolean; tabsHost?: HTMLDivElement | null | undefined; onActivate?: (() => void) | undefined; onDocumentTabs?: ((tabs: DocumentTabs | undefined) => void) | undefined }) {
   const { t } = useLocale();
   const prefix = useId();
@@ -33,12 +35,11 @@ export function ProjectToolsPane({ root, mode, active, tabsHost, onActivate, onD
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string>();
-  const [confirmation, setConfirmation] = useState<(() => void)>();
+  const [confirmation, setConfirmation] = useState<ConfirmIntent>();
   const pending = useRef(false);
   const dirtyRef = useRef(dirty); dirtyRef.current = dirty;
   const refresh = useCallback(() => { setRevision(value => value + 1); }, []);
   const onDirty = useCallback((id: string, changed: boolean) => setDirty(current => { const next = new Set(current); changed ? next.add(id) : next.delete(id); return next.size === current.size && next.has(id) === current.has(id) ? current : next; }), []);
-  const guard = (proceed: () => void, needed = dirtyRef.current.size > 0): void => { if (needed) setConfirmation(() => proceed); else proceed(); };
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => { if (dirtyRef.current.size) { event.preventDefault(); event.returnValue = ""; } };
     window.addEventListener("beforeunload", beforeUnload); return () => window.removeEventListener("beforeunload", beforeUnload);
@@ -57,14 +58,22 @@ export function ProjectToolsPane({ root, mode, active, tabsHost, onActivate, onD
   useEffect(() => {
     if (fileRequest) open(fileRequest.path, "file", false, fileRequest.line);
   }, [fileRequest]);
-  const close = (id: string): void => guard(() => {
+  const performClose = (id: string): void => {
     const index = tabs.findIndex(tab => tab.id === id), next = tabs.filter(tab => tab.id !== id);
     setTabs(next); if (!next.length) setPreviewOpen(false); if (selected === id) setSelected(next[Math.max(0, index - 1)]?.id ?? "");
     setDirty(current => { const next = new Set(current); next.delete(id); return next; });
-  }, dirty.has(id));
+  };
+  const performStartAction = (next: ExplorerAction): void => {
+    setAction(next); setName(next.kind === "rename" ? fileName(next.path) : ""); setActionError(undefined);
+  };
+  const close = (id: string): void => {
+    if (dirty.has(id)) setConfirmation({ kind: "close", id });
+    else performClose(id);
+  };
   const startAction = (next: ExplorerAction): void => {
     const affected = tabs.some(tab => (tab.path === next.path || tab.path.startsWith(`${next.path}/`)) && dirty.has(tab.id));
-    guard(() => { setAction(next); setName(next.kind === "rename" ? fileName(next.path) : ""); setActionError(undefined); }, affected && (next.kind === "rename" || next.kind === "trash"));
+    if (affected && (next.kind === "rename" || next.kind === "trash")) setConfirmation({ kind: "action", action: next });
+    else performStartAction(next);
   };
   const mutate = async (): Promise<void> => {
     if (!action || pending.current) return;
@@ -108,6 +117,6 @@ export function ProjectToolsPane({ root, mode, active, tabsHost, onActivate, onD
       </section>
     </div>
     <Dialog open={Boolean(action)} onOpenChange={value => { if (!value && !busy) setAction(undefined); }}><DialogContent><form onSubmit={event => { event.preventDefault(); void mutate(); }}><DialogHeader><DialogTitle>{action?.kind === "trash" ? t("移入回收站", "Move to trash") : action?.kind === "rename" ? t("重命名", "Rename") : action?.kind === "create-directory" ? t("新建文件夹", "New folder") : t("新建文件", "New file")}</DialogTitle><DialogDescription>{action?.kind === "trash" ? t(`将“${action.path}”及其内容移入系统回收站。`, `Move “${action.path}” and its contents to the system trash.`) : action?.path || fileName(root)}</DialogDescription></DialogHeader>{action?.kind !== "trash" && <FieldGroup className="my-4"><Field><FieldLabel htmlFor={`${prefix}-file-name`}>{t("名称", "Name")}</FieldLabel><Input autoFocus id={`${prefix}-file-name`} data-slot="project-file-name" value={name} maxLength={255} disabled={busy} onChange={event => setName(event.target.value)} /></Field></FieldGroup>}{actionError && <p className="project-tree-message" role="alert">{actionError}</p>}<DialogFooter className="mt-4"><Button variant="outline" type="button" disabled={busy} onClick={() => setAction(undefined)}>{t("取消", "Cancel")}</Button><Button variant={action?.kind === "trash" ? "destructive" : "default"} type="submit" disabled={busy || action?.kind !== "trash" && !name.trim()}>{busy ? t("处理中…", "Working…") : t("确认", "Confirm")}</Button></DialogFooter></form></DialogContent></Dialog>
-    <Dialog open={Boolean(confirmation)} onOpenChange={value => { if (!value) setConfirmation(undefined); }}><DialogContent><DialogHeader><DialogTitle>{t("有尚未保存的修改", "Unsaved changes")}</DialogTitle><DialogDescription>{t("继续会丢弃相关文件的未保存修改。你也可以取消，先保存文件。", "Continuing discards unsaved edits to the affected files. Cancel to save them first.")}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setConfirmation(undefined)}>{t("取消", "Cancel")}</Button><Button variant="destructive" onClick={() => { const proceed = confirmation; setConfirmation(undefined); proceed?.(); }}>{t("丢弃并继续", "Discard and continue")}</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={Boolean(confirmation)} onOpenChange={value => { if (!value) setConfirmation(undefined); }}><DialogContent><DialogHeader><DialogTitle>{t("有尚未保存的修改", "Unsaved changes")}</DialogTitle><DialogDescription>{t("继续会丢弃相关文件的未保存修改。你也可以取消，先保存文件。", "Continuing discards unsaved edits to the affected files. Cancel to save them first.")}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setConfirmation(undefined)}>{t("取消", "Cancel")}</Button><Button variant="destructive" onClick={() => { const intent = confirmation; setConfirmation(undefined); if (!intent) return; if (intent.kind === "close") performClose(intent.id); else performStartAction(intent.action); }}>{t("丢弃并继续", "Discard and continue")}</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }

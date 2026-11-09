@@ -655,7 +655,7 @@ pub(crate) fn record_verified_exit_proof(
         | (ExitProofKind::DriverQuiescence, ExitProofVerifier::Driver)
         | (ExitProofKind::RegisteredResourceRelease, ExitProofVerifier::ResourceHandler) => true,
         (ExitProofKind::StartupNotStarted, ExitProofVerifier::StartupCoordinator) => {
-            matches!(state.as_str(), "planned" | "starting")
+            matches!(state.as_str(), "planned" | "starting" | "stop_requested")
                 || transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM orch_exit_proofs WHERE id=?1)",
                     [&proof.proof_id],
