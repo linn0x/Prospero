@@ -584,7 +584,12 @@ impl ModelSources {
     }
 
     pub(crate) fn list(&self) -> Vec<ModelSource> {
-        self.registry.sources.clone()
+        self.registry
+            .sources
+            .iter()
+            .cloned()
+            .map(enrich_source_view)
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -849,6 +854,7 @@ impl ModelSources {
                     .iter()
                     .find(|source| source.id == id)
                     .cloned()
+                    .map(enrich_source_view)
                     .ok_or(Error::NotFound);
             }
         }
@@ -893,7 +899,7 @@ impl ModelSources {
         }
         self.registry.sources.push(source.clone());
         self.save()?;
-        Ok(source)
+        Ok(enrich_source_view(source))
     }
 
     pub(crate) fn change(
@@ -1085,7 +1091,7 @@ impl ModelSources {
                     }
                 }
                 self.save()?;
-                return Ok(removed);
+                return Ok(enrich_source_view(removed));
             }
             _ => return Err(Error::Invalid("不支持的模型源修改".into())),
         }
@@ -1093,7 +1099,7 @@ impl ModelSources {
         self.registry.sources[index].updated_at = crate::database::now();
         let source = self.registry.sources[index].clone();
         self.save()?;
-        Ok(source)
+        Ok(enrich_source_view(source))
     }
 
     pub(crate) fn bind(
@@ -1313,7 +1319,7 @@ impl ModelSources {
         }
         let source = self.registry.sources[index].clone();
         self.save()?;
-        Ok(source)
+        Ok(enrich_source_view(source))
     }
 
     #[allow(dead_code)]
@@ -1427,15 +1433,25 @@ impl ModelSources {
                 }
                 clean_name(&route.name)?;
                 clean_model(&route.model)?;
-                if let Some(effort) = &route.default_effort
-                    && (!ALLOWED_EFFORTS.contains(&effort.as_str())
-                        || !route
-                            .model_capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.supported_efforts.as_ref())
-                            .is_some_and(|efforts| efforts.iter().any(|level| level == effort)))
-                {
-                    return Err(Error::Invalid("推理档位不受此模型路由支持".into()));
+                if let Some(effort) = &route.default_effort {
+                    let supported = route
+                        .model_capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.supported_efforts.as_ref())
+                        .map(|efforts| efforts.iter().any(|level| level == effort))
+                        .unwrap_or_else(|| {
+                            route.protocol != "openai_chat_completions"
+                                && route
+                                    .model_capabilities
+                                    .as_ref()
+                                    .and_then(|caps| caps.reasoning)
+                                    != Some(false)
+                                && super::profile::known_codex_model(&route.model)
+                                    .is_some_and(|(_, efforts, _)| efforts.contains(&effort.as_str()))
+                        });
+                    if !ALLOWED_EFFORTS.contains(&effort.as_str()) || !supported {
+                        return Err(Error::Invalid("推理档位不受此模型路由支持".into()));
+                    }
                 }
             }
         }
@@ -1664,14 +1680,52 @@ fn require_supported_route_protocol(protocol: &str) -> Result<String> {
     Ok(protocol.into())
 }
 
+fn enrich_route_capabilities(route: &mut SourceRoute) {
+    if route.protocol == "openai_chat_completions" {
+        return;
+    }
+    let Some((context_window, efforts, _)) = super::profile::known_codex_model(&route.model) else {
+        return;
+    };
+    let mut caps = route.model_capabilities.take().unwrap_or_default();
+    if caps.context_window.is_none() && context_window > 0 {
+        caps.context_window = Some(context_window);
+    }
+    if caps.reasoning != Some(false) {
+        if caps.reasoning.is_none() && !efforts.is_empty() {
+            caps.reasoning = Some(true);
+        }
+        if caps.supported_efforts.is_none() && !efforts.is_empty() {
+            caps.supported_efforts = Some(
+                efforts
+                    .iter()
+                    .map(|effort| (*effort).to_owned())
+                    .collect(),
+            );
+        }
+    }
+    if caps != super::ModelCapabilities::default() {
+        route.model_capabilities = Some(caps);
+    }
+}
+
+fn enrich_source_view(mut source: ModelSource) -> ModelSource {
+    for route in &mut source.routes {
+        enrich_route_capabilities(route);
+    }
+    source
+}
+
 fn route_profile(endpoint: &SourceEndpoint, route: &SourceRoute) -> Result<ApiProfile> {
+    let mut enriched_route = route.clone();
+    enrich_route_capabilities(&mut enriched_route);
     super::profile::clean_profile(
-        agent_for_protocol(&route.protocol),
+        agent_for_protocol(&enriched_route.protocol),
         &endpoint.base_url,
-        &route.model,
-        Some(provider_for_protocol(&route.protocol)),
-        Some(&route.protocol),
-        route
+        &enriched_route.model,
+        Some(provider_for_protocol(&enriched_route.protocol)),
+        Some(&enriched_route.protocol),
+        enriched_route
             .model_capabilities
             .clone()
             .map(serde_json::to_value)

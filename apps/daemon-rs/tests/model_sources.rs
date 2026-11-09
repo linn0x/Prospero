@@ -542,3 +542,68 @@ async fn migration_apply_rejects_active_profile_sessions() {
     assert_eq!(applied["ok"], false);
     assert_eq!(applied["error"]["code"], "in_use");
 }
+
+#[tokio::test]
+async fn source_enriches_glm_routes_with_published_effort_levels() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = spawn_server();
+
+    let (status, created) = harness
+        .post(envelope(json!({
+            "kind":"create",
+            "operationId":"op-glm-create",
+            "name":"GLM",
+            "endpoints":[
+                {"protocol":"openai_responses","baseUrl":format!("{}/responses", server.base_url)},
+                {"protocol":"anthropic","baseUrl":server.base_url}
+            ],
+            "credential":{"name":"GLM Key","apiKey":SECRET},
+            "routes":[
+                {"name":"glm-5.3","model":"glm-5.3","protocol":"openai_responses","enabled":true,"defaultEffort":"high"},
+                {"name":"glm-5.3-flash · Claude","model":"glm-5.3-flash","protocol":"anthropic","enabled":true,"modelCapabilities":{"tools":true,"reasoning":true}}
+            ]
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let source = &created["sources"][0];
+    let source_id = source["id"].as_str().unwrap();
+    let revision = source["revision"].as_i64().unwrap();
+    let routes = source["routes"].as_array().unwrap();
+    for route in routes {
+        assert_eq!(
+            route["modelCapabilities"]["supportedEfforts"],
+            json!(["low", "medium", "high", "max"]),
+            "{route}"
+        );
+        assert_eq!(route["modelCapabilities"]["reasoning"], true, "{route}");
+    }
+    assert_eq!(routes[0]["modelCapabilities"]["contextWindow"], 1_048_576);
+    assert_eq!(routes[0]["defaultEffort"], "high");
+
+    let (status, bound) = harness
+        .post(envelope(json!({
+            "kind":"bind",
+            "sourceId":source_id,
+            "routeId":routes[0]["id"],
+            "revision":revision
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{bound}");
+    let account_id = bound["accountId"].as_str().unwrap();
+    let account = bound["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == account_id)
+        .unwrap();
+    assert_eq!(
+        account["apiProfile"]["modelCapabilities"]["supportedEfforts"],
+        json!(["low", "medium", "high", "max"])
+    );
+    assert_eq!(
+        account["apiProfile"]["modelCapabilities"]["contextWindow"],
+        1_048_576
+    );
+}
+

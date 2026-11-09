@@ -37,7 +37,7 @@ const BANNED_HEADERS: &[&str] = &[
 
 /// Declared model capabilities. The gateway is trusted to report these; the
 /// daemon only enforces local shape and session limits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct ModelCapabilities {
@@ -114,7 +114,7 @@ pub enum ModelCapabilitySupportValue {
 }
 
 /// Reports only explicitly declared capabilities; enforcement is engine-specific.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct ModelCapabilitySupport {
@@ -174,7 +174,7 @@ pub(crate) fn capability_support(profile: &ApiProfile) -> Option<ModelCapability
 }
 
 /// Public, non-secret API profile carried in account snapshots.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct ApiProfile {
@@ -629,8 +629,37 @@ pub(crate) fn known_codex_model(
     };
     let slug = slug.rsplit('/').next().unwrap_or(slug);
     match slug {
-        "glm-5.3" => Some((1_048_576, &["low", "high", "max"], "Z.ai's latest flagship model")),
-        "glm-5-turbo" => Some((204_800, &[], "Agent-optimized model")),
+        "glm-5.3" | "glm-5.3-flash" | "glm-5.3-flashx" => Some((
+            1_048_576,
+            &["low", "medium", "high", "max"],
+            "Z.ai's latest flagship model",
+        )),
+        "glm-5-turbo" => Some((
+            204_800,
+            &["low", "medium", "high", "max"],
+            "Agent-optimized model",
+        )),
+        "glm-5.2" | "glm-5.1" | "glm-5" => Some((
+            if has_1m { 1_000_000 } else { 204_800 },
+            &["low", "medium", "high", "max"],
+            "Z.ai GLM-5 model",
+        )),
+        "glm-4.7" | "glm-4.6" | "glm-4.5" | "glm-4.5-air" | "mira-glm-2" => Some((
+            if has_1m { 1_000_000 } else { 200_000 },
+            &["low", "medium", "high", "max"],
+            "Z.ai GLM model",
+        )),
+        "claude-opus-4-6"
+        | "claude-opus-4-7"
+        | "claude-opus-4-8"
+        | "openrouter-1"
+        | "openrouter-1o"
+        | "openrouter-2o"
+        | "openrouter-3o" => Some((
+            if has_1m { 1_000_000 } else { 200_000 },
+            &["low", "medium", "high", "xhigh", "max"],
+            "Claude Opus",
+        )),
         "gpt-daybreak-blue-latest" => Some((
             2_500_000,
             &["low", "medium", "high", "xhigh", "ultra"],
@@ -667,10 +696,21 @@ pub(crate) fn known_codex_model(
             &[],
             "DeepSeek Chat",
         )),
-        "seed-code" | "seed-evolving" | "doubao-seed-evolving" => Some((
+        "seed-code"
+        | "seed-evolving"
+        | "doubao-seed-evolving"
+        | "seed-2.1-pro-0915"
+        | "seed-2.1-turbo"
+        | "seed-dogfooding-2.0"
+        | "pioneer-seed-e" => Some((
             if has_1m { 1_000_000 } else { 256_000 },
             &["low", "medium", "high"],
             "Seed Coding model",
+        )),
+        "gemini-3-flash-preview" | "gemini-3.1-pro-preview" | "gemini-3.8-flash" => Some((
+            1_000_000,
+            &["low", "medium", "high", "max"],
+            "Gemini",
         )),
         _ if has_1m => Some((
             1_000_000,
@@ -974,7 +1014,15 @@ mod tests {
             .iter()
             .map(|level| level["effort"].as_str().unwrap())
             .collect();
-        assert_eq!(efforts, ["low", "high", "max"]);
+        assert_eq!(efforts, ["low", "medium", "high", "max"]);
+
+        let flash_catalog = codex_model_catalog(&codex_profile("glm-5.3-flash", None)).unwrap();
+        assert_eq!(flash_catalog["models"][0]["context_window"], 1_048_576);
+        assert_eq!(flash_catalog["models"][0]["default_reasoning_level"], "max");
+
+        let turbo_catalog = codex_model_catalog(&codex_profile("glm-5-turbo", None)).unwrap();
+        assert_eq!(turbo_catalog["models"][0]["context_window"], 204_800);
+        assert_eq!(turbo_catalog["models"][0]["default_reasoning_level"], "max");
     }
 
     #[test]
