@@ -31,7 +31,7 @@ export class RustProcess {
   private stopping: Promise<void> | undefined;
   private startup: AbortController | undefined;
   private connection: RustConnection | undefined;
-  private readonly expectedBuildId: string | undefined;
+  private expectedBuildId: string | undefined;
 
   constructor(
     readonly binary: string,
@@ -40,7 +40,11 @@ export class RustProcess {
     private readonly env?: Record<string, string>,
   ) {
     if (!isAbsolute(binary) || !isAbsolute(directory)) throw new Error("Rust runtime paths must be absolute");
-    try { this.expectedBuildId = createHash("sha256").update(readFileSync(binary)).digest("hex"); } catch { this.expectedBuildId = undefined; }
+    this.expectedBuildId = this.readBinaryBuildId();
+  }
+
+  private readBinaryBuildId(): string | undefined {
+    try { return createHash("sha256").update(readFileSync(this.binary)).digest("hex"); } catch { return this.expectedBuildId; }
   }
 
   get managed(): boolean { return Boolean(this.child && this.child.exitCode === null && this.child.signalCode === null); }
@@ -48,6 +52,7 @@ export class RustProcess {
 
   async attach(timeoutMs = 2500): Promise<RustConnection | undefined> {
     if (this.connection && this.managed) return this.connection;
+    this.expectedBuildId = this.readBinaryBuildId();
     let connection: RustConnection;
     try {
       connection = this.readConnectionFile();
@@ -133,11 +138,16 @@ export class RustProcess {
       const connection = this.readConnectionFile(ready);
       const client = connection.client;
       const health = await client.health(startup.signal);
+      this.expectedBuildId = this.readBinaryBuildId();
       if (health.apiVersion !== 1 || health.backend !== "rust" || (this.expectedBuildId && health.buildId !== this.expectedBuildId) || startup.signal.aborted || !this.managed) throw new Error("Rust health check failed");
       this.connection = { ...connection, buildId: health.buildId, ...(this.expectedBuildId ? { expectedBuildId: this.expectedBuildId } : {}) };
       return this.connection;
     } catch (error) {
       await this.stop();
+      if (!startup.signal.aborted) {
+        const attached = await this.waitForReplacement(0, 10_000);
+        if (attached) return attached;
+      }
       throw error;
     } finally { clearTimeout(timer); if (this.startup === startup) this.startup = undefined; }
   }
@@ -172,6 +182,7 @@ export class RustProcess {
   }
 
   private async waitForReplacement(previousPid: number, timeoutMs: number): Promise<RustConnection | undefined> {
+    this.expectedBuildId = this.readBinaryBuildId();
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await delay(100);
@@ -179,7 +190,7 @@ export class RustProcess {
         const connection = this.readConnectionFile();
         const health = await connection.client.health(AbortSignal.timeout(1000));
         if (health.apiVersion !== 1 || health.backend !== "rust") continue;
-        if (health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
+        if (!this.expectedBuildId || health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
         if (connection.pid !== previousPid) return this.accept(connection, health.buildId, true, true);
       } catch {}
     }
@@ -189,6 +200,7 @@ export class RustProcess {
 
   async completeDeferredUpgrade(timeoutMs = 20_000): Promise<RustConnection | undefined> {
     const connection = this.connection;
+    this.expectedBuildId = this.readBinaryBuildId();
     if (!connection?.upgradeDeferred || !this.expectedBuildId) return connection;
     try {
       const health = await connection.client.health(AbortSignal.timeout(1000));
