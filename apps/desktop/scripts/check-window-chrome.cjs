@@ -12,6 +12,7 @@ const home = path.join(root, "home");
 fs.mkdirSync(home);
 fs.writeFileSync(path.join(home, "desktop.json"), JSON.stringify({ settings: { startDaemonOnLaunch: false, theme: "dark" } }));
 process.env.PROSPERO_HOME = home;
+process.env.PROSPERO_BACKEND = "legacy";
 app.setPath("userData", path.join(root, "userData"));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const deadline = setTimeout(() => { console.error("Window chrome check timed out", root); app.exit(1); }, 60_000);

@@ -41,6 +41,7 @@ const server = createServer((request, response) => {
   else response.end(JSON.stringify({ ok: true, available: false, items: [], modes: [], models: [] }));
 });
 process.env.PROSPERO_HOME = home;
+process.env.PROSPERO_BACKEND = "legacy";
 process.argv.push("--background");
 app.setPath("userData", path.join(fixture, "userData"));
 app.disableHardwareAcceleration();

@@ -45,8 +45,8 @@ export function runtimeSwitchPath(appData: string): string {
   return resolve(appData, "Prospero", "runtime-switch.json");
 }
 
-export function defaultBackend(packaged: boolean): BackendPreference {
-  return packaged ? "rust" : "legacy";
+export function defaultBackend(_packaged: boolean): BackendPreference {
+  return "rust";
 }
 
 export function readBackendSelection(path: string, packaged: boolean, env = process.env): BackendSelection {

@@ -510,7 +510,7 @@ export default function HostScreen() {
       setResumeLoading(true);
       setResumeError(null);
       void conn
-        .localConversations(agent as ResumableConversation["agent"], resumeQuery, 20, selectedAccount?.id)
+        .localConversations(agent as Parameters<typeof conn.localConversations>[0], resumeQuery, 20, selectedAccount?.id)
         .then((conversations) => {
           if (!cancelled) setResumeResults(conversations);
         })

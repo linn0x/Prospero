@@ -56,9 +56,12 @@ function checkRuntimeArchitecture(context) {
   }
   if (context.electronPlatformName !== 'win32') return;
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8').replace(/^\uFEFF/, ''));
-  const actual = windowsExecutableArchitecture(join(root, 'node', 'node.exe'));
-  if (actual !== expected || manifest.prosperoRuntime?.architecture !== expected) {
-    throw new Error(`Windows ${expected} package requires matching Node and dependencies. Run scripts/package.ps1 -Architecture ${expected} -NodeExecutable <matching-node.exe> first.`);
+  if (manifest.prosperoRuntime?.architecture !== expected) {
+    throw new Error(`Windows ${expected} package requires matching runtime metadata. Run scripts/package.ps1 -Architecture ${expected} first.`);
+  }
+  const nodeExe = join(root, 'node', 'node.exe');
+  if (existsSync(nodeExe) && windowsExecutableArchitecture(nodeExe) !== expected) {
+    throw new Error(`Windows ${expected} package requires matching Node executable.`);
   }
   const rust = join(root, 'prosperod-rs.exe');
   if (!existsSync(rust)) throw new Error('Rust daemon binary is missing from .runtime. Run scripts/package.ps1 after cargo build --release -p prosperod-rs.');

@@ -21,6 +21,7 @@ const AGENTS: Record<AgentKind, { dark: string; light: string; symbol?: IconName
   deepseek: { dark: "#829BFF", light: "#3D57C8" },
   opencode: { dark: "#5BC98C", light: "#1E7049" },
   pi: { dark: "#34D399", light: "#0D9488" },
+  agy: { dark: "#A78BFA", light: "#6D28D9", symbol: "terminal.fill" },
   grok: { dark: "#C9C9D4", light: "#404957" },
   trae: { dark: "#3ED592", light: "#147A50" },
   shell: { dark: "#C1C7D0", light: "#404957", symbol: "terminal.fill" },

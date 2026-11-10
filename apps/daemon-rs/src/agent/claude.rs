@@ -379,6 +379,95 @@ mod tests {
             serde_json::json!({"command":"pwd"})
         );
     }
+
+    #[test]
+    fn forks_claude_transcript_natively_with_independent_ids_and_frozen_history() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = root.path().join("claude");
+        let project_key: String = workspace
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let project = config.join("projects").join(project_key);
+        std::fs::create_dir_all(&project).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let assistant_id = uuid::Uuid::new_v4().to_string();
+        let records = [
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "isSidechain": false,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "version": "2.1.0",
+                "type": "user",
+                "uuid": user_id,
+                "parentUuid": null,
+                "message": { "role": "user", "content": "Original question" }
+            }),
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "isSidechain": false,
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "version": "2.1.0",
+                "type": "assistant",
+                "uuid": assistant_id,
+                "parentUuid": user_id,
+                "message": {
+                    "role": "assistant",
+                    "type": "message",
+                    "id": "msg_fixture",
+                    "model": "fixture",
+                    "content": [{ "type": "text", "text": "Original answer" }],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }
+            }),
+        ];
+        let source_path = project.join(format!("{session_id}.jsonl"));
+        let original = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&records[0]).unwrap(),
+            serde_json::to_string(&records[1]).unwrap()
+        );
+        std::fs::write(&source_path, &original).unwrap();
+        let forked_id = fork_session_file_in_config_dir(
+            &config,
+            &workspace.to_string_lossy(),
+            &session_id,
+        )
+        .unwrap();
+        assert_ne!(forked_id, session_id);
+        assert_eq!(std::fs::read_to_string(&source_path).unwrap(), original);
+        let target_path = project.join(format!("{forked_id}.jsonl"));
+        let copied = std::fs::read_to_string(&target_path).unwrap();
+        assert!(copied.contains("Original question"));
+        assert!(copied.contains("Original answer"));
+        let messages: Vec<Value> = copied
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|row| {
+                matches!(
+                    row.get("type").and_then(Value::as_str),
+                    Some("user" | "assistant")
+                )
+            })
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_ne!(
+            messages[0].get("uuid").and_then(Value::as_str),
+            Some(user_id.as_str())
+        );
+        assert_eq!(
+            messages[1].get("parentUuid").and_then(Value::as_str),
+            messages[0].get("uuid").and_then(Value::as_str)
+        );
+    }
 }
 
 /// Parses the `models` array from an `initialize` control_response payload
@@ -451,6 +540,243 @@ pub(super) struct TurnOptions {
     pub(super) api_profile: Option<crate::accounts::ApiProfile>,
 }
 
+fn resolve_claude_config_dir(environment: &[(String, String)]) -> Option<std::path::PathBuf> {
+    if let Some((_, value)) = environment.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        && !value.trim().is_empty()
+    {
+        return Some(std::path::PathBuf::from(value));
+    }
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| std::path::PathBuf::from(home).join(".claude"))
+}
+
+fn find_claude_session_file(
+    config_dir: &std::path::Path,
+    workspace: &str,
+    source: &str,
+) -> Option<std::path::PathBuf> {
+    let file_name = format!("{source}.jsonl");
+    let projects_root = config_dir.join("projects");
+    let canonical = std::fs::canonicalize(workspace)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.to_owned());
+    for candidate_ws in [canonical.as_str(), workspace] {
+        let project_key: String = candidate_ws
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let direct = projects_root.join(&project_key).join(&file_name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+    }
+    let entries = std::fs::read_dir(&projects_root).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let candidate = dir.join(&file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn fork_session_file_in_config_dir(
+    config_dir: &std::path::Path,
+    workspace: &str,
+    source: &str,
+) -> Result<String> {
+    let source_path = find_claude_session_file(config_dir, workspace, source)
+        .ok_or_else(|| Error::Invalid(format!("未找到 Claude 原生会话文件: {source}")))?;
+    let raw = std::fs::read_to_string(&source_path)?;
+    let mut all_rows = Vec::new();
+    let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
+    let mut content_replacements: Vec<Value> = Vec::new();
+    let mut relocated_cwd: Option<String> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(t) = row.get("customTitle").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            custom_title = Some(t.to_owned());
+        }
+        if let Some(t) = row.get("aiTitle").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            ai_title = Some(t.to_owned());
+        }
+        match row.get("type").and_then(Value::as_str) {
+            Some("content-replacement") => {
+                if let Some(arr) = row.get("replacements").and_then(Value::as_array) {
+                    content_replacements.extend(arr.iter().cloned());
+                }
+            }
+            Some("relocated") => {
+                if let Some(cwd) = row.get("relocatedCwd").and_then(Value::as_str) {
+                    relocated_cwd = Some(cwd.to_owned());
+                }
+            }
+            Some("user" | "assistant" | "attachment" | "system" | "progress") => {
+                if row.get("isSidechain").and_then(Value::as_bool) != Some(true) {
+                    all_rows.push(row);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if all_rows.is_empty() {
+        return Err(Error::Invalid("Claude 原生会话没有可分支的消息记录".into()));
+    }
+
+    let mut uuid_map = HashMap::new();
+    let mut by_uuid = HashMap::new();
+    for row in &all_rows {
+        if let Some(u) = row.get("uuid").and_then(Value::as_str) {
+            uuid_map.insert(u.to_owned(), uuid::Uuid::new_v4().to_string());
+            by_uuid.insert(u.to_owned(), row.clone());
+        }
+    }
+
+    let non_progress: Vec<Value> = all_rows
+        .into_iter()
+        .filter(|row| row.get("type").and_then(Value::as_str) != Some("progress"))
+        .collect();
+    if non_progress.is_empty() {
+        return Err(Error::Invalid("Claude 原生会话没有可分支的消息记录".into()));
+    }
+
+    let forked_id = uuid::Uuid::new_v4().to_string();
+    let now_ms = crate::database::now();
+    let now_iso = format!("{}.{:03}Z", (now_ms / 1000).max(0), (now_ms % 1000).max(0));
+    let mut out_lines = Vec::new();
+    let total = non_progress.len();
+
+    for (idx, mut row) in non_progress.into_iter().enumerate() {
+        let old_uuid = row
+            .get("uuid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let new_uuid = uuid_map
+            .get(&old_uuid)
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let mut resolved_parent: Option<String> = None;
+        let mut cursor = row
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        while let Some(parent_id) = cursor {
+            let Some(parent_row) = by_uuid.get(&parent_id) else {
+                break;
+            };
+            if parent_row.get("type").and_then(Value::as_str) != Some("progress") {
+                resolved_parent = uuid_map.get(&parent_id).cloned();
+                break;
+            }
+            cursor = parent_row
+                .get("parentUuid")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+
+        let logical_parent = row
+            .get("logicalParentUuid")
+            .and_then(Value::as_str)
+            .and_then(|id| uuid_map.get(id).cloned());
+
+        let is_refusal_fallback = row.get("type").and_then(Value::as_str) == Some("system")
+            && row.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback");
+
+        if let Some(obj) = row.as_object_mut() {
+            if is_refusal_fallback {
+                obj.insert("neutralizedByFork".into(), Value::Bool(true));
+            }
+            obj.insert("uuid".into(), Value::String(new_uuid));
+            obj.insert(
+                "parentUuid".into(),
+                resolved_parent.map_or(Value::Null, Value::String),
+            );
+            if obj.contains_key("logicalParentUuid") {
+                obj.insert(
+                    "logicalParentUuid".into(),
+                    logical_parent.map_or(Value::Null, Value::String),
+                );
+            }
+            obj.insert("sessionId".into(), Value::String(forked_id.clone()));
+            if idx + 1 == total {
+                obj.insert("timestamp".into(), Value::String(now_iso.clone()));
+            }
+            obj.insert("isSidechain".into(), Value::Bool(false));
+            obj.remove("teamName");
+            obj.remove("agentName");
+            obj.remove("sessionKind");
+            obj.remove("slug");
+            obj.remove("sourceToolAssistantUUID");
+            obj.insert(
+                "forkedFrom".into(),
+                serde_json::json!({
+                    "sessionId": source,
+                    "messageUuid": old_uuid,
+                }),
+            );
+        }
+        out_lines.push(serde_json::to_string(&row)?);
+    }
+
+    if !content_replacements.is_empty() {
+        out_lines.push(serde_json::to_string(&serde_json::json!({
+            "type": "content-replacement",
+            "sessionId": forked_id,
+            "replacements": content_replacements,
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "timestamp": now_iso,
+        }))?);
+    }
+    if let Some(cwd) = relocated_cwd {
+        out_lines.push(serde_json::to_string(&serde_json::json!({
+            "type": "relocated",
+            "sessionId": forked_id,
+            "relocatedCwd": cwd,
+        }))?);
+    }
+    let title = custom_title
+        .or(ai_title)
+        .unwrap_or_else(|| "Forked session".into());
+    out_lines.push(serde_json::to_string(&serde_json::json!({
+        "type": "custom-title",
+        "sessionId": forked_id,
+        "customTitle": format!("{title} (fork)"),
+        "uuid": uuid::Uuid::new_v4().to_string(),
+        "timestamp": now_iso,
+    }))?);
+
+    let parent_dir = source_path
+        .parent()
+        .ok_or_else(|| Error::Invalid("Claude 会话目录无效".into()))?;
+    let dest_path = parent_dir.join(format!("{forked_id}.jsonl"));
+    let mut output = out_lines.join("\n");
+    output.push('\n');
+    std::fs::write(&dest_path, output)?;
+    Ok(forked_id)
+}
+
 /// Fork the persisted transcript without starting an inference turn.
 pub(super) async fn fork_session(
     workspace: &str,
@@ -458,68 +784,47 @@ pub(super) async fn fork_session(
     options: &TurnOptions,
 ) -> Result<String> {
     crate::database::validate_id(source)?;
-    let runtime = std::env::current_exe()?
-        .parent()
-        .ok_or(Error::Closed)?
-        .to_owned();
-    let helper = std::env::var_os("PROSPERO_CLAUDE_FORK_HELPER")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            [
-                runtime.join("node_modules/@prospero/daemon/dist/claude-session-fork.js"),
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../daemon/dist/claude-session-fork.js"),
-            ]
-            .into_iter()
-            .find(|path| path.is_file())
-        })
-        .ok_or_else(|| Error::Invalid("缺少 Claude 会话分支组件，请更新桌面 runtime".into()))?;
-    let bundled_node = runtime.join(if cfg!(windows) {
-        "node/node.exe"
-    } else {
-        "node/node"
-    });
-    let node = std::env::var_os("PROSPERO_NODE").unwrap_or_else(|| {
-        if bundled_node.is_file() {
-            bundled_node.into_os_string()
-        } else {
-            "node".into()
+    if let Some(helper) = std::env::var_os("PROSPERO_CLAUDE_FORK_HELPER").map(std::path::PathBuf::from) {
+        let node = std::env::var_os("PROSPERO_NODE").unwrap_or_else(|| "node".into());
+        let mut command = Command::new(node);
+        command
+            .arg(helper)
+            .arg(source)
+            .arg(workspace)
+            .current_dir(workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in &options.environment {
+            command.env(key, value);
         }
-    });
-    let mut command = Command::new(node);
-    command
-        .arg(helper)
-        .arg(source)
-        .arg(workspace)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    for (key, value) in &options.environment {
-        command.env(key, value);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .map_err(|_| Error::Timeout)??;
+        let reply: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| Error::Invalid("Claude 分支组件返回了无效响应".into()))?;
+        if !output.status.success() {
+            return Err(Error::Invalid(
+                reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("无法创建 Claude 聊天分支")
+                    .to_owned(),
+            ));
+        }
+        let id = reply
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| *id != source)
+            .ok_or_else(|| Error::Invalid("Claude 未返回独立的分支会话".into()))?;
+        uuid::Uuid::parse_str(id).map_err(|_| Error::Invalid("Claude 分支会话 ID 无效".into()))?;
+        return Ok(id.to_owned());
     }
-    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
-        .await
-        .map_err(|_| Error::Timeout)??;
-    let reply: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| Error::Invalid("Claude 分支组件返回了无效响应".into()))?;
-    if !output.status.success() {
-        return Err(Error::Invalid(
-            reply
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("无法创建 Claude 聊天分支")
-                .to_owned(),
-        ));
-    }
-    let id = reply
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .filter(|id| *id != source)
-        .ok_or_else(|| Error::Invalid("Claude 未返回独立的分支会话".into()))?;
-    uuid::Uuid::parse_str(id).map_err(|_| Error::Invalid("Claude 分支会话 ID 无效".into()))?;
-    Ok(id.to_owned())
+
+    let config_dir = resolve_claude_config_dir(&options.environment)
+        .ok_or_else(|| Error::Invalid("未找到 Claude 配置目录".into()))?;
+    fork_session_file_in_config_dir(&config_dir, workspace, source)
 }
 
 pub(super) fn spawn_turn(

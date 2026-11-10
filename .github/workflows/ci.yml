@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust-native-desktop:
-    name: Rust Native Desktop (${{ matrix.os }})
+  rust-daemon:
+    name: Rust Daemon (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,22 +38,17 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libwayland-dev libxkbcommon-dev pkg-config
       - uses: actions/setup-node@v6
         with:
           node-version: 22
           architecture: ${{ endsWith(matrix.artifact, 'arm64') && 'arm64' || 'x64' }}
-      - name: Check native workspace
+      - name: Check Rust workspace
         run: cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test native workspace
+      - name: Test Rust workspace
         if: runner.os != 'Windows'
         run: cargo test --workspace --locked
       - name: Test Windows workspace within runner Job
         if: runner.os == 'Windows'
-        # This one case is mandatory in the out-of-Job step below, because a
-        # runner Job intentionally rejects detached-process breakaway.
         run: cargo test --workspace --locked -- --skip conpty_shell_survives_daemon_restarts_and_explicit_close_archives_it
       - name: Accept Linux native daemon and PTY
         if: runner.os == 'Linux'
@@ -71,30 +66,6 @@ jobs:
           $executable = @($artifacts | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'terminal_host_lifecycle' -and $_.executable } | ForEach-Object { $_.executable }) | Select-Object -Last 1
           if (-not $executable) { throw 'Missing Rust lifecycle test executable' }
           & ./tools/ci/verify-rust-windows-host.ps1 -Workspace $env:GITHUB_WORKSPACE -TestExecutable $executable -NodePath (Get-Command node.exe).Source
-      - name: Package Linux Native Desktop
-        if: runner.os == 'Linux'
-        run: apps/desktop-rs/scripts/package-linux.sh
-      - name: Package macOS Native Desktop
-        if: runner.os == 'macOS'
-        run: apps/desktop-rs/scripts/package-macos.sh
-      - name: Package Windows Native Desktop
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./apps/desktop-rs/scripts/package-windows.ps1
-      - name: Audit package for Electron and Node
-        shell: bash
-        run: |
-          if find target/package target/Prospero.app -type f \( -name node -o -name '*.asar' -o -name 'electron*' \) -print 2>/dev/null | grep -q .; then
-            echo 'native package contains forbidden Electron or Node runtime files'
-            exit 1
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: prospero-native-${{ matrix.artifact }}
-          path: |
-            target/package/Prospero-*
-            target/Prospero.app
-          if-no-files-found: error
 
   node:
     name: Node checks (${{ matrix.os }})
@@ -115,139 +86,6 @@ jobs:
       - run: npm run lint -w @prospero/mobile
       - run: npm test
 
-  windows-native:
-    name: Windows native (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: windows-latest
-          # This is intentionally an unconditional real hosted ARM64 job: a
-          # queue/image/build failure is a CI failure, never a skipped pass.
-          - arch: arm64
-            runner: windows-11-arm
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - run: npm ci
-      - name: Assert the runner matches the artifact architecture
-        run: |
-          node -e "if (process.platform !== 'win32' || process.arch !== '${{ matrix.arch }}') { throw new Error('expected win32/${{ matrix.arch }}, received ' + process.platform + '/' + process.arch) }"
-      - name: Build and exercise the real Node-API addon
-        run: |
-          npm run build --workspace=@prospero/windows-native
-          npm run test:native --workspace=@prospero/windows-native
-      - name: Stage an unsigned CI-only artifact and prove production rejects it
-        run: |
-          node packages/windows-native/scripts/stage-prebuild.mjs --source packages/windows-native/build/Release/prospero_windows_native.node --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
-          node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect unsigned
-          npm run verify:prebuilds --workspace=@prospero/windows-native
-      - name: Exercise full-process Session Host acceptance with an ephemeral trusted test signature
-        # The production loader deliberately rejects source-built/unsigned
-        # addons. Trust a runner-local self-signed copy only for this step,
-        # then restore the original unsigned artifact before upload/release.
-        timeout-minutes: 10
-        run: |
-          $artifact = 'packages/windows-native/prebuilds/win32-${{ matrix.arch }}/prospero_windows_native.node'
-          $source = 'packages/windows-native/build/Release/prospero_windows_native.node'
-          Write-Host 'Creating ephemeral code-signing certificate'
-          $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Prospero Windows CI Session Host Test' -CertStoreLocation 'Cert:\CurrentUser\My'
-          $certificateFile = Join-Path $env:RUNNER_TEMP 'prospero-windows-session-host-test.cer'
-          $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\${{ matrix.arch }}\signtool.exe" -File -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signTool) { throw 'signtool.exe was not found in the Windows SDK' }
-          try {
-            Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
-            Write-Host 'Trusting ephemeral certificate in the isolated runner machine stores'
-            & certutil.exe -f -addstore Root $certificateFile
-            if ($LASTEXITCODE -ne 0) { throw 'certutil failed to trust the ephemeral root certificate' }
-            & certutil.exe -f -addstore TrustedPublisher $certificateFile
-            if ($LASTEXITCODE -ne 0) { throw 'certutil failed to trust the ephemeral publisher certificate' }
-            Copy-Item -LiteralPath $source -Destination $artifact -Force
-            Write-Host "Signing $artifact with $signTool"
-            & $signTool sign /fd SHA256 /sha1 $certificate.Thumbprint $artifact
-            if ($LASTEXITCODE -ne 0) { throw 'signtool failed for the ephemeral Session Host test artifact' }
-            $signature = Get-AuthenticodeSignature -LiteralPath $artifact
-            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
-              throw 'ephemeral Session Host test artifact is not trusted by the Windows loader'
-            }
-            Write-Host 'Ephemeral Authenticode signature is trusted; running Session Host acceptance'
-            node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status valid --thumbprint $certificate.Thumbprint
-            if ($LASTEXITCODE -ne 0) { throw 'failed to stage the signed Session Host test artifact' }
-            node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect valid
-            if ($LASTEXITCODE -ne 0) { throw 'the production loader rejected the signed Session Host test artifact' }
-            npm run build --workspace=@prospero/daemon
-            if ($LASTEXITCODE -ne 0) { throw 'daemon build failed before Windows Session Host acceptance' }
-            # GitHub hosted runners place the runner process in a restrictive
-            # Job that deliberately blocks durable child breakaway. Run the
-            # acceptance process as a one-shot SYSTEM scheduled task so the
-            # real detached-host/Job lifecycle is exercised outside that Job.
-            $taskName = "Prospero-SessionHost-$env:GITHUB_RUN_ID-${{ matrix.arch }}"
-            $taskScript = Join-Path $env:GITHUB_WORKSPACE 'packages/windows-native/scripts/run-session-host-acceptance.ps1'
-            $taskLauncher = Join-Path $env:RUNNER_TEMP "prospero-session-host-${{ matrix.arch }}-launch.ps1"
-            $taskLog = Join-Path $env:RUNNER_TEMP "prospero-session-host-${{ matrix.arch }}.log"
-            $taskResult = Join-Path $env:RUNNER_TEMP "prospero-session-host-${{ matrix.arch }}.result"
-            $npmPath = (Get-Command npm.cmd -ErrorAction Stop).Source
-            $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            @($taskScript, $taskLauncher, $taskLog, $taskResult, $npmPath, $windowsPowerShell, $env:GITHUB_WORKSPACE) | ForEach-Object {
-              if ($_.Contains("'") -or $_.Contains('"')) { throw "scheduled-task path contains an unsupported quote: $_" }
-            }
-            $taskLauncherLines = @(
-              "& '$taskScript' -Workspace '$env:GITHUB_WORKSPACE' -NpmPath '$npmPath' -LogPath '$taskLog' -ResultPath '$taskResult'",
-              'exit $LASTEXITCODE'
-            )
-            Set-Content -LiteralPath $taskLauncher -Value $taskLauncherLines -Encoding utf8
-            $taskCommand = "`"$windowsPowerShell`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$taskLauncher`""
-            if ($taskCommand.Length -gt 261) { throw 'scheduled-task launcher command exceeds the Windows Task Scheduler limit' }
-            try {
-              $startTime = (Get-Date).AddMinutes(1).ToString('HH:mm')
-              & schtasks.exe /Create /TN $taskName /SC ONCE /ST $startTime /TR $taskCommand /RU SYSTEM /RL HIGHEST /F
-              if ($LASTEXITCODE -ne 0) { throw 'failed to register out-of-Job Session Host acceptance task' }
-              & schtasks.exe /Run /TN $taskName
-              if ($LASTEXITCODE -ne 0) { throw 'failed to start out-of-Job Session Host acceptance task' }
-              $deadline = (Get-Date).AddMinutes(4)
-              while (-not (Test-Path -LiteralPath $taskResult)) {
-                if ((Get-Date) -ge $deadline) { throw 'out-of-Job Session Host acceptance timed out' }
-                Start-Sleep -Seconds 1
-              }
-              if (Test-Path -LiteralPath $taskLog) { Get-Content -LiteralPath $taskLog }
-              $acceptanceExitCode = [int]((Get-Content -LiteralPath $taskResult -Raw).Trim())
-              if ($acceptanceExitCode -ne 0) { throw "Windows Session Host acceptance failed with exit code $acceptanceExitCode" }
-            } finally {
-              & schtasks.exe /End /TN $taskName 2>$null | Out-Null
-              & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
-              $global:LASTEXITCODE = 0
-              Remove-Item -LiteralPath $taskLauncher, $taskLog, $taskResult -Force -ErrorAction SilentlyContinue
-            }
-          } finally {
-            Copy-Item -LiteralPath $source -Destination $artifact -Force
-            node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
-            & certutil.exe -f -delstore Root $certificate.Thumbprint
-            if ($LASTEXITCODE -ne 0) { Write-Warning 'certutil could not remove the ephemeral root certificate' }
-            & certutil.exe -f -delstore TrustedPublisher $certificate.Thumbprint
-            if ($LASTEXITCODE -ne 0) { Write-Warning 'certutil could not remove the ephemeral publisher certificate' }
-            $global:LASTEXITCODE = 0
-            Remove-Item -LiteralPath $certificateFile -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
-          }
-      - name: Upload unsigned test artifact and SHA-256 manifest
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-native-unsigned-${{ matrix.arch }}
-          path: packages/windows-native/prebuilds/win32-${{ matrix.arch }}
-          if-no-files-found: error
-          retention-days: 7
-
   macos-desktop:
     name: macOS Electron desktop
     runs-on: macos-latest
@@ -267,55 +105,6 @@ jobs:
         run: cargo build --release -p prosperod-rs --bins --locked
       - name: Stage the bundled daemon runtime
         run: node apps/desktop/scripts/prepare-runtime.mjs
-      - name: Package the unsigned macOS app
-        working-directory: apps/desktop
-        # CI 上没有证书,签名跳过;这一步要验的是"能不能装配出一个完整的 .app",
-        # 签名与公证属于发布流程,不该拦住每一次提交。
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npx electron-builder --mac dir --arm64
-      - name: Verify the packaged app resolves node, daemon and PATH
-        # --self-check 不开窗口,所以不依赖 GUI 会话。它恰好覆盖 macOS 上最容易
-        # 出问题、而 Windows 上根本不存在的那条链:GUI 进程的极简 PATH 里找不到
-        # node,也找不到各家 agent CLI。
-        run: |
-          smoke="$RUNNER_TEMP/prospero-macos-smoke"
-          mkdir -p "$smoke"
-          PROSPERO_HOME="$smoke" ./dist/desktop/mac-arm64/Prospero.app/Contents/MacOS/Prospero --self-check | tee "$smoke/self-check.log"
-          if grep -q "❌" "$smoke/self-check.log"; then
-            echo "自检报告里有缺失项，见上面的输出"
-            exit 1
-          fi
-      - name: Start the bundled daemon straight out of the package
-        # 自检只证明"找得到",不证明"跑得起来"。daemon 启动时会为结构化 supervisor
-        # 构建运行时镜像,而它的信任边界是从 dist 往上最近的那个 node_modules ——
-        # 打包布局稍有偏差就 fail closed。这条路径 Windows 永远走不到(ws-server
-        # 里那段显式跳过 win32),所以只能在这里守。
-        run: |
-          runtime="./dist/desktop/mac-arm64/Prospero.app/Contents/Resources/runtime"
-          # macOS 的 unix socket 路径上限是 104 字节,daemon home 必须够短。
-          home="$(mktemp -d /tmp/p-ci-XXXX)"
-          env -i HOME="$home" PROSPERO_HOME="$home" PATH=/usr/bin:/bin \
-            "$runtime/node/node" "$runtime/node_modules/@prospero/daemon/dist/cli.js" \
-            start --port 7997 --bind 127.0.0.1 --no-bonjour > "$home/daemon.log" 2>&1 &
-          # daemon 起来之前要先落地一份结构化 supervisor 的运行时镜像(复制依赖包树),
-          # CI 的磁盘比本机慢得多,给足时间;超时也要把现场打出来,否则只剩一句
-          # "没能启动",查不下去。
-          for _ in $(seq 1 90); do
-            [ -f "$home/status.json" ] && break
-            sleep 1
-          done
-          echo "--- daemon 输出 ---"
-          cat "$home/daemon.log" || true
-          if [ ! -f "$home/status.json" ]; then
-            echo "--- 目录现场 ---"
-            ls -la "$home" || true
-            echo "--- 进程是否还活着 ---"
-            pgrep -fl "runtime/node/node" || echo "(进程已不在)"
-            echo "打包内的 daemon 没能启动"
-            exit 1
-          fi
-          echo "打包内的 daemon 已就绪"
 
   windows-desktop:
     name: Windows Electron desktop
@@ -349,12 +138,6 @@ jobs:
               Get-Content -LiteralPath (Join-Path $smokeHome 'desktop.log') -ErrorAction SilentlyContinue
               throw "Windows Electron smoke test failed with exit code $($process.ExitCode)"
             }
-            # 不要断言 status.json 还在:daemon 收到 SIGTERM 会主动删掉它
-            # (StatusFile.stop 里"删掉而不是留一份陈旧快照"),而桌面端退出时正是
-            # 这么关它的。这个断言只能靠"没来得及清理"侥幸通过。daemon 是否真的起来了,
-            # 由 --smoke-test 自己断言 —— 它等 /control/health 应答,起不来就非零退出。
-            $desktopLog = Join-Path $smokeHome 'desktop.log'
-            if (-not (Test-Path -LiteralPath $desktopLog)) { throw 'Bundled daemon produced no log output' }
           } finally {
             Remove-Item Env:\PROSPERO_HOME -ErrorAction SilentlyContinue
           }
@@ -365,234 +148,6 @@ jobs:
             dist/desktop/Prospero-*-windows-x64.exe
             dist/desktop/Prospero-*-windows-x64.zip
           if-no-files-found: error
-
-  release-stage:
-    name: Sign and package Windows release artifacts
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: windows-native
-    runs-on: windows-latest
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - run: npm ci
-      - run: npm run build --workspace=@prospero/windows-native
-      - uses: actions/download-artifact@v5
-        with:
-          name: windows-native-unsigned-x64
-          path: packages/windows-native/prebuilds/win32-x64
-      - uses: actions/download-artifact@v5
-        with:
-          name: windows-native-unsigned-arm64
-          path: packages/windows-native/prebuilds/win32-arm64
-      - name: Require signing configuration and Authenticode-sign both architectures
-        env:
-          WINDOWS_AUTHENTICODE_PFX_BASE64: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_BASE64 }}
-          WINDOWS_AUTHENTICODE_PFX_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_PASSWORD }}
-          WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1: ${{ secrets.WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 }}
-          WINDOWS_AUTHENTICODE_TIMESTAMP_URL: ${{ vars.WINDOWS_AUTHENTICODE_TIMESTAMP_URL }}
-        run: |
-          $required = @(
-            'WINDOWS_AUTHENTICODE_PFX_BASE64',
-            'WINDOWS_AUTHENTICODE_PFX_PASSWORD',
-            'WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1',
-            'WINDOWS_AUTHENTICODE_TIMESTAMP_URL'
-          )
-          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
-          if ($missing.Count -gt 0) { throw "Release signing is fail-closed; missing: $($missing -join ', ')" }
-          if ($env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 -notmatch '^[a-fA-F0-9]{40}$') { throw 'WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 must be a SHA-1 thumbprint' }
-          $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -File -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signTool) { throw 'signtool.exe was not found in the Windows SDK' }
-          $certificatePath = Join-Path $env:RUNNER_TEMP 'prospero-release-signing.pfx'
-          try {
-            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_AUTHENTICODE_PFX_BASE64))
-            $artifacts = @((Get-ChildItem 'packages/windows-native/prebuilds/win32-*/prospero_windows_native.node'))
-            if ($artifacts.Count -ne 2) { throw "Expected two Windows native artifacts, found $($artifacts.Count)" }
-            $expectedThumbprint = $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1.ToUpperInvariant()
-            $artifacts | ForEach-Object {
-              & $signTool sign /fd SHA256 /f $certificatePath /p $env:WINDOWS_AUTHENTICODE_PFX_PASSWORD /tr $env:WINDOWS_AUTHENTICODE_TIMESTAMP_URL /td SHA256 $_.FullName
-              if ($LASTEXITCODE -ne 0) { throw "signtool failed for $($_.FullName)" }
-              & $signTool verify /pa /v $_.FullName
-              if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $($_.FullName)" }
-              $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName
-              if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedThumbprint) {
-                throw "Unexpected Authenticode signer for $($_.FullName)"
-              }
-            }
-          } finally {
-            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
-          }
-      - name: Emit signed SHA-256 manifests
-        env:
-          WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1: ${{ secrets.WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 }}
-        run: |
-          node packages/windows-native/scripts/stage-prebuild.mjs --source packages/windows-native/prebuilds/win32-x64/prospero_windows_native.node --destination packages/windows-native --arch x64 --authenticode-status valid --thumbprint $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1
-          node packages/windows-native/scripts/stage-prebuild.mjs --source packages/windows-native/prebuilds/win32-arm64/prospero_windows_native.node --destination packages/windows-native --arch arm64 --authenticode-status valid --thumbprint $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1
-          npm run verify:prebuilds --workspace=@prospero/windows-native
-      - name: Build daemon package and require it to embed both signed prebuilds
-        env:
-          PROSPERO_WINDOWS_NATIVE_PREBUILD_SOURCE: ${{ github.workspace }}/packages/windows-native
-        run: |
-          npm run build --workspace=@prospero/daemon
-          npm run prepack --workspace=@prospero/daemon
-          node packages/windows-native/scripts/verify-release-pack.mjs --native-root packages/windows-native --daemon-root apps/daemon --output-dir $env:RUNNER_TEMP/release-packages
-      - name: Package self-contained x64 and arm64 desktop bundles
-        env:
-          CSC_LINK: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_BASE64 }}
-          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_PASSWORD }}
-        run: |
-          $nodeVersion = node -p "process.version"
-          $armArchive = Join-Path $env:RUNNER_TEMP "node-$nodeVersion-win-arm64.zip"
-          $armDirectory = Join-Path $env:RUNNER_TEMP 'node-arm64'
-          Invoke-WebRequest -Uri "https://nodejs.org/dist/$nodeVersion/node-$nodeVersion-win-arm64.zip" -OutFile $armArchive
-          $checksums = (Invoke-WebRequest -Uri "https://nodejs.org/dist/$nodeVersion/SHASUMS256.txt").Content
-          $expected = [regex]::Match($checksums, "(?m)^([a-f0-9]{64})\s+node-$([regex]::Escape($nodeVersion))-win-arm64\.zip$")
-          if (-not $expected.Success) { throw 'Official Node.js checksum entry for win-arm64 was not found' }
-          $actual = (Get-FileHash -LiteralPath $armArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected.Groups[1].Value) { throw 'Official Node.js arm64 archive checksum mismatch' }
-          Expand-Archive -LiteralPath $armArchive -DestinationPath $armDirectory
-          $armNode = Get-ChildItem -LiteralPath $armDirectory -Filter node.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $armNode) { throw 'The official arm64 Node.js archive did not contain node.exe' }
-          ./apps/desktop/scripts/package.ps1 -Architecture x64 -NodeExecutable (Get-Command node.exe).Source
-          ./apps/desktop/scripts/package.ps1 -Architecture arm64 -NodeExecutable $armNode
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: ${{ runner.temp }}/release-packages/*.tgz
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/desktop/Prospero-*-windows-*.*
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-native-signed-x64
-          path: packages/windows-native/prebuilds/win32-x64
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-native-signed-arm64
-          path: packages/windows-native/prebuilds/win32-arm64
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: prospero-release-packages
-          path: ${{ runner.temp }}/release-packages
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: prospero-desktop
-          path: |
-            dist/desktop/Prospero-*-windows-x64.exe
-            dist/desktop/Prospero-*-windows-x64.zip
-            dist/desktop/Prospero-*-windows-arm64.exe
-            dist/desktop/Prospero-*-windows-arm64.zip
-          if-no-files-found: error
-
-  release-signed-load:
-    name: Signed production loader (${{ matrix.arch }})
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: release-stage
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: windows-latest
-          - arch: arm64
-            runner: windows-11-arm
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - run: npm ci
-      - run: npm run build --workspace=@prospero/windows-native
-      - name: Assert signed smoke runner architecture
-        run: |
-          node -e "if (process.platform !== 'win32' || process.arch !== '${{ matrix.arch }}') { throw new Error('expected win32/${{ matrix.arch }}, received ' + process.platform + '/' + process.arch) }"
-      - uses: actions/download-artifact@v5
-        with:
-          name: windows-native-signed-${{ matrix.arch }}
-          path: packages/windows-native/prebuilds/win32-${{ matrix.arch }}
-      - name: Load the signed artifact through the production loader
-        run: node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect valid
-      - name: Exercise signed full-process Session Host acceptance
-        env:
-          PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST: "1"
-        run: |
-          npm run build --workspace=@prospero/daemon
-          npm run test:windows-native --workspace=@prospero/daemon
-      - uses: actions/download-artifact@v5
-        with:
-          name: prospero-desktop
-          path: windows-bundles
-      - name: Exercise the self-contained desktop bundle
-        run: |
-          $archive = Get-ChildItem -LiteralPath (Join-Path $PWD 'windows-bundles') -Filter "Prospero-*-windows-${{ matrix.arch }}.zip" | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $archive) { throw 'Desktop ZIP artifact was not found' }
-          $expanded = Join-Path $env:RUNNER_TEMP "prospero-windows-${{ matrix.arch }}"
-          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
-          $desktop = Get-ChildItem -LiteralPath $expanded -Filter Prospero.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $desktop) { throw 'Desktop bundle did not contain Prospero.exe' }
-          $smokeHome = Join-Path $env:RUNNER_TEMP "prospero-bundle-smoke-${{ matrix.arch }}"
-          New-Item -ItemType Directory -Path $smokeHome -Force | Out-Null
-          try {
-            $env:PROSPERO_HOME = $smokeHome
-            $desktopSmoke = Start-Process -FilePath $desktop -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
-            if ($desktopSmoke.ExitCode -ne 0) {
-              Get-Content -LiteralPath (Join-Path $smokeHome 'desktop.log') -ErrorAction SilentlyContinue
-              throw "Bundled desktop smoke test failed with exit code $($desktopSmoke.ExitCode)"
-            }
-          } finally {
-            Remove-Item Env:\PROSPERO_HOME -ErrorAction SilentlyContinue
-          }
-
-  release-publish:
-    name: Publish Windows native npm package with provenance
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release-stage, release-signed-load]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v5
-        with:
-          name: prospero-release-packages
-          path: release-packages
-      - name: Require npm publish credentials and publish the attested native package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required; refusing unsigned/unprovenanced release'; exit 1; }
-          npm publish release-packages/prospero-windows-native-*.tgz --provenance
-
-  swift:
-    name: Swift build
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v6
-      - run: swift build --package-path apps/shell
 
   secret-scan:
     name: Secret scan

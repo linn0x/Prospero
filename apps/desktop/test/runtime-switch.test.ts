@@ -17,11 +17,11 @@ afterEach(() => {
 });
 
 describe("runtime backend switch", () => {
-  it("defaults packaged builds to Rust and development builds to legacy", () => {
+  it("defaults both packaged and development builds to Rust", () => {
     expect(defaultBackend(true)).toBe("rust");
-    expect(defaultBackend(false)).toBe("legacy");
+    expect(defaultBackend(false)).toBe("rust");
     expect(readBackendSelection(switchFile(), true, {})).toEqual({ backend: "rust", reason: "packaged-default", forced: false });
-    expect(readBackendSelection(switchFile(), false, {})).toEqual({ backend: "legacy", reason: "development-default", forced: false });
+    expect(readBackendSelection(switchFile(), false, {})).toEqual({ backend: "rust", reason: "development-default", forced: false });
   });
 
   it("honors environment overrides before persisted preferences", () => {

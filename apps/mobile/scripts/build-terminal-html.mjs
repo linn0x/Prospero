@@ -26,7 +26,7 @@ const assets = {
   "/assets/webgl.js": read(path.join(nm, "@xterm/addon-webgl/lib/addon-webgl.js")),
 };
 
-let html = read(path.join(repoRoot, "apps/daemon/term.html"));
+let html = read(path.join(here, "../assets/term.html"));
 // Search is a mobile-only enhancement; the shared page also runs in older shells.
 const searchAddon = read(path.join(nm, "@xterm/addon-search/lib/addon-search.js")).replace(/<\/script>/gi, "<\\/script>");
 html = html.replace('<script src="/assets/webgl.js"></script>', (tag) => `${tag}\n<script>\n${searchAddon}\n</script>`);

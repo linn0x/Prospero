@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, open, readdir, realpath, rename } from "node:fs/promises";
 import path from "node:path";
-import { listDir, readForEdit, resolveWithin, MAX_EDIT_BYTES } from "../../../daemon/src/fs-ops";
-import { git, status } from "../../../daemon/src/git-ops";
+import { listDir, readForEdit, resolveWithin, MAX_EDIT_BYTES } from "./fs-ops";
+import { git, status } from "./git-ops";
 import type { FileMutation, FilePreview, GitHistoryEntry, GitMutation, ProjectFile, ProjectGitStatus, SearchResult } from "../shared/project-tools";
 
 export type RustProjectBackend = {

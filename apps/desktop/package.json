@@ -109,24 +109,16 @@
         "from": ".runtime",
         "to": "runtime",
         "filter": [
-          "**/*",
-          "!node_modules{,/**/*}"
-        ]
-      },
-      {
-        "from": ".runtime/node_modules",
-        "to": "runtime/node_modules",
-        "filter": [
           "**/*"
         ]
       },
       {
-        "from": "../shell/Resources/AppIcon-1024.png",
+        "from": "assets/AppIcon-1024.png",
         "to": "assets/AppIcon.png"
       }
     ],
     "win": {
-      "icon": "../shell/Resources/AppIcon-1024.png",
+      "icon": "assets/AppIcon-1024.png",
       "target": [
         {
           "target": "nsis",
@@ -162,7 +154,7 @@
     },
     "mac": {
       "category": "public.app-category.developer-tools",
-      "icon": "../shell/Resources/AppIcon.icns",
+      "icon": "assets/AppIcon.icns",
       "target": [
         {
           "target": "dmg",

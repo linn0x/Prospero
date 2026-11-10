@@ -54,18 +54,6 @@ if (checks.at(-1).ok) {
     }
   }
 }
-if (platform() === "win32") {
-  const sessionHost = run("windows-native-session-host", "npm.cmd", ["run", "test:native", "--workspace=@prospero/windows-native"], { env: { ...process.env, PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST: "1" } });
-  sessionHost.userFlow = {
-    name: "windows-session-host",
-    nativeBoundary: true,
-    userVisible: sessionHost.ok,
-  };
-  checks.push(sessionHost);
-} else {
-  checks.push({ name: "windows-native-session-host", ok: true, skipped: true, reason: "not-win32" });
-}
-
 const report = {
   ok: checks.every(check => check.ok),
   scenario: "rust-real-machine-check",

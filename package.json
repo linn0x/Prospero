@@ -13,10 +13,10 @@
   },
   "scripts": {
     "dev:desktop": "npm run dev -w @prospero/desktop",
-    "build:desktop": "npm run build -w @prospero/daemon && npm run build -w @prospero/desktop",
+    "build:desktop": "npm run build -w @prospero/desktop",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/package.ps1",
-    "postinstall": "patch-package && node tools/fix-node-pty-darwin-helper.mjs",
-    "typecheck": "tsc --build --force packages/protocol packages/windows-native apps/daemon apps/relay apps/mobile && npm run typecheck -w @prospero/desktop",
+    "postinstall": "patch-package",
+    "typecheck": "tsc --build --force packages/protocol apps/relay apps/mobile && npm run typecheck -w @prospero/desktop",
     "test": "npm run test --workspaces --if-present",
     "rust:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo check --workspace --locked",
     "rust:test": "cargo test --workspace --locked",
@@ -25,11 +25,9 @@
     "rust:http:test": "cargo build --workspace --locked && node tools/perf/rust-http-smoke.mjs",
     "rust:desktop:test": "cargo build --workspace --examples --locked && cargo build --workspace --locked && npm run build -w @prospero/protocol && npm exec -w @prospero/desktop -- vitest run --dir integration",
     "rust:release:smoke": "cargo build --release -p prosperod-rs --locked && npm run prepare:runtime:mac -w @prospero/desktop && npm run pack -w @prospero/desktop && npm run check:packaged-rust -w @prospero/desktop -- --require-packaged",
-    "dev:desktop:rust": "npm run rust:build && node tools/rust-desktop.mjs",
     "rust:build": "cargo build --release --workspace --locked",
     "rust:types": "cargo run --locked -p prosperod-rs --bin prosperod-rs -- types --output packages/protocol/src/rust-daemon.ts",
     "rust:contract:check": "cargo build --workspace --locked && node tools/perf/check-rust-contract.mjs",
-    "perf:legacy": "npm run build -w @prospero/daemon && node tools/perf/legacy-baseline.mjs",
     "perf:rust-storage": "npm run rust:build && node tools/perf/rust-storage.mjs"
   },
   "devDependencies": {

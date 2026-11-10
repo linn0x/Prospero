@@ -30,7 +30,7 @@ import { NativeGhosttyManager } from "./native-ghostty";
 import { RemoteWorkspaces, RemoteWorkspaceStore } from "./remote-workspaces";
 import { remoteDirectoryRequest } from "../shared/remote-workspaces";
 import { ProjectTools } from "./project-tools";
-import { defaultBackend, readBackendSelection, readRuntimeSwitch, recordBackendRollback, runtimeBinaryAvailable, runtimeSwitchPath, saveBackendPreference } from "./runtime-switch";
+import { defaultBackend, readBackendSelection, readRuntimeSwitch, runtimeBinaryAvailable, runtimeSwitchPath, saveBackendPreference } from "./runtime-switch";
 
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const ORCHESTRATION_METHODS = new Set([
@@ -57,13 +57,19 @@ const SMOKE_TEST = process.argv.includes("--smoke-test");
 const SELF_CHECK = process.argv.includes("--self-check");
 const REQUIRE_RUST_BACKEND = process.argv.includes("--require-rust-backend");
 const START_HIDDEN = process.argv.includes("--background") || SMOKE_TEST;
-const RUST_BINARY = resolve(process.env["PROSPERO_RUST_BINARY"] || resolve(app.isPackaged ? resolve(process.resourcesPath, "runtime") : resolve(app.getAppPath(), "../../target/release"), process.platform === "win32" ? "prosperod-rs.exe" : "prosperod-rs"));
-const RUNTIME_SWITCH_PATH = resolve(process.env["PROSPERO_RUNTIME_SWITCH_FILE"] || runtimeSwitchPath(app.getPath("appData")));
-let backendSelection = readBackendSelection(RUNTIME_SWITCH_PATH, app.isPackaged);
-if (backendSelection.backend === "rust" && !runtimeBinaryAvailable(RUST_BINARY) && !backendSelection.forced && !REQUIRE_RUST_BACKEND) {
-  recordBackendRollback(RUNTIME_SWITCH_PATH, "rust", `Rust daemon binary is missing: ${RUST_BINARY}`);
-  backendSelection = readBackendSelection(RUNTIME_SWITCH_PATH, app.isPackaged);
+const RUST_BIN_NAME = process.platform === "win32" ? "prosperod-rs.exe" : "prosperod-rs";
+function resolveDefaultRustBinary(): string {
+  if (process.env["PROSPERO_RUST_BINARY"]) return resolve(process.env["PROSPERO_RUST_BINARY"]);
+  if (app.isPackaged) return resolve(process.resourcesPath, "runtime", RUST_BIN_NAME);
+  const releaseCandidate = resolve(app.getAppPath(), "../../target/release", RUST_BIN_NAME);
+  if (existsSync(releaseCandidate)) return releaseCandidate;
+  const debugCandidate = resolve(app.getAppPath(), "../../target/debug", RUST_BIN_NAME);
+  if (existsSync(debugCandidate)) return debugCandidate;
+  return releaseCandidate;
 }
+const RUST_BINARY = resolveDefaultRustBinary();
+const RUNTIME_SWITCH_PATH = resolve(process.env["PROSPERO_RUNTIME_SWITCH_FILE"] || runtimeSwitchPath(app.getPath("appData")));
+const backendSelection = readBackendSelection(RUNTIME_SWITCH_PATH, app.isPackaged);
 const RUST_BACKEND = backendSelection.backend === "rust";
 const rustHome = resolve(process.env["PROSPERO_RUST_HOME"] || resolve(app.getPath("appData"), "Prospero Rust"));
 const legacyHome = resolve(process.env["PROSPERO_HOME"] || resolve(app.getPath("home"), ".prospero"));
@@ -186,7 +192,7 @@ function publishRuntimeSwitch(): void {
   store.setRuntimeSwitch(readRuntimeSwitch(RUNTIME_SWITCH_PATH, RUST_BACKEND ? "rust" : "legacy", backendSelection, {
     rustBinary: RUST_BINARY,
     rustAvailable: runtimeBinaryAvailable(RUST_BINARY),
-    legacyAvailable: true,
+    legacyAvailable: false,
     defaultBackend: defaultBackend(app.isPackaged),
   }));
 }
@@ -1753,16 +1759,6 @@ void app.whenReady().then(async () => {
     // 跳过启动的话它只验证了一个空壳 UI。daemon 起不来必须让进程非零退出,
     // 由 CI 的退出码来兜;runtime.start() 是等到 /control/health 应答才返回的,
     // 所以"返回 ok"本身就是打包产物里 daemon 可用的证据。
-    if (!started.ok && RUST_BACKEND && !backendSelection.forced && !REQUIRE_RUST_BACKEND) {
-      const reason = started.error ?? "Rust backend failed to start";
-      store.appendLog(`[desktop] Rust backend failed; rolling back to legacy: ${reason}\n`);
-      store.flushLogs();
-      recordBackendRollback(RUNTIME_SWITCH_PATH, "rust", reason);
-      app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--require-rust-backend") });
-      quitState = "tearing_down";
-      app.exit(0);
-      return;
-    }
     if (SMOKE_TEST) {
       if (!started.ok) throw new Error(`bundled daemon failed to start: ${started.error ?? "unknown error"}`);
       process.stdout.write("Prospero bundled daemon ready\n");

@@ -104,6 +104,7 @@ const agentTitle: Record<CodeAgentKind, string> = {
   codex: "Codex",
   opencode: "OpenCode",
   pi: "Pi",
+  agy: "Antigravity",
 };
 
 const statusText: Record<AgentAccount["status"], string> = {
@@ -229,6 +230,7 @@ export default function AgentAccountsScreen() {
       codex: [],
       opencode: [],
       pi: [],
+      agy: [],
     };
     for (const source of sources) {
       if (!source.enabled) continue;
