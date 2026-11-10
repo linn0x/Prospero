@@ -1,20 +1,25 @@
 import { sessionTabLabels } from "../workspace/session-tab-labels";
 import { projectForSession } from "../workspace-sidebar-state";
 import "./workspace-tabs.css";
-import { Pin, Plus, X } from "lucide-react";
+import { Bot, Pin, Plus, X } from "lucide-react";
 import { TabStrip } from "../components/TabStrip";
-import type { DesktopSnapshot } from "../../../shared/types";
+import type { DesktopSnapshot, SessionInfo } from "../../../shared/types";
 import { useLocale } from "../locale";
 import { cn } from "../lib/utils";
-import { sessionLabel, sessionStatusLabel, SessionAgentIcon, StatusMark } from "../workspace/session-presentation";
+import { isProsperoBotSession, sessionLabel, sessionStatusLabel, SessionAgentIcon, StatusMark } from "../workspace/session-presentation";
+import { Spinner } from "../components/ui/spinner";
 
-export function WorkspaceTabs({ snapshot, openIds, activeId, onActivate, onClose, onTogglePin, onReorder, onNewSession }: { snapshot: DesktopSnapshot; openIds: string[]; activeId: string | undefined; onActivate: (id: string) => void; onClose: (id: string) => void; onTogglePin: (id: string) => void; onReorder: (ids: string[]) => void; onNewSession?: (project?: string) => void }) {
+export function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy = false, onSelectBot, onActivate, onClose, onTogglePin, onReorder, onNewSession }: { snapshot: DesktopSnapshot; openIds: string[]; activeId: string | undefined; botSession?: SessionInfo | undefined; botBusy?: boolean | undefined; onSelectBot?: (() => void) | undefined; onActivate: (id: string) => void; onClose: (id: string) => void; onTogglePin: (id: string) => void; onReorder: (ids: string[]) => void; onNewSession?: (project?: string) => void }) {
   const { t } = useLocale();
   const sessions = new Map(snapshot.daemon.sessions.map((session) => [session.id, session]));
   const labels = sessionTabLabels(snapshot.daemon.sessions);
-  const allIds = openIds.filter((id) => sessions.has(id));
+  const allIds = openIds.filter((id) => {
+    const candidate = sessions.get(id);
+    return Boolean(candidate && id !== botSession?.id && !isProsperoBotSession(candidate));
+  });
   const activeSession = activeId ? sessions.get(activeId) : undefined;
-  const activeWorkspace = activeSession ? (projectForSession(snapshot.projects, activeSession) ?? activeSession.cwd) : undefined;
+  const isBotActive = Boolean(botSession && activeId === botSession.id);
+  const activeWorkspace = activeSession && !isBotActive ? (projectForSession(snapshot.projects, activeSession) ?? activeSession.cwd) : undefined;
   const workspaceScopedIds = activeWorkspace
     ? allIds.filter((id) => {
         const candidate = sessions.get(id);
@@ -23,6 +28,33 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, onActivate, onClose
     : allIds;
   const ids = workspaceScopedIds.length > 0 ? workspaceScopedIds : allIds;
   return <TabStrip className="topbar-workspace-tabs" listClassName="workspace-tabs" label={t("打开的会话", "Open sessions")} items={ids.map(id => ({ id, label: `${labels.get(id)} · ${sessionStatusLabel(sessions.get(id)!, snapshot.unreadSessionIds.includes(id), t)} — ${sessions.get(id)!.cwd}`, onSelect: () => onActivate(id), onClose: () => onClose(id) }))} activeId={activeId} onReorder={onReorder}>
+    {onSelectBot && (
+      <button
+        type="button"
+        data-testid="workspace-bot-tab"
+        data-liquid-glass="tab"
+        role="tab"
+        aria-controls="workspace-session-panel"
+        aria-selected={isBotActive}
+        disabled={botBusy}
+        className={cn("workspace-tab workspace-bot-tab", isBotActive && "is-active")}
+        title={t("主会话 · Prospero Bot (Codex · GPT-6-Astra · Chat UI)", "Master Session · Prospero Bot (Codex · GPT-6-Astra · Chat UI)")}
+        onClick={onSelectBot}
+      >
+        {botBusy ? <Spinner className="size-3.5 shrink-0" /> : <Bot className="size-3.5 shrink-0" aria-hidden="true" />}
+        <span className="truncate font-medium">{t("主会话", "Master")}</span>
+        <span className="workspace-bot-tab-badge">Astra</span>
+        {botSession && (
+          <StatusMark
+            status={botSession.status}
+            unread={snapshot.unreadSessionIds.includes(botSession.id)}
+            pendingPermissions={botSession.pendingPermissions}
+            pendingQuestions={botSession.pendingQuestions}
+            busySince={botSession.busySince}
+          />
+        )}
+      </button>
+    )}
     {ids.map((id, index) => {
       const session = sessions.get(id)!;
       const pinned = snapshot.pinnedSessionIds.includes(id);

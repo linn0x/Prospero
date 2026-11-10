@@ -757,6 +757,7 @@ function ShellSidebar({
   view,
   activeId,
   botSession,
+  botBusy,
   onOpenBotSession,
   onConfigureBotSession,
   onView,
@@ -785,6 +786,7 @@ function ShellSidebar({
   view: View;
   activeId: string | undefined;
   botSession?: SessionInfo | undefined;
+  botBusy?: boolean | undefined;
   onOpenBotSession?: (() => void) | undefined;
   onConfigureBotSession?: (() => void) | undefined;
   onView: (view: View) => void;
@@ -944,6 +946,7 @@ function ShellSidebar({
     const activeSession = snapshot.daemon.sessions.find(
       (session) => session.id === activeId,
     );
+    if (activeSession && isProsperoBotSession(activeSession)) return;
     const activeProject = activeSession
       ? projectForSession(snapshot.projects, activeSession)
       : undefined;
@@ -968,6 +971,7 @@ function ShellSidebar({
       snapshot.projects.map((project) => [project, []]),
     );
     for (const session of snapshot.daemon.sessions) {
+      if (isProsperoBotSession(session)) continue;
       const project = projectForSession(snapshot.projects, session);
       if (project) grouped.get(project)?.push(session);
     }
@@ -1320,7 +1324,7 @@ function ShellSidebar({
       hiddenSessionCount,
       24,
     );
-    const renderSession = (session: SessionInfo): ReactNode => <WorkspaceSessionRow
+    const renderSession = (session: SessionInfo): ReactNode => isProsperoBotSession(session) ? null : <WorkspaceSessionRow
       key={session.id} session={session} active={view === "workspaces" && activeId === session.id}
       unread={snapshot.unreadSessionIds.includes(session.id)} archived={Boolean(session.archived) || snapshot.archivedSessionIds.includes(session.id)}
       onToggleArchive={onToggleArchive} pinned={snapshot.pinnedSessionIds.includes(session.id)} onOpenSession={selectSession}
@@ -1532,60 +1536,43 @@ function ShellSidebar({
           <SidebarGroup>
             <SidebarGroupContent>
               <SidebarMenu className="sidebar-primary-grid">{renderNav(primaryNav)}</SidebarMenu>
+              <SidebarMenu className="mt-1.5">
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    data-testid="sidebar-prospero-bot"
+                    isActive={Boolean(botSession && view === "workspaces" && activeId === botSession.id)}
+                    disabled={botBusy}
+                    tooltip={
+                      botSession
+                        ? `${t("主会话", "Master Session")} · Codex · ${botSession.model ?? "gpt-6-astra"}`
+                        : t("打开主会话（Codex · Astra · Chat UI）", "Open Master Session (Codex · Astra · Chat UI)")
+                    }
+                    onClick={() => {
+                      if (onOpenBotSession) onOpenBotSession();
+                      closeMobileSidebar();
+                    }}
+                  >
+                    {botBusy ? (
+                      <LoaderCircle className="animate-spin" />
+                    ) : botSession ? (
+                      <SessionAgentIcon agent={botSession.agent} unread={snapshot.unreadSessionIds.includes(botSession.id)} />
+                    ) : (
+                      <Bot />
+                    )}
+                    <span className="truncate font-semibold">{t("主会话", "Master Session")}</span>
+                    <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
+                      {botSession && <StatusMark status={botSession.status} busySince={botSession.busySince} />}
+                      <Badge variant="outline" className="text-[10px]">
+                        Astra
+                      </Badge>
+                    </span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
         </nav>
         <div className="sidebar-workspace-scroll" role="region" aria-label={t("工作区与会话", "Workspaces and sessions")}>
-        <SidebarSeparator className="sidebar-detail-section" />
-        <SidebarGroup className="sidebar-detail-section">
-          <SidebarGroupLabel>
-            <span>{t("主会话", "Master Bot")}</span>
-          </SidebarGroupLabel>
-          {onConfigureBotSession && (
-            <SidebarGroupAction
-              aria-label={t("配置或切换 Prospero Bot 主会话", "Configure or switch Prospero Bot master session")}
-              title={t("配置或切换 Prospero Bot 主会话", "Configure or switch Prospero Bot master session")}
-              onClick={() => {
-                onConfigureBotSession();
-                closeMobileSidebar();
-              }}
-            >
-              {botSession ? <Settings /> : <Plus />}
-            </SidebarGroupAction>
-          )}
-          <SidebarGroupContent>
-            <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton
-                  data-testid="sidebar-prospero-bot"
-                  isActive={Boolean(botSession && view === "workspaces" && activeId === botSession.id)}
-                  tooltip={
-                    botSession
-                      ? `Prospero Bot · ${botSession.agent}${botSession.model ? ` · ${botSession.model}` : ""}`
-                      : t("启动 Prospero Bot 全局主会话（可向各工作区派发任务）", "Start Prospero Bot master session (dispatch across workspaces)")
-                  }
-                  onClick={() => {
-                    if (onOpenBotSession) onOpenBotSession();
-                    closeMobileSidebar();
-                  }}
-                >
-                  {botSession ? <SessionAgentIcon agent={botSession.agent} unread={snapshot.unreadSessionIds.includes(botSession.id)} /> : <Bot />}
-                  <span className="truncate font-medium">Prospero Bot</span>
-                  {botSession ? (
-                    <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <StatusMark status={botSession.status} busySince={botSession.busySince} />
-                      <span className="truncate max-w-20">{botSession.model ?? botSession.agent}</span>
-                    </span>
-                  ) : (
-                    <Badge variant="outline" className="ml-auto text-[10px]">
-                      {t("启动", "Start")}
-                    </Badge>
-                  )}
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
         {snapshot.pinnedSessionIds.length > 0 && <>
           <SidebarSeparator className="sidebar-detail-section" />
           <SidebarGroup className="sidebar-detail-section">
@@ -4058,6 +4045,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     void window.prospero.forgetMissingSession(id).catch(() => undefined);
   }, []);
   const [newSessionBotMode, setNewSessionBotMode] = useState(false);
+  const [botCreating, setBotCreating] = useState(false);
+  const botCreatingRef = useRef(false);
+  const botUpgradedModelRef = useRef<string | undefined>(undefined);
   const [botSessionId, setBotSessionId] = useState<string | undefined>(() => {
     try {
       return localStorage.getItem(PROSPERO_BOT_SESSION_STORAGE_KEY) || undefined;
@@ -4066,20 +4056,31 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     }
   });
   const botSession = useMemo(() => {
-    const structured = sessionSnapshot.daemon.sessions.filter((session) => session.kind === "structured");
+    const structuredCodex = sessionSnapshot.daemon.sessions.filter(
+      (session) => session.kind === "structured" && session.agent === "codex",
+    );
     if (botSessionId) {
-      const exact = structured.find((session) => session.id === botSessionId);
+      const exact = structuredCodex.find((session) => session.id === botSessionId);
       if (exact) return exact;
     }
-    return structured.find((session) => isProsperoBotSession(session) && !session.archived)
-      ?? structured.find((session) => isProsperoBotSession(session));
+    return structuredCodex.find((session) => isProsperoBotSession(session) && !session.archived)
+      ?? structuredCodex.find((session) => isProsperoBotSession(session));
   }, [botSessionId, sessionSnapshot.daemon.sessions]);
   useEffect(() => {
-    if (botSession && botSession.id !== botSessionId) {
+    if (!botSession) return;
+    if (botSession.id !== botSessionId) {
       setBotSessionId(botSession.id);
       try {
         localStorage.setItem(PROSPERO_BOT_SESSION_STORAGE_KEY, botSession.id);
       } catch {}
+    }
+    setOpenIds((current) =>
+      current.includes(botSession.id) ? current.filter((id) => id !== botSession.id) : current,
+    );
+    const currentModel = botSession.model ?? botSession.agentControls?.currentModel;
+    if (currentModel !== "gpt-6-astra" && botUpgradedModelRef.current !== botSession.id) {
+      botUpgradedModelRef.current = botSession.id;
+      void window.prospero.setAgentModel(botSession.id, "gpt-6-astra", botSession.effort).catch(() => undefined);
     }
   }, [botSession, botSessionId]);
   const openNewSession = useCallback((project?: string): void => {
@@ -4103,11 +4104,51 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       if (botSession.archived || snapshotRef.current.archivedSessionIds.includes(botSession.id)) {
         void window.prospero.setSessionArchived(botSession.id, false).catch(() => undefined);
       }
-      openSession(botSession.id, botSession, { openTab: true });
+      const currentModel = botSession.model ?? botSession.agentControls?.currentModel;
+      if (currentModel !== "gpt-6-astra") {
+        void window.prospero.setAgentModel(botSession.id, "gpt-6-astra", botSession.effort).catch(() => undefined);
+      }
+      openSession(botSession.id, botSession, { openTab: false });
       return;
     }
-    configureBotSession();
-  }, [botSession, configureBotSession, openSession]);
+    if (botCreatingRef.current) return;
+    botCreatingRef.current = true;
+    setBotCreating(true);
+    const cwd =
+      snapshotRef.current.projects[0] ||
+      sessionSnapshot.daemon.sessions[0]?.cwd ||
+      "/Users/bytedance/Prospero";
+    const codexAccounts = sessionLaunchAccounts(snapshotRef.current.accounts, "codex");
+    const accountId = defaultSessionLaunchAccountId(codexAccounts, "codex");
+    void (async () => {
+      try {
+        const created = await window.prospero.createSession({
+          cwd,
+          agent: "codex",
+          kind: "structured",
+          model: "gpt-6-astra",
+          approvalPolicy: "yolo",
+          ...(accountId ? { accountId } : {}),
+        });
+        let named: SessionInfo = { ...created, title: PROSPERO_BOT_TITLE, model: "gpt-6-astra" };
+        try {
+          named = await window.prospero.renameSession(created.id, PROSPERO_BOT_TITLE);
+        } catch {
+          // Keep optimistic title
+        }
+        setBotSessionId(created.id);
+        try {
+          localStorage.setItem(PROSPERO_BOT_SESSION_STORAGE_KEY, created.id);
+        } catch {}
+        openSession(created.id, named, { openTab: false });
+      } catch (reason) {
+        setSessionActionError(reportError(reason));
+      } finally {
+        botCreatingRef.current = false;
+        setBotCreating(false);
+      }
+    })();
+  }, [botSession, openSession, sessionSnapshot.daemon.sessions]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (matchesDesktopShortcut(event, "k", window.prospero.platform)) {
@@ -4298,6 +4339,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         view={view}
         activeId={activeRemoteId ? undefined : activeId}
         botSession={botSession}
+        botBusy={botCreating}
         onOpenBotSession={openBotSession}
         onConfigureBotSession={configureBotSession}
         onView={selectView}
@@ -4387,7 +4429,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             )}
           </Suspense>
           {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
-              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => { const next = [...ids, ...current.filter(id => !ids.includes(id))]; const first = sessionSnapshot.daemon.sessions.find(item => item.id === ids[0]); persistWorkspaceTabs(first ? (projectForSession(snapshotRef.current.projects, first) ?? first.cwd) : undefined, next, activeId); return next; })} onNewSession={openNewSession} />}
+              {!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} botSession={botSession} botBusy={botCreating} onSelectBot={openBotSession} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => { const next = [...ids, ...current.filter(id => !ids.includes(id))]; const first = sessionSnapshot.daemon.sessions.find(item => item.id === ids[0]); persistWorkspaceTabs(first ? (projectForSession(snapshotRef.current.projects, first) ?? first.cwd) : undefined, next, activeId); return next; })} onNewSession={openNewSession} />}
               <WorkspacePane
                 active={localWorkspaceVisible}
                 focus={focus}

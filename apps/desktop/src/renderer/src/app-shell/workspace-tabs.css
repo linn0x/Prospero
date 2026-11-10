@@ -1,5 +1,24 @@
 /* Maintain readable labels instead of shrinking every tab as more sessions open. */
 .topbar-workspace-tabs.tab-strip .workspace-tab { flex: 0 0 196px; min-width: 196px; max-width: 196px; }
+.topbar-workspace-tabs.tab-strip .workspace-tab.workspace-bot-tab {
+  order: -1;
+  flex: 0 0 auto;
+  min-width: auto;
+  max-width: 180px;
+  width: auto;
+  padding: 0 10px;
+  gap: 6px;
+  margin-right: 4px;
+  cursor: pointer;
+}
+.topbar-workspace-tabs.tab-strip .workspace-bot-tab-badge {
+  font-size: 10px;
+  line-height: 1.2;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--foreground) 10%, transparent);
+  color: var(--muted-foreground);
+}
 .topbar-workspace-tabs.tab-strip .workspace-tab-main > .truncate { flex: 1; }
 .topbar-workspace-tabs.tab-strip .workspace-tab-new {
   order: 9999;
