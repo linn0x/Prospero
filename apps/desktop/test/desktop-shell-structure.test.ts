@@ -28,7 +28,7 @@ describe("desktop shell structure", () => {
   it("keeps the shell sidebar while hiding workspace chrome in focus mode", () => {
     expect(app).toMatch(/<ShellSidebar\s+snapshot=\{sessionSnapshot\}/);
     expect(app).not.toContain("{shellChromeVisible && <ShellSidebar");
-    expect(app).toContain('!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs');
+    expect(app).toContain('!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs');
     expect(app).toContain('className="local-workspace-container"');
     expect(app).toContain('{focus && <Button className="sidebar-exit-focus"');
     expect(workspace).toContain('{chromeVisible && session && <SessionToolbar');

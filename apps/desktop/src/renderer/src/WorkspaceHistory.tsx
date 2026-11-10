@@ -16,17 +16,17 @@ export function WorkspaceHistory({ workspace, name, enabled, revision, preview, 
   const state = useSyncExternalStore(pager.subscribe, pager.getSnapshot, pager.getSnapshot);
   useEffect(() => pager.setRevision(revision), [pager, revision]);
   useEffect(() => { pager.setActive(enabled); return () => pager.setActive(false); }, [pager, enabled]);
-  const total = state.page?.total;
-  useEffect(() => { if (total !== undefined) onTotal(workspace, total); }, [onTotal, total, workspace]);
   const items = state.expanded ? state.page?.items ?? [] : [...new Map([...preview, ...(state.page?.items ?? [])].map(item => [item.id, item])).values()];
   const candidate = state.expanded ? filterSessionsByQuery(items, query) : sidebarProjectSessions(items, archived, query);
   const visible = sortSidebarSessions(candidate, activeId, pinned, unread).slice(0, state.expanded ? WORKSPACE_PAGE_SIZE : WORKSPACE_PREVIEW_SIZE);
+  const unarchivedTotal = state.page ? (state.page.nextCursor ? state.page.total : sidebarProjectSessions(items, archived, query).length) : undefined;
+  useEffect(() => { if (unarchivedTotal !== undefined) onTotal(workspace, unarchivedTotal); }, [onTotal, unarchivedTotal, workspace]);
   return <>
     {visible.map(renderRow)}
     {state.loading && <SidebarMenuSubItem className="workspace-search-summary" aria-live="polite"><Spinner /><span>{t("正在载入会话…", "Loading sessions…")}</span></SidebarMenuSubItem>}
     {state.error && <SidebarMenuSubItem className="workspace-session-more-item"><button type="button" className="workspace-session-more" data-slot="workspace-session-more" disabled={state.loading} onClick={() => void pager.retry()}>{t("加载失败，点击重试", "Load failed, retry")}</button></SidebarMenuSubItem>}
-    {!state.expanded && (total !== undefined ? total > visible.length : preview.length > WORKSPACE_PREVIEW_SIZE) && <SidebarMenuSubItem className="workspace-session-more-item">
-      <button type="button" className="workspace-session-more" data-slot="workspace-session-more" disabled={state.loading} aria-label={t(`显示 ${name} 的更多会话`, `Show more sessions in ${name}`)} onClick={() => void pager.expand()}><ChevronRight aria-hidden="true" /><span>{t(`显示更多 · 共 ${total ?? preview.length} 个`, `Show more · ${total ?? preview.length} total`)}</span></button>
+    {!state.expanded && (unarchivedTotal !== undefined ? unarchivedTotal > visible.length : preview.length > WORKSPACE_PREVIEW_SIZE) && <SidebarMenuSubItem className="workspace-session-more-item">
+      <button type="button" className="workspace-session-more" data-slot="workspace-session-more" disabled={state.loading} aria-label={t(`显示 ${name} 的更多会话`, `Show more sessions in ${name}`)} onClick={() => void pager.expand()}><ChevronRight aria-hidden="true" /><span>{t(`显示更多 · 共 ${unarchivedTotal ?? preview.length} 个`, `Show more · ${unarchivedTotal ?? preview.length} total`)}</span></button>
     </SidebarMenuSubItem>}
     {state.expanded && <>
       {state.page?.previousCursor && <SidebarMenuSubItem className="workspace-session-more-item"><button type="button" className="workspace-session-more" data-slot="workspace-session-more" disabled={state.loading} aria-label={t(`${name} 的第一页`, `First page in ${name}`)} onClick={() => void pager.first()}><ChevronsLeft aria-hidden="true" /><span>{t("第一页", "First page")}</span></button></SidebarMenuSubItem>}

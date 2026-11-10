@@ -234,7 +234,7 @@ import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
 import { SourceSelector } from "./model-sources/SourceSelector";
 import { useModelSources, runModelSourceAction } from "./model-sources/use-model-sources";
 import { defaultSourceSelection, rememberSourceSelection, rememberedSourceSelection, selectedSourceRoute, type SourceRuntimeAgent, type SourceSelection } from "./model-sources/source-state";
-import { sessionLabel, SessionAgentIcon, StatusMark, PROSPERO_BOT_SESSION_STORAGE_KEY, PROSPERO_BOT_TITLE, isProsperoBotSession } from "./workspace/session-presentation";
+import { sessionLabel, sidebarSessionLabel, SessionAgentIcon, StatusMark, PROSPERO_BOT_SESSION_STORAGE_KEY, PROSPERO_BOT_TITLE, isProsperoBotSession } from "./workspace/session-presentation";
 import { useSessionUnread } from "./workspace/use-session-unread";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
@@ -508,7 +508,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
         >
           <SessionAgentIcon agent={session.agent} />
           <span className="workspace-session-copy">
-            <strong>{sessionLabel(session)}</strong>
+            <strong>{pinnedArea ? sessionLabel(session) : sidebarSessionLabel(session)}</strong>
           </span>
           <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} />
         </ContextMenuTrigger>
@@ -876,9 +876,13 @@ function ShellSidebar({
         snapshot.pinnedProjectPaths,
         activeId,
       );
-      return new Set(restored ?? (fallback ? [fallback] : []));
+      if (restored && restored.length > 0 && restored.length <= 2) {
+        return new Set(restored);
+      }
+      return new Set(fallback ? [fallback] : []);
     },
   );
+  const previousAutoExpandedProjectRef = useRef<string | undefined>(undefined);
   const [sessionLimits, setSessionLimits] = useState<Record<string, number>>(
     {},
   );
@@ -951,9 +955,18 @@ function ShellSidebar({
       ? projectForSession(snapshot.projects, activeSession)
       : undefined;
     if (!activeProject) return;
+    const previousAuto = previousAutoExpandedProjectRef.current;
+    previousAutoExpandedProjectRef.current = activeProject;
     setExpandedProjects((current) => {
-      if (current.has(activeProject)) return current;
-      return new Set([...current, activeProject]);
+      if (current.has(activeProject) && (!previousAuto || previousAuto === activeProject || !current.has(previousAuto))) {
+        return current;
+      }
+      const next = new Set(current);
+      if (previousAuto && previousAuto !== activeProject) {
+        next.delete(previousAuto);
+      }
+      next.add(activeProject);
+      return next;
     });
   }, [activeId, snapshot.daemon.sessions, snapshot.projects]);
   const selectedSession = snapshot.daemon.sessions.find((session) => session.id === activeId);
@@ -1366,11 +1379,13 @@ function ShellSidebar({
             {managedWorkspace?.cleaned && (
               <span className="workspace-task-cleaned">{t("已清理", "Cleaned")}</span>
             )}
-            <span className="workspace-session-count">
-              {normalizedSessionQuery
-                ? `${String(matchingSessions.length)}/${String(sessions.length)}`
-                    : projectSessionCount}
-            </span>
+            {(normalizedSessionQuery || projectSessionCount > 0) && (
+              <span className="workspace-session-count">
+                {normalizedSessionQuery
+                  ? `${String(matchingSessions.length)}/${String(sessions.length)}`
+                  : projectSessionCount}
+              </span>
+            )}
           </CollapsibleTrigger>
           <button
             type="button"
@@ -1536,53 +1551,18 @@ function ShellSidebar({
           <SidebarGroup>
             <SidebarGroupContent>
               <SidebarMenu className="sidebar-primary-grid">{renderNav(primaryNav)}</SidebarMenu>
-              <SidebarMenu className="mt-1.5">
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    data-testid="sidebar-prospero-bot"
-                    isActive={Boolean(botSession && view === "workspaces" && activeId === botSession.id)}
-                    disabled={botBusy}
-                    tooltip={
-                      botSession
-                        ? `${t("主会话", "Master Session")} · ${botSession.agent.toUpperCase()} · ${botSession.agentControls?.currentModel ?? botSession.model ?? "gpt-6-astra"}`
-                        : t("打开主会话（Codex · Astra · Chat UI）", "Open Master Session (Codex · Astra · Chat UI)")
-                    }
-                    onClick={() => {
-                      if (onOpenBotSession) onOpenBotSession();
-                      closeMobileSidebar();
-                    }}
-                  >
-                    {botBusy ? (
-                      <LoaderCircle className="animate-spin" />
-                    ) : botSession ? (
-                      <SessionAgentIcon agent={botSession.agent} unread={snapshot.unreadSessionIds.includes(botSession.id)} />
-                    ) : (
-                      <Bot />
-                    )}
-                    <span className="truncate font-semibold">{t("主会话", "Master Session")}</span>
-                    <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
-                      {botSession && <StatusMark status={botSession.status} busySince={botSession.busySince} />}
-                      <Badge variant="outline" className="text-[10px]">
-                        {(botSession?.agentControls?.currentModel ?? botSession?.model ?? "gpt-6-astra") === "gpt-6-astra"
-                          ? "Astra"
-                          : (botSession?.agentControls?.currentModel ?? botSession?.model ?? "Astra")}
-                      </Badge>
-                    </span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
         </nav>
         <div className="sidebar-workspace-scroll" role="region" aria-label={t("工作区与会话", "Workspaces and sessions")}>
-        {snapshot.pinnedSessionIds.length > 0 && <>
+        {(pinned.length > 0 || pinnedLoading) && <>
           <SidebarSeparator className="sidebar-detail-section" />
           <SidebarGroup className="sidebar-detail-section">
             <SidebarGroupLabel>
               {t("置顶", "Pinned")}
-              {snapshot.daemon.sessionSummary?.truncated && (
+              {snapshot.daemon.sessionSummary?.truncated && pinned.length > 0 && (
                 <span className="workspace-session-count">
-                  {pinned.length}/{snapshot.pinnedSessionIds.length}
+                  {pinned.length}
                 </span>
               )}
             </SidebarGroupLabel>

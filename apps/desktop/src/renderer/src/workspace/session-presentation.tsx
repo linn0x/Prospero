@@ -4,8 +4,42 @@ import { cn } from "../lib/utils";
 import { useLocale } from "../locale";
 import { sessionIndicator } from "./session-status";
 
+const AGENT_SHORT_LABELS: Record<string, string> = {
+  codex: "Codex",
+  claude: "Claude",
+  agy: "Antigravity",
+  opencode: "OpenCode",
+  pi: "Pi",
+  deepseek: "DeepSeek",
+  shell: "Terminal",
+};
+
 export function sessionLabel(session: SessionInfo): string {
   return session.displayTitle || session.title || session.preview || session.agent;
+}
+
+export function sidebarSessionLabel(session: SessionInfo): string {
+  if (session.displayTitle?.trim()) return session.displayTitle.trim();
+  const workspaceName = session.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? "";
+  const raw = (session.title || session.preview || "").trim();
+  const fallbackAgent = AGENT_SHORT_LABELS[session.agent.toLowerCase()] ?? session.agent;
+  if (!raw) return fallbackAgent;
+  if (workspaceName) {
+    const escapedWorkspace = workspaceName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const stripped = raw
+      .replace(new RegExp(`^${escapedWorkspace}$`, "i"), "")
+      .replace(new RegExp(`\\s*[·:—-]\\s*${escapedWorkspace}(\\s+副本|\\s+Copy)?$`, "i"), "$1")
+      .trim();
+    if (!stripped) return fallbackAgent;
+    const copyMatch = stripped.match(/^([a-z0-9_-]+)(\s+副本|\s+Copy)?$/i);
+    if (copyMatch && copyMatch[1]?.toLowerCase() === session.agent.toLowerCase()) {
+      return `${fallbackAgent}${copyMatch[2] ?? ""}`;
+    }
+    const escapedAgent = session.agent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const withoutAgentPrefix = stripped.replace(new RegExp(`^${escapedAgent}(?:\\s+Code)?\\s*[·:—-]\\s*`, "i"), "").trim();
+    return withoutAgentPrefix || stripped;
+  }
+  return raw;
 }
 
 export function StatusMark({ status, unread = false, pendingPermissions, pendingQuestions, busySince }: { status: string; unread?: boolean; pendingPermissions?: number | undefined; pendingQuestions?: number | undefined; busySince?: number | undefined }) {
