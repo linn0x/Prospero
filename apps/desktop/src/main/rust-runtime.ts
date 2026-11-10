@@ -297,7 +297,7 @@ export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[
     ...(controls.currentEffort !== null ? { currentEffort: controls.currentEffort } : {}),
     ...(controls.currentMode !== null ? { currentMode: controls.currentMode } : {}),
   } : undefined;
-  return { id: head.id, archived: head.lifecycle === "archived" && !["archiving", "failed"].includes(head.nativeSession?.state ?? ""), ...(head.nativeSession ? { nativeSession: head.nativeSession } : {}), agent: head.agent, kind: head.kind, ...(head.accountId ? { accountId: head.accountId } : {}), ...(head.model ? { model: head.model } : {}), ...(head.effort ? { effort: head.effort } : {}), ...(head.approvalPolicy ? { approvalPolicy: head.approvalPolicy } : {}), ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
+  return { id: head.id, archived: head.lifecycle === "archived" && head.nativeSession?.state !== "archiving", ...(head.nativeSession ? { nativeSession: head.nativeSession } : {}), agent: head.agent, kind: head.kind, ...(head.accountId ? { accountId: head.accountId } : {}), ...(head.model ? { model: head.model } : {}), ...(head.effort ? { effort: head.effort } : {}), ...(head.approvalPolicy ? { approvalPolicy: head.approvalPolicy } : {}), ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
 }
 
 type TerminalReader = Pick<RustConnection["client"], "terminalOutput" | "terminalSnapshot">;
@@ -1377,13 +1377,13 @@ export class RustRuntime {
             return { ok: true };
           }
           if (action === "interrupt") { await client.agentInterrupt(id, signal); return { ok: true }; }
-          if (action === "kill") { await client.agentClose(id, signal); await this.refresh(true); return { ok: true }; }
+          if (action === "kill") { await client.sessionLifecycle(id, true, undefined, signal); await this.refresh(true); return { ok: true }; }
           throw new Error("此 Agent 操作尚未接入 Rust daemon");
         }
         if (action === "interact" && input?.["type"] === "term.input" && typeof input["dataB64"] === "string") { await this.terminalWrite(id, input["dataB64"], signal); return { ok: true }; }
         if (action === "interact" && input?.["type"] === "term.resize") return client.terminalResize(id, { cols: Number(input["cols"]), rows: Number(input["rows"]) }, signal);
         if (action === "interrupt") { await this.terminalWrite(id, "Aw==", signal); return { ok: true }; }
-        if (action === "kill") return client.terminalClose(id, signal);
+        if (action === "kill") { await client.sessionLifecycle(id, true, undefined, signal); await this.refresh(true); return { ok: true }; }
       }
     }
     throw new Error("此功能尚未接入 Rust daemon");

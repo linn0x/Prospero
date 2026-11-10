@@ -308,6 +308,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
   const epochRef = useRef<string | undefined>(undefined);
   const [streamReconnectNonce, setStreamReconnectNonce] = useState(0);
   const [requiresFreshReload, setRequiresFreshReload] = useState(false);
+  const [resumingSession, setResumingSession] = useState(false);
   const readOnly = terminalSessionIsReadOnly(session.status) || (streamMode === "stream" && streamState.readOnly);
   const sessionEnded = terminalSessionIsReadOnly(session.status) || (streamMode === "stream" && streamState.exited);
   const readOnlyRef = useRef(readOnly);
@@ -1154,9 +1155,18 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
     setSyncing(true);
     setStreamReconnectNonce(value => value + 1);
   };
+  const resumeSession = (): void => {
+    if (resumingSession) return;
+    setResumingSession(true);
+    setOperationError(undefined);
+    void window.prospero
+      .setSessionArchived(session.id, false)
+      .catch(reason => setOperationError(reportError(reason)))
+      .finally(() => setResumingSession(false));
+  };
 
   return <div className={bell ? "terminal-shell terminal-bell" : "terminal-shell"}>
-    <div className={connected && !readOnly && streamMode === "legacy" ? "terminal-status is-quiet" : "terminal-status"} role="status" aria-live="polite"><span className={sessionEnded ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{sessionEnded ? t("会话已结束 · 只读", "Session ended · Read only") : streamMode === "stream" && connected && !streamState.controller ? t("正在观察 · 只读", "Observing · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("流已断开", "Stream disconnected")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span>{streamMode === "stream" && !sessionEnded && <span className="terminal-control">{!connected ? <button type="button" onClick={reconnectStream}>{requiresFreshReload ? t("重新载入画面", "Reload screen") : t("重新连接", "Reconnect")}</button> : streamState.controller ? <button type="button" onClick={releaseControl}>{t("释放控制", "Release control")}</button> : <><button type="button" onClick={() => acquireControl(false)}>{t("请求控制", "Request control")}</button><button type="button" onClick={() => acquireControl(true)}>{t("接管", "Take over")}</button></>}</span>}</div>
+    <div className={connected && !readOnly && streamMode === "legacy" ? "terminal-status is-quiet" : "terminal-status"} role="status" aria-live="polite"><span className={sessionEnded ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{sessionEnded ? t("会话已结束 · 只读", "Session ended · Read only") : streamMode === "stream" && connected && !streamState.controller ? t("正在观察 · 只读", "Observing · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("流已断开", "Stream disconnected")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span>{(sessionEnded || session.archived) ? <span className="terminal-control"><button type="button" disabled={resumingSession} onClick={resumeSession}>{resumingSession ? t("正在恢复…", "Resuming…") : t("恢复会话", "Resume")}</button></span> : streamMode === "stream" && <span className="terminal-control">{!connected ? <button type="button" onClick={reconnectStream}>{requiresFreshReload ? t("重新载入画面", "Reload screen") : t("重新连接", "Reconnect")}</button> : streamState.controller ? <button type="button" onClick={releaseControl}>{t("释放控制", "Release control")}</button> : <><button type="button" onClick={() => acquireControl(false)}>{t("请求控制", "Request control")}</button><button type="button" onClick={() => acquireControl(true)}>{t("接管", "Take over")}</button></>}</span>}</div>
     {findOpen && <div className="terminal-find">
       <input
         ref={findInputRef}

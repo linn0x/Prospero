@@ -831,16 +831,17 @@ impl Terminals {
             && spec
                 .as_ref()
                 .is_some_and(|spec| !spec.args.iter().any(|arg| arg == "setup-token" || arg == "login"));
+        let restored_native_id = restored
+            .as_ref()
+            .and_then(|head| head.native_session.as_ref())
+            .and_then(|native| native.native_id.clone());
         let mut native = if managed {
             Some(crate::protocol::NativeSession {
                 output_start_seq: None,
                 runtime_id: uuid::Uuid::new_v4().to_string(),
-                native_id: restored
-                    .as_ref()
-                    .and_then(|head| head.native_session.as_ref())
-                    .and_then(|native| native.native_id.clone()),
+                native_id: restored_native_id.clone(),
                 managed: true,
-                state: if restored.is_some() {
+                state: if restored.is_some() && restored_native_id.is_some() {
                     "resuming"
                 } else {
                     "binding"
@@ -848,19 +849,17 @@ impl Terminals {
                 .into(),
                 error: None,
             })
+        } else if restored.is_some() || restored_native_id.is_some() {
+            Some(crate::protocol::NativeSession {
+                output_start_seq: None,
+                runtime_id: uuid::Uuid::new_v4().to_string(),
+                native_id: restored_native_id,
+                managed: false,
+                state: "running".into(),
+                error: None,
+            })
         } else {
-            restored
-                .as_ref()
-                .and_then(|head| head.native_session.as_ref())
-                .and_then(|native| native.native_id.clone())
-                .map(|native_id| crate::protocol::NativeSession {
-                    output_start_seq: None,
-                    runtime_id: uuid::Uuid::new_v4().to_string(),
-                    native_id: Some(native_id),
-                    managed: false,
-                    state: "running".into(),
-                    error: None,
-                })
+            None
         };
         let base_seq = if let Some(head) = &restored {
             let id = head.id.clone();
@@ -936,8 +935,21 @@ impl Terminals {
                         let mut command = portable_pty::CommandBuilder::new(&spec.program);
                         command.args(&spec.args);
                         if let Some(id) = native.as_ref().and_then(|n| n.native_id.as_deref()) {
-                            if agent == "agy" {
-                                command.args(["--conversation", id]);
+                            match agent.as_str() {
+                                "agy" => command.args(["--conversation", id]),
+                                "pi" => {
+                                    if let Some(existing_path) =
+                                        crate::agent::pi::find_session_file(&spec.environment, id)
+                                    {
+                                        command.arg("--session");
+                                        command.arg(existing_path);
+                                    } else {
+                                        command.args(["--session", id]);
+                                    }
+                                }
+                                "claude" => command.args(["--resume", id]),
+                                "codex" => command.args(["resume", id]),
+                                _ => {}
                             }
                         }
                         command
@@ -1228,48 +1240,47 @@ impl Terminals {
 
     pub async fn archive(&self, id: &str, native_id: Option<String>) -> Result<SessionHead> {
         let _guard = self.0.lifecycle.try_lock().map_err(|_| Error::Busy)?;
-        let mut head = self.sync_native_binding(id).await?;
-        if head.lifecycle == crate::protocol::SessionLifecycle::Archived
-            && self.terminal(id).is_err()
-        {
-            let sid = id.to_owned();
-            return self
-                .0
-                .database
-                .call(move |store| store.set_native_state(&sid, "archived", None))
-                .await;
-        }
+        let head = self.sync_native_binding(id).await?;
         if let Some(native_id) = native_id.filter(|value| !value.trim().is_empty()) {
             self.validate_binding(id, &native_id).await?;
             if head.native_session.as_ref().is_some_and(|n| n.managed) {
                 return Err(Error::Conflict);
             }
+            let runtime_id = head
+                .native_session
+                .as_ref()
+                .map(|n| n.runtime_id.clone())
+                .unwrap_or_else(|| head.id.clone());
+            let output_start_seq = head
+                .native_session
+                .as_ref()
+                .and_then(|n| n.output_start_seq);
             let native = crate::protocol::NativeSession {
-                output_start_seq: None,
-                runtime_id: head.id.clone(),
+                output_start_seq,
+                runtime_id,
                 native_id: Some(native_id),
                 managed: false,
-                state: "running".into(),
+                state: if head.lifecycle == crate::protocol::SessionLifecycle::Archived {
+                    "archived"
+                } else {
+                    "running"
+                }
+                .into(),
                 error: None,
             };
             let sid = id.to_owned();
-            head = self
-                .0
+            self.0
                 .database
                 .call(move |store| store.set_native_session(&sid, native))
                 .await?;
         }
-        let skip_binding = head.title.ends_with(" · 登录");
-        if !skip_binding
-            && matches!(
-                head.agent,
-                crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
-            )
-            && head.native_session.as_ref().is_none_or(|native| {
-                native.native_id.is_none() && !native.managed
-            })
-        {
-            // Allow archiving if no native_id was available/selected by marking state archived below.
+        if self.terminal(id).is_err() {
+            let sid = id.to_owned();
+            return self
+                .0
+                .database
+                .call(move |store| store.archive_terminal_head(&sid))
+                .await;
         }
         let sid = id.to_owned();
         self.0
@@ -1297,7 +1308,7 @@ impl Terminals {
             Ok(()) => {
                 self.0
                     .database
-                    .call(move |store| store.set_native_state(&sid, "archived", None))
+                    .call(move |store| store.archive_terminal_head(&sid))
                     .await
             }
             Err(error) => {
@@ -1322,27 +1333,20 @@ impl Terminals {
             .database
             .call(move |store| store.session(&sid))
             .await?;
-        let native = head
-            .native_session
-            .as_ref()
-            .ok_or_else(|| Error::Invalid("此终端没有可恢复的原生对话".into()))?;
-        if head.lifecycle != crate::protocol::SessionLifecycle::Archived
-            || (native.native_id.is_none()
-                && !(native.managed
-                    && matches!(
-                        head.agent,
-                        crate::protocol::AgentKind::Codex | crate::protocol::AgentKind::Claude
-                    )))
-            || self.0.guard.is_none()
-        {
+        if head.lifecycle != crate::protocol::SessionLifecycle::Archived {
             return Err(Error::Conflict);
         }
+        let old_runtime_id = head
+            .native_session
+            .as_ref()
+            .map(|native| native.runtime_id.as_str())
+            .unwrap_or(&head.id);
         let old_directory = self
             .0
             .database
             .directory()
             .join("terminal-hosts")
-            .join(&native.runtime_id);
+            .join(old_runtime_id);
         if host::owner_alive(&old_directory)? {
             if let Ok(host) = host::Host::attach(old_directory.clone()).await {
                 let _ = Handle::Hosted(host).release().await;
@@ -1378,14 +1382,18 @@ impl Terminals {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
-        let empty = native.native_id.is_none();
+        let wait_for_managed_resume = head
+            .native_session
+            .as_ref()
+            .is_some_and(|native| native.managed && native.native_id.is_some())
+            && self.0.guard.is_some();
         let (head, terminal) = self.start(input, spec, Some(head)).await?;
         let runtime = self.clone();
         let saved = head.clone();
         tokio::spawn(async move {
             runtime.track(saved, terminal, permit).await;
         });
-        if empty {
+        if !wait_for_managed_resume {
             return Ok(head);
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

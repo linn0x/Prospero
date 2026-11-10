@@ -542,7 +542,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
             </ContextMenuItem>
             <ContextMenuItem onClick={() => onToggleArchive(session.id, session)}>
               {archived ? <ArchiveRestore /> : <Archive />}
-              {archived ? t("取消归档", "Unarchive") : t("归档", "Archive")}
+              {archived ? t("恢复会话", "Resume session") : t("归档会话", "Archive session")}
             </ContextMenuItem>
             <ContextMenuItem
               onClick={() => void window.prospero.revealPath(session.cwd)}
@@ -553,20 +553,17 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
                 : t("在资源管理器中打开", "Open in Explorer")}
             </ContextMenuItem>
           </ContextMenuGroup>
-          <ContextMenuSeparator />
-          <ContextMenuGroup>
-            <ContextMenuItem onClick={() => void window.prospero.interruptSession(session.id)}>
-              <CircleStop />
-              {t("停止本轮", "Stop current turn")}
-            </ContextMenuItem>
-            <ContextMenuItem
-              variant="destructive"
-              onClick={() => void window.prospero.killSession(session.id)}
-            >
-              <X />
-              {t("结束会话", "End session")}
-            </ContextMenuItem>
-          </ContextMenuGroup>
+          {["running", "starting", "waiting_input", "waiting_approval"].includes(session.status) && (
+            <>
+              <ContextMenuSeparator />
+              <ContextMenuGroup>
+                <ContextMenuItem onClick={() => void window.prospero.interruptSession(session.id)}>
+                  <CircleStop />
+                  {t("停止本轮", "Stop current turn")}
+                </ContextMenuItem>
+              </ContextMenuGroup>
+            </>
+          )}
         </ContextMenuContent>
       </ContextMenu>
       <button
@@ -4021,11 +4018,18 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     const session = passedSession ?? snapshotRef.current.daemon.sessions.find(item => item.id === id);
     const currentlyArchived = Boolean(session?.archived) || snapshotRef.current.archivedSessionIds.includes(id);
     const archived = !currentlyArchived;
-    if (session && archived && needsNativeBinding(session)) { setArchiveBinding({ session, archived }); return; }
-    void window.prospero.setSessionArchived(id, archived).then(() => {
+    if (session && archived && needsNativeBinding(session) && !isSessionEndedStatus(session.status)) { setArchiveBinding({ session, archived }); return; }
+    void window.prospero.setSessionArchived(id, archived).then((nextSnapshot) => {
       if (archived) {
         setOpenIds(current => current.filter(item => item !== id));
         setActiveId(current => current === id ? undefined : current);
+      } else {
+        const resumed = nextSnapshot.daemon.sessions.find(item => item.id === id) ?? (session ? { ...session, archived: false } : undefined);
+        if (resumed) {
+          setHydratedSessions(current => [...current.filter(item => item.id !== id), resumed]);
+        }
+        setOpenIds(current => current.includes(id) ? current : [...current, id]);
+        setActiveId(id);
       }
     }).catch(reason => isMissingSessionError(reason) ? forgetMissingSession(id) : setSessionActionError(reportError(reason)));
   }, [forgetMissingSession]);

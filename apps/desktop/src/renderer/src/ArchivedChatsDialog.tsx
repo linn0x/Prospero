@@ -44,12 +44,12 @@ export function ArchivedChatsDialog({ ids, onClose, onOpen }: { ids: string[]; o
     {items.filter(session => session.archived !== false).map(session => <div key={session.id} className="archived-chat-row">
       <div><strong>{sessionLabel(session)}</strong><small title={session.cwd}>{session.cwd}</small></div>
       <Button size="sm" variant="ghost" disabled={Boolean(busy)} onClick={() => { onOpen(session.id, session); onClose(); }}>{t('查看历史', 'View history')}</Button>
-      {(session.kind === 'structured' || ['claude', 'codex'].includes(session.agent)) && <Button size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => {
+      <Button size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => {
         if (needsNativeBinding(session)) { setBinding(session); return; }
         setBusy(session.id); setError(undefined);
         void window.prospero.setSessionArchived(session.id, false).then(snapshot => { onOpen(session.id, snapshot.daemon.sessions.find(item => item.id === session.id) ?? { ...session, archived: false }); onClose(); })
           .catch(error => setError(reportError(error))).finally(() => setBusy(undefined));
-      }}><ArchiveRestore />{t('继续对话', 'Resume')}</Button>}
+      }}><ArchiveRestore />{t('继续对话', 'Resume')}</Button>
     </div>)}
     {loading && <p role="status">{t('正在读取…', 'Loading…')}</p>}
     {next && <Button variant="ghost" disabled={loading || Boolean(busy)} onClick={() => setCursor(next)}>{t('显示更多', 'Show more')}</Button>}

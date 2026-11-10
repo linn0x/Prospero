@@ -39,13 +39,13 @@ export function NativeSessionBindingDialog({ session, archived, onClose, onDone 
     {!loading && !items.length && <p>{t("没有匹配的对话。可粘贴原生对话 ID 重新查询。", "No matching conversation. Try its native ID.")}</p>}
     {error && <p role="alert">{error}</p>}
     <div className="flex gap-2 justify-end">
-      {archived && <Button variant="outline" disabled={busy || loading} onClick={() => {
+      <Button variant="outline" disabled={busy || loading} onClick={() => {
         setBusy(true); setError(undefined);
-        void window.prospero.setSessionArchived(session.id, true).then(snapshot => onDone(snapshot.daemon.sessions.find(item => item.id === session.id) ?? session)).catch(error => setError(reportError(error))).finally(() => setBusy(false));
-      }}>{t("不绑定，直接归档", "Archive without linking")}</Button>}
+        void window.prospero.setSessionArchived(session.id, archived).then(snapshot => onDone(snapshot.daemon.sessions.find(item => item.id === session.id) ?? { ...session, archived })).catch(error => setError(reportError(error))).finally(() => setBusy(false));
+      }}>{archived ? t("不绑定，直接归档", "Archive without linking") : t("不绑定，直接恢复", "Resume without linking")}</Button>
       <Button disabled={!selected || busy || loading} onClick={() => {
         setBusy(true); setError(undefined);
-        void window.prospero.setSessionArchived(session.id, archived, selected).then(snapshot => onDone(snapshot.daemon.sessions.find(item => item.id === session.id) ?? session)).catch(error => setError(reportError(error))).finally(() => setBusy(false));
+        void window.prospero.setSessionArchived(session.id, archived, selected).then(snapshot => onDone(snapshot.daemon.sessions.find(item => item.id === session.id) ?? { ...session, archived })).catch(error => setError(reportError(error))).finally(() => setBusy(false));
       }}>{busy ? t("正在处理…", "Working…") : archived ? t("确认绑定，停止并归档", "Link, stop and archive") : t("确认绑定，继续对话", "Link and resume")}</Button>
     </div>
   </DialogContent></Dialog>;

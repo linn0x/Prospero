@@ -61,15 +61,34 @@ impl Store {
             },
         )?;
         if let Some(native) = &updated.native_session {
-            let state = if native.native_id.is_some() {
-                "archived"
-            } else {
-                "failed"
-            };
-            self.set_native_state(id, state, native.error.clone())
+            self.set_native_state(id, "archived", native.error.clone())
         } else {
             Ok(updated)
         }
+    }
+
+    pub(crate) fn archive_terminal_head(&mut self, id: &str) -> Result<SessionHead> {
+        let head = self.session(id)?;
+        let status = match head.status {
+            SessionStatus::Completed | SessionStatus::Failed => head.status,
+            _ => SessionStatus::Completed,
+        };
+        if head.lifecycle != SessionLifecycle::Archived {
+            self.update_session_with(
+                id,
+                UpdateSession {
+                    revision: head.revision,
+                    title: None,
+                    lifecycle: Some(SessionLifecycle::Archived),
+                    status: Some(status),
+                },
+                |tx| {
+                    tx.execute("UPDATE terminal_runs SET active=0 WHERE session_id=?", [id])?;
+                    Ok(())
+                },
+            )?;
+        }
+        self.set_native_state(id, "archived", None)
     }
 
     pub(crate) fn checkpoint_terminal(&mut self, id: &str, archive: Archive) -> Result<()> {
@@ -563,5 +582,43 @@ mod tests {
         let tabs = store.workspace_tabs().unwrap();
         assert_eq!(tabs.items.len(), 1);
         assert_eq!(tabs.items[0].open_session_ids, vec![head.id]);
+    }
+
+    #[test]
+    fn finishing_unbound_terminal_marks_native_state_archived() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let head = store
+            .create_terminal(CreateTerminal {
+                title: "Claude".into(),
+                workspace: "/synthetic".into(),
+                size: TerminalSize { cols: 80, rows: 24 },
+                agent: Some(AgentKind::Claude),
+                command: None,
+                account_id: None,
+                model: None,
+                effort: None,
+                approval_policy: None,
+            })
+            .unwrap();
+        store
+            .set_native_session(
+                &head.id,
+                NativeSession {
+                    output_start_seq: Some(0),
+                    runtime_id: head.id.clone(),
+                    native_id: None,
+                    managed: true,
+                    state: "binding".into(),
+                    error: None,
+                },
+            )
+            .unwrap();
+        let finished = store.finish_terminal(&head.id, archive(1, 2)).unwrap();
+        assert_eq!(finished.lifecycle, SessionLifecycle::Archived);
+        assert_eq!(
+            finished.native_session.as_ref().map(|n| n.state.as_str()),
+            Some("archived")
+        );
     }
 }

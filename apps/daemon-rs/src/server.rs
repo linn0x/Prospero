@@ -6399,13 +6399,22 @@ async fn perform_session_lifecycle(
                 }
                 api.terminals.validate_binding(id, &native_id).await?;
                 let sid = id.to_owned();
+                let runtime_id = head
+                    .native_session
+                    .as_ref()
+                    .map(|n| n.runtime_id.clone())
+                    .unwrap_or_else(|| sid.clone());
+                let output_start_seq = head
+                    .native_session
+                    .as_ref()
+                    .and_then(|n| n.output_start_seq);
                 api.database
                     .call(move |store| {
                         store.set_native_session(
                             &sid,
                             NativeSession {
-                                output_start_seq: None,
-                                runtime_id: sid.clone(),
+                                output_start_seq,
+                                runtime_id,
                                 native_id: Some(native_id),
                                 managed: false,
                                 state: "archived".into(),

@@ -1157,24 +1157,31 @@ impl Store {
     pub(crate) fn resume_archived_agent(&mut self, id: &str) -> Result<SessionHead> {
         let head = self.session(id)?;
         let run = self.agent_run(id)?;
+        let has_incomplete_recovery: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orch_recovery_jobs WHERE kind='legacy_session' AND object_id=?1 AND state<>'complete')",
+            [id],
+            |row| row.get(0),
+        )?;
         if head.lifecycle != SessionLifecycle::Archived
             || run.active
             || self.agent_execution_unknown(id)?
-            || !self.agent_execution_stopped(id)?
+            || has_incomplete_recovery
         {
             return Err(Error::Conflict);
         }
-        if run.native_id.is_none() && run.turn != 0 {
-            return Err(Error::Invalid("此会话没有可恢复的原生历史".into()));
-        }
-        let native_id = run.native_id.clone();
+        let native_id = run.native_id.clone().or_else(|| {
+            head.native_session
+                .as_ref()
+                .and_then(|native| native.native_id.clone())
+        });
         if let Some(native_id) = &native_id {
             self.ensure_native_available(id, native_id)?;
         }
+        let native_id_for_run = native_id.clone();
         self.update_session_with_native(id, UpdateSession {
             revision: head.revision, title: None, lifecycle: Some(SessionLifecycle::Active), status: Some(SessionStatus::Idle),
         }, Some(NativeSession { output_start_seq: None, runtime_id: uuid::Uuid::new_v4().to_string(), native_id, managed: true, state: "running".into(), error: None }), |tx| {
-            if tx.execute("UPDATE agent_runs SET active=1 WHERE session_id=? AND active=0 AND execution_unknown=0", [id])? != 1 { return Err(Error::Conflict); }
+            if tx.execute("UPDATE agent_runs SET active=1, native_id=COALESCE(native_id, ?2) WHERE session_id=?1 AND active=0 AND execution_unknown=0", params![id, native_id_for_run])? != 1 { return Err(Error::Conflict); }
             Ok(())
         })
     }
@@ -3216,5 +3223,19 @@ mod tests {
         assert_ne!(reclaimed.claim_id, first.claim_id);
         assert_eq!(reclaimed.children, vec![(child.clone(), 1)]);
         assert!(store.message_queue(&parent).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_archived_agent_supports_sessions_without_native_id_or_recovery_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let session_id = active_child_session(&mut store, "unbound-turn");
+        store.begin_agent_turn(&session_id).unwrap();
+        store.archive_agent_session(&session_id, true).unwrap();
+
+        let resumed = store.resume_archived_agent(&session_id).unwrap();
+        assert_eq!(resumed.lifecycle, SessionLifecycle::Active);
+        assert_eq!(resumed.status, SessionStatus::Idle);
+        assert!(store.agent_run(&session_id).unwrap().active);
     }
 }

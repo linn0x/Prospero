@@ -5158,9 +5158,7 @@ impl Agents {
                 let run_native_id = store.agent_run(&sid)?.native_id;
                 if let Some(mut native) = head.native_session.filter(|native| {
                     native.state == "archiving"
-                        || (lifecycle == SessionLifecycle::Archived
-                            && native.state == "failed"
-                            && (native.native_id.is_some() || run_native_id.is_some()))
+                        || (lifecycle == SessionLifecycle::Archived && native.state == "failed")
                 }) {
                     native.native_id = run_native_id.or(native.native_id);
                     native.state = "archived".into();
