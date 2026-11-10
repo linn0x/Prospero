@@ -100,13 +100,25 @@ let lastBroadcastSnapshot: ReturnType<StateStore["snapshot"]> | undefined;
 let lastBroadcastWindowId: number | undefined;
 let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
 let accountActionTail: Promise<void> = Promise.resolve();
+function sendToMainWindow(channel: string, payload: unknown): boolean {
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return false;
+  try {
+    const contents = window.webContents;
+    if (!contents || contents.isDestroyed()) return false;
+    contents.send(channel, payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
 const store = RUST_BACKEND ? new StateStore(resolve(rustHome, "desktop"), "api", { daemonBackend: backendSelection.backend }) : new StateStore(undefined, "files", { daemonBackend: backendSelection.backend });
 const remoteHostStore = new RemoteHostStore(resolve(app.getPath("userData"), "remote-hosts.json"));
 const remoteShellManager = new RemoteShellManager(remoteHostStore, (event) => {
-  mainWindow?.webContents.send("remote-shell:event", event);
+  sendToMainWindow("remote-shell:event", event);
 });
 const remoteWorkspaces = new RemoteWorkspaces(new RemoteWorkspaceStore(resolve(app.getPath("userData"), "remote-workspaces.json")), remoteHostStore, remoteShellManager);
-const publishRemoteWorkspaces = (): void => { mainWindow?.webContents.send("remote-workspace:changed", remoteWorkspaces.list()); };
+const publishRemoteWorkspaces = (): void => { sendToMainWindow("remote-workspace:changed", remoteWorkspaces.list()); };
 const runtime = RUST_BACKEND ? new RustRuntime(store,
   RUST_BINARY,
   resolve(rustHome, "daemon"),
@@ -127,16 +139,11 @@ const nativeGhosttyManager = new NativeGhosttyManager(
     return runtime.createTerminalStreamSocket(sessionId);
   },
   async sessionId => RUST_BACKEND && runtime instanceof RustRuntime && runtime.supportsTerminalStream(sessionId),
-  (id, state) => mainWindow?.webContents.send("native-terminal:state", { id, state }),
-  (id, message) => mainWindow?.webContents.send("native-terminal:error", { id, message }),
-  (id, action) => mainWindow?.webContents.send("native-terminal:shortcut", { id, action }),
-  (id, focused) => mainWindow?.webContents.send("native-terminal:focus", { id, focused }),
-  id => {
-    const window = mainWindow;
-    if (!window || window.isDestroyed()) return false;
-    try { window.webContents.send("native-terminal:shortcut", { id, action: "paste-image" }); return true; }
-    catch { return false; }
-  },
+  (id, state) => { sendToMainWindow("native-terminal:state", { id, state }); },
+  (id, message) => { sendToMainWindow("native-terminal:error", { id, message }); },
+  (id, action) => { sendToMainWindow("native-terminal:shortcut", { id, action }); },
+  (id, focused) => { sendToMainWindow("native-terminal:focus", { id, focused }); },
+  id => sendToMainWindow("native-terminal:shortcut", { id, action: "paste-image" }),
 );
 let daemonStartRequest: Promise<{ ok: boolean; error?: string }> | undefined;
 function publishRuntimeSwitch(): void {
@@ -337,7 +344,7 @@ function applyTheme(settings: DesktopSettings): void {
     }
     if (process.platform === "darwin") mainWindow.setVibrancy(appearance.nativeGlass ? "sidebar" : null);
     mainWindow.setBackgroundColor(appearance.nativeGlass ? "#00000000" : (dark ? "#0f1624" : "#f3f6fb"));
-    mainWindow.webContents.send("appearance:changed", appearance);
+    sendToMainWindow("appearance:changed", appearance);
   }
 }
 
@@ -350,7 +357,7 @@ function broadcastSnapshot(snapshot: ReturnType<StateStore["snapshot"]> = store.
   lastBroadcastSnapshot = snapshot;
   lastBroadcastWindowId = mainWindow.id;
   if (isEmptyDesktopSnapshotPatch(patch)) return;
-  mainWindow.webContents.send("snapshot:changed", patch);
+  if (!sendToMainWindow("snapshot:changed", patch)) return;
   const pending = snapshot.daemon.sessions.reduce((total, session) => total + (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0), 0);
   const active = snapshot.daemon.sessions.some((session) => session.status === "running" || session.status === "starting");
   mainWindow.setProgressBar(pending > 0 ? 1 : active ? 2 : -1, { mode: pending > 0 ? "paused" : active ? "indeterminate" : "none" });
@@ -403,6 +410,7 @@ function createWindow(): BrowserWindow {
     },
   });
   const contents = window.webContents;
+  const contentsId = contents.id;
 
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-prevent-unload", event => {
@@ -420,12 +428,12 @@ function createWindow(): BrowserWindow {
   // garbage collection to close the transferred port.
   contents.on("did-start-navigation", (_event, _url, _inPlace, isMainFrame) => {
     if (isMainFrame) {
-      terminalStreamBridge.closeAllForId(contents.id);
-      nativeGhosttyManager.closeAllForContents(contents.id);
+      terminalStreamBridge.closeAllForId(contentsId);
+      nativeGhosttyManager.closeAllForContents(contentsId);
     }
   });
-  contents.on("render-process-gone", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); nativeGhosttyManager.closeAllForContents(contents.id); });
-  contents.once("destroyed", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contents.id); nativeGhosttyManager.closeAllForContents(contents.id); });
+  contents.on("render-process-gone", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contentsId); nativeGhosttyManager.closeAllForContents(contentsId); });
+  contents.once("destroyed", () => { sessionPageRequests.cancelAll(); terminalStreamBridge.closeAllForId(contentsId); nativeGhosttyManager.closeAllForContents(contentsId); });
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   window.webContents.session.setPermissionCheckHandler(() => false);
   window.once("ready-to-show", () => { if (!START_HIDDEN) window.show(); });
@@ -441,8 +449,8 @@ function createWindow(): BrowserWindow {
   });
   window.on("closed", () => {
     const shouldQuitApp = !isQuitting() && !store.settingsSnapshot().minimizeToTray;
-    terminalStreamBridge.closeAllForId(contents.id);
-    nativeGhosttyManager.closeAllForContents(contents.id);
+    terminalStreamBridge.closeAllForId(contentsId);
+    nativeGhosttyManager.closeAllForContents(contentsId);
     if (mainWindow === window) mainWindow = undefined;
     teardownDesktopSubsystems();
     if (shouldQuitApp) {
@@ -1521,7 +1529,7 @@ function installIpc(): void {
       try {
         const result = modelSourceResult(await runtime.request("/_prospero/control/model-sources", { method: "POST", body: message, timeoutMs: 45_000, acceptJsonError: true }), message.requestId, message.action.kind);
         if (result.accounts) store.setAccounts(result.accounts);
-        if (result.sources && result.ok) mainWindow?.webContents.send("model-source:changed", result.sources);
+        if (result.sources && result.ok) sendToMainWindow("model-source:changed", result.sources);
         return result;
       } catch { return failed("network", "模型源请求失败，请刷新确认后重试 / Model source request failed; refresh before retrying"); }
     };

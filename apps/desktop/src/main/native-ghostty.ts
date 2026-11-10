@@ -111,11 +111,12 @@ export class NativeGhosttyManager {
   ) {}
 
   private publishState(session: NativeSession): void {
-    if (session.surfacePhase !== "mounted") return;
+    if (session.closing || session.surfacePhase !== "mounted") return;
     this.onState(session.id, session.controllerState);
   }
 
   private publishError(session: NativeSession, message: string): void {
+    if (session.closing) return;
     if (session.surfacePhase !== "mounted") {
       session.pendingError = message;
       return;
