@@ -1417,15 +1417,32 @@ impl Agents {
         input: CreateCrossModelChild,
     ) -> Result<CrossModelChild> {
         crate::database::validate_id(parent_session_id)?;
-        crate::accounts::sources::validate_source_id(&input.source_id)?;
-        crate::accounts::sources::validate_source_id(&input.route_id)?;
         crate::database::validate_text(&input.task, 65_536, false)?;
-        if !matches!(
+        let use_model_source = !input.source_id.trim().is_empty()
+            && !matches!(input.source_id.trim(), "subscription" | "native")
+            && !input.route_id.trim().is_empty();
+        if use_model_source {
+            crate::accounts::sources::validate_source_id(&input.source_id)?;
+            crate::accounts::sources::validate_source_id(&input.route_id)?;
+            if !matches!(
+                input.agent,
+                AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
+            ) {
+                return Err(Error::Invalid(
+                    "跨模型子任务仅支持 Claude、Codex、OpenCode 或 Pi".into(),
+                ));
+            }
+        } else if !matches!(
             input.agent,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
+            AgentKind::Claude
+                | AgentKind::Codex
+                | AgentKind::Opencode
+                | AgentKind::Pi
+                | AgentKind::Deepseek
+                | AgentKind::Agy
         ) {
             return Err(Error::Invalid(
-                "跨模型子任务仅支持 Claude、Codex、OpenCode 或 Pi".into(),
+                "派发子会话仅支持 Claude、Codex、OpenCode、Pi、DeepSeek 或 Antigravity".into(),
             ));
         }
         let data = self.0.database.directory().to_owned();
@@ -1433,95 +1450,194 @@ impl Agents {
         let route_id = input.route_id.clone();
         let revision = input.revision;
         let agent = input.agent;
-        let (account_id, profile, source_name, route_name) = self
+        let requested_account = input
+            .account_id
+            .clone()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let requested_model = input
+            .model
+            .clone()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let requested_effort = input
+            .effort
+            .clone()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let (
+            account_id,
+            resolved_model,
+            resolved_effort,
+            source_name,
+            route_name,
+            recorded_source_id,
+            recorded_route_id,
+        ) = self
             .0
             .database
             .call(move |store| {
                 let accounts = store.list_managed_accounts(&data)?;
-                let known = accounts
-                    .iter()
-                    .map(|account| account.id.clone())
-                    .collect::<std::collections::HashSet<_>>();
-                let account_agents = accounts
-                    .into_iter()
-                    .map(|account| (account.id, account.agent))
-                    .collect::<std::collections::HashMap<_, _>>();
-                let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
-                let source = sources
-                    .list()
-                    .into_iter()
-                    .find(|source| source.id == source_id)
-                    .ok_or(Error::NotFound)?;
-                let route_name = source
-                    .routes
-                    .iter()
-                    .find(|route| route.id == route_id)
-                    .ok_or(Error::NotFound)?
-                    .name
-                    .clone();
-                let source_name = source.name.clone();
-                let outcome = sources.bind(
-                    &source_id,
-                    &route_id,
-                    revision,
-                    Some(agent),
-                    &known,
-                    &account_agents,
-                )?;
-                let (account_id, profile) = match outcome {
-                    crate::accounts::sources::BindOutcome::Existing(account_id) => {
-                        let profile = store
-                            .managed_snapshot_row(&data, &account_id)?
-                            .api_profile
-                            .ok_or(Error::NotFound)?;
-                        (account_id, profile)
-                    }
-                    crate::accounts::sources::BindOutcome::Created {
-                        account_id,
-                        agent,
-                        profile,
-                        name,
-                        secret,
-                    } => {
-                        store.insert_api_profile_account_with_id(
-                            &data,
-                            &account_id,
-                            &name,
+                if use_model_source {
+                    let known = accounts
+                        .iter()
+                        .map(|account| account.id.clone())
+                        .collect::<std::collections::HashSet<_>>();
+                    let account_agents = accounts
+                        .into_iter()
+                        .map(|account| (account.id, account.agent))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    let source = sources
+                        .list()
+                        .into_iter()
+                        .find(|source| source.id == source_id)
+                        .ok_or(Error::NotFound)?;
+                    let route_name = source
+                        .routes
+                        .iter()
+                        .find(|route| route.id == route_id)
+                        .ok_or(Error::NotFound)?
+                        .name
+                        .clone();
+                    let source_name = source.name.clone();
+                    let outcome = sources.bind(
+                        &source_id,
+                        &route_id,
+                        revision,
+                        Some(agent),
+                        &known,
+                        &account_agents,
+                    )?;
+                    let (account_id, profile) = match outcome {
+                        crate::accounts::sources::BindOutcome::Existing(account_id) => {
+                            let profile = store
+                                .managed_snapshot_row(&data, &account_id)?
+                                .api_profile
+                                .ok_or(Error::NotFound)?;
+                            (account_id, profile)
+                        }
+                        crate::accounts::sources::BindOutcome::Created {
+                            account_id,
                             agent,
-                            &profile,
-                            &secret,
-                        )?;
-                        (account_id, profile)
-                    }
-                };
-                Ok((account_id, profile, source_name, route_name))
+                            profile,
+                            name,
+                            secret,
+                        } => {
+                            store.insert_api_profile_account_with_id(
+                                &data,
+                                &account_id,
+                                &name,
+                                agent,
+                                &profile,
+                                &secret,
+                            )?;
+                            (account_id, profile)
+                        }
+                    };
+                    let default_effort = requested_effort.or_else(|| {
+                        profile
+                            .model_capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.supported_efforts.as_ref())
+                            .and_then(|values| values.first())
+                            .cloned()
+                    });
+                    Ok((
+                        Some(account_id),
+                        Some(profile.model),
+                        default_effort,
+                        source_name,
+                        route_name,
+                        source_id,
+                        route_id,
+                    ))
+                } else {
+                    let agent_name = match agent {
+                        AgentKind::Codex => "codex",
+                        AgentKind::Claude => "claude",
+                        AgentKind::Opencode => "opencode",
+                        AgentKind::Pi => "pi",
+                        AgentKind::Deepseek => "deepseek",
+                        AgentKind::Agy => "agy",
+                        _ => "agent",
+                    };
+                    let default_native_id = match agent {
+                        AgentKind::Codex => Some(crate::agent::NATIVE_CODEX_ID.to_owned()),
+                        AgentKind::Claude => Some(crate::accounts::NATIVE_CLAUDE_ID.to_owned()),
+                        AgentKind::Deepseek => Some("native-deepseek".to_owned()),
+                        AgentKind::Agy => Some(crate::accounts::NATIVE_AGY_ID.to_owned()),
+                        _ => None,
+                    };
+                    let chosen_account_id = requested_account.or(default_native_id);
+                    let account_label = if let Some(ref acc_id) = chosen_account_id {
+                        if let Some(acc) = accounts.iter().find(|a| &a.id == acc_id) {
+                            if acc.agent != agent {
+                                return Err(Error::Invalid("账号与所选 Agent 类型不匹配".into()));
+                            }
+                            acc.name.clone()
+                        } else {
+                            acc_id.clone()
+                        }
+                    } else {
+                        agent_name.to_owned()
+                    };
+                    let route_label = requested_model
+                        .clone()
+                        .unwrap_or_else(|| agent_name.to_owned());
+                    let rec_account = chosen_account_id
+                        .clone()
+                        .unwrap_or_else(|| format!("native-{agent_name}"));
+                    Ok((
+                        chosen_account_id,
+                        requested_model,
+                        requested_effort,
+                        account_label,
+                        route_label.clone(),
+                        "subscription".to_owned(),
+                        rec_account,
+                    ))
+                }
             })
             .await?;
+        let parent_workspace = {
+            let id = parent_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| Ok(store.session(&id)?.workspace))
+                .await?
+        };
+        let target_workspace = input
+            .workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| parent_workspace.clone());
+        let workspace_badge = if target_workspace != parent_workspace {
+            std::path::Path::new(&target_workspace)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("[{name}] "))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let title = input
             .title
-            .unwrap_or_else(|| format!("{} · {}", source_name, route_name));
+            .unwrap_or_else(|| format!("{workspace_badge}{source_name} · {route_name}"));
         let head = self
             .create(CreateAgentSession {
                 agent,
                 title,
-                workspace: {
-                    let id = parent_session_id.to_owned();
-                    self.0
-                        .database
-                        .call(move |store| Ok(store.session(&id)?.workspace))
-                        .await?
-                },
+                workspace: target_workspace,
                 auto_approve: true,
                 mode: None,
-                model: Some(profile.model.clone()),
-                effort: profile
-                    .model_capabilities
-                    .as_ref()
-                    .and_then(|caps| caps.supported_efforts.as_ref())
-                    .and_then(|values| values.first())
-                    .cloned(),
+                model: resolved_model,
+                effort: resolved_effort,
                 agent_preset: None,
-                account_id: Some(account_id.clone()),
+                account_id: account_id.clone(),
                 resume: None,
             })
             .await?;
@@ -1529,9 +1645,9 @@ impl Agents {
             let child_id = head.id.clone();
             let parent_id = parent_session_id.to_owned();
             let task = input.task.clone();
-            let source_id = input.source_id.clone();
-            let route_id = input.route_id.clone();
-            let account_id = account_id.clone();
+            let source_id = recorded_source_id;
+            let route_id = recorded_route_id.clone();
+            let account_id = account_id.unwrap_or(recorded_route_id);
             self.0
                 .database
                 .call(move |store| {

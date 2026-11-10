@@ -1397,11 +1397,73 @@ pub(super) struct CodexTurn {
     approval_policy: Value,
     sandbox_policy: Value,
     model: Option<String>,
+    daybreak: bool,
     effort: Option<String>,
     mode: PermissionMode,
     lifecycle: ProcessLifecycle,
     responses: PendingResponses,
     diagnostics: ProcessDiagnostics,
+}
+
+pub(crate) fn parse_codex_daybreak_model(model: Option<&str>) -> (Option<String>, bool) {
+    let Some(raw) = model.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (None, false);
+    };
+    let lower = raw.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "gpt-daybreak-blue-latest" | "daybreak" | "daybreak-blue" | "daybreak_blue"
+    ) {
+        return (Some("gpt-daybreak-blue-latest".into()), true);
+    }
+    for suffix in ["+daybreak", ":daybreak", "+daybreak-blue", ":daybreak-blue"] {
+        if lower.ends_with(suffix) {
+            let base = raw[..raw.len() - suffix.len()].trim();
+            if !base.is_empty() {
+                return (Some(base.into()), true);
+            }
+        }
+    }
+    if lower.contains("daybreak") {
+        return (Some(raw.into()), true);
+    }
+    (Some(raw.into()), false)
+}
+
+fn codex_daybreak_enabled_in_environment(
+    environment: &[(String, String)],
+    app_server_args: &[String],
+) -> bool {
+    if app_server_args
+        .iter()
+        .any(|arg| arg.trim() == "daybreak=true")
+    {
+        return true;
+    }
+    let Some(home) = codex_home_from_environment(environment) else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(home.join("config.toml")) else {
+        return false;
+    };
+    let mut in_table = false;
+    for line in raw.lines() {
+        let trimmed = line.split('#').next().unwrap_or_default().trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_table = true;
+            continue;
+        }
+        if !in_table
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim() == "daybreak"
+        {
+            return value.trim() == "true";
+        }
+    }
+    false
 }
 
 #[derive(Clone)]
@@ -1579,7 +1641,12 @@ pub(super) async fn spawn_turn(
     native_id: Option<&str>,
     options: &TurnOptions,
 ) -> Result<CodexTurn> {
-    let (environment, app_server_args) = if let Some(profile) = options.api_profile.as_ref() {
+    let (resolved_model, model_daybreak) = parse_codex_daybreak_model(options.model.as_deref());
+    let profile_daybreak = options
+        .api_profile
+        .as_ref()
+        .is_some_and(|profile| parse_codex_daybreak_model(Some(&profile.model)).1);
+    let (environment, mut app_server_args) = if let Some(profile) = options.api_profile.as_ref() {
         if profile.protocol() != "openai_responses" {
             return Err(Error::Invalid(
                 "Codex structured runtime 仅支持 OpenAI Responses Profile".into(),
@@ -1596,6 +1663,17 @@ pub(super) async fn spawn_turn(
         environment.extend(options.environment.iter().cloned());
         (environment, Vec::new())
     };
+    let daybreak = model_daybreak
+        || profile_daybreak
+        || codex_daybreak_enabled_in_environment(&environment, &app_server_args);
+    if daybreak
+        && !app_server_args
+            .iter()
+            .any(|arg| arg.trim() == "daybreak=true")
+    {
+        app_server_args.push("-c".into());
+        app_server_args.push("daybreak=true".into());
+    }
     let mut rpc = StartingRpc::start(data, workspace, &environment, &app_server_args).await?;
     let lifecycle = rpc.cleanup.lifecycle();
     let policy = execution_policy(workspace, options.policy);
@@ -1618,8 +1696,11 @@ pub(super) async fn spawn_turn(
             "developerInstructions".into(),
             json!(crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS),
         );
-        if let Some(model) = options.model.as_ref() {
+        if let Some(model) = resolved_model.as_ref() {
             base.insert("model".into(), json!(model));
+        }
+        if daybreak {
+            base.insert("daybreakEnabled".into(), json!(true));
         }
         let started = if let Some(thread_id) = native_id {
             let mut params = base.clone();
@@ -1707,9 +1788,15 @@ pub(super) async fn spawn_turn(
         policy.approval_policy_for_turn.clone(),
     );
     turn_params.insert("sandboxPolicy".into(), policy.sandbox_policy.clone());
-    if let Some(model) = options.model.as_ref() {
+    if let Some(model) = resolved_model.as_ref() {
         turn_params.insert("model".into(), json!(model));
-        turn_params.insert("collaborationMode".into(), collaboration_mode(options));
+        turn_params.insert(
+            "collaborationMode".into(),
+            collaboration_mode(options, model),
+        );
+    }
+    if daybreak {
+        turn_params.insert("cyberAccessProgram".into(), json!("daybreakBlue"));
     }
     if let Some(effort) = options.effort.as_ref() {
         turn_params.insert("effort".into(), json!(effort));
@@ -1744,7 +1831,8 @@ pub(super) async fn spawn_turn(
         current_turns,
         approval_policy: policy.approval_policy_for_turn,
         sandbox_policy: policy.sandbox_policy,
-        model: options.model.clone(),
+        model: resolved_model,
+        daybreak,
         effort: options.effort.clone(),
         mode: options.mode,
         lifecycle,
@@ -1868,11 +1956,11 @@ fn execution_policy(workspace: &str, policy: ApprovalPolicy) -> ExecutionPolicy 
     }
 }
 
-fn collaboration_mode(options: &TurnOptions) -> Value {
+fn collaboration_mode(options: &TurnOptions, model: &str) -> Value {
     json!({
         "mode": if options.mode == PermissionMode::Plan { "plan" } else { "default" },
         "settings": {
-            "model": options.model.as_deref().unwrap_or(""),
+            "model": model,
             "reasoning_effort": options.effort,
             "developer_instructions": null,
         }
@@ -3385,6 +3473,9 @@ impl CodexTurn {
                 }),
             );
         }
+        if self.daybreak {
+            params.insert("cyberAccessProgram".into(), json!("daybreakBlue"));
+        }
         if let Some(effort) = self.effort.as_ref() {
             params.insert("effort".into(), json!(effort));
         }
@@ -3426,6 +3517,8 @@ impl CodexTurn {
     }
 
     pub(super) async fn apply_selection(&self, model: &str, effort: Option<&str>) -> Result<()> {
+        let (resolved, _) = parse_codex_daybreak_model(Some(model));
+        let resolved_model = resolved.as_deref().unwrap_or(model);
         self.send_request(
             "thread/settings/update",
             json!({
@@ -3433,7 +3526,7 @@ impl CodexTurn {
                 "collaborationMode": {
                     "mode": "default",
                     "settings": {
-                        "model": model,
+                        "model": resolved_model,
                         "reasoning_effort": effort,
                         "developer_instructions": null,
                     }

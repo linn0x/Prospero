@@ -245,8 +245,10 @@ enum WorkerCommand {
 
 #[derive(Subcommand)]
 enum ChildCommand {
-    /// List enabled model-source routes that can be targeted by a child.
+    /// List enabled model-source routes, subscription accounts, and workspaces that can be targeted by a child.
     Sources,
+    /// List known workspaces, subscription accounts, and model-source routes.
+    Workspaces,
     /// List cross-model children for the current or specified parent.
     List {
         /// Parent session id. Defaults to PROSPERO_SESSION_ID.
@@ -283,19 +285,27 @@ enum ChildCommand {
         #[arg(long)]
         child: String,
     },
-    /// Start an independent source-bound child and return its session id.
+    /// Start an independent child session (in the current or another workspace) and return its session id.
     Start {
-        /// Parent structured-session id. Defaults to PROSPERO_SESSION_ID.
+        /// Parent session id. Defaults to PROSPERO_SESSION_ID.
         #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
-        source: String,
+        source: Option<String>,
         #[arg(long)]
-        route: String,
+        route: Option<String>,
         #[arg(long)]
-        revision: i64,
+        revision: Option<i64>,
         #[arg(long, default_value = "codex")]
         agent: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long = "account")]
+        account_id: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
         #[arg(long)]
         task: String,
         #[arg(long)]
@@ -650,7 +660,9 @@ fn command_request(
             ),
         },
         Command::Child { command } => match command {
-            ChildCommand::Sources => ("cross_model.child.sources", json!({})),
+            ChildCommand::Sources | ChildCommand::Workspaces => {
+                ("cross_model.child.sources", json!({}))
+            }
             ChildCommand::List {
                 parent,
                 status,
@@ -681,6 +693,10 @@ fn command_request(
                 route,
                 revision,
                 agent,
+                workspace,
+                account_id,
+                model,
+                effort,
                 task,
                 title,
             } => {
@@ -689,19 +705,41 @@ fn command_request(
                         "缺少 --parent（或 PROSPERO_SESSION_ID）".into(),
                     )
                 })?;
-                if !matches!(agent.as_str(), "codex" | "claude" | "opencode") {
+                if !matches!(
+                    agent.as_str(),
+                    "codex" | "claude" | "opencode" | "pi" | "deepseek" | "agy"
+                ) {
                     return Err(prosperod_rs::error::Error::Invalid(
-                        "--agent 仅支持 codex、claude 或 opencode".into(),
+                        "--agent 仅支持 codex、claude、opencode、pi、deepseek 或 agy".into(),
                     ));
                 }
-                if revision < 1 {
+                if source.is_some()
+                    && !matches!(source.as_deref(), Some("subscription" | "native"))
+                    && revision.unwrap_or(0) < 1
+                {
                     return Err(prosperod_rs::error::Error::Invalid(
                         "--revision 必须为正整数".into(),
                     ));
                 }
+                let workspace = match workspace {
+                    Some(path) => Some(absolute(path)?),
+                    None => None,
+                };
                 (
                     "cross_model.child.start",
-                    json!({"parentSessionId": parent, "sourceId": source, "routeId": route, "revision": revision, "agent": agent, "task": require_text(task, "--task")?, "title": title}),
+                    json!({
+                        "parentSessionId": parent,
+                        "sourceId": source,
+                        "routeId": route,
+                        "revision": revision.unwrap_or(0),
+                        "agent": agent,
+                        "workspace": workspace,
+                        "accountId": account_id,
+                        "model": model,
+                        "effort": effort,
+                        "task": require_text(task, "--task")?,
+                        "title": title,
+                    }),
                 )
             }
             ChildCommand::FollowUp {

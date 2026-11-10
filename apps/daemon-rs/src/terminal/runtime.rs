@@ -1770,11 +1770,17 @@ impl Terminals {
                     input.model = Some(profile.model.clone());
                 }
                 if let Some(model) = effective_model {
+                    let (resolved, daybreak) =
+                        crate::agent::codex::parse_codex_daybreak_model(Some(&model));
+                    let resolved_model = resolved.unwrap_or_else(|| model.clone());
                     input.model = Some(model.clone());
                     args.extend([
                         "-c".into(),
-                        format!("model={}", serde_json::to_string(&model)?),
+                        format!("model={}", serde_json::to_string(&resolved_model)?),
                     ]);
+                    if daybreak && !args.iter().any(|arg| arg.trim() == "daybreak=true") {
+                        args.extend(["-c".into(), "daybreak=true".into()]);
+                    }
                 }
                 if let Some(effort) = effective_effort {
                     input.effort = Some(effort.clone());

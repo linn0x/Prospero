@@ -777,10 +777,50 @@ pub(crate) async fn search_codex_conversations_in(
     result
 }
 
+fn row_supports_daybreak_blue(row: &serde_json::Map<String, Value>) -> bool {
+    row.get("available_access_programs")
+        .or_else(|| row.get("availableAccessPrograms"))
+        .and_then(|programs| programs.get("cyber"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item.as_str(),
+                    Some("daybreak_blue" | "daybreakBlue" | "daybreak-blue")
+                )
+            })
+        })
+}
+
+fn ensure_daybreak_blue_model_entry(models: &mut Vec<crate::agent::LaunchModelInfo>) {
+    if models.is_empty()
+        || models
+            .iter()
+            .any(|model| model.id.eq_ignore_ascii_case("gpt-daybreak-blue-latest"))
+    {
+        return;
+    }
+    models.push(crate::agent::LaunchModelInfo {
+        id: "gpt-daybreak-blue-latest".into(),
+        label: "Daybreak Blue".into(),
+        description: Some("Flagship cybersecurity model (Daybreak Blue access program)".into()),
+        supported_efforts: vec![
+            "low".into(),
+            "medium".into(),
+            "high".into(),
+            "xhigh".into(),
+            "ultra".into(),
+        ],
+        default_effort: Some("high".into()),
+        is_default: false,
+    });
+}
+
 fn codex_models_from_response(value: &Value, models: &mut Vec<crate::agent::LaunchModelInfo>) {
     let Some(data) = value.get("data").and_then(Value::as_array) else {
         return;
     };
+    let mut daybreak_variants = Vec::new();
     for item in data {
         let Some(row) = item.as_object() else {
             continue;
@@ -791,6 +831,11 @@ fn codex_models_from_response(value: &Value, models: &mut Vec<crate::agent::Laun
             .and_then(Value::as_str)
             .unwrap_or_default();
         if id.is_empty() || id.chars().count() > 160 {
+            continue;
+        }
+        let is_daybreak_slug =
+            id.eq_ignore_ascii_case("gpt-daybreak-blue-latest") || id.contains("daybreak");
+        if row.get("hidden").and_then(Value::as_bool) == Some(true) && !is_daybreak_slug {
             continue;
         }
         let label = row
@@ -817,23 +862,36 @@ fn codex_models_from_response(value: &Value, models: &mut Vec<crate::agent::Laun
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let default_effort = row
+            .get("defaultReasoningEffort")
+            .or_else(|| row.get("default_reasoning_level"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| trim_codex(value, 80));
+        let description = row
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|value| trim_codex(value, 1000));
         models.push(crate::agent::LaunchModelInfo {
             id: id.to_owned(),
             label: trim_codex(label, 160),
-            description: row
-                .get("description")
-                .and_then(Value::as_str)
-                .map(|value| trim_codex(value, 1000)),
-            supported_efforts,
-            default_effort: row
-                .get("defaultReasoningEffort")
-                .or_else(|| row.get("default_reasoning_level"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(|value| trim_codex(value, 80)),
+            description: description.clone(),
+            supported_efforts: supported_efforts.clone(),
+            default_effort: default_effort.clone(),
             is_default: row.get("isDefault").and_then(Value::as_bool) == Some(true),
         });
+        if !is_daybreak_slug && row_supports_daybreak_blue(row) {
+            daybreak_variants.push(crate::agent::LaunchModelInfo {
+                id: format!("{id}+daybreak"),
+                label: trim_codex(&format!("{label} · Daybreak Blue"), 160),
+                description,
+                supported_efforts,
+                default_effort,
+                is_default: false,
+            });
+        }
     }
+    models.extend(daybreak_variants);
 }
 
 fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchModelInfo>> {
@@ -867,15 +925,11 @@ fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchM
     let parsed: Value = serde_json::from_str(&raw).ok()?;
     let rows = parsed.get("models")?.as_array()?;
     let mut models = Vec::new();
+    let mut daybreak_variants = Vec::new();
     for item in rows {
         let Some(row) = item.as_object() else {
             continue;
         };
-        if let Some(visibility) = row.get("visibility").and_then(Value::as_str)
-            && visibility != "list"
-        {
-            continue;
-        }
         let id = row
             .get("slug")
             .or_else(|| row.get("model"))
@@ -883,6 +937,14 @@ fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchM
             .and_then(Value::as_str)
             .unwrap_or_default();
         if id.is_empty() || id.chars().count() > 160 {
+            continue;
+        }
+        let is_daybreak_slug =
+            id.eq_ignore_ascii_case("gpt-daybreak-blue-latest") || id.contains("daybreak");
+        if let Some(visibility) = row.get("visibility").and_then(Value::as_str)
+            && visibility != "list"
+            && !is_daybreak_slug
+        {
             continue;
         }
         let label = row
@@ -913,24 +975,38 @@ fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchM
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let is_default = models.is_empty();
+        let default_effort = row
+            .get("default_reasoning_level")
+            .or_else(|| row.get("defaultReasoningEffort"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| trim_codex(value, 80));
+        let description = row
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|value| trim_codex(value, 1000));
+        let is_default = models.is_empty() && !is_daybreak_slug;
         models.push(crate::agent::LaunchModelInfo {
             id: id.to_owned(),
             label: trim_codex(label, 160),
-            description: row
-                .get("description")
-                .and_then(Value::as_str)
-                .map(|value| trim_codex(value, 1000)),
-            supported_efforts,
-            default_effort: row
-                .get("default_reasoning_level")
-                .or_else(|| row.get("defaultReasoningEffort"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(|value| trim_codex(value, 80)),
+            description: description.clone(),
+            supported_efforts: supported_efforts.clone(),
+            default_effort: default_effort.clone(),
             is_default,
         });
+        if !is_daybreak_slug && row_supports_daybreak_blue(row) {
+            daybreak_variants.push(crate::agent::LaunchModelInfo {
+                id: format!("{id}+daybreak"),
+                label: trim_codex(&format!("{label} · Daybreak Blue"), 160),
+                description,
+                supported_efforts,
+                default_effort,
+                is_default: false,
+            });
+        }
     }
+    models.extend(daybreak_variants);
+    ensure_daybreak_blue_model_entry(&mut models);
     if models.is_empty() {
         return None;
     }
@@ -960,7 +1036,19 @@ fn codex_config_defaults(codex_home: &Path) -> (Option<String>, Option<String>) 
             .filter(|v| !v.is_empty())
             .map(str::to_owned)
     };
-    (value("model"), value("model_reasoning_effort"))
+    let daybreak = selected
+        .and_then(|table| table.get("daybreak"))
+        .or_else(|| config.get("daybreak"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let model = match (value("model"), daybreak) {
+        (Some(model), true) if !model.to_ascii_lowercase().contains("daybreak") => {
+            Some(format!("{model}+daybreak"))
+        }
+        (None, true) => Some("gpt-daybreak-blue-latest".into()),
+        (model, _) => model,
+    };
+    (model, value("model_reasoning_effort"))
 }
 
 fn apply_codex_catalog_defaults(
@@ -968,10 +1056,15 @@ fn apply_codex_catalog_defaults(
     preferred_model: Option<String>,
     preferred_effort: Option<String>,
 ) {
-    if let Some(model_id) = preferred_model
-        && catalog.models.iter().any(|model| model.id == model_id)
-    {
-        catalog.current_model = Some(model_id);
+    if let Some(model_id) = preferred_model {
+        if catalog.models.iter().any(|model| model.id == model_id) {
+            catalog.current_model = Some(model_id);
+        } else if let Some((Some(base), true)) = Some(
+            crate::agent::codex::parse_codex_daybreak_model(Some(&model_id)),
+        ) && catalog.models.iter().any(|model| model.id == base)
+        {
+            catalog.current_model = Some(base);
+        }
     }
     let active_model = catalog
         .current_model
@@ -1203,6 +1296,9 @@ async fn read_codex_models(
         if models.is_empty() {
             return Err(Error::Invalid("Codex 没有返回可选模型".into()));
         }
+        if std::env::var_os("PROSPERO_CODEX_BIN").is_none() {
+            ensure_daybreak_blue_model_entry(&mut models);
+        }
         let current_model = models
             .iter()
             .find(|model| model.is_default)
@@ -1288,5 +1384,42 @@ mod tests {
         let result = replace_file_atomically(&directory.path().join("missing"), &target);
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "existing");
+    }
+
+    #[test]
+    fn codex_models_cache_includes_hidden_daybreak_blue_and_daybreak_variants() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_file = directory.path().join("models_cache.json");
+        std::fs::write(
+            &cache_file,
+            serde_json::to_string(&json!({
+                "models": [
+                    {
+                        "slug": "gpt-6-sol",
+                        "display_name": "GPT-6-Sol",
+                        "visibility": "list",
+                        "default_reasoning_level": "medium",
+                        "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}],
+                        "available_access_programs": { "cyber": ["standard", "daybreak_blue"] }
+                    },
+                    {
+                        "slug": "gpt-daybreak-blue-latest",
+                        "display_name": "Daybreak Blue",
+                        "visibility": "hide",
+                        "model_specialty": "cyber",
+                        "default_reasoning_level": "high",
+                        "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}],
+                        "available_access_programs": { "cyber": ["daybreak_blue"] }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let models = codex_models_from_cache_file(&cache_file).unwrap();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"gpt-6-sol"));
+        assert!(ids.contains(&"gpt-daybreak-blue-latest"));
+        assert!(ids.contains(&"gpt-6-sol+daybreak"));
     }
 }

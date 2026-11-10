@@ -7,12 +7,14 @@ import { ConversationRail } from "./chat/ConversationRail";
 import { chatDisplayItems, historyEndForItem } from "./chat/display";
 import { useConversationFont } from "./chat/use-conversation-font";
 import { supportsTrajectory } from "./workspace/dock-state";
+import { isProsperoBotSession } from "./workspace/session-presentation";
 import { createPortal } from "react-dom";
 import { notify } from "./notifications/notifications";
 import { ModelSwitcher } from "./workspace/ModelSwitcher";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type UIEvent } from "react";
-import { Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, ListChecks, Paperclip, Send, ShieldAlert, Target, Trash2, UserRound, X, Workflow } from "lucide-react";
-import type { AgentModeCatalog, JsonObject, SessionInfo, SkillSuggestion } from "../../shared/types";
+import { Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, FolderKanban, ListChecks, Paperclip, Send, ShieldAlert, Sparkles, Target, Trash2, UserRound, X, Workflow } from "lucide-react";
+import type { AgentModeCatalog, AgentModel, DesktopSnapshot, JsonObject, SessionInfo, SkillSuggestion } from "../../shared/types";
+import { defaultSessionLaunchAccountId, sessionLaunchAccounts, sessionLaunchWorkspaces } from "../../shared/session-launch-options";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@/components/ui/attachment";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -130,36 +132,371 @@ function PermissionCard({ event, isDone, sessionId, onError }: { event: JsonObje
   return <Card><CardHeader><CardTitle className="flex items-center gap-2"><ShieldAlert className="size-4" />{text(event.summary, t("Agent 请求权限", "Agent requests permission"))}</CardTitle><CardDescription>{t("请确认这项操作是否可以继续。", "Confirm whether this operation may continue.")}</CardDescription></CardHeader><CardContent className="flex flex-col gap-3">{array(event.resources).length > 0 && <pre className="rounded-lg bg-muted p-3 text-xs">{array(event.resources).map(String).join("\n")}</pre>}<DiffBlock value={event.diff} />{isDone && <Badge variant="secondary" className="w-fit"><Check />{t("已处理", "Resolved")}</Badge>}</CardContent>{!isDone && <CardFooter className="justify-end gap-2"><Button variant="destructive" disabled={Boolean(busy)} onClick={() => void reply("reject")}>{busy === "reject" && <Spinner data-icon="inline-start" />}{t("拒绝", "Reject")}</Button><Button variant="outline" disabled={Boolean(busy)} onClick={() => void reply("always")}>{busy === "always" && <Spinner data-icon="inline-start" />}{t("本会话允许", "Allow for session")}</Button><Button disabled={Boolean(busy)} onClick={() => void reply("once")}>{busy === "once" && <Spinner data-icon="inline-start" />}{t("允许一次", "Allow once")}</Button></CardFooter>}</Card>;
 }
 
-type EventProps = { event: JsonObject; projectRoot?: string | undefined; isResolved: boolean; sessionId: string; onError: (message?: string) => void; openOutput: (id: string, tool: string) => void; openSubagent: (id: string, label: string) => void };
+type EventProps = { event: JsonObject; projectRoot?: string | undefined; isResolved: boolean; sessionId: string; onError: (message?: string) => void; openOutput: (id: string, tool: string) => void; openSubagent: (id: string, label: string) => void; onOpenSession?: ((id: string) => void) | undefined };
 
-function CrossModelChildLauncher({ session, onCreated, onError }: { session: SessionInfo; onCreated: (id: string) => void; onError: (message: string) => void }) {
+type ChildDispatchAgent = "codex" | "claude" | "opencode" | "pi" | "deepseek" | "agy";
+
+function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { session: SessionInfo; snapshot?: DesktopSnapshot | undefined; onCreated: (id: string, jump?: boolean) => void; onError: (message: string) => void }) {
   const { t } = useLocale();
   const supported = typeof window.prospero.createCrossModelChild === "function";
+  const isBot = isProsperoBotSession(session);
   const [open, setOpen] = useState(false);
-  const sourceState = useModelSources(supported && open);
-  const [agent, setAgent] = useState<SourceRuntimeAgent>("codex");
+  const independentAccounts = useMemo(
+    () => (snapshot?.accounts ?? []).filter((account) => !account["modelSource"] && !account["apiProfile"] && !account["apiProfileError"]),
+    [snapshot?.accounts],
+  );
+  const [useSource, setUseSource] = useState(() => independentAccounts.length === 0);
+  const sourceState = useModelSources(supported && open && useSource);
+  const [agent, setAgent] = useState<ChildDispatchAgent>("codex");
+  const sourceAgent: SourceRuntimeAgent =
+    agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi" ? agent : "codex";
+  const [workspace, setWorkspace] = useState(session.cwd);
+  const [accountId, setAccountId] = useState<string | undefined>(() =>
+    defaultSessionLaunchAccountId(independentAccounts, "codex"),
+  );
+  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
+  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
+  const [model, setModel] = useState<string | undefined>();
+  const [effort, setEffort] = useState<string | undefined>();
   const [selection, setSelection] = useState<SourceSelection>();
   const [task, setTask] = useState("");
   const [busy, setBusy] = useState(false);
-  const choice = selectedSourceRoute(sourceState.sources, selection, agent);
+
+  const workspaces = useMemo(() => {
+    const list = snapshot ? sessionLaunchWorkspaces(snapshot) : [];
+    if (session.cwd && !list.some((item) => item.path === session.cwd)) {
+      const name = session.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? session.cwd;
+      return [{ path: session.cwd, label: name, detail: session.cwd, kind: "project" as const }, ...list];
+    }
+    return list;
+  }, [session.cwd, snapshot]);
+
+  useEffect(() => {
+    if (open && (!workspace || !workspaces.some((item) => item.path === workspace))) {
+      setWorkspace(session.cwd || workspaces[0]?.path || "");
+    }
+  }, [open, session.cwd, workspace, workspaces]);
+
+  const launchAccounts = useMemo(
+    () => sessionLaunchAccounts(independentAccounts, agent),
+    [agent, independentAccounts],
+  );
+
+  useEffect(() => {
+    if (!open || useSource) return;
+    if (!accountId || !launchAccounts.some((item) => item.id === accountId)) {
+      setAccountId(defaultSessionLaunchAccountId(independentAccounts, agent));
+    }
+  }, [accountId, agent, independentAccounts, launchAccounts, open, useSource]);
+
+  useEffect(() => {
+    if (!open || useSource || typeof window.prospero.getLaunchModels !== "function") {
+      setLaunchModels([]);
+      setLaunchModelsLoading(false);
+      return;
+    }
+    if (agent === "opencode") {
+      setLaunchModels([]);
+      return;
+    }
+    let cancelled = false;
+    setLaunchModelsLoading(true);
+    void window.prospero
+      .getLaunchModels(agent, accountId)
+      .then((catalog) => {
+        if (cancelled) return;
+        setLaunchModels(catalog.models);
+        setModel((current) => {
+          const matched = catalog.models.find((item) => item.id === current);
+          const fallback =
+            matched ??
+            catalog.models.find((item) => item.id === catalog.currentModel) ??
+            catalog.models.find((item) => item.isDefault) ??
+            catalog.models[0];
+          setEffort(
+            fallback?.defaultEffort ??
+              (catalog.currentEffort && fallback?.supportedEfforts.includes(catalog.currentEffort)
+                ? catalog.currentEffort
+                : fallback?.supportedEfforts[0]),
+          );
+          return fallback?.id;
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setLaunchModels([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLaunchModelsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, agent, open, useSource]);
+
+  const choice = selectedSourceRoute(sourceState.sources, selection, sourceAgent);
+  const selectedLaunchModel = launchModels.find((item) => item.id === model);
+  const canLaunch = Boolean(
+    task.trim() &&
+      !busy &&
+      (useSource ? choice && selection : agent === "opencode" || launchAccounts.length > 0),
+  );
+
   if (!supported || session.kind !== "structured") return null;
-  const launch = async (): Promise<void> => {
-    if (!choice || !selection || !task.trim() || busy) return;
+
+  const launch = async (jump = false): Promise<void> => {
+    if (!canLaunch) return;
     setBusy(true);
     try {
-      const result = await window.prospero.createCrossModelChild(session.id, { sourceId: selection.sourceId, routeId: selection.routeId, revision: selection.revision, agent, task: task.trim() });
+      const targetWorkspace = workspace && workspace !== session.cwd ? workspace : undefined;
+      const result = useSource && selection
+        ? await window.prospero.createCrossModelChild(session.id, {
+            sourceId: selection.sourceId,
+            routeId: selection.routeId,
+            revision: selection.revision,
+            agent: sourceAgent,
+            task: task.trim(),
+            ...(targetWorkspace ? { workspace: targetWorkspace } : {}),
+          })
+        : await window.prospero.createCrossModelChild(session.id, {
+            agent,
+            task: task.trim(),
+            ...(targetWorkspace ? { workspace: targetWorkspace } : {}),
+            ...(accountId ? { accountId } : {}),
+            ...(model ? { model } : {}),
+            ...(effort ? { effort } : {}),
+          });
       const id = text(result["sessionId"]);
       if (!id) throw new Error(t("子 Agent 创建没有返回会话 ID", "Child agent creation did not return a session id"));
-      setTask(""); setOpen(false); onCreated(id);
-    } catch (reason) { onError(reportError(reason)); } finally { setBusy(false); }
+      setTask("");
+      setOpen(false);
+      onCreated(id, jump);
+    } catch (reason) {
+      onError(reportError(reason));
+    } finally {
+      setBusy(false);
+    }
   };
+
   return <>
-    <Button variant="outline" size="sm" onClick={() => setOpen(true)}><Workflow data-icon="inline-start" />{t("跨模型子 Agent", "Cross-model child")}</Button>
-    <Dialog open={open} onOpenChange={(next) => { if (!busy) setOpen(next); }}><DialogContent className="sm:max-w-2xl"><DialogHeader><DialogTitle>{t("派发跨模型子 Agent", "Dispatch a cross-model child")}</DialogTitle><DialogDescription>{t("独立模型源、独立 structured 会话，固定 YOLO 自动批准；完成摘要回传当前会话。", "Independent model source and structured session with YOLO auto-approval. Its summary returns here.")}</DialogDescription></DialogHeader><div className="grid gap-4"><NativeSelect value={agent} disabled={busy} aria-label={t("子 Agent 类型", "Child agent runtime")} onChange={event => { setAgent(event.target.value as SourceRuntimeAgent); setSelection(undefined); }}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude Code</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption><NativeSelectOption value="pi">Pi</NativeSelectOption></NativeSelect><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={selection} agent={agent} onChange={setSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /><InputGroup><InputGroupTextarea value={task} maxLength={65_536} rows={6} aria-label={t("子任务", "Child task")} placeholder={t("描述要交给另一个模型完成的独立任务…", "Describe an independent task for the other model…")} onChange={event => setTask(event.target.value)} /></InputGroup>{choice && <p className="text-xs text-muted-foreground">{t("目标：", "Target: ")}{choice.source.name} / {choice.route.model} · {t("YOLO 自动批准", "YOLO auto-approval")}</p>}</div><DialogFooter><Button variant="outline" disabled={busy} onClick={() => setOpen(false)}>{t("取消", "Cancel")}</Button><Button disabled={busy || !choice || !task.trim()} onClick={() => void launch()}>{busy && <Spinner data-icon="inline-start" />}{t("派发子任务", "Dispatch child")}</Button></DialogFooter></DialogContent></Dialog>
+    <Button variant={isBot ? "secondary" : "outline"} size="sm" onClick={() => setOpen(true)}>
+      <Workflow data-icon="inline-start" />
+      {isBot ? t("派发工作区会话", "Dispatch workspace session") : t("跨模型子 Agent", "Cross-model child")}
+    </Button>
+    <Dialog open={open} onOpenChange={(next) => { if (!busy) setOpen(next); }}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("派发跨工作区 / 跨模型子会话", "Dispatch cross-workspace / cross-model child session")}</DialogTitle>
+          <DialogDescription>
+            {t(
+              "可指定任意工作区、订阅账号（含 Codex Daybreak Blue）或 API 模型源启动独立 structured 会话（YOLO 自动批准），完成后自动将结果回传主会话。",
+              "Launch an independent YOLO structured session in any workspace using a subscription account or API model source; its summary fans back into this session.",
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          {workspaces.length > 0 && (
+            <div className="grid gap-1.5">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-workspace">
+                {t("目标工作区", "Target workspace")}
+              </label>
+              <NativeSelect
+                id="child-dispatch-workspace"
+                value={workspace}
+                disabled={busy}
+                aria-label={t("目标工作区", "Target workspace")}
+                onChange={(event) => setWorkspace(event.target.value)}
+              >
+                {workspaces.map((item) => (
+                  <NativeSelectOption key={item.path} value={item.path}>
+                    {item.label} ({item.path})
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </div>
+          )}
+          {independentAccounts.length > 0 && (
+            <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}>
+              <Button
+                data-liquid-glass="tab"
+                variant={!useSource ? "secondary" : "ghost"}
+                aria-pressed={!useSource}
+                disabled={busy}
+                onClick={() => setUseSource(false)}
+              >
+                {t("订阅登录态", "Subscription login")}
+              </Button>
+              <Button
+                data-liquid-glass="tab"
+                variant={useSource ? "secondary" : "ghost"}
+                aria-pressed={useSource}
+                disabled={busy}
+                onClick={() => {
+                  if (agent === "deepseek" || agent === "agy") setAgent("codex");
+                  setUseSource(true);
+                }}
+              >
+                {t("API 模型源", "API model source")}
+              </Button>
+            </div>
+          )}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="grid gap-1.5">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-agent">
+                {t("子 Agent 类型", "Child agent runtime")}
+              </label>
+              <NativeSelect
+                id="child-dispatch-agent"
+                value={useSource ? sourceAgent : agent}
+                disabled={busy}
+                aria-label={t("子 Agent 类型", "Child agent runtime")}
+                onChange={(event) => {
+                  const nextAgent = event.target.value as ChildDispatchAgent;
+                  setAgent(nextAgent);
+                  setSelection(undefined);
+                  setAccountId(defaultSessionLaunchAccountId(independentAccounts, nextAgent));
+                  setModel(undefined);
+                  setEffort(undefined);
+                }}
+              >
+                <NativeSelectOption value="codex">Codex</NativeSelectOption>
+                <NativeSelectOption value="claude">Claude Code</NativeSelectOption>
+                <NativeSelectOption value="opencode">OpenCode</NativeSelectOption>
+                <NativeSelectOption value="pi">Pi</NativeSelectOption>
+                {!useSource && <NativeSelectOption value="agy">Antigravity (agy)</NativeSelectOption>}
+                {!useSource && <NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption>}
+              </NativeSelect>
+            </div>
+            {!useSource && (
+              <div className="grid gap-1.5">
+                <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-account">
+                  {t("订阅账号", "Subscription account")}
+                </label>
+                <NativeSelect
+                  id="child-dispatch-account"
+                  value={accountId ?? ""}
+                  disabled={busy}
+                  aria-label={t("订阅账号", "Subscription account")}
+                  onChange={(event) => {
+                    setAccountId(event.target.value || undefined);
+                    setModel(undefined);
+                    setEffort(undefined);
+                  }}
+                >
+                  {agent === "opencode" && (
+                    <NativeSelectOption value="">{t("本机 OpenCode CLI", "Local OpenCode CLI")}</NativeSelectOption>
+                  )}
+                  {launchAccounts.map((acc) => (
+                    <NativeSelectOption key={acc.id} value={acc.id}>
+                      {acc.name}{acc.isDefault ? t("（默认）", " (default)") : ""}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              </div>
+            )}
+          </div>
+          {useSource ? (
+            <SourceSelector
+              sources={sourceState.sources}
+              loading={sourceState.loading}
+              error={sourceState.error}
+              value={selection}
+              agent={sourceAgent}
+              onChange={setSelection}
+              onRefresh={() => void sourceState.refresh()}
+              disabled={busy}
+            />
+          ) : (
+            launchModels.length > 0 && (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-1.5">
+                  <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-model">
+                    {t("模型", "Model")}
+                  </label>
+                  <NativeSelect
+                    id="child-dispatch-model"
+                    value={model ?? ""}
+                    disabled={busy || launchModelsLoading}
+                    aria-label={t("模型", "Model")}
+                    onChange={(event) => {
+                      const nextModel = launchModels.find((item) => item.id === event.target.value);
+                      setModel(nextModel?.id);
+                      setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
+                    }}
+                  >
+                    {launchModels.map((item) => (
+                      <NativeSelectOption key={item.id} value={item.id}>
+                        {item.label}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                </div>
+                {Boolean(selectedLaunchModel?.supportedEfforts.length) && (
+                  <div className="grid gap-1.5">
+                    <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-effort">
+                      {t("推理强度", "Reasoning effort")}
+                    </label>
+                    <NativeSelect
+                      id="child-dispatch-effort"
+                      value={effort ?? ""}
+                      disabled={busy}
+                      aria-label={t("推理强度", "Reasoning effort")}
+                      onChange={(event) => setEffort(event.target.value || undefined)}
+                    >
+                      {selectedLaunchModel?.supportedEfforts.map((level) => (
+                        <NativeSelectOption key={level} value={level}>
+                          {level}
+                        </NativeSelectOption>
+                      ))}
+                    </NativeSelect>
+                  </div>
+                )}
+              </div>
+            )
+          )}
+          <InputGroup>
+            <InputGroupTextarea
+              value={task}
+              maxLength={65_536}
+              rows={5}
+              aria-label={t("子任务", "Child task")}
+              placeholder={t(
+                "描述要派发到目标工作区执行的完整任务，完成后摘要将自动回传当前会话…",
+                "Describe the task to dispatch to the target workspace; its summary will return here…",
+              )}
+              onChange={(event) => setTask(event.target.value)}
+            />
+          </InputGroup>
+          {(useSource ? choice : true) && (
+            <p className="text-xs text-muted-foreground">
+              {t("目标：", "Target: ")}
+              {workspace ? `${workspace.split(/[\\/]/).filter(Boolean).at(-1) ?? workspace} · ` : ""}
+              {useSource && choice
+                ? `${choice.source.name} / ${choice.route.model}`
+                : `${agent}${selectedLaunchModel ? ` / ${selectedLaunchModel.label}` : ""}`}
+              {" · "}
+              {t("YOLO 自动批准", "YOLO auto-approval")}
+            </p>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => setOpen(false)}>
+            {t("取消", "Cancel")}
+          </Button>
+          <Button variant="secondary" disabled={!canLaunch} onClick={() => void launch(true)}>
+            {busy && <Spinner data-icon="inline-start" />}
+            {t("派发并打开会话", "Dispatch & open")}
+          </Button>
+          <Button disabled={!canLaunch} onClick={() => void launch(false)}>
+            {busy && <Spinner data-icon="inline-start" />}
+            {t("派发子任务", "Dispatch child")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </>;
 }
 const EventCardBody = memo(function EventCardBody(props: EventProps) {
-  const { event, isResolved, sessionId, onError, openOutput, openSubagent, projectRoot } = props;
+  const { event, isResolved, sessionId, onError, openOutput, openSubagent, onOpenSession, projectRoot } = props;
   const { t, status } = useLocale();
   const kind = text(event.kind);
   if (kind === "conversation.turn") return <ConversationTurn event={event} projectRoot={projectRoot} renderEvent={(entry, activity) => activity && entry.kind === "reasoning" && entry.hasMore !== true ? <div className="chat-reasoning"><MarkdownContent value={text(entry.text)} onError={onError} projectRoot={projectRoot} /></div> : activity && ["tool.start", "tool.end"].includes(text(entry.kind)) ? <ToolCard compact event={entry} openOutput={openOutput} /> : <EventCard {...props} event={entry} isResolved={Boolean(activity)} />} />;
@@ -169,15 +506,15 @@ const EventCardBody = memo(function EventCardBody(props: EventProps) {
   }
   if (kind === "assistant.text") return <Message><MessageAvatar><Avatar><AvatarFallback><Bot className="size-4" /></AvatarFallback></Avatar></MessageAvatar><MessageContent><MessageHeader>Agent</MessageHeader><Bubble variant="ghost"><BubbleContent><MarkdownContent value={text(event.text)} onError={onError} projectRoot={projectRoot} /></BubbleContent></Bubble></MessageContent></Message>;
   if (kind === "reasoning") return <Collapsible><CollapsibleTrigger render={<Button variant="ghost" size="sm" />}><ChevronDown data-icon="inline-start" />{t("思考过程", "Reasoning")}</CollapsibleTrigger><CollapsibleContent><div className="chat-reasoning mt-2 max-h-96 overflow-auto rounded-lg bg-muted p-3 text-muted-foreground"><MarkdownContent value={text(event.text)} onError={onError} projectRoot={projectRoot} /></div></CollapsibleContent></Collapsible>;
-  if (kind === "activity.group") return <Collapsible><CollapsibleTrigger render={<Button variant="ghost" size="sm" />}><ChevronDown />{t(`已完成 ${array(event.events).length} 项操作`, `Completed ${array(event.events).length} actions`)}</CollapsibleTrigger><CollapsibleContent className="grid gap-3 pt-3">{array(event.events).map(record).map((entry, index) => <EventCard key={index} event={entry} isResolved sessionId={sessionId} onError={onError} openOutput={openOutput} openSubagent={openSubagent} />)}</CollapsibleContent></Collapsible>;
+  if (kind === "activity.group") return <Collapsible><CollapsibleTrigger render={<Button variant="ghost" size="sm" />}><ChevronDown />{t(`已完成 ${array(event.events).length} 项操作`, `Completed ${array(event.events).length} actions`)}</CollapsibleTrigger><CollapsibleContent className="grid gap-3 pt-3">{array(event.events).map(record).map((entry, index) => <EventCard key={index} event={entry} isResolved sessionId={sessionId} onError={onError} openOutput={openOutput} openSubagent={openSubagent} onOpenSession={onOpenSession} />)}</CollapsibleContent></Collapsible>;
   if (kind === "tool.start" || kind === "tool.end") return <ToolCard event={event} openOutput={openOutput} />;
   if (kind === "permission.request") return <PermissionCard event={event} isDone={isResolved} sessionId={sessionId} onError={onError} />;
   if (kind === "permission.auto") return <Alert><ShieldAlert /><AlertTitle>{t("已按", "Automatically allowed by")} {text(event.policy, t("策略", "policy"))}</AlertTitle><AlertDescription>{text(event.summary)}</AlertDescription></Alert>;
   if (kind === "question.request") return <QuestionCard event={event} isDone={isResolved} sessionId={sessionId} onError={onError} />;
   if (kind === "agent.error") return <Alert variant="destructive"><X /><AlertTitle>{t("Agent 运行错误", "Agent runtime error")}</AlertTitle><AlertDescription>{text(event.message)}</AlertDescription></Alert>;
   if (kind === "subagent.started" || kind === "subagent.updated") {
-    const subagent = record(event.subagent); const id = text(subagent.id, text(event.subagentId)); const label = text(subagent.name, id); const role = text(subagent.role); const summary = terminalPlainText(text(event.summary, text(subagent.preview))); const crossModel = role.includes("跨模型") || role.includes("Cross-model");
-    return <Card size="sm"><CardHeader><CardTitle className="flex items-center gap-2"><Bot className="size-4" />{crossModel ? t("跨模型子 Agent", "Cross-model child") : t("子 Agent", "Subagent")}</CardTitle><CardDescription>{label}</CardDescription></CardHeader><CardContent className="flex flex-col items-start gap-3">{summary && <p className="text-sm text-muted-foreground whitespace-pre-wrap">{summary}</p>}{id && !crossModel && <Button variant="outline" size="sm" onClick={() => openSubagent(id, label)}><ExternalLink data-icon="inline-start" />{t("查看执行详情", "View execution details")}</Button>}{crossModel && <p className="text-xs text-muted-foreground">{t("作为独立会话运行，可从侧栏查看完整过程。", "Runs as an independent session; use the sidebar for its full transcript.")}</p>}</CardContent><CardFooter><Badge variant="secondary">{status(text(subagent.status, text(event.status, "active")))}</Badge></CardFooter></Card>;
+    const subagent = record(event.subagent); const id = text(subagent.id, text(event.subagentId)); const label = text(subagent.name, id); const role = text(subagent.role); const summary = terminalPlainText(text(event.summary, text(subagent.preview))); const crossModel = role.includes("跨模型") || role.includes("Cross-model") || role.includes("跨工作区");
+    return <Card size="sm"><CardHeader><CardTitle className="flex items-center gap-2"><Bot className="size-4" />{crossModel ? t("派发子会话", "Dispatched session") : t("子 Agent", "Subagent")}</CardTitle><CardDescription>{label}{role ? ` · ${role}` : ""}</CardDescription></CardHeader><CardContent className="flex flex-col items-start gap-3">{summary && <p className="text-sm text-muted-foreground whitespace-pre-wrap">{summary}</p>}{id && !crossModel && <Button variant="outline" size="sm" onClick={() => openSubagent(id, label)}><ExternalLink data-icon="inline-start" />{t("查看执行详情", "View execution details")}</Button>}{crossModel && <div className="flex flex-wrap items-center gap-2">{id && onOpenSession && <Button variant="outline" size="sm" onClick={() => onOpenSession(id)}><ExternalLink data-icon="inline-start" />{t("打开子会话", "Open child session")}</Button>}<p className="text-xs text-muted-foreground">{t("作为独立会话运行，完成后摘要自动回传主会话。", "Runs as an independent session; summary returns here on completion.")}</p></div>}</CardContent><CardFooter><Badge variant="secondary">{status(text(subagent.status, text(event.status, "active")))}</Badge></CardFooter></Card>;
   }
   if (kind === "trajectory.record") return <Alert><Bot /><AlertTitle>{text(event.title)}</AlertTitle><AlertDescription><MarkdownContent value={text(event.detail)} onError={onError} projectRoot={projectRoot} /><Badge variant={text(event.phase) === "failed" ? "destructive" : "secondary"}>{status(text(event.phase))}</Badge></AlertDescription></Alert>;
   if (kind === "turn.end") return <Marker variant="separator"><MarkerIcon><Check /></MarkerIcon><MarkerContent>{text(event.finish) === "failed" ? t("本轮失败", "Turn failed") : text(event.finish) === "interrupted" ? t("本轮已停止", "Turn stopped") : t("本轮完成", "Turn complete")}{number(event.outputTokens) > 0 && ` · ${String(number(event.outputTokens))} tokens`}</MarkerContent></Marker>;
@@ -218,7 +555,7 @@ async function fileToAttachment(file: File): Promise<PendingAttachment> {
   return { id: crypto.randomUUID(), name: file.name, mimeType: file.type, size: file.size, dataB64: btoa(binary) };
 }
 
-export function ChatPane({ session, account, onOpenGoal, trajectoryHost, onMissingSession }: { session: SessionInfo; account?: JsonObject | undefined; onOpenGoal?: (() => void) | undefined; trajectoryHost?: HTMLDivElement | null; onMissingSession?: (id: string) => void }) {
+export function ChatPane({ session, account, snapshot, onOpenSession, onOpenGoal, trajectoryHost, onMissingSession }: { session: SessionInfo; account?: JsonObject | undefined; snapshot?: DesktopSnapshot | undefined; onOpenSession?: ((id: string) => void) | undefined; onOpenGoal?: (() => void) | undefined; trajectoryHost?: HTMLDivElement | null; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const [composerOptionsOpen, setComposerOptionsOpen] = useState(false);
   const composerOptionsId = useId();
@@ -531,11 +868,11 @@ export function ChatPane({ session, account, onOpenGoal, trajectoryHost, onMissi
       {paged.state.loading && <Spinner />}
       {paged.state.error && <Button variant="outline" size="sm" onClick={() => void paged.controller.retry()}>{t("重新读取", "Reload")}</Button>}
     </div>}
-    {deepseek && trajectoryHost && createPortal(<TrajectoryFeed key={session.id} items={timeline.items} resolutions={timeline.resolutions} sessionId={session.id} projectRoot={session.cwd} onError={setOperationError} openOutput={openOutput} openSubagent={openSubagent} />, trajectoryHost)}
-    <MessageScrollerProvider autoScroll={historyCursor === null && (!paged.enabled || paged.state.live)}><MessageScroller><ConversationRail points={navigationPoints} pendingKey={pendingJumpKey} revision={visibleItems.map((item) => item.key).join("|")} onJumped={jumpCompleted} onJump={(key) => { selectHistoryCursor({ end: historyEndForItem(displayItems, key, timeline.nextOrdinal, CHAT_TIMELINE_WINDOW_SIZE), mode: "page" }); setPendingJumpKey(key); }} /><MessageScrollerViewport ref={timelineViewport} onScroll={handleTimelineScroll} aria-label={t("会话消息时间线", "Conversation message timeline")}><MessageScrollerContent className="mx-auto w-full max-w-4xl px-6 py-8">{!displayItems.length && <Empty className="my-auto"><EmptyHeader><EmptyMedia variant="icon"><Bot /></EmptyMedia><EmptyTitle>{`${t("开始与", "Start collaborating with")} ${session.agent}`}</EmptyTitle><EmptyDescription>{t("消息、工具调用、审批、提问和子 Agent 过程会按时间线显示在这里。", "Messages, tool calls, approvals, questions, and subagent activity appear here in a timeline.")}</EmptyDescription></EmptyHeader></Empty>}{historyWindow.start > 0 && <div className="flex justify-center"><Button variant="outline" size="sm" onClick={() => selectHistoryCursor({ end: historyWindow.cursorStart, mode: "page" })}><ChevronDown className="rotate-180" data-icon="inline-start" />{t(`查看更早的 ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} 条记录`, `View ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} earlier events`)}</Button></div>}{visibleItems.map((item) => { const kind = text(item.event.kind); const isResolved = kind === "permission.request" ? hasChatResolution(timeline.resolutions, "permission.resolved", text(item.event.reqId)) : kind === "question.request" ? hasChatResolution(timeline.resolutions, "question.resolved", text(item.event.reqId)) : false; return <TimelineItem key={item.key} item={item} isResolved={isResolved} sessionId={session.id} projectRoot={session.cwd} onError={setOperationError} openOutput={openOutput} openSubagent={openSubagent} />; })}{!historyWindow.isLatest && <div className="flex flex-wrap items-center justify-center gap-2 rounded-lg border bg-muted/40 p-3 text-sm text-muted-foreground"><span>{t(`当前显示 ${String(historyWindow.start + 1)}–${String(historyWindow.end)}，另有 ${String(historyWindow.newerCount)} 条较新记录`, `Showing ${String(historyWindow.start + 1)}–${String(historyWindow.end)} with ${String(historyWindow.newerCount)} newer events`)}</span><Button variant="outline" size="sm" onClick={() => { const nextEnd = Math.min(displayItems.length, historyWindow.end + CHAT_TIMELINE_WINDOW_SIZE); if (nextEnd >= displayItems.length) jumpToLatest(); else selectHistoryCursor({ end: displayItems[nextEnd]?.ordinal ?? timeline.nextOrdinal, mode: "page" }); }}>{t("查看较新记录", "View newer events")}<ChevronDown data-icon="inline-end" /></Button><Button size="sm" onClick={jumpToLatest}>{t("回到最新", "Jump to latest")}</Button></div>}</MessageScrollerContent></MessageScrollerViewport><MessageScrollerButton onClick={jumpToLatest} /></MessageScroller></MessageScrollerProvider>
+    {deepseek && trajectoryHost && createPortal(<TrajectoryFeed key={session.id} items={timeline.items} resolutions={timeline.resolutions} sessionId={session.id} projectRoot={session.cwd} onError={setOperationError} openOutput={openOutput} openSubagent={openSubagent} onOpenSession={onOpenSession} />, trajectoryHost)}
+    <MessageScrollerProvider autoScroll={historyCursor === null && (!paged.enabled || paged.state.live)}><MessageScroller><ConversationRail points={navigationPoints} pendingKey={pendingJumpKey} revision={visibleItems.map((item) => item.key).join("|")} onJumped={jumpCompleted} onJump={(key) => { selectHistoryCursor({ end: historyEndForItem(displayItems, key, timeline.nextOrdinal, CHAT_TIMELINE_WINDOW_SIZE), mode: "page" }); setPendingJumpKey(key); }} /><MessageScrollerViewport ref={timelineViewport} onScroll={handleTimelineScroll} aria-label={t("会话消息时间线", "Conversation message timeline")}><MessageScrollerContent className="mx-auto w-full max-w-4xl px-6 py-8">{!displayItems.length && (isProsperoBotSession(session) ? <Empty className="my-auto"><EmptyHeader><EmptyMedia variant="icon"><Sparkles /></EmptyMedia><EmptyTitle>{t("Prospero Bot · 全局主会话", "Prospero Bot · Master Session")}</EmptyTitle><EmptyDescription>{t("像 Grokbot 主对话一样统筹全局：直接发消息让 Prospero Bot 给任意工作区派发子会话、跟进进度并汇总结果，或点击下方「派发工作区会话」手动派发。", "Coordinate across all workspaces like a master chat: ask Prospero Bot to dispatch child sessions to any workspace and synthesize results, or click Dispatch Workspace Session below.")}</EmptyDescription></EmptyHeader>{(snapshot?.projects.length ?? 0) > 0 && <div className="mt-2 flex flex-wrap justify-center gap-2">{snapshot!.projects.slice(0, 6).map((project) => { const name = snapshot!.projectAliases[project.toLocaleLowerCase()] || project.split(/[\\/]/).filter(Boolean).at(-1) || project; return <Button key={project} variant="outline" size="sm" onClick={() => setDraft(t(`请在工作区 ${project} (${name}) 派发一个子会话，任务是：`, `Dispatch a child session in workspace ${project} (${name}) to: `))}><FolderKanban data-icon="inline-start" />{name}</Button>; })}</div>}</Empty> : <Empty className="my-auto"><EmptyHeader><EmptyMedia variant="icon"><Bot /></EmptyMedia><EmptyTitle>{`${t("开始与", "Start collaborating with")} ${session.agent}`}</EmptyTitle><EmptyDescription>{t("消息、工具调用、审批、提问和子 Agent 过程会按时间线显示在这里。", "Messages, tool calls, approvals, questions, and subagent activity appear here in a timeline.")}</EmptyDescription></EmptyHeader></Empty>)}{historyWindow.start > 0 && <div className="flex justify-center"><Button variant="outline" size="sm" onClick={() => selectHistoryCursor({ end: historyWindow.cursorStart, mode: "page" })}><ChevronDown className="rotate-180" data-icon="inline-start" />{t(`查看更早的 ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} 条记录`, `View ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} earlier events`)}</Button></div>}{visibleItems.map((item) => { const kind = text(item.event.kind); const isResolved = kind === "permission.request" ? hasChatResolution(timeline.resolutions, "permission.resolved", text(item.event.reqId)) : kind === "question.request" ? hasChatResolution(timeline.resolutions, "question.resolved", text(item.event.reqId)) : false; return <TimelineItem key={item.key} item={item} isResolved={isResolved} sessionId={session.id} projectRoot={session.cwd} onError={setOperationError} openOutput={openOutput} openSubagent={openSubagent} onOpenSession={onOpenSession} />; })}{!historyWindow.isLatest && <div className="flex flex-wrap items-center justify-center gap-2 rounded-lg border bg-muted/40 p-3 text-sm text-muted-foreground"><span>{t(`当前显示 ${String(historyWindow.start + 1)}–${String(historyWindow.end)}，另有 ${String(historyWindow.newerCount)} 条较新记录`, `Showing ${String(historyWindow.start + 1)}–${String(historyWindow.end)} with ${String(historyWindow.newerCount)} newer events`)}</span><Button variant="outline" size="sm" onClick={() => { const nextEnd = Math.min(displayItems.length, historyWindow.end + CHAT_TIMELINE_WINDOW_SIZE); if (nextEnd >= displayItems.length) jumpToLatest(); else selectHistoryCursor({ end: displayItems[nextEnd]?.ordinal ?? timeline.nextOrdinal, mode: "page" }); }}>{t("查看较新记录", "View newer events")}<ChevronDown data-icon="inline-end" /></Button><Button size="sm" onClick={jumpToLatest}>{t("回到最新", "Jump to latest")}</Button></div>}</MessageScrollerContent></MessageScrollerViewport><MessageScrollerButton onClick={jumpToLatest} /></MessageScroller></MessageScrollerProvider>
     <div className="chat-composer-shell"><div className="chat-composer-inner flex flex-col gap-2">{connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}{operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}{messageQueue.length > 0 && <section className="grid gap-2 rounded-xl border bg-muted/35 p-3" aria-label={t("待发送消息", "Queued messages")} aria-live="polite"><header className="flex flex-wrap items-center justify-between gap-2"><strong className="flex items-center gap-2 text-sm"><Clock3 className="size-4" />{t("待发送", "Queued")} · {messageQueue.length}</strong><span className="text-xs text-muted-foreground">{t("当前轮结束后依次发送", "Sent in order after the current turn")}</span></header><div className="grid max-h-52 gap-1.5 overflow-y-auto">{messageQueue.map((item) => <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background/80 px-2.5 py-2" key={item.id}><Badge variant="outline">{item.kind === "guide" ? t("引导", "Guide") : t("排队", "Queue")}</Badge><span className="min-w-0 flex-1 truncate text-sm" title={item.text}>{item.text || t(`${String(item.attachmentCount)} 张图片`, `${String(item.attachmentCount)} images`)}</span>{item.attachmentCount > 0 && <span className="flex items-center gap-1 text-xs text-muted-foreground"><FileImage className="size-3.5" />{item.attachmentCount}</span>}{item.kind !== "guide" && <Button variant="ghost" size="xs" aria-busy={queueBusy[item.id] === "guide"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "guide")}>{queueBusy[item.id] === "guide" ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{t("现在引导", "Guide now")}</Button>}<Button variant="ghost" size="icon-xs" aria-label={t("取消待发送消息", "Cancel queued message")} aria-busy={queueBusy[item.id] === "remove"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "remove")}>{queueBusy[item.id] === "remove" ? <Spinner /> : <Trash2 />}</Button></div>)}</div></section>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t(`图片 · ${(item.size / 1024 / 1024).toFixed(1)} MB · 等待发送`, `Image · ${(item.size / 1024 / 1024).toFixed(1)} MB · waiting to send`)}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
       {attachmentProgress && <div className="flex items-center gap-2 text-xs text-muted-foreground" role="status"><Spinner />{t(`正在处理图片 ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`, `Processing image ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`)}</div>}
-      <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}><CrossModelChildLauncher session={session} onCreated={() => undefined} onError={setOperationError} />{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} /><Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}<ChevronDown /></Button>{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张，单张 5 MB / 共 10 MB", "Enter to send · Shift + Enter for a new line · Up to 6 images, 5 MB each / 10 MB total")}</p></div></div>
+      <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}><CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) onOpenSession?.(id); }} onError={setOperationError} />{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={isProsperoBotSession(session) ? t("向 Prospero Bot 发送全局指令，如“在某工作区派发会话完成某任务”…", "Ask Prospero Bot to dispatch tasks to any workspace…") : t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} />{isProsperoBotSession(session) && !composerOptionsOpen && <CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) onOpenSession?.(id); }} onError={setOperationError} />}<Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}<ChevronDown /></Button>{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张，单张 5 MB / 共 10 MB", "Enter to send · Shift + Enter for a new line · Up to 6 images, 5 MB each / 10 MB total")}</p></div></div>
     <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open) closeDetail(); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{detail?.title}</DialogTitle><DialogDescription>{t("可选择部分内容，或复制全部已显示内容。", "Select part of the output, or copy all displayed content.")}</DialogDescription></DialogHeader>{detail?.loading ? <div className="flex items-center justify-center gap-2 py-16 text-muted-foreground"><Spinner />{t("正在读取…", "Loading…")}</div> : <>{detail?.truncated && <Alert><CircleAlert /><AlertTitle>{t("输出已截断", "Output truncated")}</AlertTitle><AlertDescription>{t("daemon 仅保留了这次工具输出的前 200,000 个字符。", "The daemon retained only the first 200,000 characters of this tool output.")}</AlertDescription></Alert>}<pre className="terminal-output-text max-h-[60vh] overflow-auto rounded-lg bg-muted p-4 text-xs leading-relaxed">{detail?.content}</pre></>}<DialogFooter>{detail?.content && <Button variant="outline" onClick={() => void window.prospero.writeClipboard(detail.content)}><Copy data-icon="inline-start" />{t("复制", "Copy")}</Button>}<Button variant="outline" onClick={closeDetail}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }

@@ -543,13 +543,16 @@ fn codex_session_environment(
 }
 
 pub(crate) fn codex_app_server_args(profile: &ApiProfile) -> Vec<String> {
+    let (resolved_model, daybreak) =
+        crate::agent::codex::parse_codex_daybreak_model(Some(&profile.model));
+    let model = resolved_model.as_deref().unwrap_or(&profile.model);
     let mut args = vec![
         "-c".into(),
         format!("model_provider={}", toml_string("prospero")),
         "-c".into(),
-        format!("model={}", toml_string(&profile.model)),
+        format!("model={}", toml_string(model)),
         "-c".into(),
-        format!("default_subagent_model={}", toml_string(&profile.model)),
+        format!("default_subagent_model={}", toml_string(model)),
         "-c".into(),
         format!(
             "model_providers.prospero.name={}",
@@ -572,7 +575,15 @@ pub(crate) fn codex_app_server_args(profile: &ApiProfile) -> Vec<String> {
         ),
         "-c".into(),
         "model_providers.prospero.requires_openai_auth=false".into(),
+        "-c".into(),
+        "model_providers.prospero.capabilities.cyber_access_programs=true".into(),
+        "-c".into(),
+        "features.api_key_cyber_access_programs=true".into(),
     ];
+    if daybreak {
+        args.push("-c".into());
+        args.push("daybreak=true".into());
+    }
     for (index, (name, _)) in profile
         .headers
         .clone()
@@ -622,7 +633,12 @@ pub(crate) const CODEX_MODEL_CATALOG: &str = "prospero-models.json";
 pub(crate) fn known_codex_model(
     model: &str,
 ) -> Option<(i64, &'static [&'static str], &'static str)> {
-    let lower = model.trim().to_ascii_lowercase();
+    let (resolved, _) = crate::agent::codex::parse_codex_daybreak_model(Some(model));
+    let lower = resolved
+        .as_deref()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
     let (slug, has_1m) = match lower.strip_suffix("[1m]") {
         Some(base) => (base.trim(), true),
         None => (lower.as_str(), false),
@@ -670,8 +686,8 @@ pub(crate) fn known_codex_model(
             &["low", "medium", "high", "xhigh", "ultra"],
             "GPT-6 Astra",
         )),
-        "gpt-6.1-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5"
-        | "gpt-5.4" | "gpt-5.2" => Some((
+        "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra"
+        | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.4" | "gpt-5.2" => Some((
             if has_1m { 1_000_000 } else { 400_000 },
             &["low", "medium", "high", "xhigh"],
             "OpenAI reasoning model",
@@ -844,10 +860,10 @@ pub(crate) fn codex_model_catalog(profile: &ApiProfile) -> Option<serde_json::Va
     } else {
         serde_json::json!(["text"])
     };
-    Some(serde_json::json!({
-        "models": [{
-            "slug": profile.model,
-            "display_name": profile.model,
+    let build_entry = |slug: &str| {
+        serde_json::json!({
+            "slug": slug,
+            "display_name": slug,
             "description": known.map(|(_, _, description)| description).unwrap_or("Prospero model source"),
             "default_reasoning_level": default_effort,
             "supported_reasoning_levels": efforts
@@ -870,8 +886,19 @@ pub(crate) fn codex_model_catalog(profile: &ApiProfile) -> Option<serde_json::Va
             "supports_parallel_tool_calls": caps.and_then(|caps| caps.tools).unwrap_or(true),
             "experimental_supported_tools": [],
             "input_modalities": input_modalities,
-        }]
-    }))
+            "available_access_programs": {
+                "cyber": ["standard", "daybreak_blue"]
+            },
+        })
+    };
+    let (resolved, _) = crate::agent::codex::parse_codex_daybreak_model(Some(&profile.model));
+    let mut models = vec![build_entry(&profile.model)];
+    if let Some(resolved) = resolved
+        && resolved != profile.model
+    {
+        models.push(build_entry(&resolved));
+    }
+    Some(serde_json::json!({ "models": models }))
 }
 
 /// Writes the account's model catalog and points the account's own

@@ -24,3 +24,19 @@ export function sessionStatusLabel(session: { status: string; pendingPermissions
 export function SessionAgentIcon({ agent, unread = false }: { agent: string; unread?: boolean }) {
   return <span className={cn("session-agent-icon", unread && "is-unread")} aria-hidden="true"><AgentLogo agent={agent} size={15} decorative /></span>;
 }
+
+export const PROSPERO_BOT_SESSION_STORAGE_KEY = "prospero.botSessionId";
+export const PROSPERO_BOT_TITLE = "Prospero Bot";
+
+export function isProsperoBotSession(session: SessionInfo | undefined): boolean {
+  if (!session) return false;
+  const title = (session.displayTitle ?? session.title ?? "").trim();
+  if (title === PROSPERO_BOT_TITLE || title.startsWith(`${PROSPERO_BOT_TITLE} ·`) || title.startsWith(`${PROSPERO_BOT_TITLE} `)) {
+    return true;
+  }
+  try {
+    return typeof localStorage !== "undefined" && localStorage.getItem(PROSPERO_BOT_SESSION_STORAGE_KEY) === session.id;
+  } catch {
+    return false;
+  }
+}

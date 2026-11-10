@@ -398,7 +398,21 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   writeClipboard(value: string): Promise<{ ok: boolean }>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   forkSession(sessionId: string): Promise<SessionInfo>;
-  createCrossModelChild(sessionId: string, input: { sourceId: string; routeId: string; revision: number; agent: "codex" | "claude" | "opencode" | "pi"; task: string; title?: string }): Promise<JsonObject>;
+  createCrossModelChild(
+    sessionId: string,
+    input: {
+      sourceId?: string;
+      routeId?: string;
+      revision?: number;
+      agent: "codex" | "claude" | "opencode" | "pi" | "deepseek" | "agy";
+      task: string;
+      title?: string;
+      workspace?: string;
+      accountId?: string;
+      model?: string;
+      effort?: string;
+    },
+  ): Promise<JsonObject>;
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
   cancelSessionPage(requestId: string): Promise<void>;

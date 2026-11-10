@@ -77,7 +77,7 @@ accountId?: string | null,
  * Agent-native local conversation to resume at launch.
  */
 resume?: ResumeInput | null, };
-export type CreateCrossModelChild = { sourceId: string, routeId: string, revision: number, agent: AgentKind, task: string, title?: string | null, };
+export type CreateCrossModelChild = { sourceId?: string | null, routeId?: string | null, revision?: number | null, agent: AgentKind, task: string, title?: string | null, workspace?: string | null, accountId?: string | null, model?: string | null, effort?: string | null, };
 export type FollowUpCrossModelChild = { task: string, };
 export type MessageCrossModelChild = { text: string, };
 export type CancelCrossModelChild = { reason?: string | null, };

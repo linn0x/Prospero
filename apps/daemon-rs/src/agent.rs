@@ -1,5 +1,5 @@
 mod claude;
-mod codex;
+pub(crate) mod codex;
 pub(crate) mod conversations;
 mod deepseek;
 pub(crate) mod lifecycle;
@@ -76,14 +76,25 @@ pub struct CreateAgentSession {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct CreateCrossModelChild {
+    #[serde(default)]
     pub source_id: String,
+    #[serde(default)]
     pub route_id: String,
+    #[serde(default)]
     #[ts(type = "number")]
     pub revision: i64,
     pub agent: crate::protocol::AgentKind,
     pub task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]

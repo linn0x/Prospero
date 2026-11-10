@@ -293,7 +293,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
             let timeout = params.get("timeout").and_then(Value::as_u64).unwrap_or(30);
             wait_operation(&client, &id, wait, Duration::from_secs(timeout.min(86400))).await
         }
-        "cross_model.child.sources" => {
+        "cross_model.child.sources" | "cross_model.child.workspaces" => {
             let sources: Value = client.post(
                 "/v1/model-sources",
                 json!({"type":"model.source.action","requestId":"cli-cross-model-sources","action":{"kind":"list"}}),
@@ -313,8 +313,82 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                     }).collect::<Vec<_>>();
                     Some(routes)
                 }).flatten().collect::<Vec<_>>();
+            let accounts_raw = client
+                .post::<Value>(
+                    "/v1/accounts",
+                    json!({"type":"agent.accounts.list","requestId":"cli-cross-model-accounts"}),
+                )
+                .await
+                .unwrap_or_else(|_| json!({}));
+            let accounts = accounts_raw
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| {
+                            if row.get("status").and_then(Value::as_str) != Some("ready") {
+                                return None;
+                            }
+                            if row.get("authMode").and_then(Value::as_str) == Some("api_profile") {
+                                return None;
+                            }
+                            Some(json!({
+                                "accountId": row.get("id"),
+                                "name": row.get("name"),
+                                "agent": row.get("agent"),
+                                "authMode": row.get("authMode"),
+                                "default": row.get("isDefault"),
+                            }))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let sessions_raw = client
+                .get::<Value>("/v1/sessions?limit=50")
+                .await
+                .unwrap_or_else(|_| json!({}));
+            let mut workspace_set = std::collections::BTreeSet::new();
+            if let Some(rows) = sessions_raw.get("items").and_then(Value::as_array) {
+                for row in rows {
+                    if let Some(ws) = row
+                        .get("workspace")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|ws| !ws.is_empty())
+                    {
+                        workspace_set.insert(ws.to_owned());
+                    }
+                }
+            }
+            for candidate in [
+                home.join("desktop-state.json"),
+                std::env::var_os("HOME")
+                    .map(|h| PathBuf::from(h).join(".prospero").join("desktop-state.json"))
+                    .unwrap_or_default(),
+            ] {
+                if let Ok(raw) = fs::read_to_string(&candidate)
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&raw)
+                    && let Some(projects) = parsed.get("projects").and_then(Value::as_array)
+                {
+                    for project in projects {
+                        if let Some(ws) = project
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|ws| !ws.is_empty())
+                        {
+                            workspace_set.insert(ws.to_owned());
+                        }
+                    }
+                }
+            }
+            let workspaces = workspace_set.into_iter().collect::<Vec<_>>();
             Ok(
-                json!({"items":items,"hint":"Start: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> --task <task>. Inspect: prospero child list|get|logs|result. Guide a running child: prospero child message --child <sessionId> --text <text>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Stop: prospero child cancel --child <sessionId>. Re-deliver: prospero child redeliver --child <sessionId>. Mark processed: prospero child ack --child <sessionId>. Recheck later: prospero child check --after <seconds>. Children always use YOLO auto-approval."}),
+                json!({
+                    "items": items,
+                    "accounts": accounts,
+                    "workspaces": workspaces,
+                    "hint": "Start with model source: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> [--workspace <path>] --task <task>. Start with subscription/native account: prospero child start --agent <codex|claude|opencode|pi|deepseek|agy> [--account <accountId>] [--model <model>] [--effort <effort>] [--workspace <path>] --task <task>. Inspect: prospero child list|get|logs|result. Guide a running child: prospero child message --child <sessionId> --text <text>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Stop: prospero child cancel --child <sessionId>. Re-deliver: prospero child redeliver --child <sessionId>. Mark processed: prospero child ack --child <sessionId>. Recheck later: prospero child check --after <seconds>. Children always use YOLO auto-approval."
+                }),
             )
         }
         "cross_model.child.list" => {
@@ -394,16 +468,44 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
         }
         "cross_model.child.start" => {
             let parent = required_id(&params, "parentSessionId")?;
-            let source = required_id(&params, "sourceId")?;
-            let route = required_id(&params, "routeId")?;
+            let source = optional_text(&params, "sourceId").unwrap_or_default();
+            let route = optional_text(&params, "routeId").unwrap_or_default();
             let revision = params
                 .get("revision")
                 .and_then(Value::as_i64)
-                .filter(|value| *value > 0)
-                .ok_or_else(|| Error::Invalid("模型源版本无效".into()))?;
+                .unwrap_or(0);
+            if !source.is_empty() && !matches!(source.as_str(), "subscription" | "native") {
+                let _ = required_id(&params, "sourceId")?;
+                let _ = required_id(&params, "routeId")?;
+                if revision <= 0 {
+                    return Err(Error::Invalid("模型源版本无效".into()));
+                }
+            }
             let agent = required_text(&params, "agent")?;
             let task = required_text(&params, "task")?;
-            client.post(&format!("/v1/agent-sessions/{}/cross-model-children", path_component(&parent)), strip_empty(json!({"sourceId":source,"routeId":route,"revision":revision,"agent":agent,"task":task,"title":optional_text(&params, "title")}), &[])).await
+            client
+                .post(
+                    &format!(
+                        "/v1/agent-sessions/{}/cross-model-children",
+                        path_component(&parent)
+                    ),
+                    strip_empty(
+                        json!({
+                            "sourceId": source,
+                            "routeId": route,
+                            "revision": revision,
+                            "agent": agent,
+                            "task": task,
+                            "title": optional_text(&params, "title"),
+                            "workspace": optional_text(&params, "workspace"),
+                            "accountId": optional_text(&params, "accountId"),
+                            "model": optional_text(&params, "model"),
+                            "effort": optional_text(&params, "effort"),
+                        }),
+                        &[],
+                    ),
+                )
+                .await
         }
         "cross_model.child.follow_up" => {
             let parent = required_id(&params, "parentSessionId")?;

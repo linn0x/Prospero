@@ -234,7 +234,7 @@ import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
 import { SourceSelector } from "./model-sources/SourceSelector";
 import { useModelSources, runModelSourceAction } from "./model-sources/use-model-sources";
 import { defaultSourceSelection, rememberSourceSelection, rememberedSourceSelection, selectedSourceRoute, type SourceRuntimeAgent, type SourceSelection } from "./model-sources/source-state";
-import { sessionLabel, SessionAgentIcon, StatusMark } from "./workspace/session-presentation";
+import { sessionLabel, SessionAgentIcon, StatusMark, PROSPERO_BOT_SESSION_STORAGE_KEY, PROSPERO_BOT_TITLE, isProsperoBotSession } from "./workspace/session-presentation";
 import { useSessionUnread } from "./workspace/use-session-unread";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
@@ -756,6 +756,9 @@ function ShellSidebar({
   snapshot,
   view,
   activeId,
+  botSession,
+  onOpenBotSession,
+  onConfigureBotSession,
   onView,
   onOpenSession,
   onNewSession,
@@ -781,6 +784,9 @@ function ShellSidebar({
   snapshot: DesktopSnapshot;
   view: View;
   activeId: string | undefined;
+  botSession?: SessionInfo | undefined;
+  onOpenBotSession?: (() => void) | undefined;
+  onConfigureBotSession?: (() => void) | undefined;
   onView: (view: View) => void;
   onOpenSession: (id: string, session?: SessionInfo) => void;
   onNewSession: (project?: string) => void;
@@ -1530,6 +1536,56 @@ function ShellSidebar({
           </SidebarGroup>
         </nav>
         <div className="sidebar-workspace-scroll" role="region" aria-label={t("工作区与会话", "Workspaces and sessions")}>
+        <SidebarSeparator className="sidebar-detail-section" />
+        <SidebarGroup className="sidebar-detail-section">
+          <SidebarGroupLabel>
+            <span>{t("主会话", "Master Bot")}</span>
+          </SidebarGroupLabel>
+          {onConfigureBotSession && (
+            <SidebarGroupAction
+              aria-label={t("配置或切换 Prospero Bot 主会话", "Configure or switch Prospero Bot master session")}
+              title={t("配置或切换 Prospero Bot 主会话", "Configure or switch Prospero Bot master session")}
+              onClick={() => {
+                onConfigureBotSession();
+                closeMobileSidebar();
+              }}
+            >
+              {botSession ? <Settings /> : <Plus />}
+            </SidebarGroupAction>
+          )}
+          <SidebarGroupContent>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  data-testid="sidebar-prospero-bot"
+                  isActive={Boolean(botSession && view === "workspaces" && activeId === botSession.id)}
+                  tooltip={
+                    botSession
+                      ? `Prospero Bot · ${botSession.agent}${botSession.model ? ` · ${botSession.model}` : ""}`
+                      : t("启动 Prospero Bot 全局主会话（可向各工作区派发任务）", "Start Prospero Bot master session (dispatch across workspaces)")
+                  }
+                  onClick={() => {
+                    if (onOpenBotSession) onOpenBotSession();
+                    closeMobileSidebar();
+                  }}
+                >
+                  {botSession ? <SessionAgentIcon agent={botSession.agent} unread={snapshot.unreadSessionIds.includes(botSession.id)} /> : <Bot />}
+                  <span className="truncate font-medium">Prospero Bot</span>
+                  {botSession ? (
+                    <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <StatusMark status={botSession.status} busySince={botSession.busySince} />
+                      <span className="truncate max-w-20">{botSession.model ?? botSession.agent}</span>
+                    </span>
+                  ) : (
+                    <Badge variant="outline" className="ml-auto text-[10px]">
+                      {t("启动", "Start")}
+                    </Badge>
+                  )}
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
         {snapshot.pinnedSessionIds.length > 0 && <>
           <SidebarSeparator className="sidebar-detail-section" />
           <SidebarGroup className="sidebar-detail-section">
@@ -2730,6 +2786,7 @@ function NewSessionDialog({
   initialTab,
   initialDraft,
   onConfigureAccounts,
+  botMode = false,
 }: {
   initialDraft: SessionCreateDraft | undefined;
   onConfigureAccounts: (draft: SessionCreateDraft) => void;
@@ -2743,6 +2800,7 @@ function NewSessionDialog({
   onRemoteWorkspace: (workspace: RemoteWorkspace, newSession?: boolean) => void;
   onManageHosts: () => void;
   initialSource: SourceSelection | undefined;
+  botMode?: boolean | undefined;
 }) {
   const { t, status } = useLocale();
   const [tab, setTab] = useState(initialTab);
@@ -2757,9 +2815,9 @@ function NewSessionDialog({
   const [input, setInput] = useState<SessionCreateInput>(initialDraft?.input ?? {
     cwd: project || snapshot.projects[0] || "",
     agent: initialAgent,
-    kind: initialSource ? "structured" : rememberedLaunchKind(initialAgent),
-    approvalPolicy: "standard",
-    accountId: initialAgent === "opencode" && rememberedLaunchKind(initialAgent) === "pty" ? undefined : defaultSessionLaunchAccountId(independentAccounts, initialAgent),
+    kind: botMode || initialSource ? "structured" : rememberedLaunchKind(initialAgent),
+    approvalPolicy: botMode ? "yolo" : "standard",
+    accountId: initialAgent === "opencode" && !botMode && rememberedLaunchKind(initialAgent) === "pty" ? undefined : defaultSessionLaunchAccountId(independentAccounts, initialAgent),
   });
   const [terminalApprovalPolicy, setTerminalApprovalPolicy] = useState<SessionCreateInput["approvalPolicy"]>(
     initialDraft?.input.kind === "pty" && (initialDraft.input.agent === "codex" || initialDraft.input.agent === "claude" || initialDraft.input.agent === "agy")
@@ -2802,7 +2860,7 @@ function NewSessionDialog({
     (account) => account.id === input.accountId,
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
-  const selectedKind: SessionCreateInput["kind"] = useSource ? (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi" ? "structured" : input.kind) : requiresStructured ? "structured" : input.kind;
+  const selectedKind: SessionCreateInput["kind"] = botMode ? "structured" : useSource ? (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi" ? "structured" : input.kind) : requiresStructured ? "structured" : input.kind;
   const managedAgentTerminal = selectedKind === "pty" && (input.agent === "codex" || input.agent === "claude" || input.agent === "agy");
   const selectedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : input.approvalPolicy;
   const supportsApprovalPolicy = selectedKind === "structured" || input.agent === "codex" || input.agent === "claude" || input.agent === "agy";
@@ -2949,18 +3007,27 @@ function NewSessionDialog({
     setBusy(true);
     setError(undefined);
     try {
+      let created: SessionInfo;
       if (useSource) {
         if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
         const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
         const routeEfforts = sourceChoice.route.protocol !== "openai_chat_completions" ? (sourceChoice.route.modelCapabilities?.supportedEfforts ?? []) : [];
         const sessionEffort = (input.effort && routeEfforts.some(level => level === input.effort) ? input.effort : undefined) ?? sourceChoice.route.defaultEffort;
-        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, ...(sessionEffort ? { effort: sessionEffort as SessionCreateInput["effort"] } : {}) }));
+        created = await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, ...(sessionEffort ? { effort: sessionEffort as SessionCreateInput["effort"] } : {}) });
         rememberSourceSelection({ sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
       } else {
-        onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
+        created = await window.prospero.createSession({ ...input, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort });
         rememberSourceSelection(undefined);
       }
+      if (botMode) {
+        await window.prospero.renameSession(created.id, PROSPERO_BOT_TITLE).catch(() => undefined);
+        try {
+          localStorage.setItem(PROSPERO_BOT_SESSION_STORAGE_KEY, created.id);
+        } catch {}
+        created = { ...created, title: PROSPERO_BOT_TITLE, displayTitle: PROSPERO_BOT_TITLE };
+      }
+      onCreated(created);
       rememberLaunch(input.agent, selectedKind);
       onOpenChange(false);
     } catch (reason) {
@@ -2980,8 +3047,8 @@ function NewSessionDialog({
         aria-busy={busy || choosingWorkspace}
       >
         <DialogHeader>
-          <DialogTitle>{tab === "workspace" ? t("添加工作区", "Add workspace") : t("新建会话", "New session")}</DialogTitle>
-          <DialogDescription>{tab === "workspace" ? t("添加本机或远程文件夹，继续创建会话。", "Add a local or remote folder, then start a conversation.") : t("选择工作区、Agent 和模型。", "Choose a workspace, agent, and model.")}</DialogDescription>
+          <DialogTitle>{tab === "workspace" ? t("添加工作区", "Add workspace") : botMode ? t("启动 Prospero Bot 主会话", "Start Prospero Bot Master Session") : t("新建会话", "New session")}</DialogTitle>
+          <DialogDescription>{tab === "workspace" ? t("添加本机或远程文件夹，继续创建会话。", "Add a local or remote folder, then start a conversation.") : botMode ? t("选择驱动 Prospero Bot 全局主对话的 Agent 与模型（如 Codex Daybreak Blue 或 Claude），创建后可跨工作区派发子会话。", "Choose the agent and model for your Prospero Bot master chat; once started, it can dispatch child sessions across all workspaces.") : t("选择工作区、Agent 和模型。", "Choose a workspace, agent, and model.")}</DialogDescription>
         </DialogHeader>
         <Tabs className="create-dialog-tabs" value={tab} onValueChange={(value) => { if (!busy && !choosingWorkspace && (value === "session" || value === "workspace")) setTab(value); }}>
           <TabsList variant="line" aria-label={t("创建类型", "Create type")}>
@@ -3990,13 +4057,57 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setEditingSession((current) => current === id ? undefined : current);
     void window.prospero.forgetMissingSession(id).catch(() => undefined);
   }, []);
+  const [newSessionBotMode, setNewSessionBotMode] = useState(false);
+  const [botSessionId, setBotSessionId] = useState<string | undefined>(() => {
+    try {
+      return localStorage.getItem(PROSPERO_BOT_SESSION_STORAGE_KEY) || undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  const botSession = useMemo(() => {
+    const structured = sessionSnapshot.daemon.sessions.filter((session) => session.kind === "structured");
+    if (botSessionId) {
+      const exact = structured.find((session) => session.id === botSessionId);
+      if (exact) return exact;
+    }
+    return structured.find((session) => isProsperoBotSession(session) && !session.archived)
+      ?? structured.find((session) => isProsperoBotSession(session));
+  }, [botSessionId, sessionSnapshot.daemon.sessions]);
+  useEffect(() => {
+    if (botSession && botSession.id !== botSessionId) {
+      setBotSessionId(botSession.id);
+      try {
+        localStorage.setItem(PROSPERO_BOT_SESSION_STORAGE_KEY, botSession.id);
+      } catch {}
+    }
+  }, [botSession, botSessionId]);
   const openNewSession = useCallback((project?: string): void => {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
+    setNewSessionBotMode(false);
     setInitialSessionDraft(undefined);
     setNewSessionProject(sessionLaunchProject(sessionSnapshot, project, activeRemoteId ? undefined : activeId));
     setNewSessionSource(undefined);
     setCreateTab("session"); setNewSessionOpen(true);
   }, [activeId, activeRemote, activeRemoteId, sessionSnapshot, view]);
+  const configureBotSession = useCallback((): void => {
+    setNewSessionBotMode(true);
+    setInitialSessionDraft(undefined);
+    setNewSessionProject(sessionLaunchProject(sessionSnapshot, undefined, activeRemoteId ? undefined : activeId));
+    setNewSessionSource(undefined);
+    setCreateTab("session");
+    setNewSessionOpen(true);
+  }, [activeId, activeRemoteId, sessionSnapshot]);
+  const openBotSession = useCallback((): void => {
+    if (botSession) {
+      if (botSession.archived || snapshotRef.current.archivedSessionIds.includes(botSession.id)) {
+        void window.prospero.setSessionArchived(botSession.id, false).catch(() => undefined);
+      }
+      openSession(botSession.id, botSession, { openTab: true });
+      return;
+    }
+    configureBotSession();
+  }, [botSession, configureBotSession, openSession]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (matchesDesktopShortcut(event, "k", window.prospero.platform)) {
@@ -4186,6 +4297,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         snapshot={sessionSnapshot}
         view={view}
         activeId={activeRemoteId ? undefined : activeId}
+        botSession={botSession}
+        onOpenBotSession={openBotSession}
+        onConfigureBotSession={configureBotSession}
         onView={selectView}
         onOpenSession={openSession}
         onNewSession={openNewSession}
@@ -4301,8 +4415,17 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           snapshot={sessionSnapshot}
           project={newSessionProject}
           open
-          onOpenChange={setNewSessionOpen}
-          onCreated={(session) => openSession(session.id, session, { openTab: true })}
+          onOpenChange={(next) => {
+            setNewSessionOpen(next);
+            if (!next) setNewSessionBotMode(false);
+          }}
+          onCreated={(session) => {
+            if (newSessionBotMode) {
+              setBotSessionId(session.id);
+            }
+            setNewSessionBotMode(false);
+            openSession(session.id, session, { openTab: true });
+          }}
           remoteWorkspaces={remote.workspaces}
           onRemoteWorkspace={openRemoteWorkspace}
           onManageHosts={() => selectView("remote")}
@@ -4314,6 +4437,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             selectView("providers");
           }}
           initialSource={newSessionSource}
+          botMode={newSessionBotMode}
         />
       )}
       {editingProject && (
