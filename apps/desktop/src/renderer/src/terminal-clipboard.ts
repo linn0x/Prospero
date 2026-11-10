@@ -20,6 +20,11 @@ export function allowNativeTerminalPaste(event: Pick<KeyboardEvent, "preventDefa
   return allowed;
 }
 
+function shellEscapePath(path: string): string {
+  if (!path) return "";
+  return /[^\w./:@~-]/.test(path) ? `'${path.replace(/'/g, "'\\''")}'` : path;
+}
+
 export function bindTerminalPaste(target: EventTarget, terminal: { paste(text: string): void }, canPaste: () => boolean, blocked: () => void = () => {}, pasted: () => void = () => {}, nonText: () => void = () => {}, image?: () => void): () => void {
   const handle = (raw: Event): void => {
     const event = raw as ClipboardEvent;
@@ -28,6 +33,15 @@ export function bindTerminalPaste(target: EventTarget, terminal: { paste(text: s
     if (cancelled) return;
     if (!canPaste()) { blocked(); return; }
     const clipboard = event.clipboardData;
+    const files = Array.from(clipboard?.files ?? []);
+    const filePaths = files
+      .map(file => (file as File & { path?: string }).path?.trim())
+      .filter((path): path is string => Boolean(path));
+    if (filePaths.length > 0) {
+      pasted();
+      terminal.paste(filePaths.map(shellEscapePath).join(" "));
+      return;
+    }
     const hasImage = Array.from(clipboard?.items ?? []).some(item => item.type.startsWith("image/")) || Array.from(clipboard?.types ?? []).some(type => type.startsWith("image/"));
     if (hasImage && image) { image(); return; }
     const text = event.clipboardData?.getData("text/plain");

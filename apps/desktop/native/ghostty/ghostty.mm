@@ -381,12 +381,33 @@ static bool notifyImagePaste(ProsperoGhosttyView *);
   int scrollMods = (precise ? 1 : 0) | ((int)scrollMomentum(e.momentumPhase) << 1);
   ghostty_surface_mouse_scroll(_surface, x, y, scrollMods);
 }
+static NSString *shellEscapePasteboardPath(NSString *path) {
+  if (path.length == 0) return @"";
+  NSCharacterSet *safe = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@~"];
+  if ([path rangeOfCharacterFromSet:safe.invertedSet].location == NSNotFound) return path;
+  return [NSString stringWithFormat:@"'%@'", [path stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+static NSString *pasteboardFilePaths(NSPasteboard *pasteboard) {
+  NSArray<NSURL *> *urls = [pasteboard readObjectsForClasses:@[NSURL.class]
+                                                     options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+  if (urls.count == 0) return nil;
+  NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:urls.count];
+  for (NSURL *url in urls) {
+    if (url.isFileURL && url.path.length > 0) {
+      [paths addObject:shellEscapePasteboardPath(url.path)];
+    }
+  }
+  return paths.count > 0 ? [paths componentsJoinedByString:@" "] : nil;
+}
+
 - (void)copy:(id)sender { if (_surface) ghostty_surface_binding_action(_surface, "copy_to_clipboard", 17); }
 - (void)paste:(id)sender {
   if (getenv("PROSPERO_NATIVE_GHOSTTY_DEBUG")) fprintf(stderr, "[native-ghostty] paste action id=%u readonly=%d firstResponder=%d\n", self.surfaceId, self.readOnly, self.window.firstResponder == self);
   if (!_surface || _readOnly) return;
   NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
-  BOOL hasImage = [pasteboard canReadObjectForClasses:@[NSImage.class] options:@{}];
+  NSString *filePaths = pasteboardFilePaths(pasteboard);
+  BOOL hasImage = (filePaths == nil) && [pasteboard canReadObjectForClasses:@[NSImage.class] options:@{}];
   if (hasImage && notifyImagePaste(self)) return;
   ghostty_surface_binding_action(_surface, "paste_from_clipboard", 20);
 }
@@ -532,7 +553,8 @@ static bool action(ghostty_app_t, ghostty_target_s, ghostty_action_s) { return f
 static uint64_t clipboardReadCount = 0;
 static bool readClipboard(void *userdata, ghostty_clipboard_e location, void *state) {
   ProsperoGhosttyView *view = (__bridge ProsperoGhosttyView *)userdata;
-  NSString *text = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString] ?: @"";
+  NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
+  NSString *text = pasteboardFilePaths(pasteboard) ?: ([pasteboard stringForType:NSPasteboardTypeString] ?: @"");
   clipboardReadCount++;
   if (getenv("PROSPERO_NATIVE_GHOSTTY_DEBUG")) fprintf(stderr, "[native-ghostty] clipboard read id=%u count=%llu location=%d bytes=%lu\n",
     view.surfaceId, (unsigned long long)clipboardReadCount, (int)location,

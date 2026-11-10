@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell, Tray } from "electron";
 import type { MenuItemConstructorOptions, Rectangle } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, SessionPage, SessionPageRequest, WorkflowTemplate } from "../shared/types";
@@ -132,6 +133,30 @@ const terminalStreamBridge = new TerminalStreamBridge((sessionId) => {
   if (!(runtime instanceof RustRuntime)) throw new Error("Terminal streaming is unavailable for this backend");
   return runtime.createTerminalStreamSocket(sessionId);
 });
+function shellEscapeClipboardPath(filePath: string): string {
+  if (!filePath) return "";
+  return /[^\w./:@~-]/.test(filePath) ? `'${filePath.replace(/'/g, "'\\''")}'` : filePath;
+}
+
+function readClipboardFilePaths(): string[] {
+  try {
+    const plist = clipboard.read("NSFilenamesPboardType");
+    if (plist && plist.includes("<string>")) {
+      const matches = [...plist.matchAll(/<string>([^<]+)<\/string>/g)]
+        .map(match => match[1]?.trim())
+        .filter((item): item is string => Boolean(item));
+      if (matches.length > 0) return matches;
+    }
+  } catch {}
+  try {
+    const rawUrl = clipboard.read("public.file-url").trim();
+    if (rawUrl.startsWith("file://") && !rawUrl.startsWith("file:///.file/id=")) {
+      return [fileURLToPath(rawUrl)];
+    }
+  } catch {}
+  return [];
+}
+
 const nativeGhosttyManager = new NativeGhosttyManager(
   app.getAppPath(),
   sessionId => {
@@ -143,7 +168,18 @@ const nativeGhosttyManager = new NativeGhosttyManager(
   (id, message) => { sendToMainWindow("native-terminal:error", { id, message }); },
   (id, action) => { sendToMainWindow("native-terminal:shortcut", { id, action }); },
   (id, focused) => { sendToMainWindow("native-terminal:focus", { id, focused }); },
-  id => sendToMainWindow("native-terminal:shortcut", { id, action: "paste-image" }),
+  id => {
+    const filePaths = readClipboardFilePaths();
+    if (filePaths.length > 0) {
+      try {
+        nativeGhosttyManager.inputText(id, filePaths.map(shellEscapeClipboardPath).join(" "));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return sendToMainWindow("native-terminal:shortcut", { id, action: "paste-image" });
+  },
 );
 let daemonStartRequest: Promise<{ ok: boolean; error?: string }> | undefined;
 function publishRuntimeSwitch(): void {
@@ -1100,6 +1136,10 @@ function installIpc(): void {
     const id = requireId(rawId, "终端会话");
     const session = store.snapshot().daemon.sessions.find(item => item.id === id);
     if (!session || session.kind !== "pty" || !["codex", "claude", "pi"].includes(session.agent)) throw new Error("此会话不支持图片粘贴 / Image paste is unavailable for this session");
+    const copiedFiles = readClipboardFilePaths();
+    if (copiedFiles.length > 0) {
+      return { path: copiedFiles[0]! };
+    }
     const image = clipboard.readImage();
     if (image.isEmpty()) throw new Error("剪贴板中没有图片 / No image in clipboard");
     const bytes = image.toPNG();

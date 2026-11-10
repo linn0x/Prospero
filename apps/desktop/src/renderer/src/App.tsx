@@ -876,13 +876,9 @@ function ShellSidebar({
         snapshot.pinnedProjectPaths,
         activeId,
       );
-      if (restored && restored.length > 0 && restored.length <= 2) {
-        return new Set(restored);
-      }
-      return new Set(fallback ? [fallback] : []);
+      return new Set(restored ?? (fallback ? [fallback] : []));
     },
   );
-  const previousAutoExpandedProjectRef = useRef<string | undefined>(undefined);
   const [sessionLimits, setSessionLimits] = useState<Record<string, number>>(
     {},
   );
@@ -955,18 +951,9 @@ function ShellSidebar({
       ? projectForSession(snapshot.projects, activeSession)
       : undefined;
     if (!activeProject) return;
-    const previousAuto = previousAutoExpandedProjectRef.current;
-    previousAutoExpandedProjectRef.current = activeProject;
     setExpandedProjects((current) => {
-      if (current.has(activeProject) && (!previousAuto || previousAuto === activeProject || !current.has(previousAuto))) {
-        return current;
-      }
-      const next = new Set(current);
-      if (previousAuto && previousAuto !== activeProject) {
-        next.delete(previousAuto);
-      }
-      next.add(activeProject);
-      return next;
+      if (current.has(activeProject)) return current;
+      return new Set([...current, activeProject]);
     });
   }, [activeId, snapshot.daemon.sessions, snapshot.projects]);
   const selectedSession = snapshot.daemon.sessions.find((session) => session.id === activeId);
