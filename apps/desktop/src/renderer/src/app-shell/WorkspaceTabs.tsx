@@ -19,6 +19,8 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy
   });
   const activeSession = activeId ? sessions.get(activeId) : undefined;
   const isBotActive = Boolean(botSession && activeId === botSession.id);
+  const botModelRaw = botSession?.agentControls?.currentModel ?? botSession?.model ?? "gpt-6-astra";
+  const botBadgeLabel = botModelRaw === "gpt-6-astra" ? "Astra" : (botModelRaw.split("/").at(-1) ?? botModelRaw);
   const activeWorkspace = activeSession && !isBotActive ? (projectForSession(snapshot.projects, activeSession) ?? activeSession.cwd) : undefined;
   const workspaceScopedIds = activeWorkspace
     ? allIds.filter((id) => {
@@ -38,12 +40,12 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy
         aria-selected={isBotActive}
         disabled={botBusy}
         className={cn("workspace-tab workspace-bot-tab", isBotActive && "is-active")}
-        title={t("主会话 · Prospero Bot (Codex · GPT-6-Astra · Chat UI)", "Master Session · Prospero Bot (Codex · GPT-6-Astra · Chat UI)")}
+        title={`${t("主会话 · Prospero Bot", "Master Session · Prospero Bot")} (${botSession?.agent ?? "codex"} · ${botModelRaw} · Chat UI)`}
         onClick={onSelectBot}
       >
         {botBusy ? <Spinner className="size-3.5 shrink-0" /> : <Bot className="size-3.5 shrink-0" aria-hidden="true" />}
         <span className="truncate font-medium">{t("主会话", "Master")}</span>
-        <span className="workspace-bot-tab-badge">Astra</span>
+        <span className="workspace-bot-tab-badge">{botBadgeLabel}</span>
         {botSession && (
           <StatusMark
             status={botSession.status}

@@ -8,7 +8,9 @@ const LIMIT = 40;
 // The running adapter's capability is authoritative. Account defaults describe
 // session creation and may mark API sources as non-selectable (e.g. DeepSeek).
 export function modelSwitchSupported(session: SessionInfo, _account?: JsonObject): boolean {
-  return session.kind === "structured" && session.agentControls?.model === true;
+  if (session.kind !== "structured") return false;
+  if (session.agentControls) return session.agentControls.model === true;
+  return ["claude", "codex", "deepseek", "opencode", "pi"].includes(session.agent);
 }
 
 export function supportedModelEffort(model: AgentModel | undefined, effort: string): string | undefined {

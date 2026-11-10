@@ -1544,7 +1544,7 @@ function ShellSidebar({
                     disabled={botBusy}
                     tooltip={
                       botSession
-                        ? `${t("主会话", "Master Session")} · Codex · ${botSession.model ?? "gpt-6-astra"}`
+                        ? `${t("主会话", "Master Session")} · ${botSession.agent.toUpperCase()} · ${botSession.agentControls?.currentModel ?? botSession.model ?? "gpt-6-astra"}`
                         : t("打开主会话（Codex · Astra · Chat UI）", "Open Master Session (Codex · Astra · Chat UI)")
                     }
                     onClick={() => {
@@ -1563,7 +1563,9 @@ function ShellSidebar({
                     <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
                       {botSession && <StatusMark status={botSession.status} busySince={botSession.busySince} />}
                       <Badge variant="outline" className="text-[10px]">
-                        Astra
+                        {(botSession?.agentControls?.currentModel ?? botSession?.model ?? "gpt-6-astra") === "gpt-6-astra"
+                          ? "Astra"
+                          : (botSession?.agentControls?.currentModel ?? botSession?.model ?? "Astra")}
                       </Badge>
                     </span>
                   </SidebarMenuButton>
@@ -3696,14 +3698,23 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       return [];
     }
   });
-  const restoredOpenIds = useRef(openIds);
-  const [restoredSessionsReady, setRestoredSessionsReady] = useState(
-    openIds.length === 0,
-  );
-  const [sessionRestoreAttempt, setSessionRestoreAttempt] = useState(0);
   const [activeId, setActiveId] = useState<string | undefined>(
     readStoredActiveSession,
   );
+  const [botSessionId, setBotSessionId] = useState<string | undefined>(() => {
+    try {
+      return localStorage.getItem(PROSPERO_BOT_SESSION_STORAGE_KEY) || undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  const restoredOpenIds = useRef(
+    [...new Set([...openIds, ...(activeId ? [activeId] : []), ...(botSessionId ? [botSessionId] : [])])],
+  );
+  const [restoredSessionsReady, setRestoredSessionsReady] = useState(
+    restoredOpenIds.current.length === 0,
+  );
+  const [sessionRestoreAttempt, setSessionRestoreAttempt] = useState(0);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [pendingSessionDraft, setPendingSessionDraft] = useState<SessionCreateDraft>();
   const [initialSessionDraft, setInitialSessionDraft] = useState<SessionCreateDraft>();
@@ -3744,16 +3755,29 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [launcher, setLauncher] = useState<"command" | "quick">();
   const sessionSnapshot = useMemo(() => {
     if (hydratedSessions.length === 0) return snapshot;
+    const validHydrated = hydratedSessions.filter((session) => Boolean(session && typeof session.id === "string" && session.id));
+    if (validHydrated.length === 0) return snapshot;
+    const hydratedById = new Map(validHydrated.map((session) => [session.id, session]));
     const liveIds = new Set(snapshot.daemon.sessions.map((session) => session.id));
-    const historical = hydratedSessions.filter(
+    const mergedLive = snapshot.daemon.sessions.map((session) => {
+      const hydrated = hydratedById.get(session.id);
+      if (!hydrated) return session;
+      return {
+        ...session,
+        ...(!session.title && hydrated.title ? { title: hydrated.title } : {}),
+        ...(!session.displayTitle && hydrated.displayTitle ? { displayTitle: hydrated.displayTitle } : {}),
+        ...(hydrated.model ? { model: hydrated.model } : {}),
+        ...(hydrated.effort ? { effort: hydrated.effort } : {}),
+      };
+    });
+    const historical = validHydrated.filter(
       (session) => !liveIds.has(session.id),
     );
-    if (historical.length === 0) return snapshot;
     return {
       ...snapshot,
       daemon: {
         ...snapshot.daemon,
-        sessions: [...snapshot.daemon.sessions, ...historical],
+        sessions: historical.length > 0 ? [...mergedLive, ...historical] : mergedLive,
       },
     };
   }, [hydratedSessions, snapshot]);
@@ -3773,6 +3797,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       if (entry.revision <= previousRevision) continue;
       syncedDaemonTabRevisions.current[workspace] = entry.revision;
       for (const id of entry.openSessionIds) {
+        if (id === botSessionId) continue;
         if (!newlyDiscoveredIds.includes(id)) newlyDiscoveredIds.push(id);
       }
       if (entry.activeSessionId && entry.updatedAt > latestUpdatedAt) {
@@ -3789,7 +3814,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     if (preferredActiveId) {
       setActiveId((current) => current ?? preferredActiveId);
     }
-  }, [snapshot.daemon.workspaceTabs]);
+  }, [botSessionId, snapshot.daemon.workspaceTabs]);
   const persistWorkspaceTabs = useCallback((workspace: string | undefined, allOpenIds: readonly string[], currentActiveId: string | undefined): void => {
     if (!workspace || !window.prospero.setWorkspaceTabs || !snapshotRef.current.daemon.running) return;
     const sessionsById = new Map(sessionSnapshot.daemon.sessions.map((item) => [item.id, item]));
@@ -3808,7 +3833,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, [sessionSnapshot.daemon.sessions]);
   useEffect(() => {
     if (snapshot.daemon.sessions.length === 0) return;
-    const trackedIds = new Set(activeId ? [activeId, ...openIds] : openIds);
+    const trackedIds = new Set([...(activeId ? [activeId] : []), ...(botSessionId ? [botSessionId] : []), ...openIds]);
     if (trackedIds.size === 0) return;
     const liveTracked = snapshot.daemon.sessions.filter((session) => trackedIds.has(session.id));
     if (liveTracked.length === 0) return;
@@ -3826,8 +3851,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       const updatedIds = new Set(liveTracked.map((item) => item.id));
       return [...liveTracked, ...current.filter((item) => !updatedIds.has(item.id))].slice(0, HYDRATED_SESSION_CACHE_LIMIT);
     });
-  }, [activeId, openIds, snapshot.daemon.sessions]);
-  const openMetadataKey = openIds.slice(0, 100).join("|");
+  }, [activeId, botSessionId, openIds, snapshot.daemon.sessions]);
+  const openMetadataKey = [...new Set([...(activeId ? [activeId] : []), ...(botSessionId ? [botSessionId] : []), ...openIds])].slice(0, 100).join("|");
   useEffect(() => {
     if (!snapshot.daemon.metadataRevision || !openMetadataKey || !snapshot.daemon.running) return;
     const liveIds = new Set(snapshotRef.current.daemon.sessions.map(session => session.id));
@@ -3981,7 +4006,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, []);
   const openSession = useCallback((id: string, session?: SessionInfo, options: { openTab?: boolean } = {}): void => {
     setActiveRemoteId(undefined);
-    if (session) {
+    if (session && typeof session.id === "string" && session.id) {
       setHydratedSessions((current) =>
         upsertHydratedSession(current, session, HYDRATED_SESSION_CACHE_LIMIT),
       );
@@ -3994,14 +4019,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         persistWorkspaceTabs(workspace, next, id);
         return next;
       });
-    } else {
-      persistWorkspaceTabs(workspace, openIds, id);
     }
     setActiveId(id);
     setView("workspaces");
     if (snapshotRef.current.unreadSessionIds.includes(id))
       void window.prospero.setSessionUnread(id, false);
-  }, [openIds, persistWorkspaceTabs, sessionSnapshot.daemon.sessions]);
+  }, [persistWorkspaceTabs, sessionSnapshot.daemon.sessions]);
   const openRun = useCallback((runId?: string, taskId?: string): void => {
     setRunTargetId(runId);
     setTaskTargetId(taskId);
@@ -4047,24 +4070,16 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [newSessionBotMode, setNewSessionBotMode] = useState(false);
   const [botCreating, setBotCreating] = useState(false);
   const botCreatingRef = useRef(false);
-  const botUpgradedModelRef = useRef<string | undefined>(undefined);
-  const [botSessionId, setBotSessionId] = useState<string | undefined>(() => {
-    try {
-      return localStorage.getItem(PROSPERO_BOT_SESSION_STORAGE_KEY) || undefined;
-    } catch {
-      return undefined;
-    }
-  });
   const botSession = useMemo(() => {
-    const structuredCodex = sessionSnapshot.daemon.sessions.filter(
-      (session) => session.kind === "structured" && session.agent === "codex",
+    const structuredSessions = sessionSnapshot.daemon.sessions.filter(
+      (session) => session.kind === "structured",
     );
     if (botSessionId) {
-      const exact = structuredCodex.find((session) => session.id === botSessionId);
+      const exact = structuredSessions.find((session) => session.id === botSessionId);
       if (exact) return exact;
     }
-    return structuredCodex.find((session) => isProsperoBotSession(session) && !session.archived)
-      ?? structuredCodex.find((session) => isProsperoBotSession(session));
+    return structuredSessions.find((session) => isProsperoBotSession(session) && !session.archived)
+      ?? structuredSessions.find((session) => isProsperoBotSession(session));
   }, [botSessionId, sessionSnapshot.daemon.sessions]);
   useEffect(() => {
     if (!botSession) return;
@@ -4077,12 +4092,14 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setOpenIds((current) =>
       current.includes(botSession.id) ? current.filter((id) => id !== botSession.id) : current,
     );
-    const currentModel = botSession.model ?? botSession.agentControls?.currentModel;
-    if (currentModel !== "gpt-6-astra" && botUpgradedModelRef.current !== botSession.id) {
-      botUpgradedModelRef.current = botSession.id;
-      void window.prospero.setAgentModel(botSession.id, "gpt-6-astra", botSession.effort).catch(() => undefined);
-    }
   }, [botSession, botSessionId]);
+  const switchBotSession = useCallback((nextSession: SessionInfo): void => {
+    setBotSessionId(nextSession.id);
+    try {
+      localStorage.setItem(PROSPERO_BOT_SESSION_STORAGE_KEY, nextSession.id);
+    } catch {}
+    openSession(nextSession.id, nextSession, { openTab: false });
+  }, [openSession]);
   const openNewSession = useCallback((project?: string): void => {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
     setNewSessionBotMode(false);
@@ -4103,10 +4120,6 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     if (botSession) {
       if (botSession.archived || snapshotRef.current.archivedSessionIds.includes(botSession.id)) {
         void window.prospero.setSessionArchived(botSession.id, false).catch(() => undefined);
-      }
-      const currentModel = botSession.model ?? botSession.agentControls?.currentModel;
-      if (currentModel !== "gpt-6-astra") {
-        void window.prospero.setAgentModel(botSession.id, "gpt-6-astra", botSession.effort).catch(() => undefined);
       }
       openSession(botSession.id, botSession, { openTab: false });
       return;
@@ -4130,12 +4143,13 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           approvalPolicy: "yolo",
           ...(accountId ? { accountId } : {}),
         });
-        let named: SessionInfo = { ...created, title: PROSPERO_BOT_TITLE, model: "gpt-6-astra" };
-        try {
-          named = await window.prospero.renameSession(created.id, PROSPERO_BOT_TITLE);
-        } catch {
-          // Keep optimistic title
-        }
+        const named: SessionInfo = {
+          ...created,
+          title: PROSPERO_BOT_TITLE,
+          displayTitle: PROSPERO_BOT_TITLE,
+          model: created.model ?? "gpt-6-astra",
+        };
+        await window.prospero.renameSession(created.id, PROSPERO_BOT_TITLE).catch(() => undefined);
         setBotSessionId(created.id);
         try {
           localStorage.setItem(PROSPERO_BOT_SESSION_STORAGE_KEY, created.id);
@@ -4445,6 +4459,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onAddWorkspace={openAddWorkspace}
                 onMissingSession={forgetMissingSession}
                 onFocusedSessionChange={setFocusedSessionId}
+                onSwitchBotSession={switchBotSession}
               /></div></Suspense>}
         </div>
       </SidebarInset>
@@ -4463,7 +4478,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           }}
           onCreated={(session) => {
             if (newSessionBotMode) {
-              setBotSessionId(session.id);
+              setNewSessionBotMode(false);
+              switchBotSession(session);
+              return;
             }
             setNewSessionBotMode(false);
             openSession(session.id, session, { openTab: true });

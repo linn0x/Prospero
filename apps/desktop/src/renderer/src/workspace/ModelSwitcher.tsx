@@ -34,7 +34,7 @@ export function ModelSwitcher({ session, account }: { session: SessionInfo; acco
     if (!controls?.currentModel) return;
     setCatalog((previous) => previous ? { models: previous.models, currentModel: controls.currentModel!, ...(controls.currentEffort ? { currentEffort: controls.currentEffort } : {}) } : previous);
   }, [controls?.currentModel, controls?.currentEffort]);
-  const current = catalog?.currentModel || controls?.currentModel;
+  const current = catalog?.currentModel || controls?.currentModel || session.model;
   const model = catalog?.models.find((entry) => entry.id === modelId);
   const models = useMemo(() => catalog?.models.filter((entry) => `${entry.label} ${entry.id} ${entry.description ?? ""}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())).slice(0, 200) ?? [], [catalog, query]);
   const unavailable = !supported || session.status === "starting" || ["failed", "cancelled", "exited", "stopped"].includes(session.status);

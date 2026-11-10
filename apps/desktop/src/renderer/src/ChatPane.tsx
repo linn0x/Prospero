@@ -7,13 +7,14 @@ import { ConversationRail } from "./chat/ConversationRail";
 import { chatDisplayItems, historyEndForItem } from "./chat/display";
 import { useConversationFont } from "./chat/use-conversation-font";
 import { supportsTrajectory } from "./workspace/dock-state";
-import { isProsperoBotSession } from "./workspace/session-presentation";
+import { isProsperoBotSession, PROSPERO_BOT_SESSION_STORAGE_KEY, PROSPERO_BOT_TITLE } from "./workspace/session-presentation";
 import { createPortal } from "react-dom";
 import { notify } from "./notifications/notifications";
 import { ModelSwitcher } from "./workspace/ModelSwitcher";
+import { modelSwitchSupported } from "./workspace/model-catalog";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type UIEvent } from "react";
-import { Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, FolderKanban, ListChecks, Paperclip, Send, ShieldAlert, Sparkles, Target, Trash2, UserRound, X, Workflow } from "lucide-react";
-import type { AgentModeCatalog, AgentModel, DesktopSnapshot, JsonObject, SessionInfo, SkillSuggestion } from "../../shared/types";
+import { Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, FolderKanban, ListChecks, Paperclip, Send, Settings, ShieldAlert, Sparkles, Target, Trash2, UserRound, X, Workflow } from "lucide-react";
+import type { AgentModeCatalog, AgentModel, DesktopSnapshot, JsonObject, SessionCreateInput, SessionInfo, SkillSuggestion } from "../../shared/types";
 import { defaultSessionLaunchAccountId, sessionLaunchAccounts, sessionLaunchWorkspaces } from "../../shared/session-launch-options";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@/components/ui/attachment";
@@ -38,7 +39,7 @@ import { useLocale } from "./locale";
 import { terminalPlainText } from "./terminal-text";
 import { SourceSelector } from "./model-sources/SourceSelector";
 import { selectedSourceRoute, type SourceRuntimeAgent, type SourceSelection } from "./model-sources/source-state";
-import { useModelSources } from "./model-sources/use-model-sources";
+import { runModelSourceAction, useModelSources } from "./model-sources/use-model-sources";
 import {
   CHAT_TIMELINE_WINDOW_SIZE,
   MAX_CHAT_ATTACHMENT_BYTES,
@@ -495,6 +496,424 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
     </Dialog>
   </>;
 }
+
+function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onError }: { session: SessionInfo; account?: JsonObject | undefined; snapshot?: DesktopSnapshot | undefined; onSwitched?: ((session: SessionInfo) => void) | undefined; onError: (message: string) => void }) {
+  const { t } = useLocale();
+  const [open, setOpen] = useState(false);
+  const independentAccounts = useMemo(
+    () => (snapshot?.accounts ?? []).filter((item) => !item["modelSource"] && !item["apiProfile"] && !item["apiProfileError"]),
+    [snapshot?.accounts],
+  );
+  const initialUseSource = Boolean(account?.["modelSource"]);
+  const [useSource, setUseSource] = useState(initialUseSource);
+  const sourceState = useModelSources(open && useSource);
+  const initialAgent: ChildDispatchAgent =
+    ["codex", "claude", "opencode", "pi", "deepseek", "agy"].includes(session.agent)
+      ? (session.agent as ChildDispatchAgent)
+      : "codex";
+  const [agent, setAgent] = useState<ChildDispatchAgent>(initialAgent);
+  const sourceAgent: SourceRuntimeAgent =
+    agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi" ? agent : "codex";
+  const [workspace, setWorkspace] = useState(session.cwd);
+  const [accountId, setAccountId] = useState<string | undefined>(
+    session.accountId ?? defaultSessionLaunchAccountId(independentAccounts, initialAgent),
+  );
+  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
+  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
+  const [model, setModel] = useState<string | undefined>(
+    session.agentControls?.currentModel ?? session.model ?? (initialAgent === "codex" ? "gpt-6-astra" : undefined),
+  );
+  const [customModel, setCustomModel] = useState("");
+  const [effort, setEffort] = useState<string | undefined>(
+    session.agentControls?.currentEffort ?? session.effort,
+  );
+  const [selection, setSelection] = useState<SourceSelection>();
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const nextAgent: ChildDispatchAgent =
+      ["codex", "claude", "opencode", "pi", "deepseek", "agy"].includes(session.agent)
+        ? (session.agent as ChildDispatchAgent)
+        : "codex";
+    setAgent(nextAgent);
+    setUseSource(Boolean(account?.["modelSource"]));
+    setWorkspace(session.cwd);
+    setAccountId(session.accountId ?? defaultSessionLaunchAccountId(independentAccounts, nextAgent));
+    setModel(session.agentControls?.currentModel ?? session.model ?? (nextAgent === "codex" ? "gpt-6-astra" : undefined));
+    setCustomModel("");
+    setEffort(session.agentControls?.currentEffort ?? session.effort);
+  }, [account, independentAccounts, open, session.accountId, session.agent, session.agentControls?.currentEffort, session.agentControls?.currentModel, session.cwd, session.effort, session.model]);
+
+  const workspaces = useMemo(() => {
+    const list = snapshot ? sessionLaunchWorkspaces(snapshot) : [];
+    if (session.cwd && !list.some((item) => item.path === session.cwd)) {
+      const name = session.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? session.cwd;
+      return [{ path: session.cwd, label: name, detail: session.cwd, kind: "project" as const }, ...list];
+    }
+    return list;
+  }, [session.cwd, snapshot]);
+
+  const launchAccounts = useMemo(
+    () => sessionLaunchAccounts(independentAccounts, agent),
+    [agent, independentAccounts],
+  );
+
+  useEffect(() => {
+    if (!open || useSource) return;
+    if (!accountId || !launchAccounts.some((item) => item.id === accountId)) {
+      setAccountId(defaultSessionLaunchAccountId(independentAccounts, agent));
+    }
+  }, [accountId, agent, independentAccounts, launchAccounts, open, useSource]);
+
+  useEffect(() => {
+    if (!open || useSource || typeof window.prospero.getLaunchModels !== "function") {
+      setLaunchModels([]);
+      setLaunchModelsLoading(false);
+      return;
+    }
+    if (agent === "opencode") {
+      setLaunchModels([]);
+      return;
+    }
+    let cancelled = false;
+    setLaunchModelsLoading(true);
+    void window.prospero
+      .getLaunchModels(agent, accountId)
+      .then((catalog) => {
+        if (cancelled) return;
+        const astraPresent = catalog.models.some((item) => item.id === "gpt-6-astra");
+        const models =
+          agent === "codex" && !astraPresent
+            ? [
+                {
+                  id: "gpt-6-astra",
+                  label: "GPT-6-Astra",
+                  description: "Codex Astra model",
+                  isDefault: false,
+                  supportedEfforts: ["low", "medium", "high", "xhigh"],
+                  defaultEffort: "high",
+                },
+                ...catalog.models,
+              ]
+            : catalog.models;
+        setLaunchModels(models);
+        setModel((current) => {
+          const matched = models.find((item) => item.id === current);
+          const fallback =
+            matched ??
+            (agent === "codex" ? models.find((item) => item.id === "gpt-6-astra") : undefined) ??
+            models.find((item) => item.id === catalog.currentModel) ??
+            models.find((item) => item.isDefault) ??
+            models[0];
+          setEffort((currentEffort) =>
+            currentEffort && fallback?.supportedEfforts.includes(currentEffort)
+              ? currentEffort
+              : fallback?.defaultEffort ?? fallback?.supportedEfforts[0],
+          );
+          return fallback?.id;
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setLaunchModels([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLaunchModelsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, agent, open, useSource]);
+
+  const choice = selectedSourceRoute(sourceState.sources, selection, sourceAgent);
+  const selectedLaunchModel = launchModels.find((item) => item.id === model);
+  const effectiveModel = customModel.trim() || model;
+  const canApply = Boolean(
+    !busy &&
+      workspace &&
+      (useSource ? choice && selection : agent === "opencode" || launchAccounts.length > 0 || Boolean(effectiveModel)),
+  );
+
+  const applyConfig = async (): Promise<void> => {
+    if (!canApply) return;
+    setBusy(true);
+    try {
+      const sameHarnessAndWorkspace =
+        !useSource &&
+        agent === session.agent &&
+        (accountId ?? undefined) === (session.accountId ?? undefined) &&
+        workspace === session.cwd;
+      if (sameHarnessAndWorkspace && effectiveModel && modelSwitchSupported(session, account)) {
+        await window.prospero.setAgentModel(session.id, effectiveModel, effort);
+        onSwitched?.({
+          ...session,
+          model: effectiveModel,
+          ...(effort ? { effort } : {}),
+          agentControls: session.agentControls
+            ? {
+                ...session.agentControls,
+                currentModel: effectiveModel,
+                ...(effort ? { currentEffort: effort } : {}),
+              }
+            : {
+                compact: true,
+                model: true,
+                mode: true,
+                currentModel: effectiveModel,
+                ...(effort ? { currentEffort: effort } : {}),
+              },
+        });
+        setOpen(false);
+        return;
+      }
+
+      let created: SessionInfo;
+      if (useSource) {
+        if (!choice || !selection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
+        const bound = await runModelSourceAction({
+          kind: "bind",
+          sourceId: choice.source.id,
+          routeId: choice.route.id,
+          revision: choice.source.revision,
+          agent: sourceAgent,
+        });
+        if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
+        const routeEfforts =
+          choice.route.protocol !== "openai_chat_completions"
+            ? (choice.route.modelCapabilities?.supportedEfforts ?? [])
+            : [];
+        const sessionEffort =
+          (effort && routeEfforts.includes(effort as never) ? effort : undefined) ??
+          choice.route.defaultEffort;
+        created = await window.prospero.createSession({
+          cwd: workspace || session.cwd,
+          agent: sourceAgent,
+          accountId: bound.accountId,
+          kind: "structured",
+          approvalPolicy: "yolo",
+          ...(sessionEffort ? { effort: sessionEffort as SessionCreateInput["effort"] } : {}),
+        });
+      } else {
+        created = await window.prospero.createSession({
+          cwd: workspace || session.cwd,
+          agent,
+          kind: "structured",
+          approvalPolicy: "yolo",
+          ...(accountId ? { accountId } : {}),
+          ...(effectiveModel ? { model: effectiveModel } : {}),
+          ...(effort ? { effort: effort as SessionCreateInput["effort"] } : {}),
+        });
+      }
+      await window.prospero.renameSession(created.id, PROSPERO_BOT_TITLE).catch(() => undefined);
+      try {
+        localStorage.setItem(PROSPERO_BOT_SESSION_STORAGE_KEY, created.id);
+      } catch {}
+      const named: SessionInfo = {
+        ...created,
+        title: PROSPERO_BOT_TITLE,
+        displayTitle: PROSPERO_BOT_TITLE,
+        ...(effectiveModel && !useSource ? { model: effectiveModel } : {}),
+        ...(effort ? { effort } : {}),
+      };
+      onSwitched?.(named);
+      setOpen(false);
+    } catch (reason) {
+      onError(reportError(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <>
+    <Button variant="outline" size="sm" onClick={() => setOpen(true)} data-testid="master-harness-config-button">
+      <Settings data-icon="inline-start" />
+      {t("修改模型 / Harness", "Model & Harness")}
+    </Button>
+    <Dialog open={open} onOpenChange={(next) => { if (!busy) setOpen(next); }}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{t("配置主会话 Harness 与模型", "Configure Master Session Harness & Model")}</DialogTitle>
+          <DialogDescription>
+            {t(
+              "自定义 Prospero Bot 主会话使用的 Harness（Codex / Claude / OpenCode / Pi / DeepSeek / AGY）、账号或外部模型源、模型（如 gpt-6-astra）及推理强度。",
+              "Customize the Harness (Codex / Claude / OpenCode / Pi / DeepSeek / AGY), account or external model source, model (e.g. gpt-6-astra), and reasoning effort for the Prospero Bot Master Session.",
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          {workspaces.length > 0 && (
+            <div className="grid gap-1.5">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-workspace">
+                {t("主会话统筹工作区", "Master Session Workspace")}
+              </label>
+              <NativeSelect
+                id="master-config-workspace"
+                value={workspace}
+                disabled={busy}
+                aria-label={t("主会话统筹工作区", "Master Session Workspace")}
+                onChange={(event) => setWorkspace(event.target.value)}
+              >
+                {workspaces.map((item) => (
+                  <NativeSelectOption key={item.path} value={item.path}>
+                    {item.label} ({item.detail})
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </div>
+          )}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">
+              {t("配置来源", "Configuration Source")}
+            </span>
+            <ToggleGroup
+              value={[useSource ? "source" : "account"]}
+              onValueChange={(values) => {
+                if (values[0] === "account") setUseSource(false);
+                if (values[0] === "source") setUseSource(true);
+              }}
+              variant="outline"
+              size="sm"
+            >
+              <ToggleGroupItem value="account">{t("订阅 / 账号", "Account / Subscription")}</ToggleGroupItem>
+              <ToggleGroupItem value="source">{t("外部模型源", "External Model Source")}</ToggleGroupItem>
+            </ToggleGroup>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="grid gap-1.5">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-harness">
+                {t("Harness (Agent 运行时)", "Harness (Agent Runtime)")}
+              </label>
+              <NativeSelect
+                id="master-config-harness"
+                value={useSource ? sourceAgent : agent}
+                disabled={busy}
+                aria-label={t("Harness (Agent 运行时)", "Harness (Agent Runtime)")}
+                onChange={(event) => {
+                  const next = event.target.value as ChildDispatchAgent;
+                  setAgent(next);
+                  if (!useSource) {
+                    setAccountId(defaultSessionLaunchAccountId(independentAccounts, next));
+                    setModel(next === "codex" ? "gpt-6-astra" : undefined);
+                  }
+                }}
+              >
+                <NativeSelectOption value="codex">Codex</NativeSelectOption>
+                <NativeSelectOption value="claude">Claude Code</NativeSelectOption>
+                <NativeSelectOption value="opencode">OpenCode</NativeSelectOption>
+                <NativeSelectOption value="pi">Pi</NativeSelectOption>
+                {!useSource && <NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption>}
+                {!useSource && <NativeSelectOption value="agy">AGY</NativeSelectOption>}
+              </NativeSelect>
+            </div>
+            {!useSource && launchAccounts.length > 0 && (
+              <div className="grid gap-1.5">
+                <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-account">
+                  {t("订阅 / 账号", "Subscription / Account")}
+                </label>
+                <NativeSelect
+                  id="master-config-account"
+                  value={accountId ?? ""}
+                  disabled={busy}
+                  aria-label={t("订阅 / 账号", "Subscription / Account")}
+                  onChange={(event) => setAccountId(event.target.value || undefined)}
+                >
+                  {launchAccounts.map((item) => (
+                    <NativeSelectOption key={item.id} value={item.id}>
+                      {item.name}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              </div>
+            )}
+          </div>
+          {useSource ? (
+            <SourceSelector
+              sources={sourceState.sources}
+              loading={sourceState.loading}
+              error={sourceState.error}
+              value={selection}
+              agent={sourceAgent}
+              onChange={setSelection}
+              onRefresh={() => void sourceState.refresh()}
+              disabled={busy}
+            />
+          ) : (
+            <div className="grid gap-3">
+              {launchModels.length > 0 && (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-1.5">
+                    <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-model">
+                      {t("模型", "Model")}
+                    </label>
+                    <NativeSelect
+                      id="master-config-model"
+                      value={model ?? ""}
+                      disabled={busy || launchModelsLoading}
+                      aria-label={t("模型", "Model")}
+                      onChange={(event) => {
+                        const nextModel = launchModels.find((item) => item.id === event.target.value);
+                        setModel(nextModel?.id ?? event.target.value);
+                        setCustomModel("");
+                        setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
+                      }}
+                    >
+                      {launchModels.map((item) => (
+                        <NativeSelectOption key={item.id} value={item.id}>
+                          {item.label} ({item.id})
+                        </NativeSelectOption>
+                      ))}
+                    </NativeSelect>
+                  </div>
+                  {Boolean(selectedLaunchModel?.supportedEfforts.length) && (
+                    <div className="grid gap-1.5">
+                      <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-effort">
+                        {t("推理强度", "Reasoning Effort")}
+                      </label>
+                      <NativeSelect
+                        id="master-config-effort"
+                        value={effort ?? ""}
+                        disabled={busy}
+                        aria-label={t("推理强度", "Reasoning Effort")}
+                        onChange={(event) => setEffort(event.target.value || undefined)}
+                      >
+                        {selectedLaunchModel?.supportedEfforts.map((level) => (
+                          <NativeSelectOption key={level} value={level}>
+                            {level}
+                          </NativeSelectOption>
+                        ))}
+                      </NativeSelect>
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="grid gap-1.5">
+                <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-custom-model">
+                  {t("自定义模型 ID（可选，如 gpt-6-astra / gpt-daybreak-blue-latest）", "Custom Model ID (optional, e.g. gpt-6-astra / gpt-daybreak-blue-latest)")}
+                </label>
+                <Input
+                  id="master-config-custom-model"
+                  value={customModel}
+                  disabled={busy}
+                  placeholder={model ?? "gpt-6-astra"}
+                  onChange={(event) => setCustomModel(event.target.value)}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => setOpen(false)}>
+            {t("取消", "Cancel")}
+          </Button>
+          <Button disabled={!canApply} onClick={() => void applyConfig()}>
+            {busy && <Spinner data-icon="inline-start" />}
+            {t("应用到主会话", "Apply to Master Session")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  </>;
+}
 const EventCardBody = memo(function EventCardBody(props: EventProps) {
   const { event, isResolved, sessionId, onError, openOutput, openSubagent, onOpenSession, projectRoot } = props;
   const { t, status } = useLocale();
@@ -555,7 +974,7 @@ async function fileToAttachment(file: File): Promise<PendingAttachment> {
   return { id: crypto.randomUUID(), name: file.name, mimeType: file.type, size: file.size, dataB64: btoa(binary) };
 }
 
-export function ChatPane({ session, account, snapshot, onOpenSession, onOpenGoal, trajectoryHost, onMissingSession }: { session: SessionInfo; account?: JsonObject | undefined; snapshot?: DesktopSnapshot | undefined; onOpenSession?: ((id: string) => void) | undefined; onOpenGoal?: (() => void) | undefined; trajectoryHost?: HTMLDivElement | null; onMissingSession?: (id: string) => void }) {
+export function ChatPane({ session, account, snapshot, onOpenSession, onSwitchBotSession, onOpenGoal, trajectoryHost, onMissingSession }: { session: SessionInfo; account?: JsonObject | undefined; snapshot?: DesktopSnapshot | undefined; onOpenSession?: ((id: string) => void) | undefined; onSwitchBotSession?: ((session: SessionInfo) => void) | undefined; onOpenGoal?: (() => void) | undefined; trajectoryHost?: HTMLDivElement | null; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const [composerOptionsOpen, setComposerOptionsOpen] = useState(false);
   const composerOptionsId = useId();
@@ -861,6 +1280,46 @@ export function ChatPane({ session, account, snapshot, onOpenSession, onOpenGoal
   };
   return <div className="chat-pane flex size-full min-h-0 flex-col bg-background" style={{ "--conversation-font-size": `${fontSize}px` } as CSSProperties}>
     {bodyDetail?.sessionId === session.id && <TimelineBodyDialog key={`${session.id}:${bodyDetail.id}`} sessionId={session.id} recordId={bodyDetail.id} title={bodyDetail.title} onClose={() => setBodyDetail(undefined)} />}
+    {isProsperoBotSession(session) && (
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/25 px-4 py-2" data-testid="master-session-config-bar">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="flex items-center gap-1.5 font-medium text-foreground">
+            <Sparkles className="size-3.5 text-primary" />
+            {t("Prospero Bot · 主会话", "Prospero Bot · Master Session")}
+          </span>
+          <Badge variant="secondary">Harness: {session.agent}</Badge>
+          <Badge variant="outline">
+            {session.agentControls?.currentModel ?? session.model ?? "gpt-6-astra"}
+            {(session.agentControls?.currentEffort ?? session.effort)
+              ? ` · ${session.agentControls?.currentEffort ?? session.effort}`
+              : ""}
+          </Badge>
+          {account && (
+            <Badge variant="outline">
+              {text(account["name"], session.accountId)}
+            </Badge>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <ModelSwitcher key={`${session.id}:header`} session={session} account={account} />
+          <MasterHarnessConfigDialog
+            session={session}
+            account={account}
+            snapshot={snapshot}
+            onSwitched={onSwitchBotSession}
+            onError={setOperationError}
+          />
+          <CrossModelChildLauncher
+            session={session}
+            snapshot={snapshot}
+            onCreated={(id, jump) => {
+              if (jump) onOpenSession?.(id);
+            }}
+            onError={setOperationError}
+          />
+        </div>
+      </div>
+    )}
     {paged.enabled && <div className="flex flex-wrap items-center justify-center gap-2 px-6 py-2" aria-label={t("会话历史分页", "Conversation history pages")}>
       {paged.state.page?.older && <Button variant="outline" size="sm" disabled={paged.state.loading} onClick={() => void paged.controller.older()}>{t("查看更早记录", "Older records")}</Button>}
       {paged.state.page?.newer && <Button variant="outline" size="sm" disabled={paged.state.loading} onClick={() => void paged.controller.newer()}>{t("查看较新记录", "Newer records")}</Button>}
@@ -872,7 +1331,7 @@ export function ChatPane({ session, account, snapshot, onOpenSession, onOpenGoal
     <MessageScrollerProvider autoScroll={historyCursor === null && (!paged.enabled || paged.state.live)}><MessageScroller><ConversationRail points={navigationPoints} pendingKey={pendingJumpKey} revision={visibleItems.map((item) => item.key).join("|")} onJumped={jumpCompleted} onJump={(key) => { selectHistoryCursor({ end: historyEndForItem(displayItems, key, timeline.nextOrdinal, CHAT_TIMELINE_WINDOW_SIZE), mode: "page" }); setPendingJumpKey(key); }} /><MessageScrollerViewport ref={timelineViewport} onScroll={handleTimelineScroll} aria-label={t("会话消息时间线", "Conversation message timeline")}><MessageScrollerContent className="mx-auto w-full max-w-4xl px-6 py-8">{!displayItems.length && (isProsperoBotSession(session) ? <Empty className="my-auto"><EmptyHeader><EmptyMedia variant="icon"><Sparkles /></EmptyMedia><EmptyTitle>{t("Prospero Bot · 全局主会话", "Prospero Bot · Master Session")}</EmptyTitle><EmptyDescription>{t("像 Grokbot 主对话一样统筹全局：直接发消息让 Prospero Bot 给任意工作区派发子会话、跟进进度并汇总结果，或点击下方「派发工作区会话」手动派发。", "Coordinate across all workspaces like a master chat: ask Prospero Bot to dispatch child sessions to any workspace and synthesize results, or click Dispatch Workspace Session below.")}</EmptyDescription></EmptyHeader>{(snapshot?.projects.length ?? 0) > 0 && <div className="mt-2 flex flex-wrap justify-center gap-2">{snapshot!.projects.slice(0, 6).map((project) => { const name = snapshot!.projectAliases[project.toLocaleLowerCase()] || project.split(/[\\/]/).filter(Boolean).at(-1) || project; return <Button key={project} variant="outline" size="sm" onClick={() => setDraft(t(`请在工作区 ${project} (${name}) 派发一个子会话，任务是：`, `Dispatch a child session in workspace ${project} (${name}) to: `))}><FolderKanban data-icon="inline-start" />{name}</Button>; })}</div>}</Empty> : <Empty className="my-auto"><EmptyHeader><EmptyMedia variant="icon"><Bot /></EmptyMedia><EmptyTitle>{`${t("开始与", "Start collaborating with")} ${session.agent}`}</EmptyTitle><EmptyDescription>{t("消息、工具调用、审批、提问和子 Agent 过程会按时间线显示在这里。", "Messages, tool calls, approvals, questions, and subagent activity appear here in a timeline.")}</EmptyDescription></EmptyHeader></Empty>)}{historyWindow.start > 0 && <div className="flex justify-center"><Button variant="outline" size="sm" onClick={() => selectHistoryCursor({ end: historyWindow.cursorStart, mode: "page" })}><ChevronDown className="rotate-180" data-icon="inline-start" />{t(`查看更早的 ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} 条记录`, `View ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} earlier events`)}</Button></div>}{visibleItems.map((item) => { const kind = text(item.event.kind); const isResolved = kind === "permission.request" ? hasChatResolution(timeline.resolutions, "permission.resolved", text(item.event.reqId)) : kind === "question.request" ? hasChatResolution(timeline.resolutions, "question.resolved", text(item.event.reqId)) : false; return <TimelineItem key={item.key} item={item} isResolved={isResolved} sessionId={session.id} projectRoot={session.cwd} onError={setOperationError} openOutput={openOutput} openSubagent={openSubagent} onOpenSession={onOpenSession} />; })}{!historyWindow.isLatest && <div className="flex flex-wrap items-center justify-center gap-2 rounded-lg border bg-muted/40 p-3 text-sm text-muted-foreground"><span>{t(`当前显示 ${String(historyWindow.start + 1)}–${String(historyWindow.end)}，另有 ${String(historyWindow.newerCount)} 条较新记录`, `Showing ${String(historyWindow.start + 1)}–${String(historyWindow.end)} with ${String(historyWindow.newerCount)} newer events`)}</span><Button variant="outline" size="sm" onClick={() => { const nextEnd = Math.min(displayItems.length, historyWindow.end + CHAT_TIMELINE_WINDOW_SIZE); if (nextEnd >= displayItems.length) jumpToLatest(); else selectHistoryCursor({ end: displayItems[nextEnd]?.ordinal ?? timeline.nextOrdinal, mode: "page" }); }}>{t("查看较新记录", "View newer events")}<ChevronDown data-icon="inline-end" /></Button><Button size="sm" onClick={jumpToLatest}>{t("回到最新", "Jump to latest")}</Button></div>}</MessageScrollerContent></MessageScrollerViewport><MessageScrollerButton onClick={jumpToLatest} /></MessageScroller></MessageScrollerProvider>
     <div className="chat-composer-shell"><div className="chat-composer-inner flex flex-col gap-2">{connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}{operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}{messageQueue.length > 0 && <section className="grid gap-2 rounded-xl border bg-muted/35 p-3" aria-label={t("待发送消息", "Queued messages")} aria-live="polite"><header className="flex flex-wrap items-center justify-between gap-2"><strong className="flex items-center gap-2 text-sm"><Clock3 className="size-4" />{t("待发送", "Queued")} · {messageQueue.length}</strong><span className="text-xs text-muted-foreground">{t("当前轮结束后依次发送", "Sent in order after the current turn")}</span></header><div className="grid max-h-52 gap-1.5 overflow-y-auto">{messageQueue.map((item) => <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background/80 px-2.5 py-2" key={item.id}><Badge variant="outline">{item.kind === "guide" ? t("引导", "Guide") : t("排队", "Queue")}</Badge><span className="min-w-0 flex-1 truncate text-sm" title={item.text}>{item.text || t(`${String(item.attachmentCount)} 张图片`, `${String(item.attachmentCount)} images`)}</span>{item.attachmentCount > 0 && <span className="flex items-center gap-1 text-xs text-muted-foreground"><FileImage className="size-3.5" />{item.attachmentCount}</span>}{item.kind !== "guide" && <Button variant="ghost" size="xs" aria-busy={queueBusy[item.id] === "guide"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "guide")}>{queueBusy[item.id] === "guide" ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{t("现在引导", "Guide now")}</Button>}<Button variant="ghost" size="icon-xs" aria-label={t("取消待发送消息", "Cancel queued message")} aria-busy={queueBusy[item.id] === "remove"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "remove")}>{queueBusy[item.id] === "remove" ? <Spinner /> : <Trash2 />}</Button></div>)}</div></section>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t(`图片 · ${(item.size / 1024 / 1024).toFixed(1)} MB · 等待发送`, `Image · ${(item.size / 1024 / 1024).toFixed(1)} MB · waiting to send`)}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
       {attachmentProgress && <div className="flex items-center gap-2 text-xs text-muted-foreground" role="status"><Spinner />{t(`正在处理图片 ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`, `Processing image ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`)}</div>}
-      <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}><CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) onOpenSession?.(id); }} onError={setOperationError} />{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={isProsperoBotSession(session) ? t("向 Prospero Bot 发送全局指令，如“在某工作区派发会话完成某任务”…", "Ask Prospero Bot to dispatch tasks to any workspace…") : t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} />{isProsperoBotSession(session) && !composerOptionsOpen && <CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) onOpenSession?.(id); }} onError={setOperationError} />}<Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}<ChevronDown /></Button>{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张，单张 5 MB / 共 10 MB", "Enter to send · Shift + Enter for a new line · Up to 6 images, 5 MB each / 10 MB total")}</p></div></div>
+      <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}><CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) onOpenSession?.(id); }} onError={setOperationError} />{isProsperoBotSession(session) && <MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} />}{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={isProsperoBotSession(session) ? t("向 Prospero Bot 发送全局指令，如“在某工作区派发会话完成某任务”…", "Ask Prospero Bot to dispatch tasks to any workspace…") : t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} />{isProsperoBotSession(session) && !composerOptionsOpen && <><MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} /><CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) onOpenSession?.(id); }} onError={setOperationError} /></>}<Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}<ChevronDown /></Button>{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张，单张 5 MB / 共 10 MB", "Enter to send · Shift + Enter for a new line · Up to 6 images, 5 MB each / 10 MB total")}</p></div></div>
     <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open) closeDetail(); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{detail?.title}</DialogTitle><DialogDescription>{t("可选择部分内容，或复制全部已显示内容。", "Select part of the output, or copy all displayed content.")}</DialogDescription></DialogHeader>{detail?.loading ? <div className="flex items-center justify-center gap-2 py-16 text-muted-foreground"><Spinner />{t("正在读取…", "Loading…")}</div> : <>{detail?.truncated && <Alert><CircleAlert /><AlertTitle>{t("输出已截断", "Output truncated")}</AlertTitle><AlertDescription>{t("daemon 仅保留了这次工具输出的前 200,000 个字符。", "The daemon retained only the first 200,000 characters of this tool output.")}</AlertDescription></Alert>}<pre className="terminal-output-text max-h-[60vh] overflow-auto rounded-lg bg-muted p-4 text-xs leading-relaxed">{detail?.content}</pre></>}<DialogFooter>{detail?.content && <Button variant="outline" onClick={() => void window.prospero.writeClipboard(detail.content)}><Copy data-icon="inline-start" />{t("复制", "Copy")}</Button>}<Button variant="outline" onClick={closeDetail}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }
