@@ -16,6 +16,57 @@ import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } fro
 const ATTACHMENT_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const BASE64_RE = /^[A-Za-z0-9+/=]+$/;
 const PROJECT_IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".ico": "image/x-icon", ".bmp": "image/bmp", ".svg": "image/svg+xml" };
+const ACTIVE_SESSION_PAGE_LIMIT = 100;
+export const ACTIVE_SESSION_WINDOW_LIMIT = 500;
+
+async function readActiveSessionWindow(
+  client: RustConnection["client"],
+  signal: AbortSignal,
+): Promise<{ items: SessionHead[]; latestSeq: number }> {
+  const first = await client.sidebarSessions(
+    { limit: ACTIVE_SESSION_PAGE_LIMIT, cursor: null, lifecycle: "active", workspace: null, text: null },
+    signal,
+  );
+  if (!first.nextCursor || first.items.length >= ACTIVE_SESSION_WINDOW_LIMIT) {
+    return first;
+  }
+  const items: SessionHead[] = [];
+  const seenIds = new Set<string>();
+  for (const head of first.items) {
+    if (!seenIds.has(head.id)) {
+      seenIds.add(head.id);
+      items.push(head);
+    }
+  }
+  let latestSeq = first.latestSeq;
+  let cursor: string | null | undefined = first.nextCursor;
+  const seenCursors = new Set<string>();
+  while (cursor && items.length < ACTIVE_SESSION_WINDOW_LIMIT && !seenCursors.has(cursor)) {
+    seenCursors.add(cursor);
+    const remaining = ACTIVE_SESSION_WINDOW_LIMIT - items.length;
+    const page = await client.sidebarSessions(
+      {
+        limit: Math.min(ACTIVE_SESSION_PAGE_LIMIT, remaining),
+        cursor,
+        lifecycle: "active",
+        workspace: null,
+        text: null,
+      },
+      signal,
+    );
+    latestSeq = Math.min(latestSeq, page.latestSeq);
+    if (!page.items.length) break;
+    for (const head of page.items) {
+      if (!seenIds.has(head.id)) {
+        seenIds.add(head.id);
+        items.push(head);
+        if (items.length >= ACTIVE_SESSION_WINDOW_LIMIT) break;
+      }
+    }
+    cursor = page.nextCursor;
+  }
+  return { items, latestSeq };
+}
 
 
 function requireRelativePath(raw: unknown, allowRoot = false): string {
@@ -339,6 +390,8 @@ export class RustRuntime {
   private starting: Promise<{ ok: boolean; error?: string }> | undefined;
   private stopping: Promise<{ ok: boolean; error?: string }> | undefined;
   private refreshing: Promise<void> | undefined;
+  private queuedRefresh: Promise<void> | undefined;
+  private queuedFullForce = false;
   private sequence = 0;
   private orchestrationSequence = 0;
   private orchestrationWindow: JsonObject = {};
@@ -451,13 +504,29 @@ export class RustRuntime {
     return this.connection;
   }
 
-  private refresh(force = false): Promise<void> {
-    if (this.refreshing) return force ? this.refreshing.then(() => this.refresh(true)) : this.refreshing;
-    this.refreshing = this.readWindow(force).finally(() => { this.refreshing = undefined; });
+  private refresh(force = false, options?: { tabsOnly?: boolean }): Promise<void> {
+    const tabsOnly = force && options?.tabsOnly === true;
+    if (this.refreshing) {
+      if (!force) return this.queuedRefresh ?? this.refreshing;
+      if (!tabsOnly) this.queuedFullForce = true;
+      if (!this.queuedRefresh) {
+        const current = this.refreshing;
+        const runQueued = (): Promise<void> => {
+          const fullForce = this.queuedFullForce;
+          this.queuedFullForce = false;
+          this.queuedRefresh = undefined;
+          if (this.controller.signal.aborted || !this.connection) return Promise.resolve();
+          return this.refresh(true, { tabsOnly: !fullForce });
+        };
+        this.queuedRefresh = current.then(runQueued, runQueued);
+      }
+      return this.queuedRefresh;
+    }
+    this.refreshing = this.readWindow(force, tabsOnly).finally(() => { this.refreshing = undefined; });
     return this.refreshing;
   }
 
-  private async readWindow(force = false): Promise<void> {
+  private async readWindow(force = false, tabsOnly = false): Promise<void> {
     const { client, pid, baseUrl } = this.current();
     const connection = `${pid}:${baseUrl}`;
     if (this.orchestrationConnection !== connection) {
@@ -473,20 +542,27 @@ export class RustRuntime {
     }
     const signal = this.controller.signal;
     const now = Date.now();
-    const refreshSlowMetadata = force
+    const fullForce = force && !tabsOnly;
+    const refreshSlowMetadata = fullForce
       || !this.cachedHealth
       || !this.cachedDevices
       || !this.cachedSchedules
       || now - this.slowMetadataReadAt >= 5_000;
-    const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
+    const skipOrchestrationProbe = tabsOnly
+      && this.orchestrationReady
+      && !this.orchestrationRetryPending
+      && now - this.orchestrationReadAt < 2_000;
+    const orchCursor = skipOrchestrationProbe
+      ? { latestSeq: this.orchestrationSequence, resyncRequired: false }
+      : await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
     // Runtime observations can change without a graph event, so even identical
     // revisions are reused for at most two seconds during active refreshes.
-    const refreshOrchestration = Boolean(orchCursor && (force || !this.orchestrationReady
+    const refreshOrchestration = Boolean(orchCursor && (fullForce || !this.orchestrationReady
       || this.orchestrationRetryPending || orchCursor.resyncRequired
       || orchCursor.latestSeq !== this.orchestrationSequence || now - this.orchestrationReadAt >= 2_000));
     const [summary, active, recent, workspaces, workspaceTabs, health, devices, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
-      client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
+      readActiveSessionWindow(client, signal),
       client.sidebarSessions({ limit: 100, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       (typeof client.workspaceTabs === "function" ? client.workspaceTabs(signal) : Promise.resolve({ items: [], latestSeq: 0 })).catch(() => ({ items: [], latestSeq: 0 })),
@@ -569,7 +645,7 @@ export class RustRuntime {
           revision: item.revision,
         }])),
       } : {}),
-      sessionSummary: { total: summary.total, active: summary.active, terminal: summary.archived, attention: summary.attention, activeLimit: 100, attentionLimit: 0, recentTerminalLimit: 100 },
+      sessionSummary: { total: summary.total, active: summary.active, terminal: summary.archived, attention: summary.attention, activeLimit: ACTIVE_SESSION_WINDOW_LIMIT, attentionLimit: 0, recentTerminalLimit: 100 },
       schedules: schedules as unknown as JsonObject[],
     } });
   }
@@ -672,7 +748,7 @@ export class RustRuntime {
         ...(input.activeSessionId ? { activeSessionId: input.activeSessionId } : {}),
         ...(input.splitSessionId ? { splitSessionId: input.splitSessionId } : {}),
       }, this.controller.signal);
-      await this.refresh(true);
+      await this.refresh(true, { tabsOnly: true });
     }
     return this.store.snapshot();
   }

@@ -11,6 +11,72 @@ const PROJECTED_TASK_LIMIT = 2_000;
 const PROJECTED_DISPATCH_LIMIT = 2_000;
 const PROJECTED_GATE_LIMIT = 1_000;
 const PROJECTED_WORKTREE_LIMIT = 1_000;
+export const ORCHESTRATION_FETCH_CONCURRENCY = 6;
+export const ORCHESTRATION_RUN_CACHE_LIMIT = 256;
+const ACTIVE_RUN_CACHE_TTL_MS = 5_000;
+const TERMINAL_RUN_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "canceled",
+  "stopped",
+  "abandoned",
+  "done",
+]);
+
+type RunTask = Awaited<ReturnType<RustClient["listTasks"]>>[number] & { runtime?: JsonObject };
+type HydratedRunSlice = {
+  signature: string;
+  terminal: boolean;
+  cachedAt: number;
+  tasks: RunTask[];
+  dispatches: Awaited<ReturnType<RustClient["listDispatches"]>>;
+  gates: Awaited<ReturnType<RustClient["listGates"]>>;
+  worktreeAssets: Awaited<ReturnType<RustClient["listWorktreeAssets"]>>;
+};
+
+const runHydrationCacheByClient = new WeakMap<object, Map<string, HydratedRunSlice>>();
+
+function isTerminalRunStatus(status: string): boolean {
+  return TERMINAL_RUN_STATUSES.has(status);
+}
+
+function runCacheSignature(run: { id: string; status: string; updatedAt: number } & Record<string, unknown>): string {
+  return `${run.id}\0${run.status}\0${String(run.updatedAt ?? "")}\0${String(run["graphRevision"] ?? "")}`;
+}
+
+function getClientRunCache(client: RustClient): Map<string, HydratedRunSlice> {
+  let cache = runHydrationCacheByClient.get(client);
+  if (!cache) {
+    cache = new Map<string, HydratedRunSlice>();
+    runHydrationCacheByClient.set(client, cache);
+  }
+  return cache;
+}
+
+function readCachedRunSlice(
+  cache: Map<string, HydratedRunSlice>,
+  run: { id: string; status: string; updatedAt: number } & Record<string, unknown>,
+  now: number,
+): HydratedRunSlice | undefined {
+  const cached = cache.get(run.id);
+  if (!cached) return undefined;
+  if (cached.signature !== runCacheSignature(run)) return undefined;
+  if (!cached.terminal && now - cached.cachedAt > ACTIVE_RUN_CACHE_TTL_MS) return undefined;
+  cache.delete(run.id);
+  cache.set(run.id, cached);
+  return cached;
+}
+
+function writeCachedRunSlice(cache: Map<string, HydratedRunSlice>, runId: string, slice: HydratedRunSlice): void {
+  cache.delete(runId);
+  cache.set(runId, slice);
+  while (cache.size > ORCHESTRATION_RUN_CACHE_LIMIT) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
 
 function record(value: unknown): JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -47,15 +113,76 @@ function prioritizedRuns<T extends { id: string; status: string; createdAt: numb
   });
 }
 
-async function appendRunItems<T>(
-  output: T[],
-  limit: number,
-  runId: string,
-  load: (runId: string) => Promise<T[]>,
-): Promise<void> {
-  if (output.length >= limit) return;
-  const items = await load(runId).catch((): T[] => []);
-  output.push(...items.slice(0, Math.max(0, limit - output.length)));
+async function hydrateRunSlice(
+  client: RustClient,
+  run: Awaited<ReturnType<RustClient["listRuns"]>>[number],
+  signal: AbortSignal,
+): Promise<{ slice: HydratedRunSlice; cacheable: boolean }> {
+  signal.throwIfAborted();
+  let hadError = false;
+  const safeLoad = async <T>(loader: () => Promise<T[]>): Promise<T[]> => {
+    try {
+      return await loader();
+    } catch (error) {
+      signal.throwIfAborted();
+      hadError = true;
+      void error;
+      return [];
+    }
+  };
+  const [rawTasks, dispatches, gates, worktreeAssets] = await Promise.all([
+    safeLoad(() => client.listTasks(run.id, signal)),
+    safeLoad(() => client.listDispatches(run.id, signal)),
+    safeLoad(() => client.listGates(run.id, signal)),
+    safeLoad(() => client.listWorktreeAssets(run.id, signal)),
+  ]);
+  const runtimeByTask = new Map<string, JsonObject>();
+  if (rawTasks.length > 0 && typeof client.taskActivities === "function") {
+    const pages: Array<typeof rawTasks> = [];
+    for (let offset = 0; offset < rawTasks.length; offset += 200) {
+      pages.push(rawTasks.slice(offset, offset + 200));
+    }
+    await Promise.all(
+      pages.map(async page => {
+        try {
+          const activity = await client.taskActivities(run.id, page.map(task => task.id), signal);
+          for (const item of activity.activities) {
+            runtimeByTask.set(item.task.id, {
+              execution: item.execution,
+              latestOperation: item.latestOperation,
+              structuredError: item.structuredError,
+              reservedResources: item.reservedResources,
+              quarantinedResources: item.quarantinedResources,
+              executionUnknown: item.executionUnknown,
+              observedAt: item.observedAt,
+            });
+          }
+        } catch (error) {
+          signal.throwIfAborted();
+          hadError = true;
+          const message = error instanceof Error ? error.message : String(error);
+          for (const task of page) runtimeByTask.set(task.id, { observationError: message });
+        }
+      }),
+    );
+  }
+  const tasks: RunTask[] = rawTasks.map(task => {
+    const runtime = runtimeByTask.get(task.id);
+    return runtime !== undefined ? { ...task, runtime } : { ...task };
+  });
+  const recordRun = run as typeof run & Record<string, unknown>;
+  return {
+    cacheable: !hadError,
+    slice: {
+      signature: runCacheSignature(recordRun),
+      terminal: isTerminalRunStatus(run.status),
+      cachedAt: Date.now(),
+      tasks,
+      dispatches,
+      gates,
+      worktreeAssets,
+    },
+  };
 }
 
 /**
@@ -71,41 +198,59 @@ export async function readOrchestrationWindow(
 ): Promise<JsonObject> {
   const runs = await client.listRuns(signal);
   const projectedRuns = prioritizedRuns(runs).slice(0, PROJECTED_RUN_LIMIT);
-  const tasks: Awaited<ReturnType<RustClient["listTasks"]>> = [];
+  const cache = getClientRunCache(client);
+  const now = Date.now();
+  const slices = new Array<HydratedRunSlice>(projectedRuns.length);
+  const uncachedIndices: number[] = [];
+
+  for (let index = 0; index < projectedRuns.length; index += 1) {
+    const run = projectedRuns[index]!;
+    const cached = readCachedRunSlice(cache, run as typeof run & Record<string, unknown>, now);
+    if (cached) slices[index] = cached;
+    else uncachedIndices.push(index);
+  }
+
+  if (uncachedIndices.length > 0) {
+    let cursor = 0;
+    const workerCount = Math.min(ORCHESTRATION_FETCH_CONCURRENCY, uncachedIndices.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (cursor < uncachedIndices.length) {
+          signal.throwIfAborted();
+          const targetIndex = uncachedIndices[cursor]!;
+          cursor += 1;
+          const run = projectedRuns[targetIndex]!;
+          const { slice, cacheable } = await hydrateRunSlice(client, run, signal);
+          slices[targetIndex] = slice;
+          if (cacheable) writeCachedRunSlice(cache, run.id, slice);
+        }
+      }),
+    );
+  }
+
+  const tasks: RunTask[] = [];
   const dispatches: Awaited<ReturnType<RustClient["listDispatches"]>> = [];
   const gates: Awaited<ReturnType<RustClient["listGates"]>> = [];
   const worktreeAssets: Awaited<ReturnType<RustClient["listWorktreeAssets"]>> = [];
-  const runtimeByTask = new Map<string, JsonObject>();
-  for (const run of projectedRuns) {
-    signal.throwIfAborted();
-    await Promise.all([
-      appendRunItems(tasks, PROJECTED_TASK_LIMIT, run.id, runId => client.listTasks(runId, signal)),
-      appendRunItems(dispatches, PROJECTED_DISPATCH_LIMIT, run.id, runId => client.listDispatches(runId, signal)),
-      appendRunItems(gates, PROJECTED_GATE_LIMIT, run.id, runId => client.listGates(runId, signal)),
-      appendRunItems(worktreeAssets, PROJECTED_WORKTREE_LIMIT, run.id, runId => client.listWorktreeAssets(runId, signal)),
-    ]);
-    const runTasks = tasks.filter(task => task.runId === run.id);
-    for (let offset = 0; offset < runTasks.length; offset += 200) {
-      const page = runTasks.slice(offset, offset + 200);
-      try {
-        const activity = await client.taskActivities(run.id, page.map(task => task.id), signal);
-        for (const item of activity.activities) runtimeByTask.set(item.task.id, {
-          execution: item.execution,
-          latestOperation: item.latestOperation,
-          structuredError: item.structuredError,
-          reservedResources: item.reservedResources,
-          quarantinedResources: item.quarantinedResources,
-          executionUnknown: item.executionUnknown,
-          observedAt: item.observedAt,
-        });
-      } catch (error) {
-        signal.throwIfAborted();
-        for (const task of page) runtimeByTask.set(task.id, { observationError: error instanceof Error ? error.message : String(error) });
-      }
+
+  for (const slice of slices) {
+    if (!slice) continue;
+    if (tasks.length < PROJECTED_TASK_LIMIT && slice.tasks.length) {
+      tasks.push(...slice.tasks.slice(0, PROJECTED_TASK_LIMIT - tasks.length));
+    }
+    if (dispatches.length < PROJECTED_DISPATCH_LIMIT && slice.dispatches.length) {
+      dispatches.push(...slice.dispatches.slice(0, PROJECTED_DISPATCH_LIMIT - dispatches.length));
+    }
+    if (gates.length < PROJECTED_GATE_LIMIT && slice.gates.length) {
+      gates.push(...slice.gates.slice(0, PROJECTED_GATE_LIMIT - gates.length));
+    }
+    if (worktreeAssets.length < PROJECTED_WORKTREE_LIMIT && slice.worktreeAssets.length) {
+      worktreeAssets.push(...slice.worktreeAssets.slice(0, PROJECTED_WORKTREE_LIMIT - worktreeAssets.length));
     }
   }
+
   return createLegacyDesktopProjection(
-    { eventSeq, runs: projectedRuns, tasks: tasks.map(task => ({ ...task, runtime: runtimeByTask.get(task.id) })), dispatches, gates, worktreeAssets },
+    { eventSeq, runs: projectedRuns, tasks, dispatches, gates, worktreeAssets },
   );
 }
 

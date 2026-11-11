@@ -5,6 +5,7 @@ import { pageRequest } from "./page-request";
 
 type TimelineApi = Pick<DesktopApi, "readTimeline" | "readTimelineChanges" | "lookupTimeline" | "cancelSessionPage">;
 export type TimelineState = { page: TimelinePage | undefined; loading: boolean; error: string | undefined; live: boolean };
+export const MAX_TURN_CONTINUATION_PAGES = 8;
 const latest: TimelineQuery = { before: null, after: null, limit: 40 };
 
 export class TimelineController {
@@ -38,22 +39,23 @@ export class TimelineController {
 
   private publish(state: TimelineState): void { this.state = state; for (const listener of this.listeners) listener(); }
 
-  private async load(query: TimelineQuery, live: boolean): Promise<void> {
+  private async load(query: TimelineQuery, live: boolean, silent = false): Promise<void> {
     if (!this.active) return;
     this.controller.abort(); clearTimeout(this.timer);
     const controller = new AbortController(); this.controller = controller;
     this.attemptedQuery = query;
-    this.publish({ ...this.state, loading: true, error: undefined, live });
+    const showLoading = !silent || !this.state.page;
+    if (showLoading) this.publish({ ...this.state, loading: true, error: undefined, live });
     try {
       let page = await pageRequest(this.api, controller.signal, id => this.api.readTimeline(this.sessionId, query, id));
       if (controller.signal.aborted) return;
       this.validate(page.items);
-      if (!page.items.length && page.latestPosition > 0 && (query.before !== null || query.after !== null)) { await this.load(latest, true); return; }
+      if (!page.items.length && page.latestPosition > 0 && (query.before !== null || query.after !== null)) { await this.load(latest, true, silent); return; }
       page = await this.completeBoundaryTurns(page, controller.signal);
       if (controller.signal.aborted) return;
       this.query = query; this.sequence = page.revision; this.failures = 0; this.loadFailed = false;
       this.publish({ page, loading: false, error: undefined, live });
-    } catch { if (!controller.signal.aborted) { this.failures++; this.loadFailed = true; this.publish({ ...this.state, loading: false, error: "无法读取会话记录，请重试" }); } }
+    } catch { if (!controller.signal.aborted) { this.failures++; this.loadFailed = true; this.publish({ ...this.state, loading: false, error: silent && this.state.page ? "会话更新暂不可用，正在重试" : "无法读取会话记录，请重试" }); } }
     finally { if (!controller.signal.aborted) this.schedule(Math.min(8000, 500 * 2 ** Math.min(this.failures, 4))); }
   }
 
@@ -77,7 +79,9 @@ export class TimelineController {
     if (!page.items.length) return page;
     let items = page.items;
     const firstTurn = items[0]!.turnId;
-    while (items[0]!.position > 1 && items[0]!.turnId === firstTurn) {
+    let backwardPages = 0;
+    while (backwardPages < MAX_TURN_CONTINUATION_PAGES && items[0]!.position > 1 && items[0]!.turnId === firstTurn) {
+      backwardPages += 1;
       const older = await pageRequest(this.api, signal, id => this.api.readTimeline(this.sessionId, { before: items[0]!.position, after: null, limit: 40 }, id));
       if (signal.aborted) return page;
       this.validate(older.items);
@@ -87,7 +91,9 @@ export class TimelineController {
       if (sameTurn.length !== older.items.length || older.older === null) break;
     }
     const lastTurn = items.at(-1)!.turnId;
-    while (items.at(-1)!.body.kind !== "turn_end" && items.at(-1)!.position < page.latestPosition) {
+    let forwardPages = 0;
+    while (forwardPages < MAX_TURN_CONTINUATION_PAGES && items.at(-1)!.body.kind !== "turn_end" && items.at(-1)!.position < page.latestPosition) {
+      forwardPages += 1;
       const newer = await pageRequest(this.api, signal, id => this.api.readTimeline(this.sessionId, { before: null, after: items.at(-1)!.position, limit: 40 }, id));
       if (signal.aborted) return page;
       this.validate(newer.items);
@@ -116,14 +122,14 @@ export class TimelineController {
     let delay = 500;
     try {
       const page = this.state.page;
-      if (!page || this.loadFailed) { await this.load(this.attemptedQuery, this.state.live); return; }
+      if (!page || this.loadFailed) { await this.load(this.attemptedQuery, this.state.live, Boolean(page)); return; }
       const changes = await pageRequest(this.api, controller.signal, id => this.api.readTimelineChanges(this.sessionId, this.sequence, id));
       if (controller.signal.aborted) return;
-      if (changes.resyncRequired) { await this.load(this.query, this.state.live); return; }
+      if (changes.resyncRequired) { await this.load(this.query, this.state.live, true); return; }
       const notices = changes.items.filter(event => event.kind === "timeline.updated" && event.scope === `timeline:${this.sessionId}`);
       const positions = notices.map(event => (event.data as { position?: unknown } | null)?.position).filter((position): position is number => typeof position === "number" && Number.isSafeInteger(position) && position > 0);
       const latestPosition = Math.max(page.latestPosition, ...positions);
-      if (this.state.live && latestPosition > (page.items.at(-1)?.position ?? 0)) { await this.load(latest, true); return; }
+      if (this.state.live && latestPosition > (page.items.at(-1)?.position ?? 0)) { await this.load(latest, true, true); return; }
       const ids = new Set(notices.map(event => event.entityId));
       const changed = page.items.filter(item => ids.has(item.id)).map(item => item.id);
       let items = page.items;

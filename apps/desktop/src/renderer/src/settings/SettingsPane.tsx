@@ -167,10 +167,15 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot; onOpenAc
         <div className="settings-terminal-preview" aria-label={t("终端预览", "Terminal preview")} style={{ fontFamily: terminalFontFamilyWithFallbacks(fontFamily || settings.terminalFontFamily), lineHeight: TERMINAL_LINE_HEIGHT, fontSize: terminalFontSize(fontSize) ?? settings.terminalFontSize }}>{window.prospero.platform === "darwin" ? "zsh % codex" : isWindows ? "PS C:\\Prospero> codex" : "$ codex"}{"\n"}{t("中文预览：工作区 · 会话记录 · 正在运行", "Font preview: Workspace · Session history · Running")}{"\nAa Bb 0123456789  {} [] () =>"}</div>
       </SettingsSection>}
       {category.id === "runtime" && <SettingsSection id="runtime" title={t("运行时与网络", "Runtime and network")} description={t("本地服务、直连网卡与运行权限。", "Local service, direct connection interface, and runtime permissions.")}>
-        {runtimeSwitch && <SettingRow id="daemon-backend" title={t("Daemon 后端", "Daemon backend")} description={runtimeSwitch.forced ? t("当前由环境变量 PROSPERO_BACKEND 强制指定。", "Currently forced by the PROSPERO_BACKEND environment variable.") : t(`当前运行 ${backendLabel(runtimeSwitch.backend)}；切换会重启应用。`, `Currently running ${backendLabel(runtimeSwitch.backend)}. Switching relaunches the app.`)} {...rowFeedback("daemon-backend")}>
-          <select id="daemon-backend" value={settings.daemonBackend} disabled={busy("daemon-backend") || runtimeSwitch.forced} aria-describedby={description("daemon-backend")} onChange={(event) => { void update("daemon-backend", { daemonBackend: event.target.value as DesktopSettings["daemonBackend"] }, "runtime"); }}>
+        {runtimeSwitch && <SettingRow id="daemon-backend" title={t("Daemon 后端", "Daemon backend")} description={runtimeSwitch.forced ? t("当前由环境变量 PROSPERO_BACKEND 强制指定。", "Currently forced by the PROSPERO_BACKEND environment variable.") : runtimeSwitch.legacyAvailable !== true ? t(`当前运行 ${backendLabel(runtimeSwitch.backend)}；Legacy Node 后端已弃用且在此 Rust 构建中不可用。`, `Currently running ${backendLabel(runtimeSwitch.backend)}. The Legacy Node backend is deprecated and unavailable in Rust-only builds.`) : t(`当前运行 ${backendLabel(runtimeSwitch.backend)}；切换会重启应用。`, `Currently running ${backendLabel(runtimeSwitch.backend)}. Switching relaunches the app.`)} {...rowFeedback("daemon-backend")}>
+          <select id="daemon-backend" value={runtimeSwitch.legacyAvailable !== true && settings.daemonBackend === "legacy" && runtimeSwitch.backend === "rust" ? "rust" : settings.daemonBackend} disabled={busy("daemon-backend") || runtimeSwitch.forced} title={runtimeSwitch.legacyAvailable !== true ? t("Legacy Node 后端已弃用且在此 Rust 构建中不可用", "Legacy Node backend is deprecated and unavailable in Rust-only builds") : undefined} aria-describedby={description("daemon-backend")} onChange={(event) => {
+            const nextBackend = event.target.value as DesktopSettings["daemonBackend"];
+            if (nextBackend === "legacy" && runtimeSwitch.legacyAvailable !== true) return;
+            if (nextBackend === "rust" && !runtimeSwitch.rustAvailable) return;
+            void update("daemon-backend", { daemonBackend: nextBackend }, "runtime");
+          }}>
             <option value="rust" disabled={!runtimeSwitch.rustAvailable}>Rust</option>
-            <option value="legacy">Legacy</option>
+            <option value="legacy" disabled={runtimeSwitch.legacyAvailable !== true}>{runtimeSwitch.legacyAvailable === true ? "Legacy" : t("Legacy（已弃用 / 不可用）", "Legacy (deprecated / unavailable)")}</option>
           </select>
         </SettingRow>}
         {runtimeSwitch && <div className="settings-runtime-summary" aria-label={t("运行时状态", "Runtime status")}>

@@ -34,6 +34,113 @@ const SAFE_PERSISTED_SESSION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const HYDRATED_SESSION_ID_LIMIT = 500;
 const MAX_DESKTOP_LOG_CHARS = 500_000;
 const LOG_FLUSH_DELAY_MS = 120;
+export const MAX_API_STATE_SESSIONS = 600;
+export const API_STATE_SOFT_LIMIT_BYTES = 12 * 1024 * 1024;
+export const API_STATE_MAX_BYTES = 16 * 1024 * 1024;
+
+function trimOptionalText(record: JsonObject, key: string, maxLength: number): void {
+  const value = record[key];
+  if (typeof value === "string" && value.length > maxLength) {
+    record[key] = value.slice(0, maxLength);
+  }
+}
+
+function compactApiState(state: ApiState, level: "soft" | "aggressive"): ApiState {
+  const maxText = level === "soft" ? 320 : 120;
+  const maxQueueItems = level === "soft" ? 25 : 8;
+
+  const status: JsonObject = { ...state.status };
+  if (Array.isArray(status["sessions"])) {
+    status["sessions"] = arrayValue(status["sessions"]).map((raw) => {
+      const session: JsonObject = { ...objectValue(raw) };
+      if (level === "aggressive") {
+        delete session["preview"];
+        delete session["subagents"];
+      } else {
+        trimOptionalText(session, "preview", 240);
+        if (Array.isArray(session["subagents"])) {
+          session["subagents"] = arrayValue(session["subagents"]).slice(0, 20).map((sub) => {
+            const copy: JsonObject = { ...objectValue(sub) };
+            trimOptionalText(copy, "preview", maxText);
+            trimOptionalText(copy, "summary", maxText);
+            trimOptionalText(copy, "task", maxText);
+            return copy;
+          });
+        }
+      }
+      trimOptionalText(session, "title", 240);
+      if (Array.isArray(session["messageQueue"])) {
+        session["messageQueue"] = arrayValue(session["messageQueue"]).slice(0, maxQueueItems).map((item) => {
+          const copy: JsonObject = { ...objectValue(item) };
+          trimOptionalText(copy, "text", maxText);
+          return copy;
+        });
+      }
+      return session;
+    });
+  }
+  if (Array.isArray(status["schedules"])) {
+    status["schedules"] = arrayValue(status["schedules"]).slice(0, level === "soft" ? 200 : 100).map((raw) => {
+      const schedule: JsonObject = { ...objectValue(raw) };
+      trimOptionalText(schedule, "prompt", level === "soft" ? 512 : 120);
+      trimOptionalText(schedule, "description", maxText);
+      trimOptionalText(schedule, "lastError", maxText);
+      return schedule;
+    });
+  }
+
+  const orchestration: JsonObject = { ...state.orchestration };
+  if (Array.isArray(orchestration["runs"])) {
+    orchestration["runs"] = arrayValue(orchestration["runs"]).slice(0, 100).map((raw) => {
+      const run: JsonObject = { ...objectValue(raw) };
+      trimOptionalText(run, "objective", maxText);
+      trimOptionalText(run, "summary", maxText);
+      return run;
+    });
+  }
+  if (Array.isArray(orchestration["tasks"])) {
+    const taskCap = level === "soft" ? 2_000 : 400;
+    orchestration["tasks"] = arrayValue(orchestration["tasks"]).slice(0, taskCap).map((raw) => {
+      const task: JsonObject = { ...objectValue(raw) };
+      trimOptionalText(task, "title", 240);
+      trimOptionalText(task, "spec", maxText);
+      trimOptionalText(task, "result", maxText);
+      trimOptionalText(task, "error", maxText);
+      if (level === "aggressive") {
+        delete task["runtime"];
+      } else if (task["runtime"] && typeof task["runtime"] === "object" && !Array.isArray(task["runtime"])) {
+        const runtime: JsonObject = { ...objectValue(task["runtime"]) };
+        trimOptionalText(runtime, "observationError", maxText);
+        task["runtime"] = runtime;
+      }
+      return task;
+    });
+  }
+  if (Array.isArray(orchestration["dispatches"])) {
+    const dispatchCap = level === "soft" ? 2_000 : 200;
+    orchestration["dispatches"] = arrayValue(orchestration["dispatches"]).slice(0, dispatchCap).map((raw) => {
+      const dispatch: JsonObject = { ...objectValue(raw) };
+      trimOptionalText(dispatch, "outcome", maxText);
+      trimOptionalText(dispatch, "prompt", maxText);
+      trimOptionalText(dispatch, "summary", maxText);
+      return dispatch;
+    });
+  }
+  if (level === "aggressive") {
+    if (Array.isArray(orchestration["gates"])) {
+      orchestration["gates"] = arrayValue(orchestration["gates"]).slice(0, 200);
+    }
+    if (Array.isArray(orchestration["worktreeAssets"])) {
+      orchestration["worktreeAssets"] = arrayValue(orchestration["worktreeAssets"]).slice(0, 200);
+    }
+  }
+
+  return {
+    ...state,
+    status,
+    orchestration,
+  };
+}
 
 type CachedJsonFile = {
   signature: string;
@@ -572,16 +679,29 @@ export class StateStore extends EventEmitter {
 
   setApiState(state: ApiState): void {
     if (this.backend !== "api") throw new Error("API data is not enabled");
-    if (arrayValue(state.status["sessions"]).length > 200 || state.projects.length > 100) {
+    if (arrayValue(state.status["sessions"]).length > MAX_API_STATE_SESSIONS || state.projects.length > 100) {
+      throw new Error("API projection exceeds page limit");
+    }
+    let effective = state;
+    let byteLength = Buffer.byteLength(JSON.stringify(effective));
+    if (byteLength >= API_STATE_SOFT_LIMIT_BYTES) {
+      effective = compactApiState(effective, "soft");
+      byteLength = Buffer.byteLength(JSON.stringify(effective));
+      if (byteLength > API_STATE_MAX_BYTES) {
+        effective = compactApiState(effective, "aggressive");
+        byteLength = Buffer.byteLength(JSON.stringify(effective));
+      }
+    }
+    if (byteLength > API_STATE_MAX_BYTES) {
       throw new Error("API projection exceeds page limit");
     }
     const next: ApiState = {
-      config: reuseEquivalent(this.apiState.config, state.config),
-      status: reuseEquivalent(this.apiState.status, state.status),
-      devices: reuseEquivalent(this.apiState.devices, state.devices),
-      orchestration: reuseEquivalent(this.apiState.orchestration, state.orchestration),
-      running: state.running,
-      projects: reuseEquivalent(this.apiState.projects, state.projects),
+      config: reuseEquivalent(this.apiState.config, effective.config),
+      status: reuseEquivalent(this.apiState.status, effective.status),
+      devices: reuseEquivalent(this.apiState.devices, effective.devices),
+      orchestration: reuseEquivalent(this.apiState.orchestration, effective.orchestration),
+      running: effective.running,
+      projects: reuseEquivalent(this.apiState.projects, effective.projects),
     };
     if (
       next.config === this.apiState.config
@@ -592,9 +712,6 @@ export class StateStore extends EventEmitter {
       && next.projects === this.apiState.projects
     ) {
       return;
-    }
-    if (Buffer.byteLength(JSON.stringify(state)) > 2 * 1024 * 1024) {
-      throw new Error("API projection exceeds page limit");
     }
     this.apiState = next;
     this.changed();

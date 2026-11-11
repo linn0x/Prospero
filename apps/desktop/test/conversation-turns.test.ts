@@ -71,6 +71,34 @@ describe("per-turn conversation", () => {
     expect(turns[1]!.event.finalText).toBe("");
     expect(turns[1]!.event.finish).toBe("interrupted");
   });
+
+  it("preserves exact object references for unchanged tool events in an active turn across streaming deltas", () => {
+    const accumulator = new ChatEventAccumulator();
+    const initialEvents: Array<Record<string, unknown>> = [{ kind: "user.message", text: "refactor 80 files" }];
+    for (let index = 0; index < 80; index++) {
+      initialEvents.push({ kind: "tool.start", callId: `call-${index}`, name: "edit_file" });
+      initialEvents.push({ kind: "tool.end", callId: `call-${index}`, name: "edit_file", state: "success", summary: `edited ${index}` });
+    }
+    initialEvents.push({ kind: "text.delta", msgId: "stream-msg", delta: "Step 1", phase: "final_answer" });
+
+    const snap1 = accumulator.reset(initialEvents);
+    const turns1 = conversationTurns(snap1.items, snap1.resolutions);
+    const activity1 = array(turns1[0]!.event.activity);
+    const users1 = array(turns1[0]!.event.users);
+    expect(activity1).toHaveLength(80);
+
+    const snap2 = accumulator.append([{ kind: "text.delta", msgId: "stream-msg", delta: " + Step 2", phase: "final_answer" }])!;
+    const turns2 = conversationTurns(snap2.items, snap2.resolutions);
+    const activity2 = array(turns2[0]!.event.activity);
+    const users2 = array(turns2[0]!.event.users);
+    const outcomes2 = array(turns2[0]!.event.outcomes);
+
+    expect(users2[0]).toBe(users1[0]);
+    for (let index = 0; index < 80; index++) {
+      expect(activity2[index]).toBe(activity1[index]);
+    }
+    expect(record(outcomes2[0]).text).toBe("Step 1 + Step 2");
+  });
 });
 
 describe("result file references", () => {

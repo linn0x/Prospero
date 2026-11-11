@@ -120,7 +120,9 @@ static_assert(scrollMomentum(NSEventPhaseMayBegin) == GHOSTTY_MOUSE_MOMENTUM_MAY
 @property(nonatomic, strong) id mouseAppResignObserver;
 @property(nonatomic, strong) id displayObserver;
 @property(nonatomic, strong) NSMutableAttributedString *marked;
+@property(nonatomic, assign) NSRange markedSelectedRange;
 @property(nonatomic, strong) NSMutableString *keyText;
+@property(nonatomic, copy) dispatch_block_t testInterpretKeyEventsHandler;
 @property(nonatomic, strong) NSMutableArray<ProsperoPendingClipboard *> *pendingClipboardConfirmations;
 @property(nonatomic, strong) NSTrackingArea *tracking;
 @end
@@ -135,6 +137,7 @@ static bool notifyImagePaste(ProsperoGhosttyView *);
   if ((self = [super initWithFrame:frame])) {
     self.wantsLayer = YES;
     self.marked = [[NSMutableAttributedString alloc] initWithString:@""];
+    self.markedSelectedRange = NSMakeRange(0, 0);
     self.pendingClipboardConfirmations = [[NSMutableArray alloc] init];
     self.accessibilityElement = YES;
     self.accessibilityRole = NSAccessibilityTextAreaRole;
@@ -449,15 +452,42 @@ static NSString *pasteboardFilePaths(NSPasteboard *pasteboard) {
   if (!_surface || _readOnly) return;
   BOOL wasComposing = self.hasMarkedText;
   self.keyText = [[NSMutableString alloc] init];
-  [self interpretKeyEvents:@[e]];
+  if (self.testInterpretKeyEventsHandler) {
+    dispatch_block_t handler = self.testInterpretKeyEventsHandler;
+    self.testInterpretKeyEventsHandler = nil;
+    handler();
+  } else {
+    [self interpretKeyEvents:@[e]];
+  }
+  NSString *committed = self.keyText;
+  self.keyText = nil;
+  BOOL imeHandled = self.hasMarkedText || wasComposing;
+  if (imeHandled) {
+    if (committed.length > 0) {
+      const char *utf8 = committed.UTF8String;
+      if (utf8) {
+        ghostty_surface_text(_surface, utf8, [committed lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+      }
+      if (self.hasMarkedText) {
+        NSString *markedString = self.marked.string;
+        ghostty_surface_preedit(_surface, markedString.UTF8String, [markedString lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+      }
+    } else {
+      ghostty_input_key_s composingKey = {};
+      composingKey.action = e.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS;
+      composingKey.keycode = e.keyCode;
+      composingKey.mods = GHOSTTY_MODS_NONE;
+      composingKey.composing = true;
+      ghostty_surface_key(_surface, composingKey);
+    }
+    return;
+  }
   ghostty_input_key_s key = {};
   key.action = e.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS;
   key.keycode = e.keyCode;
   key.mods = mods(e.modifierFlags);
   key.consumed_mods = (ghostty_input_mods_e)(key.mods & (GHOSTTY_MODS_SHIFT | GHOSTTY_MODS_ALT));
-  // Text accumulated by NSTextInputClient is a committed character. Only a
-  // key that changed/cancelled preedit without committing text is composing.
-  key.composing = self.keyText.length == 0 && (self.hasMarkedText || wasComposing);
+  key.composing = false;
   NSString *plain = [e charactersByApplyingModifiers:0];
   if (plain.length) {
     unichar first = [plain characterAtIndex:0];
@@ -468,10 +498,9 @@ static NSString *pasteboardFilePaths(NSPasteboard *pasteboard) {
       key.unshifted_codepoint = first;
     }
   }
-  const char *text = self.keyText.UTF8String;
-  key.text = self.keyText.length && text && (uint8_t)text[0] >= 0x20 ? text : nullptr;
+  const char *text = committed.UTF8String;
+  key.text = committed.length && text && (uint8_t)text[0] >= 0x20 ? text : nullptr;
   ghostty_surface_key(_surface, key);
-  self.keyText = nil;
 }
 - (void)keyUp:(NSEvent *)e {
   if (!_surface || _readOnly) return;
@@ -504,21 +533,34 @@ static NSString *pasteboardFilePaths(NSPasteboard *pasteboard) {
 }
 - (void)setMarkedText:(id)value selectedRange:(NSRange)selected replacementRange:(NSRange)replacement {
   if (_readOnly) return;
-  NSString *s = [value isKindOfClass:NSAttributedString.class] ? [value string] : value;
+  NSString *s = [value isKindOfClass:NSAttributedString.class] ? [value string] : (value ?: @"");
   self.marked = [[NSMutableAttributedString alloc] initWithString:s];
-  if (_surface) ghostty_surface_preedit(_surface, s.UTF8String, [s lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+  if (s.length > 0) {
+    NSUInteger loc = selected.location == NSNotFound ? s.length : MIN(selected.location, s.length);
+    NSUInteger len = MIN(selected.length, s.length - loc);
+    self.markedSelectedRange = NSMakeRange(loc, len);
+    if (_surface) ghostty_surface_preedit(_surface, s.UTF8String, [s lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+  } else {
+    self.markedSelectedRange = NSMakeRange(0, 0);
+    if (_surface) ghostty_surface_preedit(_surface, nullptr, 0);
+  }
 }
-- (void)unmarkText { [self.marked setAttributedString:[[NSAttributedString alloc] initWithString:@""]]; if (_surface) ghostty_surface_preedit(_surface, nullptr, 0); }
+- (void)unmarkText {
+  [self.marked setAttributedString:[[NSAttributedString alloc] initWithString:@""]];
+  self.markedSelectedRange = NSMakeRange(0, 0);
+  if (_surface) ghostty_surface_preedit(_surface, nullptr, 0);
+}
 - (BOOL)hasMarkedText { return self.marked.length > 0; }
 - (NSRange)markedRange { return self.hasMarkedText ? NSMakeRange(0, self.marked.length) : NSMakeRange(NSNotFound, 0); }
-- (NSRange)selectedRange { return NSMakeRange(NSNotFound, 0); }
+- (NSRange)selectedRange { return self.hasMarkedText ? self.markedSelectedRange : NSMakeRange(0, 0); }
 - (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText { return @[]; }
 - (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)r actualRange:(NSRangePointer)actual { if (actual) *actual = NSMakeRange(NSNotFound, 0); return nil; }
 - (NSUInteger)characterIndexForPoint:(NSPoint)p { return NSNotFound; }
 - (NSRect)firstRectForCharacterRange:(NSRange)r actualRange:(NSRangePointer)actual {
+  if (actual) *actual = self.hasMarkedText ? self.markedRange : NSMakeRange(0, 0);
+  if (!self.window) return NSZeroRect;
   double x = 0, y = 0, w = 1, h = 16;
   if (_surface) ghostty_surface_ime_point(_surface, &x, &y, &w, &h);
-  if (actual) *actual = self.markedRange;
   return [self.window convertRectToScreen:[self convertRect:NSMakeRect(x, y, w, h) toView:nil]];
 }
 - (void)doCommandBySelector:(SEL)selector { /* Ghostty encodes non-text keys. */ }
@@ -821,6 +863,71 @@ static napi_value testIMECommit(napi_env e, napi_callback_info info) {
   [v insertText:committed replacementRange:NSMakeRange(NSNotFound, 0)];
   return undefined(e);
 }
+static napi_value testSetMarkedText(napi_env e, napi_callback_info info) {
+  size_t n = 4; napi_value args[4]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
+  uint32_t id; ProsperoGhosttyView *v;
+  if (n < 2 || !surfaceFor(e, args[0], &id, &v)) return fail(e, "Invalid Ghostty surface ID");
+  if (v.readOnly) return fail(e, "Native terminal is read-only");
+  std::string preeditBytes = str(e, args[1]);
+  NSString *preedit = [[NSString alloc] initWithBytes:preeditBytes.data() length:preeditBytes.size() encoding:NSUTF8StringEncoding];
+  if (!preedit) return fail(e, "IME preedit text must be valid UTF-8");
+  uint32_t selLoc = (uint32_t)preedit.length, selLen = 0;
+  if (n >= 3) napi_get_value_uint32(e, args[2], &selLoc);
+  if (n >= 4) napi_get_value_uint32(e, args[3], &selLen);
+  [v setMarkedText:preedit selectedRange:NSMakeRange(selLoc, selLen) replacementRange:NSMakeRange(NSNotFound, 0)];
+  return undefined(e);
+}
+static napi_value testKeyDown(napi_env e, napi_callback_info info) {
+  size_t n = 5; napi_value args[5]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
+  uint32_t id, keyCode = 0, modifiers = 0; ProsperoGhosttyView *v;
+  if (n < 3 || !surfaceFor(e, args[0], &id, &v) ||
+      napi_get_value_uint32(e, args[1], &keyCode) != napi_ok ||
+      napi_get_value_uint32(e, args[2], &modifiers) != napi_ok) {
+    return fail(e, "Expected (id, keyCode, modifierFlags[, characters[, imeOptions]])");
+  }
+  if (v.readOnly) return fail(e, "Native terminal is read-only");
+  std::string charsBytes = n >= 4 ? str(e, args[3]) : "\r";
+  NSString *chars = [[NSString alloc] initWithBytes:charsBytes.data() length:charsBytes.size() encoding:NSUTF8StringEncoding] ?: @"\r";
+  if (n >= 5) {
+    napi_valuetype optType = napi_undefined;
+    napi_typeof(e, args[4], &optType);
+    if (optType == napi_object) {
+      bool hasCommit = false, hasUnmark = false;
+      napi_has_named_property(e, args[4], "commitText", &hasCommit);
+      napi_has_named_property(e, args[4], "unmark", &hasUnmark);
+      if (hasCommit) {
+        napi_value commitVal; napi_get_named_property(e, args[4], "commitText", &commitVal);
+        std::string commitBytes = str(e, commitVal);
+        NSString *commitStr = [[NSString alloc] initWithBytes:commitBytes.data() length:commitBytes.size() encoding:NSUTF8StringEncoding];
+        if (!commitStr) return fail(e, "commitText must be valid UTF-8");
+        __weak ProsperoGhosttyView *weakV = v;
+        v.testInterpretKeyEventsHandler = ^{
+          ProsperoGhosttyView *strongV = weakV;
+          if (strongV) [strongV insertText:commitStr replacementRange:NSMakeRange(NSNotFound, 0)];
+        };
+      } else if (hasUnmark && boolean(e, args[4], "unmark")) {
+        __weak ProsperoGhosttyView *weakV = v;
+        v.testInterpretKeyEventsHandler = ^{
+          ProsperoGhosttyView *strongV = weakV;
+          if (strongV) [strongV unmarkText];
+        };
+      }
+    }
+  }
+  NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                    location:NSZeroPoint
+                               modifierFlags:(NSEventModifierFlags)modifiers
+                                   timestamp:NSProcessInfo.processInfo.systemUptime
+                                windowNumber:v.window ? v.window.windowNumber : 0
+                                     context:nil
+                                  characters:chars
+                 charactersIgnoringModifiers:chars
+                                   isARepeat:NO
+                                     keyCode:(unsigned short)keyCode];
+  if (!event) { v.testInterpretKeyEventsHandler = nil; return fail(e, "Could not synthesize NSEvent"); }
+  [v keyDown:event];
+  return undefined(e);
+}
 static napi_value isVisible(napi_env e, napi_callback_info info) {
   size_t n = 1; napi_value arg; napi_get_cb_info(e, info, &n, &arg, nullptr, nullptr);
   uint32_t id; ProsperoGhosttyView *v;
@@ -865,6 +972,10 @@ static napi_value inspect(napi_env e, napi_callback_info info) {
   setString("superviewClass", v.superview ? NSStringFromClass(v.superview.class) : @"none");
   setString("firstResponderClass", v.window.firstResponder ? NSStringFromClass([v.window.firstResponder class]) : @"none");
   setBool("isFirstResponder", v.window.firstResponder == v);
+  setBool("hasMarkedText", v.hasMarkedText);
+  NSRange selected = v.selectedRange;
+  setNumber("selectedRangeLocation", selected.location == NSNotFound ? -1 : (double)selected.location);
+  setNumber("selectedRangeLength", (double)selected.length);
   setNumber("frameX", v.frame.origin.x); setNumber("frameY", v.frame.origin.y);
   setNumber("frameWidth", v.frame.size.width); setNumber("frameHeight", v.frame.size.height);
   setNumber("boundsWidth", v.bounds.size.width); setNumber("boundsHeight", v.bounds.size.height);
@@ -917,6 +1028,6 @@ static napi_value setPasteImageHandler(napi_env e, napi_callback_info info) {
   return undefined(e);
 }
 NAPI_MODULE_INIT() {
-  napi_property_descriptor props[] = {{"initialize", 0, initialize, 0, 0, 0, napi_default, 0}, {"create", 0, create, 0, 0, 0, napi_default, 0}, {"update", 0, update, 0, 0, 0, napi_default, 0}, {"destroy", 0, destroy, 0, 0, 0, napi_default, 0}, {"size", 0, size, 0, 0, 0, napi_default, 0}, {"setGrid", 0, setGrid, 0, 0, 0, napi_default, 0}, {"readText", 0, readText, 0, 0, 0, napi_default, 0}, {"inputText", 0, inputText, 0, 0, 0, napi_default, 0}, {"testIMECommit", 0, testIMECommit, 0, 0, 0, napi_default, 0}, {"isVisible", 0, isVisible, 0, 0, 0, napi_default, 0}, {"setReadOnly", 0, setReadOnly, 0, 0, 0, napi_default, 0}, {"inspect", 0, inspect, 0, 0, 0, napi_default, 0}, {"bindingAction", 0, bindingAction, 0, 0, 0, napi_default, 0}, {"setShortcutHandler", 0, setShortcutHandler, 0, 0, 0, napi_default, 0}, {"setFocusHandler", 0, setFocusHandler, 0, 0, 0, napi_default, 0}, {"setPasteImageHandler", 0, setPasteImageHandler, 0, 0, 0, napi_default, 0}};
+  napi_property_descriptor props[] = {{"initialize", 0, initialize, 0, 0, 0, napi_default, 0}, {"create", 0, create, 0, 0, 0, napi_default, 0}, {"update", 0, update, 0, 0, 0, napi_default, 0}, {"destroy", 0, destroy, 0, 0, 0, napi_default, 0}, {"size", 0, size, 0, 0, 0, napi_default, 0}, {"setGrid", 0, setGrid, 0, 0, 0, napi_default, 0}, {"readText", 0, readText, 0, 0, 0, napi_default, 0}, {"inputText", 0, inputText, 0, 0, 0, napi_default, 0}, {"testIMECommit", 0, testIMECommit, 0, 0, 0, napi_default, 0}, {"testSetMarkedText", 0, testSetMarkedText, 0, 0, 0, napi_default, 0}, {"testKeyDown", 0, testKeyDown, 0, 0, 0, napi_default, 0}, {"isVisible", 0, isVisible, 0, 0, 0, napi_default, 0}, {"setReadOnly", 0, setReadOnly, 0, 0, 0, napi_default, 0}, {"inspect", 0, inspect, 0, 0, 0, napi_default, 0}, {"bindingAction", 0, bindingAction, 0, 0, 0, napi_default, 0}, {"setShortcutHandler", 0, setShortcutHandler, 0, 0, 0, napi_default, 0}, {"setFocusHandler", 0, setFocusHandler, 0, 0, 0, napi_default, 0}, {"setPasteImageHandler", 0, setPasteImageHandler, 0, 0, 0, napi_default, 0}};
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props); return exports;
 }

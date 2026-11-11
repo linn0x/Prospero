@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EventPage, TimelinePage, TimelineQuery, TimelineRecord } from "@prospero/protocol/rust-daemon";
-import { TimelineController, TimelineViewCache, timelineEvent } from "../src/renderer/src/timeline-controller";
+import { MAX_TURN_CONTINUATION_PAGES, TimelineController, TimelineViewCache, timelineEvent } from "../src/renderer/src/timeline-controller";
 
 function entry(position: number, revision = 1, preview = `Record ${position}`): TimelineRecord {
   return { id: `record-${position}`, turnId: `turn-${position}`, position, revision, body: { kind: "message", role: "assistant", finalAnswer: true }, preview, bytes: preview.length, generation: 1, truncated: false };
@@ -106,7 +106,7 @@ describe("paged materialized timelines", () => {
     controller.stop();
   });
 
-  it("materializes a turn longer than the old 2000-record safety cap", async () => {
+  it("caps backward turn-continuation page fetching per refresh cycle", async () => {
     vi.useFakeTimers();
     const records = [
       turnEntry(1, "turn1", { kind: "message", role: "assistant", finalAnswer: true }, "very old answer"),
@@ -121,8 +121,49 @@ describe("paged materialized timelines", () => {
     });
     const controller = new TimelineController({ readTimeline, readTimelineChanges: vi.fn(async () => changes(10)), lookupTimeline: vi.fn(), cancelSessionPage: vi.fn(async () => {}) }, "session");
     controller.start(); await vi.advanceTimersByTimeAsync(0);
-    expect(controller.getSnapshot().page?.items).toHaveLength(2_040);
-    expect(controller.getSnapshot().page?.items[0]?.preview).toBe("very old answer");
+    const expectedItems = 40 * (1 + MAX_TURN_CONTINUATION_PAGES);
+    expect(readTimeline).toHaveBeenCalledTimes(1 + MAX_TURN_CONTINUATION_PAGES);
+    expect(controller.getSnapshot().page?.items).toHaveLength(expectedItems);
+    expect(controller.getSnapshot().page?.older).toBe(2_040 - expectedItems + 1);
+    controller.stop();
+  });
+
+  it("does not publish loading: true during routine 500ms polls once initial records are loaded", async () => {
+    vi.useFakeTimers();
+    let total = 100;
+    const api = {
+      readTimeline: vi.fn(async (_id: string, query: TimelineQuery) => page(query, total)),
+      readTimelineChanges: vi.fn()
+        .mockResolvedValueOnce(changes(11, [101]))
+        .mockResolvedValueOnce(changes(12, [], true))
+        .mockResolvedValue(changes(12)),
+      lookupTimeline: vi.fn(async () => ({ items: [], latestPosition: total, revision: 12 })),
+      cancelSessionPage: vi.fn(async () => {}),
+    };
+    const controller = new TimelineController(api, "session");
+    const loadingStatesAfterInitialLoad: boolean[] = [];
+    let initialLoaded = false;
+    controller.subscribe(() => {
+      const snap = controller.getSnapshot();
+      if (!initialLoaded && snap.page && !snap.loading) {
+        initialLoaded = true;
+        return;
+      }
+      if (initialLoaded) {
+        loadingStatesAfterInitialLoad.push(snap.loading);
+      }
+    });
+    controller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(initialLoaded).toBe(true);
+    total = 101;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(controller.getSnapshot().page?.items.at(-1)?.position).toBe(101);
+    total = 105;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(controller.getSnapshot().page?.items.at(-1)?.position).toBe(105);
+    expect(loadingStatesAfterInitialLoad.length).toBeGreaterThan(0);
+    expect(loadingStatesAfterInitialLoad.every((flag) => flag === false)).toBe(true);
     controller.stop();
   });
 

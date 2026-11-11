@@ -70,11 +70,28 @@ const require = createRequire(import.meta.url);
 
 function shellQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 function abortError(): Error { return new Error("Native terminal open was cancelled because its window is closing or reloading"); }
-function firstFontFamily(value: string | undefined): string | undefined {
+export function parseFontFamilies(value: string | undefined): string[] | undefined {
   if (value === undefined) return undefined;
-  const family = (value.match(/(?:"[^"]*"|'[^']*'|[^,])+/)?.[0] ?? "").trim().replace(/^(?:"(.*)"|'(.*)')$/, (_match, doubleQuoted: string | undefined, singleQuoted: string | undefined) => doubleQuoted ?? singleQuoted ?? "");
-  if (!family || family.length > 200 || /[\u0000-\u001f\u007f]/.test(family)) throw new Error("Native terminal font family is invalid");
-  return family;
+  if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error("Native terminal font family is invalid");
+  const tokens = value.match(/(?:"[^"]*"|'[^']*'|[^,]+)/g) ?? [];
+  const families: string[] = [];
+  const seen = new Set<string>();
+  for (const token of tokens) {
+    const trimmed = token.trim();
+    if (!trimmed) continue;
+    const unquoted = trimmed
+      .replace(/^(?:"(.*)"|'(.*)')$/, (_match, doubleQuoted: string | undefined, singleQuoted: string | undefined) => doubleQuoted ?? singleQuoted ?? "")
+      .trim();
+    if (!unquoted || unquoted.length > 200 || /[\u0000-\u001f\u007f]/.test(unquoted)) {
+      throw new Error("Native terminal font family is invalid");
+    }
+    if (!seen.has(unquoted)) {
+      seen.add(unquoted);
+      families.push(unquoted);
+    }
+  }
+  if (!families.length) throw new Error("Native terminal font family is invalid");
+  return families;
 }
 function waitForAbortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(abortError());
@@ -151,7 +168,8 @@ export class NativeGhosttyManager {
     const availability = this.availability();
     if (!availability.available) throw new Error(availability.reason ?? "Native Ghostty is unavailable");
     if (!Number.isFinite(fontSize) || fontSize < 8 || fontSize > 40) throw new Error("Invalid native terminal font size");
-    const fontFamily = firstFontFamily(requestedFontFamily);
+    const fontFamilies = parseFontFamilies(requestedFontFamily);
+    const primaryFontFamily = fontFamilies?.[0];
     if (!(await waitForAbortable(this.supportsSession(sessionId), signal))) throw new Error("This Rust daemon session does not support terminal streaming");
     if (signal.aborted || window.isDestroyed() || window.webContents.isDestroyed() || window.webContents.id !== contentsId) throw abortError();
 
@@ -179,11 +197,27 @@ export class NativeGhosttyManager {
       surfaceConfig = /^\s*font-size\s*=.*$/m.test(surfaceConfig)
         ? surfaceConfig.replace(/^\s*font-size\s*=.*$/m, fontSizeLine)
         : `${surfaceConfig.trimEnd()}\n${fontSizeLine}\n`;
-      if (fontFamily) {
-        const fontLine = `font-family = "${fontFamily.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
-        surfaceConfig = /^\s*font-family\s*=.*$/m.test(surfaceConfig)
-          ? surfaceConfig.replace(/^\s*font-family\s*=.*$/m, fontLine)
-          : `${surfaceConfig.trimEnd()}\n${fontLine}\n`;
+      if (fontFamilies?.length) {
+        const fontLines = [
+          'font-family = ""',
+          ...fontFamilies.map(family => `font-family = "${family.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`),
+        ].join("\n");
+        if (/^\s*font-family\s*=.*$/m.test(surfaceConfig)) {
+          let replaced = false;
+          surfaceConfig = surfaceConfig.replace(/^\s*font-family\s*=.*$/gm, () => {
+            if (replaced) return "";
+            replaced = true;
+            return fontLines;
+          }).replace(/\n{3,}/g, "\n\n");
+        } else {
+          surfaceConfig = `${surfaceConfig.trimEnd()}\n${fontLines}\n`;
+        }
+      }
+      for (const trigger of ["shift+enter", "shift+numpad_enter"]) {
+        const pattern = new RegExp(`^\\s*keybind\\s*=\\s*${trigger.replace("+", "\\+")}\\s*=`, "m");
+        if (!pattern.test(surfaceConfig)) {
+          surfaceConfig = `${surfaceConfig.trimEnd()}\nkeybind = ${trigger}=csi:13;2u\n`;
+        }
       }
       writeFileSync(configPath, surfaceConfig, { encoding: "utf8", mode: 0o600, flag: "wx" });
 
@@ -400,7 +434,7 @@ export class NativeGhosttyManager {
       // command, so this must be the quoted executable and arguments only.
       const command = `${shellQuote(join(bundle, "prospero-terminal-relay"))} ${shellQuote(socketPath)}`;
       if (signal.aborted || window.isDestroyed() || window.webContents.isDestroyed()) throw abortError();
-      const surfaceId = addon.create(window.getNativeWindowHandle(), command, { fontSize, ...(fontFamily ? { fontFamily } : {}), configPath });
+      const surfaceId = addon.create(window.getNativeWindowHandle(), command, { fontSize, ...(primaryFontFamily ? { fontFamily: primaryFontFamily } : {}), configPath });
       // The NSView identifier is public IPC identity; remap the internal relay/controller id.
       if (!Number.isSafeInteger(surfaceId) || surfaceId <= 0 || (surfaceId !== ghosttySessionId && this.sessions.has(surfaceId))) {
         try { addon.destroy(surfaceId); } catch {}

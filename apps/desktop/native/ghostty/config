@@ -35,3 +35,5 @@ keybind = clear
 keybind = super+c=copy_to_clipboard
 keybind = super+v=paste_from_clipboard
 keybind = super+a=select_all
+keybind = shift+enter=csi:13;2u
+keybind = shift+numpad_enter=csi:13;2u

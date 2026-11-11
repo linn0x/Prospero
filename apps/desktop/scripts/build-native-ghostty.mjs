@@ -31,7 +31,12 @@ const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "u
 if (head !== revision) throw new Error(`Ghostty API revision mismatch: expected ${revision}, got ${head}`);
 const patch = resolve(root, "native/ghostty/standalone-library.patch");
 const patched = spawnSync("git", ["apply", "--reverse", "--check", patch], { cwd: source, stdio: "ignore" }).status === 0;
-if (!patched) run("git", ["apply", patch], { cwd: source });
+if (!patched) {
+  run("git", ["checkout", "--", "."], { cwd: source });
+  run("git", ["apply", patch], { cwd: source });
+} else if (spawnSync("git", ["diff", "--quiet", "--", "include/ghostty.h", "src/apprt/embedded.zig", "src/main_c.zig", "src/build/GhosttyLib.zig", "pkg/libpng/build.zig"], { cwd: source }).status !== 0) {
+  run("git", ["checkout", "--", "include/ghostty.h", "src/apprt/embedded.zig", "src/main_c.zig", "src/build/GhosttyLib.zig", "pkg/libpng/build.zig"], { cwd: source });
+}
 const developerDir = process.env.PROSPERO_GHOSTTY_DEVELOPER_DIR || "/Library/Developer/CommandLineTools";
 // Only libSystem's own (first) `targets:` list matters; later re-exported documents in
 // the same .tbd may still mention arm64 when libSystem itself is arm64e-only.
@@ -81,7 +86,7 @@ for input in "$@"; do
     *) path=$PWD/$input ;;
   esac
   case "$input" in
-    *.a) (cd "$work/$i" && /usr/bin/ar -x "$path" && chmod 644 ./*) ;;
+    *.a) (cd "$work/$i" && /usr/bin/ar -x "$path" && rm -f __.SYMDEF* && chmod 644 ./*) ;;
     *) cp "$path" "$work/$i/" ;;
   esac
 done

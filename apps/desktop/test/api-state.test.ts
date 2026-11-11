@@ -42,8 +42,66 @@ describe("API-only desktop state", () => {
     expect(changed).not.toHaveBeenCalled();
     store.hydrateSessions(Array.from({ length: 10000 }, (_, index) => ({ id: `archive-${index}`, agent: "codex", kind: "structured", title: "History", cwd: "/synthetic", status: "completed" })));
     expect(store.snapshot().daemon.sessions).toHaveLength(1);
-    expect(() => store.setApiState({ ...data(), status: { sessions: Array(201).fill({}) } })).toThrow("page limit");
+    store.setApiState({
+      ...data(),
+      status: {
+        ...data().status,
+        sessions: Array.from({ length: 600 }, (_, index) => ({
+          id: `session-${index}`,
+          kind: "structured",
+          title: `Session ${index}`,
+          cwd: "/synthetic",
+        })),
+      },
+    });
+    expect(store.snapshot().daemon.sessions).toHaveLength(600);
+    expect(() => store.setApiState({ ...data(), status: { sessions: Array(601).fill({}) } })).toThrow("page limit");
     expect(() => store.setApiState({ ...data(), projects: Array(101).fill("/synthetic") })).toThrow("page limit");
     expect(() => new StateStore(home()).setApiState(data())).toThrow("not enabled");
+  });
+
+  it("accepts multi-megabyte API windows above 2 MiB and compacts heavy preview payloads before hitting 16 MiB", () => {
+    const store = new StateStore(home(), "api");
+    const fourMiBTasks = Array.from({ length: 40 }, (_, index) => ({
+      id: `task-${index}`,
+      runId: "run-1",
+      title: `Task ${index}`,
+      status: "running",
+      spec: "s".repeat(110_000),
+    }));
+    expect(() =>
+      store.setApiState({
+        ...data(),
+        orchestration: { runs: [{ id: "run-1", status: "active" }], tasks: fourMiBTasks },
+      }),
+    ).not.toThrow();
+    expect(store.snapshot().orchestration.tasks).toHaveLength(40);
+
+    // Build an oversized >16 MiB payload full of heavy preview/spec strings and verify graceful compaction
+    const hugeSessions = Array.from({ length: 200 }, (_, index) => ({
+      id: `heavy-session-${index}`,
+      kind: "structured",
+      title: `Heavy ${index}`,
+      cwd: "/synthetic",
+      preview: "p".repeat(30_000),
+      lastMessagePreview: "m".repeat(30_000),
+    }));
+    const hugeTasks = Array.from({ length: 120 }, (_, index) => ({
+      id: `heavy-task-${index}`,
+      runId: "run-1",
+      title: `Heavy Task ${index}`,
+      status: "done",
+      spec: "x".repeat(60_000),
+      result: "r".repeat(60_000),
+    }));
+    const rawPayload: ApiState = {
+      ...data(),
+      status: { ...data().status, sessions: hugeSessions },
+      orchestration: { runs: [{ id: "run-1", status: "completed", objective: "o".repeat(50_000) }], tasks: hugeTasks },
+    };
+    expect(Buffer.byteLength(JSON.stringify(rawPayload))).toBeGreaterThan(16 * 1024 * 1024);
+    expect(() => store.setApiState(rawPayload)).not.toThrow();
+    expect(store.snapshot().daemon.sessions).toHaveLength(200);
+    expect(store.snapshot().orchestration.tasks).toHaveLength(120);
   });
 });

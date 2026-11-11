@@ -9,6 +9,22 @@ type CachedTurn = {
 };
 
 const completedTurnCache = new WeakMap<ChatTimelineItem, CachedTurn>();
+const activeTurnCache = new WeakMap<ChatTimelineItem, CachedTurn>();
+const wrappedEventCache = new WeakMap<JsonObject, Map<string, JsonObject>>();
+
+function stabilizeTurnEvent(item: ChatTimelineItem): JsonObject {
+  let byKey = wrappedEventCache.get(item.event);
+  if (!byKey) {
+    byKey = new Map<string, JsonObject>();
+    wrappedEventCache.set(item.event, byKey);
+  }
+  let wrapped = byKey.get(item.key);
+  if (!wrapped) {
+    wrapped = { ...item.event, displayKey: item.key };
+    byKey.set(item.key, wrapped);
+  }
+  return wrapped;
+}
 
 function turnResolutionKey(turn: readonly ChatTimelineItem[], resolutions: ReadonlySet<string>): string {
   let key = "";
@@ -54,7 +70,16 @@ export function conversationTurns(items: readonly ChatTimelineItem[], resolution
       turn = [];
       return;
     }
-    result.push(buildTurnItem(first, turn, undefined, resolutions));
+    const resolutionKey = turnResolutionKey(turn, resolutions);
+    const cachedActive = activeTurnCache.get(first);
+    if (cachedActive && cachedActive.resolutionKey === resolutionKey && sameTurnItems(cachedActive.items, turn)) {
+      result.push(cachedActive.output);
+      turn = [];
+      return;
+    }
+    const builtActive = buildTurnItem(first, turn, undefined, resolutions);
+    activeTurnCache.set(first, { items: [...turn], resolutionKey, output: builtActive });
+    result.push(builtActive);
     turn = [];
   };
   for (const item of items) {
@@ -77,7 +102,7 @@ function buildTurnItem(
       ?? answers.findLast(item => item.event.phase !== "commentary") : undefined);
   const users: JsonObject[] = [], activity: JsonObject[] = [], outcomes: JsonObject[] = [];
   for (const item of turn) {
-    const event: JsonObject = { ...item.event, displayKey: item.key };
+    const event = stabilizeTurnEvent(item);
     const kind = text(event.kind);
     if (kind === "user.message") users.push(event);
     else if (item === final || kind === "agent.error"

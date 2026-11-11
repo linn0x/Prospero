@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
+import { constants, openSync, closeSync, fstatSync, readFileSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, resolve } from "node:path";
 import { RustClient } from "./rust-client";
 
@@ -24,6 +24,15 @@ async function delay(milliseconds: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
+type CachedBinaryDigest = {
+  mtimeMs: number;
+  size: number;
+  digest: string;
+};
+
+const binaryDigestCache = new Map<string, CachedBinaryDigest>();
+const MAX_BINARY_DIGEST_CACHE_ENTRIES = 16;
+
 export class RustProcess {
   private child: ChildProcess | undefined;
   private exited: Promise<void> = Promise.resolve();
@@ -44,7 +53,26 @@ export class RustProcess {
   }
 
   private readBinaryBuildId(): string | undefined {
-    try { return createHash("sha256").update(readFileSync(this.binary)).digest("hex"); } catch { return this.expectedBuildId; }
+    try {
+      const stat = statSync(this.binary);
+      const cached = binaryDigestCache.get(this.binary);
+      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+        this.expectedBuildId = cached.digest;
+        return cached.digest;
+      }
+      const digest = createHash("sha256").update(readFileSync(this.binary)).digest("hex");
+      binaryDigestCache.delete(this.binary);
+      binaryDigestCache.set(this.binary, { mtimeMs: stat.mtimeMs, size: stat.size, digest });
+      while (binaryDigestCache.size > MAX_BINARY_DIGEST_CACHE_ENTRIES) {
+        const oldest = binaryDigestCache.keys().next().value;
+        if (oldest === undefined) break;
+        binaryDigestCache.delete(oldest);
+      }
+      this.expectedBuildId = digest;
+      return digest;
+    } catch {
+      return this.expectedBuildId;
+    }
   }
 
   get managed(): boolean { return Boolean(this.child && this.child.exitCode === null && this.child.signalCode === null); }

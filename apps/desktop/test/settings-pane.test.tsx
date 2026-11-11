@@ -55,4 +55,32 @@ describe("settings pane", () => {
     expect(html).toContain("Save failed");
     expect(html).toContain(">Retry</button>");
   });
+
+  it("disables Legacy runtime selection in Rust-only builds so users cannot brick startup", () => {
+    vi.stubGlobal("window", { prospero: { platform: "darwin" } });
+    const html = renderToStaticMarkup(
+      <SettingsPane
+        snapshot={{
+          ...snapshot,
+          daemon: {
+            ...snapshot.daemon,
+            runtime: {
+              backend: "rust",
+              selected: "rust",
+              selectionReason: "packaged-default",
+              forced: false,
+              rustAvailable: true,
+              rustBinary: "/opt/prosperod-rs",
+              legacyAvailable: false,
+              defaultBackend: "rust",
+            },
+          },
+        }}
+        onOpenAccounts={() => {}}
+      />,
+    );
+    expect(html).toContain('id="daemon-backend"');
+    expect(html).toMatch(/<option[^>]*value="legacy"[^>]*disabled=""/);
+    expect(html).toContain("Legacy Node backend is deprecated and unavailable in Rust-only builds");
+  });
 });

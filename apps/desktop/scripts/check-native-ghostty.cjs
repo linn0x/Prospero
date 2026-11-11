@@ -40,13 +40,19 @@ async function main() {
   // here becomes `exec -l exec ...` and makes Bash try to run a binary named exec.
   const command = `${shellQuote(relay)} ${shellQuote(socketPath)}`;
   const configPath = path.join(fixture, "ghostty.conf");
-  fs.writeFileSync(configPath, baseConfig.replace(/^\s*font-family\s*=.*$/m, 'font-family = "Menlo"'), { mode: 0o600 });
+  const fallbackFontLines = ['font-family = ""', 'font-family = "Menlo"', 'font-family = "PingFang SC"', 'font-family = "Apple Color Emoji"'].join("\n");
+  fs.writeFileSync(configPath, baseConfig.replace(/^\s*font-family\s*=.*$/m, fallbackFontLines), { mode: 0o600 });
   let resolveRelay;
   const relayConnected = new Promise(resolve => { resolveRelay = resolve; });
   let resolveResize;
   const resizeReceived = new Promise(resolve => { resolveResize = resolve; });
-  let resolveInput;
-  const inputReceived = new Promise(resolve => { resolveInput = resolve; });
+  const bufferedInputs = [];
+  let resolveInput = null;
+  const nextInput = () => {
+    if (bufferedInputs.length > 0) return Promise.resolve(bufferedInputs.shift());
+    return new Promise(resolve => { resolveInput = resolve; });
+  };
+  let inputReceived = nextInput();
   let relayTextSent = false;
   const relayServer = net.createServer(socket => {
     let pending = Buffer.alloc(0);
@@ -71,7 +77,14 @@ async function main() {
         } else if (kind === "A") {
           if (payload.readUInt32BE(0) === 0x12345678) console.log("relay output acknowledged by Ghostty PTY");
         } else if (kind === "I") {
-          resolveInput(payload.toString("utf8"));
+          const text = payload.toString("utf8");
+          if (resolveInput) {
+            const resolver = resolveInput;
+            resolveInput = null;
+            resolver(text);
+          } else {
+            bufferedInputs.push(text);
+          }
         }
       }
     });
@@ -103,10 +116,64 @@ async function main() {
     throw new Error("Ghostty relay output did not render in the native surface");
   }
   native.setReadOnly(id, false);
+  const initialInspect = native.inspect(id);
+  if (initialInspect.selectedRangeLocation !== 0 || initialInspect.selectedRangeLength !== 0) {
+    throw new Error(`Expected idle selectedRange {0, 0}, got ${JSON.stringify(initialInspect)}`);
+  }
   native.testIMECommit(id, "に", "日本語_IME_COMMIT");
   const imeRelayInput = await Promise.race([inputReceived, delay(5000).then(() => null)]);
   if (imeRelayInput !== "日本語_IME_COMMIT") throw new Error(`Synthetic IME commit did not reach relay as UTF-8: ${JSON.stringify(imeRelayInput)}`);
   console.log(JSON.stringify({ imeRelayInput }));
+
+  // Active CJK IME marked text + Return (36) must commit ONLY "你好" without trailing "\r" or CSI-u Enter.
+  native.testSetMarkedText(id, "nihao", 5, 0);
+  const composingInspect = native.inspect(id);
+  if (!composingInspect.hasMarkedText || composingInspect.selectedRangeLocation !== 5 || composingInspect.selectedRangeLength !== 0) {
+    throw new Error(`Expected composing selectedRange {5, 0}, got ${JSON.stringify(composingInspect)}`);
+  }
+  inputReceived = nextInput();
+  native.testKeyDown(id, 36, 0, "\r", { commitText: "你好" });
+  const imeReturnCommit = await Promise.race([inputReceived, delay(5000).then(() => null)]);
+  await delay(150);
+  if (imeReturnCommit !== "你好" || bufferedInputs.length > 0) {
+    throw new Error(`IME Return commit leaked raw Return key: got ${JSON.stringify(imeReturnCommit)}, extra=${JSON.stringify(bufferedInputs)}`);
+  }
+  const postCommitInspect = native.inspect(id);
+  if (postCommitInspect.hasMarkedText || postCommitInspect.selectedRangeLocation !== 0) {
+    throw new Error(`Expected post-commit selectedRange {0, 0}, got ${JSON.stringify(postCommitInspect)}`);
+  }
+  console.log(JSON.stringify({ imeReturnCommit }));
+
+  // Active CJK IME marked text + Space (49) must commit ONLY "世界" without trailing " ".
+  native.testSetMarkedText(id, "shijie", 6, 0);
+  inputReceived = nextInput();
+  native.testKeyDown(id, 49, 0, " ", { commitText: "世界" });
+  const imeSpaceCommit = await Promise.race([inputReceived, delay(5000).then(() => null)]);
+  await delay(150);
+  if (imeSpaceCommit !== "世界" || bufferedInputs.length > 0) {
+    throw new Error(`IME Space commit leaked raw Space key: got ${JSON.stringify(imeSpaceCommit)}, extra=${JSON.stringify(bufferedInputs)}`);
+  }
+  console.log(JSON.stringify({ imeSpaceCommit }));
+
+  // Escape (53) cancelling active preedit must NOT leak "\x1b" into the PTY.
+  native.testSetMarkedText(id, "nihao", 5, 0);
+  native.testKeyDown(id, 53, 0, "\x1b", { unmark: true });
+  await delay(150);
+  if (bufferedInputs.length > 0) {
+    throw new Error(`IME Escape preedit cancel leaked bytes to PTY: ${JSON.stringify(bufferedInputs)}`);
+  }
+
+  inputReceived = nextInput();
+  // macOS Return keyCode = 36, NumpadEnter keyCode = 76, NSEventModifierFlagShift = 1 << 17.
+  native.testKeyDown(id, 36, 1 << 17, "\r");
+  const shiftEnterRelayInput = await Promise.race([inputReceived, delay(5000).then(() => null)]);
+  if (shiftEnterRelayInput !== "\x1b[13;2u") throw new Error(`Shift+Enter did not emit CSI-u newline sequence: ${JSON.stringify(shiftEnterRelayInput)}`);
+  console.log(JSON.stringify({ shiftEnterRelayInput }));
+  inputReceived = nextInput();
+  native.testKeyDown(id, 76, 1 << 17, "\x03");
+  const shiftNumpadEnterRelayInput = await Promise.race([inputReceived, delay(5000).then(() => null)]);
+  if (shiftNumpadEnterRelayInput !== "\x1b[13;2u") throw new Error(`Shift+NumpadEnter did not emit CSI-u newline sequence: ${JSON.stringify(shiftNumpadEnterRelayInput)}`);
+  console.log(JSON.stringify({ shiftNumpadEnterRelayInput }));
   const beforeGrid = native.size(id);
   const replayGrid = native.setGrid(id, 80, 24);
   console.log(JSON.stringify({ beforeGrid, replayGrid }));

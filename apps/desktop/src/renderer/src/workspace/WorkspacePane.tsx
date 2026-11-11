@@ -260,11 +260,11 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onAc
   ratioRef.current = ratio;
   const drag = useRef<{ pointer: number; ratio: number } | undefined>(undefined);
   useEffect(() => () => { if (splitDragFrame.current !== undefined) cancelAnimationFrame(splitDragFrame.current); }, []);
-  const candidates = openIds.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty" && id !== activeId)).filter((item): item is SessionInfo => Boolean(item));
+  const candidates = openIds.map(id => snapshot.daemon.sessions.find(item => item.id === id && id !== activeId)).filter((item): item is SessionInfo => Boolean(item));
   const peerId = resolveSplitPeerId(splitLayout, activeId);
-  const splitSession = session?.kind === "pty" ? candidates.find(item => item.id === peerId) : undefined;
+  const splitSession = session ? candidates.find(item => item.id === peerId) : undefined;
   const [recentTerminals, setRecentTerminals] = useState<string[]>([]);
-  const retained = retainTerminalIds(retainTerminalIds(recentTerminals, splitSession?.id), session?.kind === "pty" ? session.id : undefined);
+  const retained = retainTerminalIds(retainTerminalIds(recentTerminals, splitSession?.kind === "pty" ? splitSession.id : undefined), session?.kind === "pty" ? session.id : undefined);
   if (retained.length !== recentTerminals.length || retained.some((id, index) => id !== recentTerminals[index])) setRecentTerminals(retained);
   const terminalSessions = retained.map(id => snapshot.daemon.sessions.find(item => item.id === id && item.kind === "pty")).filter((item): item is SessionInfo => Boolean(item));
   useEffect(() => {
@@ -310,8 +310,9 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onAc
     setSplitResizing(false);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
+  const primaryNonPtyFocused = splitSession ? focusedId === session?.id : true;
   return <div className="workspace-view workspace-view-single workspace-multipane" data-split-resizing={splitResizing || undefined}>
-    {session?.kind === "pty" && splitSession && <div className="workspace-split-controls">
+    {session && splitSession && <div className="workspace-split-controls">
       <span className="workspace-split-label"><Columns2 />{t("分屏", "Split view")}</span>
       {splitSession && <><NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => dispatchSplitLayout({ type: "open_split", splitId: event.target.value })}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect><Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button></>}
     </div>}
@@ -320,7 +321,7 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onAc
         const primary = item.id === activeId;
         const visible = active && (primary || item.id === splitSession?.id);
         return <div key={item.id} className="workspace-session-slot" data-position={primary ? "primary" : "secondary"} data-focused={focusedId === item.id || undefined} inert={!visible} aria-hidden={!visible} style={visible ? undefined : { position: "absolute", inset: 0, visibility: "hidden", pointerEvents: "none" }} onPointerDownCapture={() => visible && focusSession(item.id)} onFocusCapture={() => visible && focusSession(item.id)}>
-          <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
+          <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
         </div>;
       })}
       {splitSession && <div ref={splitResizerRef} className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={SPLIT_RATIO_MIN} aria-valuemax={SPLIT_RATIO_MAX} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => dispatchSplitLayout({ type: "set_ratio", ratio: SPLIT_RATIO_DEFAULT })} onPointerDown={event => {
@@ -360,7 +361,8 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onAc
         const next = event.key === "Home" ? SPLIT_RATIO_MIN : event.key === "End" ? SPLIT_RATIO_MAX : ["ArrowLeft", "ArrowUp"].includes(event.key) ? ratio - 5 : ["ArrowRight", "ArrowDown"].includes(event.key) ? ratio + 5 : undefined;
         if (next !== undefined) { event.preventDefault(); dispatchSplitLayout({ type: "set_ratio", ratio: next }); }
       }} />}
-      {session?.kind !== "pty" && <div className="workspace-session-slot" data-position="primary" data-focused="true"><WorkspaceSession key={session?.id ?? "empty"} active={active} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} /></div>}
+      {session?.kind !== "pty" && <div className="workspace-session-slot" data-position="primary" data-focused={primaryNonPtyFocused || undefined} onPointerDownCapture={() => active && session && focusSession(session.id)} onFocusCapture={() => active && session && focusSession(session.id)}><WorkspaceSession key={session?.id ?? "empty"} onSplit={session && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} active={active} focused={primaryNonPtyFocused} primary={true} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} /></div>}
+      {splitSession && splitSession.kind !== "pty" && <div key={splitSession.id} className="workspace-session-slot" data-position="secondary" data-focused={focusedId === splitSession.id || undefined} inert={!active} aria-hidden={!active} onPointerDownCapture={() => active && focusSession(splitSession.id)} onFocusCapture={() => active && focusSession(splitSession.id)}><WorkspaceSession session={splitSession} active={active} focused={focusedId === splitSession.id} primary={false} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} /></div>}
     </div>
   </div>;
 }
