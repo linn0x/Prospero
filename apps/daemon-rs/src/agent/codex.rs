@@ -1044,6 +1044,80 @@ impl AppServerCleanup {
     pub(crate) fn lifecycle(&self) -> ProcessLifecycle {
         self.lifecycle.clone()
     }
+
+    pub(crate) fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
+}
+
+struct AppServerGuard {
+    child: Option<Child>,
+    cleanup: AppServerCleanup,
+    thread_id: Option<String>,
+}
+
+impl AppServerGuard {
+    fn new(child: Child, cleanup: AppServerCleanup) -> Self {
+        Self {
+            child: Some(child),
+            cleanup,
+            thread_id: None,
+        }
+    }
+
+    fn set_thread_id(&mut self, thread_id: String) {
+        self.cleanup.record_thread(&thread_id);
+        self.thread_id = Some(thread_id);
+    }
+
+    fn lifecycle(&self) -> ProcessLifecycle {
+        self.cleanup.lifecycle()
+    }
+
+    async fn finish(&mut self) -> Quiescence {
+        let quiescence = if let Some(mut child) = self.child.take() {
+            self.cleanup.terminate(&mut child).await
+        } else {
+            Quiescence::Confirmed
+        };
+        if let Some(thread_id) = self.thread_id.take() {
+            self.cleanup.cleanup_thread_lock(&thread_id);
+        }
+        quiescence
+    }
+}
+
+impl Drop for AppServerGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            if let Some(thread_id) = self.thread_id.take() {
+                self.cleanup.cleanup_thread_lock(&thread_id);
+            }
+            return;
+        };
+        kill_process_group(self.cleanup.child_pid);
+        let _ = child.start_kill();
+        let cleanup = self.cleanup.clone();
+        let thread_id = self.thread_id.take();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                cleanup.terminate(&mut child).await;
+                if let Some(thread_id) = thread_id {
+                    cleanup.cleanup_thread_lock(&thread_id);
+                }
+            });
+        } else {
+            let _ = child.try_wait();
+            if !process_alive(cleanup.child_pid) {
+                if let Some(path) = cleanup.lease_path.as_ref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                if let Some(thread_id) = thread_id {
+                    cleanup.cleanup_thread_lock(&thread_id);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1386,6 +1460,110 @@ while True: time.sleep(1)
         assert!(!lease_exists);
         assert!(!lock_exists);
     }
+
+    #[test]
+    fn from_unified_patch_truncates_multibyte_utf8_safely() {
+        let mut raw = String::from("--- a/file.rs\n+++ b/file.rs\n@@ -1,1 +1,1 @@\n+");
+        // Pad with multi-byte CJK & emoji so byte 8000 lands inside a multi-byte char.
+        raw.push_str(&"中文🚀".repeat(1500));
+        let diff = from_unified_patch("file.rs", &raw);
+        assert!(diff.truncated);
+        assert!(diff.patch.len() <= MAX_PATCH_CHARS);
+        assert!(diff.patch.len() + 4 > MAX_PATCH_CHARS);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn app_server_guard_drop_terminates_process_and_cleans_lock() {
+        let (root, home) = cleanup_home();
+        let data = root.path();
+        let native_home = data
+            .join("agent-accounts/codex-usage")
+            .join(super::super::usage::NATIVE_CODEX_ID)
+            .join("home");
+        std::fs::create_dir_all(&native_home).unwrap();
+        let _ = home;
+        std::fs::create_dir_all(native_home.join(".prospero/app-server-leases")).unwrap();
+        std::fs::create_dir_all(native_home.join("thread-writer-locks")).unwrap();
+        let env = env_for(&native_home);
+
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").kill_on_drop(true);
+        super::super::lifecycle::configure_process_group(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let cleanup = AppServerCleanup::new(data, pid, &env).unwrap();
+        let lease = native_home
+            .join(".prospero/app-server-leases")
+            .join(format!("{pid}.json"));
+        let lock = native_home.join("thread-writer-locks/thread-drop-test.lock");
+        std::fs::write(&lock, []).unwrap();
+
+        {
+            let mut guard = AppServerGuard::new(child, cleanup);
+            guard.set_thread_id("thread-drop-test".into());
+            assert!(lease.exists());
+            assert!(lock.exists());
+            // Drop `guard` without calling `finish().await` to simulate unwind / early Err.
+        }
+
+        for _ in 0..100 {
+            if !process_alive(pid) && !lease.exists() && !lock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!process_alive(pid));
+        assert!(!lease.exists());
+        assert!(!lock.exists());
+    }
+
+    #[tokio::test]
+    async fn read_notifications_accumulates_reasoning_deltas_per_item() {
+        let payload = concat!(
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"t1\",\"turnId\":\"turn-1\"}}\n",
+            "{\"method\":\"item/reasoning/textDelta\",\"params\":{\"threadId\":\"t1\",\"itemId\":\"r1\",\"delta\":\"First \"}}\n",
+            "{\"method\":\"item/reasoning/summaryTextDelta\",\"params\":{\"threadId\":\"t1\",\"itemId\":\"r1\",\"delta\":\"thought\"}}\n",
+            "{\"method\":\"item/reasoning/textDelta\",\"params\":{\"threadId\":\"t1\",\"itemId\":\"r2\",\"delta\":\"Second\"}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"t1\",\"turn\":{\"status\":\"completed\"}}}\n",
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &format!("printf '%s' '{}'", payload)])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let (writer_tx, _writer_rx) = mpsc::channel(16);
+        read_notifications(
+            stdout,
+            events_tx,
+            writer_tx,
+            true,
+            "t1".into(),
+            NotificationState {
+                current_turn: Arc::new(Mutex::new(None)),
+                current_turns: Arc::new(Mutex::new(HashMap::new())),
+                responses: Arc::new(Mutex::new(HashMap::new())),
+                diagnostics: ProcessDiagnostics {
+                    file: "sh".into(),
+                    args: Vec::new(),
+                    cwd: "/".into(),
+                    env: Vec::new(),
+                    stderr_tail: Arc::new(Mutex::new(String::new())),
+                },
+            },
+        )
+        .await;
+        let _ = child.wait().await;
+        let mut thinking = Vec::new();
+        while let Some(ev) = events_rx.recv().await {
+            if let AdapterEvent::Thinking { text, .. } = ev {
+                thinking.push(text);
+            }
+        }
+        assert_eq!(thinking, vec!["First ", "First thought", "Second"]);
+    }
 }
 
 pub(super) struct CodexTurn {
@@ -1476,12 +1654,11 @@ struct ProcessDiagnostics {
 }
 
 struct StartingRpc {
-    child: Child,
+    guard: AppServerGuard,
     stdin: tokio::process::ChildStdin,
     stdout: BufReader<tokio::process::ChildStdout>,
     next_id: u64,
     diagnostics: ProcessDiagnostics,
-    cleanup: AppServerCleanup,
 }
 
 impl StartingRpc {
@@ -1509,7 +1686,7 @@ impl StartingRpc {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(false);
+            .kill_on_drop(true);
         for (key, value) in environment {
             command.env(key, value);
         }
@@ -1536,27 +1713,23 @@ impl StartingRpc {
         if let Some(stderr) = child.stderr.take() {
             spawn_stderr_tail_drain(stderr, diagnostics.stderr_tail.clone());
         }
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let quiescence = cleanup.terminate(&mut child).await;
-                return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
-            }
+        let stdin_opt = child.stdin.take();
+        let stdout_opt = child.stdout.take();
+        let mut guard = AppServerGuard::new(child, cleanup);
+        let Some(stdin) = stdin_opt else {
+            let quiescence = guard.finish().await;
+            return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
         };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let quiescence = cleanup.terminate(&mut child).await;
-                return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
-            }
+        let Some(stdout) = stdout_opt else {
+            let quiescence = guard.finish().await;
+            return Err(super::lifecycle::cleanup_error(Error::Closed, quiescence));
         };
         Ok(Self {
-            child,
+            guard,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
             diagnostics,
-            cleanup,
         })
     }
 
@@ -1675,7 +1848,7 @@ pub(super) async fn spawn_turn(
         app_server_args.push("daybreak=true".into());
     }
     let mut rpc = StartingRpc::start(data, workspace, &environment, &app_server_args).await?;
-    let lifecycle = rpc.cleanup.lifecycle();
+    let lifecycle = rpc.guard.lifecycle();
     let policy = execution_policy(workspace, options.policy);
     let startup = async {
         rpc.request(
@@ -1722,11 +1895,11 @@ pub(super) async fn spawn_turn(
     let thread_id = match startup {
         Ok(thread_id) => thread_id,
         Err(error) => {
-            let quiescence = rpc.cleanup.terminate(&mut rpc.child).await;
+            let quiescence = rpc.guard.finish().await;
             return Err(super::lifecycle::cleanup_error(error, quiescence));
         }
     };
-    rpc.cleanup.record_thread(&thread_id);
+    rpc.guard.set_thread_id(thread_id.clone());
 
     let (frames_tx, mut frames_rx) = mpsc::channel::<(Value, Option<oneshot::Sender<()>>)>(32);
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
@@ -1735,7 +1908,13 @@ pub(super) async fn spawn_turn(
     let current_turn = Arc::new(Mutex::new(None));
     let current_turns = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut stdin = rpc.stdin;
+    let StartingRpc {
+        guard,
+        mut stdin,
+        stdout,
+        diagnostics,
+        ..
+    } = rpc;
     tokio::spawn(async move {
         while let Some((frame, ack)) = frames_rx.recv().await {
             if write_frame(&mut stdin, &frame).await.is_err() {
@@ -1751,15 +1930,13 @@ pub(super) async fn spawn_turn(
     let reader_current_turns = current_turns.clone();
     let reader_frames = frames_tx.clone();
     let reader_thread_id = thread_id.clone();
-    let cleanup_thread_id = reader_thread_id.clone();
     let reader_responses = responses.clone();
-    let diagnostics = rpc.diagnostics.clone();
-    let cleanup = rpc.cleanup.clone();
     let reader_diagnostics = diagnostics.clone();
     let auto_approve = options.policy == ApprovalPolicy::Auto;
     tokio::spawn(async move {
+        let mut guard = guard;
         read_notifications(
-            rpc.stdout,
+            stdout,
             events_tx,
             reader_frames,
             auto_approve,
@@ -1772,8 +1949,7 @@ pub(super) async fn spawn_turn(
             },
         )
         .await;
-        cleanup.terminate(&mut rpc.child).await;
-        cleanup.cleanup_thread_lock(&cleanup_thread_id);
+        guard.finish().await;
     });
 
     let turn_start_id = 1_000_000_u64;
@@ -1818,6 +1994,7 @@ pub(super) async fn spawn_turn(
         .is_err()
     {
         responses.lock().await.remove(&turn_start_id.to_string());
+        let _ = lifecycle.request_termination().await;
         return Err(Error::Invalid(
             diagnostic_message(&diagnostics, "codex turn/start 失败: app-server 队列不可写").await,
         ));
@@ -1871,10 +2048,10 @@ pub(super) async fn fork_thread(
         let id = reply.get("thread").and_then(|thread| thread.get("id")).and_then(Value::as_str)
             .filter(|id| !id.is_empty() && *id != source).ok_or_else(|| Error::Invalid("Codex 未返回独立的分支线程".into()))?;
         crate::database::validate_id(id)?;
-        rpc.cleanup.record_thread(id);
+        rpc.guard.set_thread_id(id.to_owned());
         Ok(id.to_owned())
     }.await;
-    let quiescence = rpc.cleanup.terminate(&mut rpc.child).await;
+    let quiescence = rpc.guard.finish().await;
     if matches!(quiescence, Quiescence::Unknown) {
         return Err(super::lifecycle::cleanup_error(Error::Conflict, quiescence));
     }
@@ -1910,6 +2087,7 @@ pub(super) async fn read_subagent_history_once(
                 }),
             )
             .await?;
+        rpc.guard.set_thread_id(parent_thread_id.to_owned());
         let raw = rpc
             .request(
                 "thread/read",
@@ -1927,7 +2105,7 @@ pub(super) async fn read_subagent_history_once(
         Ok(Some(history_events(thread, subagent_id)))
     }
     .await;
-    rpc.cleanup.terminate(&mut rpc.child).await;
+    rpc.guard.finish().await;
     result
 }
 
@@ -1976,6 +2154,7 @@ async fn read_notifications(
     state: NotificationState,
 ) {
     let mut streamed: HashMap<String, String> = HashMap::new();
+    let mut reasoning_streamed: HashMap<String, String> = HashMap::new();
     let mut subagents: HashMap<String, bool> = HashMap::new();
     let mut pending_diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
     let mut turn_diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
@@ -2188,6 +2367,7 @@ async fn read_notifications(
                     *state.current_turn.lock().await = turn_id;
                     last_text = None;
                     streamed.clear();
+                    reasoning_streamed.clear();
                 } else if let Some(turn_id) = turn_id {
                     state
                         .current_turns
@@ -2216,10 +2396,14 @@ async fn read_notifications(
                 if let Some(delta) = params.get("delta").and_then(Value::as_str)
                     && !delta.is_empty()
                 {
+                    let item_id = codex_item_id(&params, &state.current_turn).await;
+                    let key = format!("{:?}:{item_id}", agent_id);
+                    let full = reasoning_streamed.entry(key).or_default();
+                    full.push_str(delta);
                     let _ = events
                         .send(AdapterEvent::Thinking {
                             subagent: agent_id.clone(),
-                            text: delta.to_owned(),
+                            text: full.clone(),
                         })
                         .await;
                 }
@@ -2380,7 +2564,21 @@ async fn read_notifications(
                 let diffs = aggregate_diffs
                     .take()
                     .unwrap_or_else(|| turn_diffs.values().cloned().collect());
-                let error = failed.then(|| format!("Codex turn {status}"));
+                let error = failed.then(|| {
+                    let detail = turn
+                        .get("error")
+                        .or_else(|| params.get("error"))
+                        .and_then(|err| {
+                            err.as_str()
+                                .or_else(|| err.get("message").and_then(Value::as_str))
+                        })
+                        .map(str::trim)
+                        .filter(|msg| !msg.is_empty());
+                    match detail {
+                        Some(detail) => format!("Codex turn {status}: {detail}"),
+                        None => format!("Codex turn {status}"),
+                    }
+                });
                 let reason = if interrupted {
                     "工具调用已中断"
                 } else {
@@ -2942,8 +3140,9 @@ fn diff_path(value: &str) -> String {
         .to_owned()
 }
 
+const MAX_PATCH_CHARS: usize = 8000;
+
 fn from_unified_patch(path: &str, patch_text: &str) -> crate::protocol::FileDiff {
-    const MAX_PATCH_CHARS: usize = 8000;
     let mut additions = 0_i64;
     let mut deletions = 0_i64;
     let mut lines = Vec::new();
@@ -2965,7 +3164,7 @@ fn from_unified_patch(path: &str, patch_text: &str) -> crate::protocol::FileDiff
     let mut patch = lines.join("\n");
     let truncated = patch.len() > MAX_PATCH_CHARS;
     if truncated {
-        patch.truncate(MAX_PATCH_CHARS);
+        patch.truncate(patch.floor_char_boundary(MAX_PATCH_CHARS));
     }
     crate::protocol::FileDiff {
         path: path.chars().take(4096).collect(),

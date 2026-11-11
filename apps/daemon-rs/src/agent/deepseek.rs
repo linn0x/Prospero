@@ -175,10 +175,7 @@ where
             return;
         }
         output.push_str(&line);
-        if output.len() > 8000 {
-            let drain = output.len() - 8000;
-            output.drain(..drain);
-        }
+        trim_output_buffer(&mut output, 8000);
         if !sent && let Some(port) = parse_port(&output) {
             let _ = ports.send(port);
             sent = true;
@@ -186,10 +183,20 @@ where
     }
 }
 
+fn trim_output_buffer(output: &mut String, limit: usize) {
+    if output.len() > limit {
+        let mut drain = output.len() - limit;
+        while drain < output.len() && !output.is_char_boundary(drain) {
+            drain += 1;
+        }
+        output.drain(..drain);
+    }
+}
+
 fn parse_port(output: &str) -> Option<u16> {
     let marker = "dsh web:";
     let index = output.to_ascii_lowercase().find(marker)?;
-    let rest = output[index + marker.len()..].trim_start();
+    let rest = output.get(index + marker.len()..)?.trim_start();
     let rest = rest.strip_prefix("http://127.0.0.1:")?;
     let digits = rest
         .chars()
@@ -1005,7 +1012,8 @@ async fn select_model(
     if provider.is_empty() || model_id.is_empty() {
         return Err(Error::Invalid("DeepSeek 模型 ID 格式无效".into()));
     }
-    let normalized_effort = crate::accounts::profile::normalize_known_model_effort(model_id, effort);
+    let normalized_effort =
+        crate::accounts::profile::normalize_known_model_effort(model_id, effort);
     let mut payload = serde_json::Map::new();
     payload.insert("sessionId".into(), json!(session_id));
     payload.insert("provider".into(), json!(provider));
@@ -1022,16 +1030,14 @@ async fn select_model(
     .await
     {
         Ok(value) => Ok(value),
-        Err(error) if payload.remove("reasoningEffort").is_some() => {
-            call_rpc(
-                client,
-                base_url,
-                "session.selectModel",
-                Value::Object(payload),
-            )
-            .await
-            .or(Err(error))
-        }
+        Err(error) if payload.remove("reasoningEffort").is_some() => call_rpc(
+            client,
+            base_url,
+            "session.selectModel",
+            Value::Object(payload),
+        )
+        .await
+        .or(Err(error)),
         Err(error) => Err(error),
     }
 }
@@ -1748,5 +1754,13 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn trim_output_buffer_respects_utf8_char_boundaries() {
+        let mut buf = "中".repeat(3000) + "dsh web: http://127.0.0.1:4321\n";
+        trim_output_buffer(&mut buf, 8000);
+        assert!(buf.len() <= 8000);
+        assert_eq!(parse_port(&buf), Some(4321));
     }
 }

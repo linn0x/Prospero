@@ -15,6 +15,7 @@ pub(crate) const STREAM_VIEWER_SLOTS: u32 = 16;
 const PAGE_BYTES: usize = 64 * 1024;
 const ACTIVITY_IDLE_MS: i64 = 30_000;
 const ACTIVITY_TAIL_LINES: usize = 10;
+const LIVE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub use prospero_protocol_rs::{
     CreateTerminal, TerminalEvent, TerminalInput, TerminalPage, TerminalQuery, TerminalSize,
@@ -62,6 +63,8 @@ pub struct Output {
     query_carry: Vec<u8>,
     activity_phase: PtyActivityPhase,
     activity_version: u64,
+    last_snapshot_at: Option<std::time::Instant>,
+    last_snapshot_seq: i64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -98,6 +101,8 @@ impl Output {
             query_carry: Vec::new(),
             activity_phase: PtyActivityPhase::Quiet,
             activity_version: 0,
+            last_snapshot_at: None,
+            last_snapshot_seq: base_seq,
         })
     }
 
@@ -317,33 +322,39 @@ impl Output {
             return Err(Error::Invalid("terminal cursor is ahead of output".into()));
         }
         let ring_floor = self.seq - self.events.len() as i64;
-        let (floor, events) = if after < self.base_seq {
-            (self.base_seq, Vec::new())
-        } else if after < ring_floor {
-            if self.replay_failed {
-                return Err(Error::Feature(
-                    "terminal_replay_unavailable".into(),
-                    "Terminal replay journal is unavailable".into(),
-                ));
-            }
-            self.replay.page(after, self.seq)?
+        let replay_floor = if self.replay_failed {
+            ring_floor
         } else {
-            let mut events = Vec::new();
-            let mut bytes = 0;
-            for (event, size) in self
-                .events
-                .iter()
-                .skip((after - ring_floor) as usize)
-                .take(64)
-            {
-                if !events.is_empty() && bytes + size > PAGE_BYTES {
-                    break;
-                }
-                bytes += size;
-                events.push(event.clone());
-            }
-            (ring_floor, events)
+            self.replay.floor()
         };
+        let (floor, events) =
+            if after < self.base_seq || (!self.replay_failed && after < replay_floor) {
+                (replay_floor, Vec::new())
+            } else if after < ring_floor {
+                if self.replay_failed {
+                    return Err(Error::Feature(
+                        "terminal_replay_unavailable".into(),
+                        "Terminal replay journal is unavailable".into(),
+                    ));
+                }
+                self.replay.page(after, self.seq)?
+            } else {
+                let mut events = Vec::new();
+                let mut bytes = 0;
+                for (event, size) in self
+                    .events
+                    .iter()
+                    .skip((after - ring_floor) as usize)
+                    .take(64)
+                {
+                    if !events.is_empty() && bytes + size > PAGE_BYTES {
+                        break;
+                    }
+                    bytes += size;
+                    events.push(event.clone());
+                }
+                (replay_floor, events)
+            };
         if after >= floor && after < self.seq && events.is_empty() {
             return Err(Error::Feature(
                 "terminal_replay_unavailable".into(),
@@ -356,11 +367,7 @@ impl Output {
             base_seq: after,
             next_seq: after + events.len() as i64,
             latest_seq: self.seq,
-            floor_seq: if self.replay_failed {
-                floor
-            } else {
-                self.base_seq
-            },
+            floor_seq: floor,
             resync_required: after < floor || after > self.seq,
             events,
             exited: self.is_exited(),
@@ -550,7 +557,7 @@ impl Terminal {
     }
 
     pub(crate) fn checkpoint(&self, after: Option<i64>) -> Result<Option<Archive>> {
-        let output = self.0.output.lock().map_err(|_| Error::Closed)?;
+        let mut output = self.0.output.lock().map_err(|_| Error::Closed)?;
         if after.is_none() && !output.is_exited() {
             return Err(Error::Conflict);
         }
@@ -558,10 +565,30 @@ impl Terminal {
             return Ok(None);
         }
         if let Some(after) = after {
-            let page = output.page(after)?;
-            let snapshot = (page.next_seq == page.latest_seq)
-                .then(|| output.screen.snapshot(page.latest_seq).ok())
-                .flatten();
+            let start = if output.replay_failed {
+                after
+            } else {
+                after.max(output.replay.floor())
+            };
+            let page = output.page(start)?;
+            let should_snapshot = page.next_seq == page.latest_seq
+                && (output.is_exited()
+                    || !matches!(output.activity_phase, PtyActivityPhase::Busy { .. })
+                    || page.latest_seq.saturating_sub(output.last_snapshot_seq)
+                        >= store::LIVE_TERMINAL_OUTPUT_CAP
+                    || output
+                        .last_snapshot_at
+                        .is_none_or(|last| last.elapsed() >= LIVE_SNAPSHOT_INTERVAL));
+            let snapshot = if should_snapshot {
+                let snap = output.screen.snapshot(page.latest_seq).ok();
+                if snap.is_some() {
+                    output.last_snapshot_at = Some(std::time::Instant::now());
+                    output.last_snapshot_seq = page.latest_seq;
+                }
+                snap
+            } else {
+                None
+            };
             return Ok(Some(Archive {
                 snapshot,
                 floor: page.floor_seq,
@@ -668,12 +695,20 @@ impl Terminal {
     }
 
     pub async fn input(&self, input: TerminalInput) -> Result<()> {
-        self.input_authorized(input, None).await
+        self.input_authorized(input, None, false).await
+    }
+    pub async fn system_input(&self, input: TerminalInput) -> Result<()> {
+        self.input_authorized(input, None, true).await
     }
     pub async fn input_as(&self, client: &str, input: TerminalInput) -> Result<()> {
-        self.input_authorized(input, Some(client)).await
+        self.input_authorized(input, Some(client), false).await
     }
-    async fn input_authorized(&self, input: TerminalInput, client: Option<&str>) -> Result<()> {
+    async fn input_authorized(
+        &self,
+        input: TerminalInput,
+        client: Option<&str>,
+        bypass_controller: bool,
+    ) -> Result<()> {
         if input.data_b64.len() > INPUT_BYTES.div_ceil(3) * 4 {
             return Err(Error::Invalid("terminal input exceeds limit".into()));
         }
@@ -684,7 +719,12 @@ impl Terminal {
             return Err(Error::Invalid("invalid terminal input length".into()));
         }
         let result = self
-            .control(|reply| Control::Input(bytes, reply), None, client)
+            .control(
+                |reply| Control::Input(bytes, reply),
+                None,
+                client,
+                bypass_controller,
+            )
             .await;
         if result.is_ok() {
             if let Ok(mut output) = self.0.output.lock() {
@@ -707,6 +747,7 @@ impl Terminal {
             |reply| Control::Resize(size, reply),
             Some(Duration::from_secs(1)),
             client,
+            false,
         )
         .await
     }
@@ -716,6 +757,7 @@ impl Terminal {
         build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control,
         timeout: Option<Duration>,
         client: Option<&str>,
+        bypass_controller: bool,
     ) -> Result<()> {
         if self.0.stop.load(Ordering::Acquire) {
             return Err(Error::Closed);
@@ -726,7 +768,7 @@ impl Terminal {
             // takeover. Commands accepted before takeover may finish; stale
             // commands arriving afterwards never enter the PTY queue.
             let owner = self.0.controller.lock().map_err(|_| Error::Closed)?;
-            if owner.as_deref() != client {
+            if !bypass_controller && owner.as_deref() != client {
                 return Err(Error::Conflict);
             }
             self.0.sender.try_send(build(reply)).map_err(|e| match e {
@@ -934,6 +976,22 @@ mod tests {
         let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
         assert_eq!(output.write(b"x\x1b[06n"), vec![b"\x1b[1;2R".to_vec()]);
         assert_eq!(output.write(b"\x1b[00c"), vec![b"\x1b[?6c".to_vec()]);
+    }
+
+    #[test]
+    fn bounded_replay_advances_floor_and_marks_pruned_cursors_for_resync() {
+        let mut output = Output::new_at(TerminalSize { cols: 80, rows: 24 }, 100).unwrap();
+        for _ in 0..(replay::MAX_REPLAY_EVENTS + 600) {
+            output.write(b"chunk\r\n");
+        }
+        let stale = output.page(100).unwrap();
+        assert!(stale.resync_required);
+        assert!(stale.events.is_empty());
+        assert!(stale.floor_seq > 100);
+        let resumed = output.page(stale.floor_seq).unwrap();
+        assert!(!resumed.resync_required);
+        assert_eq!(resumed.floor_seq, stale.floor_seq);
+        assert!(!resumed.events.is_empty());
     }
 }
 

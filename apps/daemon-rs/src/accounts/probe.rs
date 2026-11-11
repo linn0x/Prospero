@@ -293,37 +293,37 @@ fn can_cache_runtime_probe() -> bool {
         && std::env::var_os("PROSPERO_CODEX_BIN").is_none()
         && std::env::var_os("PROSPERO_OPENCODE_BIN").is_none()
         && std::env::var_os("PROSPERO_PI_BIN").is_none()
+        && std::env::var_os("PROSPERO_AGY_BIN").is_none()
 }
 
 fn runtime_availability_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, (std::time::Instant, bool)>,
+    std::collections::HashMap<(String, String), (std::time::Instant, bool)>,
 > {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
+        std::sync::Mutex<std::collections::HashMap<(String, String), (std::time::Instant, bool)>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 async fn command_available(binary: String, directory_env: &[(&str, &str)]) -> bool {
     let cacheable = can_cache_runtime_probe();
+    let cache_key = (binary.clone(), std::env::var("PATH").unwrap_or_default());
     if cacheable
         && let Ok(guard) = runtime_availability_cache().lock()
-        && let Some((checked_at, ok)) = guard.get(&binary).copied()
+        && let Some((checked_at, ok)) = guard.get(&cache_key).copied()
     {
         let ttl = if ok {
             Duration::from_secs(60)
         } else {
-            Duration::from_secs(10)
+            Duration::from_secs(20)
         };
         if checked_at.elapsed() < ttl {
             return ok;
         }
     }
-    let ok = command_version("", binary.clone(), directory_env)
-        .await
-        .is_ok();
+    let ok = command_version("", binary, directory_env).await.is_ok();
     if cacheable && let Ok(mut guard) = runtime_availability_cache().lock() {
-        guard.insert(binary, (std::time::Instant::now(), ok));
+        guard.insert(cache_key, (std::time::Instant::now(), ok));
     }
     ok
 }

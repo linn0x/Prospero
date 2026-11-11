@@ -187,11 +187,29 @@ pub(crate) fn native_codex_terminal_environment(data: &Path) -> Result<Vec<(Stri
 }
 
 struct CodexRpc {
-    child: Child,
+    child: Option<Child>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     cleanup: super::codex::AppServerCleanup,
+}
+
+impl Drop for CodexRpc {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        super::codex::kill_process_group(self.cleanup.child_pid());
+        let _ = child.start_kill();
+        let cleanup = self.cleanup.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                cleanup.terminate(&mut child).await;
+            });
+        } else {
+            let _ = child.try_wait();
+        }
+    }
 }
 
 impl CodexRpc {
@@ -214,7 +232,7 @@ impl CodexRpc {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(false);
+            .kill_on_drop(true);
         for (key, value) in env {
             command.env(key, value);
         }
@@ -265,7 +283,7 @@ impl CodexRpc {
             }
         };
         let mut rpc = Self {
-            child,
+            child: Some(child),
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
@@ -285,11 +303,11 @@ impl CodexRpc {
             )
             .await;
         if let Err(error) = initialized {
-            rpc.cleanup.terminate(&mut rpc.child).await;
+            rpc.shutdown().await;
             return Err(error);
         }
         if let Err(error) = rpc.notify("initialized", json!({})).await {
-            rpc.cleanup.terminate(&mut rpc.child).await;
+            rpc.shutdown().await;
             return Err(error);
         }
         Ok(rpc)
@@ -347,17 +365,47 @@ impl CodexRpc {
 
     async fn shutdown(mut self) {
         let _ = self.stdin.shutdown().await;
-        self.cleanup.terminate(&mut self.child).await;
+        if let Some(mut child) = self.child.take() {
+            self.cleanup.terminate(&mut child).await;
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CachedCodexUsage {
+    Ok(Option<UsageReport>),
+    Timeout,
+    Unavailable(String),
+    Invalid(String),
+}
+
+impl CachedCodexUsage {
+    fn from_result(result: &Result<Option<UsageReport>>) -> Self {
+        match result {
+            Ok(report) => Self::Ok(report.clone()),
+            Err(Error::Timeout) => Self::Timeout,
+            Err(Error::Feature(code, msg)) if code == "agent_unavailable" => {
+                Self::Unavailable(msg.clone())
+            }
+            Err(other) => Self::Invalid(other.to_string()),
+        }
+    }
+
+    fn into_result(self) -> Result<Option<UsageReport>> {
+        match self {
+            Self::Ok(report) => Ok(report),
+            Self::Timeout => Err(Error::Timeout),
+            Self::Unavailable(msg) => Err(Error::Feature("agent_unavailable".into(), msg)),
+            Self::Invalid(msg) => Err(Error::Invalid(msg)),
+        }
     }
 }
 
 fn codex_usage_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, (std::time::Instant, Option<UsageReport>)>,
+    std::collections::HashMap<String, (std::time::Instant, CachedCodexUsage)>,
 > {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<String, (std::time::Instant, Option<UsageReport>)>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, CachedCodexUsage)>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -421,9 +469,26 @@ async fn read_codex_usage_with_env(
         && let Some((checked_at, cached)) = guard.get(key)
         && checked_at.elapsed() < Duration::from_secs(20)
     {
-        return Ok(cached.clone());
+        return cached.clone().into_result();
     }
-    let mut rpc = CodexRpc::start(data, cwd, env).await?;
+    let mut rpc = match CodexRpc::start(data, cwd, env).await {
+        Ok(rpc) => rpc,
+        Err(error) => {
+            let err_res: Result<Option<UsageReport>> = Err(error);
+            if let Some(key) = cache_key
+                && let Ok(mut guard) = codex_usage_cache().lock()
+            {
+                guard.insert(
+                    key,
+                    (
+                        std::time::Instant::now(),
+                        CachedCodexUsage::from_result(&err_res),
+                    ),
+                );
+            }
+            return err_res;
+        }
+    };
     let result = async {
         let mut identity = rpc
             .request("account/read", json!({ "refreshToken": false }))
@@ -464,10 +529,16 @@ async fn read_codex_usage_with_env(
     }
     .await;
     rpc.shutdown().await;
-    if let (Some(key), Ok(report)) = (cache_key, &result)
+    if let Some(key) = cache_key
         && let Ok(mut guard) = codex_usage_cache().lock()
     {
-        guard.insert(key, (std::time::Instant::now(), report.clone()));
+        guard.insert(
+            key,
+            (
+                std::time::Instant::now(),
+                CachedCodexUsage::from_result(&result),
+            ),
+        );
     }
     result
 }
@@ -910,8 +981,8 @@ fn codex_models_from_cache_file(path: &Path) -> Option<Vec<crate::agent::LaunchM
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let len = meta.len();
-    let cache = MODEL_FILE_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        MODEL_FILE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(guard) = cache.lock()
         && let Some((cached_mtime, cached_len, models)) = guard.get(path)
         && *cached_mtime == mtime
@@ -1110,8 +1181,9 @@ pub(crate) fn fast_codex_catalog_for_account(
         (None, None)
     };
     let models = if std::env::var_os("PROSPERO_CODEX_BIN").is_none() {
-        codex_models_from_cache_file(&account_home.join("models_cache.json"))
-            .or_else(|| codex_models_from_cache_file(&shared_codex_home().join("models_cache.json")))
+        codex_models_from_cache_file(&account_home.join("models_cache.json")).or_else(|| {
+            codex_models_from_cache_file(&shared_codex_home().join("models_cache.json"))
+        })
     } else {
         None
     }
@@ -1255,7 +1327,9 @@ async fn read_codex_models(
         let cached = codex_home
             .as_deref()
             .and_then(|home| codex_models_from_cache_file(&home.join("models_cache.json")))
-            .or_else(|| codex_models_from_cache_file(&shared_codex_home().join("models_cache.json")));
+            .or_else(|| {
+                codex_models_from_cache_file(&shared_codex_home().join("models_cache.json"))
+            });
         if let Some(models) = cached {
             let current_model = models
                 .iter()

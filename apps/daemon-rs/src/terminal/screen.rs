@@ -69,6 +69,7 @@ pub struct Screen {
     compatible: bool,
     modes: BTreeSet<u16>,
     keypad: bool,
+    modify_other_keys: Option<u8>,
     osc: bool,
     cursor_style: String,
     glyphs: HashMap<char, Glyph>,
@@ -100,6 +101,7 @@ impl Screen {
             compatible: true,
             modes: BTreeSet::new(),
             keypad: false,
+            modify_other_keys: None,
             osc: false,
             cursor_style: String::new(),
             glyphs: HashMap::new(),
@@ -391,6 +393,7 @@ impl Screen {
     fn input_modes(&mut self, sequence: &str) {
         if sequence == "\x1b[!p" {
             self.link = None;
+            self.modify_other_keys = None;
         }
         if let Some(value) = sequence.strip_prefix("\x1b]8;").and_then(|value| {
             value
@@ -427,6 +430,17 @@ impl Screen {
         }
         if sequence == "\x1b>" {
             self.keypad = false;
+        }
+        if let Some(level) = sequence
+            .strip_prefix("\x1b[>4")
+            .and_then(|rest| rest.strip_suffix('m'))
+        {
+            match level {
+                "" | ";0" => self.modify_other_keys = None,
+                ";1" => self.modify_other_keys = Some(1),
+                ";2" => self.modify_other_keys = Some(2),
+                _ => {}
+            }
         }
         if let Some(sequence) = sequence.strip_prefix("\x1b[?") {
             let enabled = sequence.ends_with('h');
@@ -480,6 +494,9 @@ impl Screen {
         }
         if self.keypad {
             ansi.push_str("\x1b=");
+        }
+        if let Some(level) = self.modify_other_keys {
+            ansi.push_str(&format!("\x1b[>4;{level}m"));
         }
         ansi.push_str(&self.cursor_style);
         ansi.push_str(
@@ -644,5 +661,21 @@ mod dump_tests {
             normalize_xterm_dump("text 38:2:10:20:30 and \x1b[9W"),
             "text 38:2:10:20:30 and \x1b[9W"
         );
+    }
+
+    #[test]
+    fn snapshot_preserves_and_resets_modify_other_keys() {
+        let mut screen = Screen::new(TerminalSize { cols: 24, rows: 8 });
+        screen.process(b"\x1b[>4;2mprompt");
+        let enabled = STANDARD
+            .decode(screen.snapshot(1).unwrap().data_b64)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&enabled).contains("\x1b[>4;2m"));
+
+        screen.process(b"\x1b[>4;0m");
+        let disabled = STANDARD
+            .decode(screen.snapshot(2).unwrap().data_b64)
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&disabled).contains("\x1b[>4;"));
     }
 }

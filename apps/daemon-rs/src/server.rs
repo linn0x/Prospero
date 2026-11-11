@@ -584,7 +584,10 @@ impl Api {
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
             .route("/v1/workspaces", get(workspaces))
-            .route("/v1/workspaces/tabs", get(workspace_tabs).post(set_workspace_tabs))
+            .route(
+                "/v1/workspaces/tabs",
+                get(workspace_tabs).post(set_workspace_tabs),
+            )
             .route("/v1/sessions/{id}", get(session).patch(rename))
             .route("/v1/sessions/{id}/contents", get(contents))
             .route("/v1/sessions/{id}/content/{content}", get(content))
@@ -1237,6 +1240,7 @@ struct RemoteWsState {
     response_tx: Option<tokio::sync::mpsc::Sender<JsonValue>>,
     fork_requests: HashSet<String>,
     orchestration_snapshot: Option<String>,
+    orchestration_stamp: Option<(i64, u64)>,
 }
 
 #[derive(Debug)]
@@ -1247,10 +1251,11 @@ struct RemotePtyAttachment {
     replay_until: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RemoteChatAttachment {
-    cursor_position: i64,
+    cursor_updated_seq: i64,
     last_event_seq: i64,
+    started_tools: HashSet<String>,
 }
 
 async fn recv_text_frame(socket: &mut WebSocket) -> Result<Option<String>> {
@@ -1692,7 +1697,9 @@ async fn route_remote_ws_message(
             remote_execution_query(api, socket, channel, device, message).await
         }
         "orchestration.snapshot" => {
+            let stamp = remote_orchestration_stamp(api).await?;
             let snapshot = load_orchestration_snapshot(api).await?;
+            state.orchestration_stamp = Some(stamp);
             state.orchestration_snapshot = Some(serde_json::to_string(&snapshot)?);
             send_remote_json(
                 socket,
@@ -3576,7 +3583,7 @@ async fn send_terminal_snapshot(
             att.last_sent_seq = snapshot.seq;
             att.last_ack_seq = snapshot.seq;
         }
-        if let Ok(page) = api
+        let mut page = api
             .terminals
             .read(
                 sid.to_owned(),
@@ -3585,7 +3592,27 @@ async fn send_terminal_snapshot(
                     wait_ms: None,
                 },
             )
-            .await
+            .await;
+        if let Ok(ref current) = page
+            && current.resync_required
+        {
+            let floor = current.floor_seq.max(0);
+            if let Some(att) = state.pty_attachments.get_mut(sid) {
+                att.last_sent_seq = floor;
+                att.last_ack_seq = floor;
+            }
+            page = api
+                .terminals
+                .read(
+                    sid.to_owned(),
+                    TerminalQuery {
+                        after_seq: Some(floor),
+                        wait_ms: None,
+                    },
+                )
+                .await;
+        }
+        if let Ok(page) = page
             && !page.resync_required
         {
             send_terminal_page(
@@ -3697,6 +3724,7 @@ fn timeline_record_events(store: &mut Store, sid: &str, record: &TimelineRecord)
             "kind":"reasoning.delta",
             "msgId":record.id,
             "delta":timeline_text_or_preview(store, sid, record),
+            "replace":true,
         })],
         TimelineBody::Tool {
             name,
@@ -3807,38 +3835,100 @@ fn timeline_record_events(store: &mut Store, sid: &str, record: &TimelineRecord)
     }
 }
 
-async fn load_remote_timeline_events(
+fn timeline_record_delta_events(
+    store: &mut Store,
+    sid: &str,
+    record: &TimelineRecord,
+    started_tools: &mut HashSet<String>,
+) -> Vec<JsonValue> {
+    if let TimelineBody::Tool { state, .. } = &record.body {
+        let mut events = timeline_record_events(store, sid, record);
+        if *state == ToolState::Running {
+            started_tools.insert(record.id.clone());
+            return events;
+        }
+        if started_tools.insert(record.id.clone()) {
+            return events;
+        }
+        // `tool.start` was already delivered for this `callId`; emit only `tool.end`.
+        events.retain(|ev| ev.get("kind").and_then(JsonValue::as_str) == Some("tool.end"));
+        return events;
+    }
+    timeline_record_events(store, sid, record)
+}
+
+async fn load_remote_timeline_snapshot(
     api: &Api,
     sid: &str,
-    after: Option<i64>,
-) -> Result<(i64, Vec<JsonValue>)> {
+) -> Result<(i64, Vec<JsonValue>, HashSet<String>)> {
     let sid = sid.to_owned();
     api.call(move |store| {
-        let mut cursor = Some(after.unwrap_or(0));
+        let (latest_seq, items) =
+            store.remote_timeline_snapshot(&sid, crate::timeline::REMOTE_SNAPSHOT_RECORD_LIMIT)?;
+        let mut started_tools = HashSet::new();
         let mut events = Vec::new();
-        loop {
-            let page = store.timeline(
-                &sid,
-                TimelineQuery {
-                    after: cursor,
-                    limit: Some(100),
-                    ..TimelineQuery::default()
-                },
-            )?;
-            let latest = page.latest_position;
-            if page.items.is_empty() {
-                return Ok((latest, events));
+        for (_, record) in &items {
+            if matches!(record.body, TimelineBody::Tool { .. }) {
+                started_tools.insert(record.id.clone());
             }
-            cursor = page.items.last().map(|record| record.position);
-            for record in &page.items {
-                events.extend(timeline_record_events(store, &sid, record));
-            }
-            if page.newer.is_none() {
-                return Ok((latest, events));
-            }
+            events.extend(timeline_record_events(store, &sid, record));
         }
+        Ok((latest_seq, events, started_tools))
     })
     .await
+}
+
+async fn load_remote_timeline_updates(
+    api: &Api,
+    sid: &str,
+    after_updated_seq: i64,
+    mut started_tools: HashSet<String>,
+) -> Result<(i64, bool, Vec<(i64, Vec<JsonValue>)>, HashSet<String>)> {
+    let sid = sid.to_owned();
+    api.call(move |store| {
+        let (latest_seq, resync, items) = store.remote_timeline_updates_after(
+            &sid,
+            after_updated_seq,
+            crate::timeline::REMOTE_SNAPSHOT_RECORD_LIMIT,
+        )?;
+        if resync {
+            return Ok((latest_seq, true, Vec::new(), started_tools));
+        }
+        let mut batches = Vec::with_capacity(items.len());
+        for (seq, record) in &items {
+            let events = timeline_record_delta_events(store, &sid, record, &mut started_tools);
+            batches.push((*seq, events));
+        }
+        Ok((latest_seq, false, batches, started_tools))
+    })
+    .await
+}
+
+fn assign_remote_event_seqs(
+    mut last_ev_seq: i64,
+    batches: Vec<(i64, Vec<JsonValue>)>,
+) -> (i64, Vec<(i64, JsonValue)>) {
+    let mut out = Vec::new();
+    for (record_seq, events) in batches {
+        if events.is_empty() {
+            last_ev_seq = last_ev_seq.max(record_seq);
+            continue;
+        }
+        let count = events.len() as i64;
+        let mut seq = last_ev_seq.max(record_seq.saturating_sub(count));
+        for body in events {
+            seq += 1;
+            out.push((seq, body));
+        }
+        last_ev_seq = seq.max(record_seq);
+    }
+    (last_ev_seq, out)
+}
+
+async fn remote_orchestration_stamp(api: &Api) -> Result<(i64, u64)> {
+    let schedule_rev = *api.schedules.changes().borrow();
+    let db_rev = api.call(|store| store.orchestration_revision()).await?;
+    Ok((db_rev, schedule_rev))
 }
 
 async fn remote_chat_attach(
@@ -3850,31 +3940,48 @@ async fn remote_chat_attach(
 ) -> Result<()> {
     let sid = require_str(&message, "sid")?.to_owned();
     let last_seq = message.get("lastSeq").and_then(JsonValue::as_i64);
-    let (latest, events) = load_remote_timeline_events(api, &sid, last_seq).await?;
-    let mut ev_seq = last_seq.unwrap_or(latest);
-    if last_seq.is_some() {
-        for body in &events {
-            ev_seq += 1;
-            send_remote_json(
-                socket,
-                channel,
-                &json!({"type":"agent.event","sid":sid,"evSeq":ev_seq,"body":body}),
-            )
-            .await?;
+    if let Some(after) = last_seq {
+        let prior_tools = state
+            .chat_attachments
+            .get(&sid)
+            .map(|att| att.started_tools.clone())
+            .unwrap_or_default();
+        let (latest, resync, batches, started_tools) =
+            load_remote_timeline_updates(api, &sid, after, prior_tools).await?;
+        if !resync {
+            let (ev_seq, framed) = assign_remote_event_seqs(after, batches);
+            for (seq, body) in framed {
+                send_remote_json(
+                    socket,
+                    channel,
+                    &json!({"type":"agent.event","sid":sid,"evSeq":seq,"body":body}),
+                )
+                .await?;
+            }
+            state.chat_attachments.insert(
+                sid,
+                RemoteChatAttachment {
+                    cursor_updated_seq: latest,
+                    last_event_seq: ev_seq.max(latest),
+                    started_tools,
+                },
+            );
+            return Ok(());
         }
-    } else {
-        send_remote_json(
-            socket,
-            channel,
-            &json!({"type":"chat.snapshot","sid":sid,"evSeq":latest,"events":events}),
-        )
-        .await?;
     }
+    let (latest, events, started_tools) = load_remote_timeline_snapshot(api, &sid).await?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"chat.snapshot","sid":sid,"evSeq":latest,"events":events}),
+    )
+    .await?;
     state.chat_attachments.insert(
         sid,
         RemoteChatAttachment {
-            cursor_position: latest,
-            last_event_seq: ev_seq.max(latest),
+            cursor_updated_seq: latest,
+            last_event_seq: latest,
+            started_tools,
         },
     );
     Ok(())
@@ -3931,8 +4038,13 @@ async fn flush_remote_orchestration_snapshot(
     let Some(previous) = state.orchestration_snapshot.clone() else {
         return Ok(());
     };
+    let stamp = remote_orchestration_stamp(api).await?;
+    if state.orchestration_stamp == Some(stamp) {
+        return Ok(());
+    }
     let snapshot = load_orchestration_snapshot(api).await?;
     let serialized = serde_json::to_string(&snapshot)?;
+    state.orchestration_stamp = Some(stamp);
     if serialized != previous {
         send_remote_json(
             socket,
@@ -3951,46 +4063,75 @@ async fn flush_remote_chat_events(
     channel: &mut SecureChannel,
     state: &mut RemoteWsState,
 ) -> Result<()> {
-    let attached: Vec<(String, i64, i64)> = state
+    let attached: Vec<(String, RemoteChatAttachment)> = state
         .chat_attachments
         .iter()
-        .map(|(sid, att)| (sid.clone(), att.cursor_position, att.last_event_seq))
+        .map(|(sid, att)| (sid.clone(), att.clone()))
         .collect();
-    for (sid, cursor_position, last_event_seq) in attached {
-        let page = match load_remote_timeline_events(api, &sid, Some(cursor_position)).await {
-            Ok(page) => page,
+    for (sid, att) in attached {
+        let updates =
+            load_remote_timeline_updates(api, &sid, att.cursor_updated_seq, att.started_tools)
+                .await;
+        let (latest, resync, batches, started_tools) = match updates {
+            Ok(updates) => updates,
             Err(Error::NotFound) => {
                 state.chat_attachments.remove(&sid);
                 continue;
             }
             Err(error) => return Err(error),
         };
-        let (latest, bodies) = page;
-        if bodies.is_empty() {
+        if resync {
+            let (snap_seq, events, snap_tools) =
+                match load_remote_timeline_snapshot(api, &sid).await {
+                    Ok(snap) => snap,
+                    Err(Error::NotFound) => {
+                        state.chat_attachments.remove(&sid);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"chat.snapshot","sid":sid,"evSeq":snap_seq,"events":events}),
+            )
+            .await?;
             state.chat_attachments.insert(
                 sid,
                 RemoteChatAttachment {
-                    cursor_position: latest,
-                    last_event_seq: last_event_seq.max(latest),
+                    cursor_updated_seq: snap_seq,
+                    last_event_seq: snap_seq,
+                    started_tools: snap_tools,
                 },
             );
             continue;
         }
-        let mut ev_seq = last_event_seq;
-        for body in bodies {
-            ev_seq += 1;
+        if batches.is_empty() {
+            state.chat_attachments.insert(
+                sid,
+                RemoteChatAttachment {
+                    cursor_updated_seq: latest,
+                    last_event_seq: att.last_event_seq.max(latest),
+                    started_tools,
+                },
+            );
+            continue;
+        }
+        let (ev_seq, framed) = assign_remote_event_seqs(att.last_event_seq, batches);
+        for (seq, body) in framed {
             send_remote_json(
                 socket,
                 channel,
-                &json!({"type":"agent.event","sid":sid,"evSeq":ev_seq,"body":body}),
+                &json!({"type":"agent.event","sid":sid,"evSeq":seq,"body":body}),
             )
             .await?;
         }
         state.chat_attachments.insert(
             sid,
             RemoteChatAttachment {
-                cursor_position: latest,
+                cursor_updated_seq: latest,
                 last_event_seq: ev_seq.max(latest),
+                started_tools,
             },
         );
     }
@@ -5163,12 +5304,12 @@ async fn model_sources_route(
     match control.action {
         SourceAction::List => {
             let data = api.database.directory().to_owned();
-            let sources = match api
-                .call(move |_| {
-                    crate::accounts::sources::ModelSources::open(&data)
-                        .map(|sources| sources.list())
-                })
-                .await
+            let sources = match tokio::task::spawn_blocking(move || {
+                crate::accounts::sources::ModelSources::open(&data).map(|sources| sources.list())
+            })
+            .await
+            .map_err(|_| Error::Closed)
+            .and_then(|res| res)
             {
                 Ok(sources) => sources,
                 Err(error) => return ApiError(error).into_response(),
@@ -5192,12 +5333,13 @@ async fn model_sources_route(
                 .into_response();
             };
             let data = api.database.directory().to_owned();
-            let target = match api
-                .call(move |_| {
-                    let sources = crate::accounts::sources::ModelSources::open(&data)?;
-                    sources.models_target(&source_id, revision, &protocol, &credential_id)
-                })
-                .await
+            let target = match tokio::task::spawn_blocking(move || {
+                let sources = crate::accounts::sources::ModelSources::open(&data)?;
+                sources.models_target(&source_id, revision, &protocol, &credential_id)
+            })
+            .await
+            .map_err(|_| Error::Closed)
+            .and_then(|res| res)
             {
                 Ok(target) => target,
                 Err(error) => {
@@ -5282,12 +5424,12 @@ async fn model_sources_route(
                     Err(error) => return ApiError(error).into_response(),
                 };
             let data = api.database.directory().to_owned();
-            let sources = match api
-                .call(move |_| {
-                    crate::accounts::sources::ModelSources::open(&data)
-                        .map(|sources| sources.list())
-                })
-                .await
+            let sources = match tokio::task::spawn_blocking(move || {
+                crate::accounts::sources::ModelSources::open(&data).map(|sources| sources.list())
+            })
+            .await
+            .map_err(|_| Error::Closed)
+            .and_then(|res| res)
             {
                 Ok(sources) => sources,
                 Err(error) => return ApiError(error).into_response(),
@@ -6070,9 +6212,11 @@ async fn account_config(
         let data = api.database.directory().to_owned();
         match control {
             crate::accounts::AccountControl::ConfigGet { .. } => {
-                api.database
-                    .call(move |_| config::get_config(&data, target, catalog.as_ref()))
-                    .await
+                tokio::task::spawn_blocking(move || {
+                    config::get_config(&data, target, catalog.as_ref())
+                })
+                .await
+                .map_err(|_| Error::Closed)?
             }
             crate::accounts::AccountControl::ConfigSet {
                 document_id,
@@ -7317,8 +7461,7 @@ async fn set_workspace_tabs(
     State(api): State<Api>,
     body: std::result::Result<Json<WorkspaceTabsUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> std::result::Result<Json<WorkspaceTabsEntry>, ApiError> {
-    let Json(input) =
-        body.map_err(|_| Error::Invalid("invalid workspace tabs request".into()))?;
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid workspace tabs request".into()))?;
     let entry = api
         .call(move |store| store.set_workspace_tabs(input))
         .await?;
@@ -9523,6 +9666,184 @@ mod tests {
             exit_code: None,
         };
         assert!(terminal_page_output_b64(&page).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_timeline_sync_streams_in_place_updates_and_bounds_snapshots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = Database::open(dir.path().into()).await.unwrap();
+        let mut api = Api::new(
+            database.clone(),
+            Token::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+                .unwrap(),
+        );
+        api.schedules = Schedules::with_directory(dir.path().join("schedules"), api.agents.clone());
+
+        let head = database
+            .call(|store| {
+                store.create_session(CreateSession {
+                    agent: AgentKind::Codex,
+                    kind: SessionKind::Structured,
+                    title: "Mobile WS".into(),
+                    workspace: "/synthetic".into(),
+                })
+            })
+            .await
+            .unwrap();
+        let sid = head.id.clone();
+
+        // Seed 450 records to verify initial snapshot is bounded to REMOTE_SNAPSHOT_RECORD_LIMIT (400).
+        let seed_sid = sid.clone();
+        database
+            .call(move |store| {
+                for idx in 0..450 {
+                    store.write_timeline(
+                        &seed_sid,
+                        TimelineWrite {
+                            id: format!("hist-{idx:04}"),
+                            turn_id: "turn-0".into(),
+                            expected_revision: 0,
+                            body: TimelineBody::Message {
+                                role: MessageRole::User,
+                                final_answer: false,
+                                attachments: Vec::new(),
+                            },
+                            text: format!("msg {idx}"),
+                            replace: false,
+                            subagent_id: None,
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (snap_seq, snap_events, started_tools) =
+            load_remote_timeline_snapshot(&api, &sid).await.unwrap();
+        assert_eq!(
+            snap_events.len(),
+            crate::timeline::REMOTE_SNAPSHOT_RECORD_LIMIT
+        );
+        let orch_stamp_before = remote_orchestration_stamp(&api).await.unwrap();
+
+        // Write a streaming assistant message and a running tool, then update both in-place.
+        let write_sid = sid.clone();
+        database
+            .call(move |store| {
+                store.write_timeline(
+                    &write_sid,
+                    TimelineWrite {
+                        id: "stream-msg".into(),
+                        turn_id: "turn-1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::Assistant,
+                            final_answer: false,
+                            attachments: Vec::new(),
+                        },
+                        text: "Hel".into(),
+                        replace: true,
+                        subagent_id: None,
+                    },
+                )?;
+                store.write_timeline(
+                    &write_sid,
+                    TimelineWrite {
+                        id: "run-tool".into(),
+                        turn_id: "turn-1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Tool {
+                            name: "bash".into(),
+                            state: ToolState::Running,
+                            summary: "ls".into(),
+                            diff: None,
+                            has_more: false,
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (seq_after_start, resync, batches, started_tools) =
+            load_remote_timeline_updates(&api, &sid, snap_seq, started_tools)
+                .await
+                .unwrap();
+        assert!(!resync);
+        let (ev_seq_1, framed_1) = assign_remote_event_seqs(snap_seq, batches);
+        assert_eq!(ev_seq_1, seq_after_start);
+        assert_eq!(framed_1.len(), 2);
+        assert_eq!(framed_1[0].1["kind"], "text.delta");
+        assert_eq!(framed_1[0].1["delta"], "Hel");
+        assert_eq!(framed_1[1].1["kind"], "tool.start");
+
+        // Update both records in-place at their existing `position`!
+        let update_sid = sid.clone();
+        database
+            .call(move |store| {
+                store.write_timeline(
+                    &update_sid,
+                    TimelineWrite {
+                        id: "stream-msg".into(),
+                        turn_id: "turn-1".into(),
+                        expected_revision: 1,
+                        body: TimelineBody::Message {
+                            role: MessageRole::Assistant,
+                            final_answer: true,
+                            attachments: Vec::new(),
+                        },
+                        text: "Hello mobile!".into(),
+                        replace: true,
+                        subagent_id: None,
+                    },
+                )?;
+                store.write_timeline(
+                    &update_sid,
+                    TimelineWrite {
+                        id: "run-tool".into(),
+                        turn_id: "turn-1".into(),
+                        expected_revision: 1,
+                        body: TimelineBody::Tool {
+                            name: "bash".into(),
+                            state: ToolState::Success,
+                            summary: "ls".into(),
+                            diff: None,
+                            has_more: false,
+                        },
+                        text: "README.md\n".into(),
+                        replace: true,
+                        subagent_id: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (seq_after_done, resync_2, batches_2, _) =
+            load_remote_timeline_updates(&api, &sid, seq_after_start, started_tools)
+                .await
+                .unwrap();
+        assert!(!resync_2);
+        let (ev_seq_2, framed_2) = assign_remote_event_seqs(ev_seq_1, batches_2);
+        assert_eq!(ev_seq_2, seq_after_done);
+        assert_eq!(framed_2.len(), 2);
+        assert_eq!(framed_2[0].1["kind"], "text.delta");
+        assert_eq!(framed_2[0].1["delta"], "Hello mobile!");
+        assert_eq!(framed_2[1].1["kind"], "tool.end");
+        assert_eq!(framed_2[1].1["state"], "success");
+
+        // Orchestration stamp must NOT have changed during chat streaming!
+        assert_eq!(
+            remote_orchestration_stamp(&api).await.unwrap(),
+            orch_stamp_before
+        );
+        database.shutdown().await.unwrap();
     }
 }
 

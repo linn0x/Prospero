@@ -4,6 +4,9 @@ use super::*;
 use crate::database::{Store, validate_id};
 use crate::protocol::*;
 
+pub(crate) const LIVE_TERMINAL_OUTPUT_CAP: i64 = 2_048;
+pub(crate) const EXITED_TERMINAL_OUTPUT_CAP: i64 = 1_024;
+
 impl Store {
     pub fn create_terminal(&mut self, input: CreateTerminal) -> Result<SessionHead> {
         self.create_terminal_with(input, None)
@@ -110,16 +113,29 @@ impl Store {
     }
 
     pub fn active_terminal_ids(&mut self) -> Result<Vec<String>> {
-        let ids: Vec<String> = self
+        let mut ids: Vec<String> = self
             .connection
             .prepare(
-                "SELECT session_id FROM terminal_runs WHERE active=1 ORDER BY session_id LIMIT 17",
+                "SELECT t.session_id \
+                 FROM terminal_runs t \
+                 LEFT JOIN session_heads h ON h.id = t.session_id \
+                 WHERE t.active = 1 \
+                 ORDER BY COALESCE(json_extract(h.payload, '$.updatedAt'), h.created_at, 0) DESC, t.session_id DESC",
             )?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if ids.len() > 16 {
-            return Err(Error::Schema);
+        if ids.len() > super::runtime::MAX_ACTIVE_TERMINALS {
+            let surplus = ids.split_off(super::runtime::MAX_ACTIVE_TERMINALS);
+            for id in surplus {
+                if self.fail_terminal(&id).is_err() {
+                    self.connection.execute(
+                        "UPDATE terminal_runs SET active=0,exit_code=NULL WHERE session_id=?",
+                        [&id],
+                    )?;
+                }
+            }
         }
+        ids.sort();
         Ok(ids)
     }
     /// Manual Agent PTYs are intentionally separate from orchestration worker
@@ -142,9 +158,13 @@ impl Store {
              ORDER BY json_extract(h.payload,'$.updatedAt'),h.id LIMIT ?2",
         )?;
         Ok(statement
-            .query_map(rusqlite::params![before, limit.min(16) as i64], |row| {
-                row.get(0)
-            })?
+            .query_map(
+                rusqlite::params![
+                    before,
+                    limit.min(super::runtime::MAX_ACTIVE_TERMINALS) as i64
+                ],
+                |row| row.get(0),
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
     pub fn recover_terminals(&mut self) -> Result<usize> {
@@ -247,6 +267,49 @@ impl Store {
             .map(|value| serde_json::from_str(&value))
             .transpose()?)
     }
+
+    pub(crate) fn prune_terminal_storage(&mut self) -> Result<usize> {
+        let tx = self.connection.transaction()?;
+        let mut deleted = tx.execute("DELETE FROM terminal_instance_output", [])?;
+        tx.execute("DELETE FROM terminal_instances", [])?;
+        deleted += tx.execute(
+            "DELETE FROM terminal_output \
+             WHERE NOT EXISTS(SELECT 1 FROM terminal_runs r WHERE r.session_id=terminal_output.session_id)",
+            [],
+        )?;
+        let bloated: Vec<(String, bool, i64, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT session_id, active, floor_seq, latest_seq \
+                 FROM terminal_runs \
+                 WHERE latest_seq - floor_seq > ?1",
+            )?;
+            stmt.query_map([EXITED_TERMINAL_OUTPUT_CAP], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (session_id, active, floor_seq, latest_seq) in bloated {
+            let cap = if active {
+                LIVE_TERMINAL_OUTPUT_CAP
+            } else {
+                EXITED_TERMINAL_OUTPUT_CAP
+            };
+            if latest_seq.saturating_sub(floor_seq) <= cap {
+                continue;
+            }
+            let new_floor = latest_seq.saturating_sub(cap).max(floor_seq);
+            deleted += tx.execute(
+                "DELETE FROM terminal_output WHERE session_id=?1 AND seq<=?2",
+                params![session_id, new_floor],
+            )?;
+            tx.execute(
+                "UPDATE terminal_runs SET floor_seq=?2 WHERE session_id=?1",
+                params![session_id, new_floor],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
 }
 
 fn persist(tx: &Transaction<'_>, id: &str, archive: Archive, active: bool) -> Result<()> {
@@ -262,7 +325,6 @@ fn persist(tx: &Transaction<'_>, id: &str, archive: Archive, active: bool) -> Re
         || archive.latest_seq != 0 && archive.latest_seq < archive.seq
         || !active && archive.latest_seq > archive.seq
         || archive.floor < 0
-        || archive.floor < previous_floor && archive.start > archive.floor
         || archive.start < archive.floor
         || archive.start > previous.max(archive.floor)
         || archive.start + archive.events.len() as i64 != archive.seq
@@ -276,20 +338,51 @@ fn persist(tx: &Transaction<'_>, id: &str, archive: Archive, active: bool) -> Re
     {
         return Err(Error::Conflict);
     }
-    let snapshot = archive.snapshot.or(previous_snapshot
+    let previous_parsed = previous_snapshot
         .map(|value| serde_json::from_str::<TerminalSnapshot>(&value))
-        .transpose()?
-        .filter(|snapshot| snapshot.seq >= archive.floor && snapshot.seq <= archive.seq));
-    tx.execute("UPDATE terminal_runs SET active=?1,floor_seq=?2,latest_seq=?3,exit_code=?4,snapshot=?5 WHERE session_id=?6", params![active, archive.floor, archive.seq, archive.exit_code, snapshot.map(|snapshot| serde_json::to_string(&snapshot)).transpose()?, id])?;
+        .transpose()?;
+    let candidate_snapshot = archive
+        .snapshot
+        .or_else(|| previous_parsed.filter(|s| s.seq >= archive.floor && s.seq <= archive.seq));
+    let cap = if active {
+        LIVE_TERMINAL_OUTPUT_CAP
+    } else {
+        EXITED_TERMINAL_OUTPUT_CAP
+    };
+    let target_floor = archive.floor.max(archive.seq.saturating_sub(cap));
+    let effective_floor = match &candidate_snapshot {
+        Some(s)
+            if s.seq < target_floor
+                && archive.seq.saturating_sub(s.seq) <= replay::MAX_REPLAY_EVENTS =>
+        {
+            s.seq.max(archive.floor)
+        }
+        _ => target_floor,
+    }
+    .max(previous_floor);
+    let snapshot = candidate_snapshot.filter(|s| s.seq >= effective_floor && s.seq <= archive.seq);
+    tx.execute(
+        "UPDATE terminal_runs SET active=?1,floor_seq=?2,latest_seq=?3,exit_code=?4,snapshot=?5 WHERE session_id=?6",
+        params![
+            active,
+            effective_floor,
+            archive.seq,
+            archive.exit_code,
+            snapshot
+                .map(|snapshot| serde_json::to_string(&snapshot))
+                .transpose()?,
+            id
+        ],
+    )?;
     tx.execute(
         "DELETE FROM terminal_output WHERE session_id=?1 AND seq<=?2",
-        params![id, archive.floor],
+        params![id, effective_floor],
     )?;
     let mut insert =
         tx.prepare_cached("INSERT INTO terminal_output(session_id,seq,payload) VALUES(?1,?2,?3)")?;
     for (offset, event) in archive.events.iter().enumerate() {
         let seq = archive.start + offset as i64 + 1;
-        if seq > previous {
+        if seq > previous && seq > effective_floor {
             insert.execute(params![id, seq, serde_json::to_string(event)?])?;
         }
     }
@@ -619,6 +712,158 @@ mod tests {
         assert_eq!(
             finished.native_session.as_ref().map(|n| n.state.as_str()),
             Some("archived")
+        );
+    }
+
+    #[test]
+    fn persist_caps_live_and_exited_output_and_prunes_legacy_bloat() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let head = store
+            .create_terminal(CreateTerminal {
+                title: "Bounded output".into(),
+                workspace: "/synthetic".into(),
+                size: TerminalSize { cols: 80, rows: 24 },
+                agent: None,
+                command: None,
+                account_id: None,
+                model: None,
+                effort: None,
+                approval_policy: None,
+            })
+            .unwrap();
+        let mut live = archive(0, 3_000);
+        live.snapshot = Some(TerminalSnapshot {
+            seq: 3_000,
+            size: TerminalSize { cols: 80, rows: 24 },
+            data_b64: STANDARD.encode("live"),
+        });
+        store.checkpoint_terminal(&head.id, live).unwrap();
+        let live_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM terminal_output WHERE session_id=?",
+                [&head.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_count, LIVE_TERMINAL_OUTPUT_CAP);
+
+        let mut exited = archive(3_000, 3_200);
+        exited.floor = 0;
+        exited.exit_code = Some(0);
+        exited.snapshot = Some(TerminalSnapshot {
+            seq: 3_200,
+            size: TerminalSize { cols: 80, rows: 24 },
+            data_b64: STANDARD.encode("done"),
+        });
+        store.finish_terminal(&head.id, exited).unwrap();
+        let exited_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM terminal_output WHERE session_id=?",
+                [&head.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exited_count, EXITED_TERMINAL_OUTPUT_CAP);
+        let page = store
+            .terminal_output(
+                &head.id,
+                TerminalQuery {
+                    after_seq: Some(0),
+                    wait_ms: None,
+                },
+            )
+            .unwrap();
+        assert!(page.resync_required);
+        assert_eq!(page.floor_seq, 3_200 - EXITED_TERMINAL_OUTPUT_CAP);
+
+        // Simulate legacy bloated rows + dead terminal_instance_output rows.
+        store
+            .connection
+            .execute(
+                "UPDATE terminal_runs SET floor_seq=0 WHERE session_id=?",
+                [&head.id],
+            )
+            .unwrap();
+        for seq in 1..=(3_200 - EXITED_TERMINAL_OUTPUT_CAP) {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO terminal_output(session_id,seq,payload) VALUES(?1,?2,'{\"kind\":\"output\",\"dataB64\":\"eA==\"}')",
+                    params![head.id, seq],
+                )
+                .unwrap();
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO terminal_instances(runtime_id,session_id,session_payload,snapshot,archived_at) VALUES('rt-1',?1,'{}',NULL,1)",
+                [&head.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO terminal_instance_output(runtime_id,seq,payload) VALUES('rt-1',1,'{}')",
+                [],
+            )
+            .unwrap();
+        let pruned = store.prune_terminal_storage().unwrap();
+        assert!(pruned > 2_000);
+        let after_prune: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM terminal_output WHERE session_id=?",
+                [&head.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_prune, EXITED_TERMINAL_OUTPUT_CAP);
+        let dead_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM terminal_instances) + (SELECT count(*) FROM terminal_instance_output)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dead_rows, 0);
+    }
+
+    #[test]
+    fn active_terminal_ids_supports_full_capacity_and_gracefully_fails_surplus() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        for idx in 0..(super::super::runtime::MAX_ACTIVE_TERMINALS + 6) {
+            store
+                .create_terminal(CreateTerminal {
+                    title: format!("Term {idx}"),
+                    workspace: "/synthetic".into(),
+                    size: TerminalSize { cols: 80, rows: 24 },
+                    agent: None,
+                    command: None,
+                    account_id: None,
+                    model: None,
+                    effort: None,
+                    approval_policy: None,
+                })
+                .unwrap();
+        }
+        let active = store.active_terminal_ids().unwrap();
+        assert_eq!(active.len(), super::super::runtime::MAX_ACTIVE_TERMINALS);
+        let remaining_in_db: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM terminal_runs WHERE active=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_in_db as usize,
+            super::super::runtime::MAX_ACTIVE_TERMINALS
         );
     }
 }

@@ -135,12 +135,21 @@ const CATALOG_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
 const CLAUDE_CATALOG_TTL: Duration = Duration::from_secs(1800);
+const CLAUDE_CATALOG_FAILURE_TTL: Duration = Duration::from_secs(20);
 
 fn claude_catalog_cache() -> &'static std::sync::Mutex<
     HashMap<String, (std::time::Instant, Vec<crate::agent::LaunchModelInfo>)>,
 > {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<crate::agent::LaunchModelInfo>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn claude_catalog_failure_cache()
+-> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, String)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, (std::time::Instant, String)>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
@@ -229,8 +238,7 @@ pub(crate) fn fast_claude_catalog_for_account(
             is_default: true,
         }]
     });
-    let (settings_model, settings_effort) =
-        claude_settings_defaults(config_dir.as_deref());
+    let (settings_model, settings_effort) = claude_settings_defaults(config_dir.as_deref());
     let preferred_model = override_model.or(settings_model);
     let preferred_effort = override_effort.or(settings_effort);
     let current_model = preferred_model
@@ -267,6 +275,13 @@ pub(super) async fn fetch_launch_catalog(
         && instant.elapsed() < CLAUDE_CATALOG_TTL
     {
         return Ok(cached.clone());
+    }
+    if use_cache
+        && let Ok(guard) = claude_catalog_failure_cache().lock()
+        && let Some((instant, message)) = guard.get(&cache_key)
+        && instant.elapsed() < CLAUDE_CATALOG_FAILURE_TTL
+    {
+        return Err(Error::Invalid(message.clone()));
     }
     let mut command = Command::new(binary());
     command
@@ -341,18 +356,30 @@ pub(super) async fn fetch_launch_catalog(
     match tokio::time::timeout(CATALOG_TIMEOUT, read).await {
         Ok(Ok(models)) => {
             child.kill().await.ok();
-            if use_cache && let Ok(mut guard) = claude_catalog_cache().lock() {
-                guard.insert(cache_key, (std::time::Instant::now(), models.clone()));
+            if use_cache {
+                if let Ok(mut fail_guard) = claude_catalog_failure_cache().lock() {
+                    fail_guard.remove(&cache_key);
+                }
+                if let Ok(mut guard) = claude_catalog_cache().lock() {
+                    guard.insert(cache_key, (std::time::Instant::now(), models.clone()));
+                }
             }
             Ok(models)
         }
         Ok(Err(error)) => {
             child.kill().await.ok();
+            if use_cache && let Ok(mut fail_guard) = claude_catalog_failure_cache().lock() {
+                fail_guard.insert(cache_key, (std::time::Instant::now(), error.to_string()));
+            }
             Err(error)
         }
         Err(_) => {
             child.kill().await.ok();
-            Err(Error::Invalid("读取 Claude 模型目录超时".into()))
+            let message = "读取 Claude 模型目录超时".to_owned();
+            if use_cache && let Ok(mut fail_guard) = claude_catalog_failure_cache().lock() {
+                fail_guard.insert(cache_key, (std::time::Instant::now(), message.clone()));
+            }
+            Err(Error::Invalid(message))
         }
     }
 }
@@ -436,12 +463,9 @@ mod tests {
             serde_json::to_string(&records[1]).unwrap()
         );
         std::fs::write(&source_path, &original).unwrap();
-        let forked_id = fork_session_file_in_config_dir(
-            &config,
-            &workspace.to_string_lossy(),
-            &session_id,
-        )
-        .unwrap();
+        let forked_id =
+            fork_session_file_in_config_dir(&config, &workspace.to_string_lossy(), &session_id)
+                .unwrap();
         assert_ne!(forked_id, session_id);
         assert_eq!(std::fs::read_to_string(&source_path).unwrap(), original);
         let target_path = project.join(format!("{forked_id}.jsonl"));
@@ -613,10 +637,18 @@ fn fork_session_file_in_config_dir(
         let Ok(row) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if let Some(t) = row.get("customTitle").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        if let Some(t) = row
+            .get("customTitle")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
             custom_title = Some(t.to_owned());
         }
-        if let Some(t) = row.get("aiTitle").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        if let Some(t) = row
+            .get("aiTitle")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
             ai_title = Some(t.to_owned());
         }
         match row.get("type").and_then(Value::as_str) {
@@ -784,7 +816,9 @@ pub(super) async fn fork_session(
     options: &TurnOptions,
 ) -> Result<String> {
     crate::database::validate_id(source)?;
-    if let Some(helper) = std::env::var_os("PROSPERO_CLAUDE_FORK_HELPER").map(std::path::PathBuf::from) {
+    if let Some(helper) =
+        std::env::var_os("PROSPERO_CLAUDE_FORK_HELPER").map(std::path::PathBuf::from)
+    {
         let node = std::env::var_os("PROSPERO_NODE").unwrap_or_else(|| "node".into());
         let mut command = Command::new(node);
         command

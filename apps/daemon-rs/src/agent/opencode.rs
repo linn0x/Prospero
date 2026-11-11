@@ -76,7 +76,7 @@ fn url_encode(value: &str) -> String {
 fn parse_port(output: &str) -> Option<u16> {
     let marker = "listening on ";
     let index = output.to_ascii_lowercase().find(marker)?;
-    let rest = &output[index + marker.len()..];
+    let rest = output.get(index + marker.len()..)?;
     let (_, port) = rest.rsplit_once(':')?;
     let digits = port
         .chars()
@@ -160,14 +160,21 @@ where
             return;
         }
         output.push_str(&line);
-        if output.len() > OUTPUT_LIMIT {
-            let drain = output.len() - OUTPUT_LIMIT;
-            output.drain(..drain);
-        }
+        trim_output_buffer(&mut output, OUTPUT_LIMIT);
         if !sent && let Some(port) = parse_port(&output) {
             let _ = ports.send(port);
             sent = true;
         }
+    }
+}
+
+fn trim_output_buffer(output: &mut String, limit: usize) {
+    if output.len() > limit {
+        let mut drain = output.len() - limit;
+        while drain < output.len() && !output.is_char_boundary(drain) {
+            drain += 1;
+        }
+        output.drain(..drain);
     }
 }
 
@@ -546,6 +553,7 @@ async fn run_events(mut loop_state: EventLoop) {
     let mut buffer = String::new();
     let mut tool_names = HashMap::new();
     let mut in_flight_tools = super::turn_stream::InFlightTools::default();
+    let mut stream_buffers = StreamBuffers::default();
     let mut input_tokens = None;
     let mut output_tokens = None;
     let mut cost_usd = None;
@@ -585,6 +593,7 @@ async fn run_events(mut loop_state: EventLoop) {
                 },
                 &mut tool_names,
                 &mut in_flight_tools,
+                &mut stream_buffers,
                 &mut input_tokens,
                 &mut output_tokens,
                 &mut cost_usd,
@@ -620,10 +629,18 @@ async fn run_events(mut loop_state: EventLoop) {
     cleanup_child_with_lifecycle(&mut loop_state.child, &loop_state.lifecycle).await;
 }
 
+#[derive(Default)]
+struct StreamBuffers {
+    text_by_key: HashMap<String, String>,
+    reasoning_by_key: HashMap<String, String>,
+    generation: u64,
+}
+
 async fn consume_event(
     context: EventContext<'_>,
     tool_names: &mut HashMap<String, String>,
     in_flight_tools: &mut super::turn_stream::InFlightTools,
+    stream_buffers: &mut StreamBuffers,
     input_tokens: &mut Option<i64>,
     output_tokens: &mut Option<i64>,
     cost_usd: &mut Option<f64>,
@@ -638,16 +655,23 @@ async fn consume_event(
         .get("assistantMessageID")
         .and_then(Value::as_str)
         .unwrap_or("opencode-message");
+    let part_id = data
+        .get("partID")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match typ {
         "session.next.text.delta" => {
             if let Some(delta) = data.get("delta").and_then(Value::as_str)
                 && !delta.is_empty()
             {
+                let key = format!("{msg_id}:{}:{part_id}", stream_buffers.generation);
+                let text = stream_buffers.text_by_key.entry(key).or_default();
+                text.push_str(delta);
                 let _ = context
                     .events
                     .send(AdapterEvent::Text {
                         subagent: None,
-                        text: delta.to_owned(),
+                        text: text.clone(),
                     })
                     .await;
             }
@@ -656,16 +680,20 @@ async fn consume_event(
             if let Some(delta) = data.get("delta").and_then(Value::as_str)
                 && !delta.is_empty()
             {
+                let key = format!("{msg_id}:{}:{part_id}", stream_buffers.generation);
+                let text = stream_buffers.reasoning_by_key.entry(key).or_default();
+                text.push_str(delta);
                 let _ = context
                     .events
                     .send(AdapterEvent::Thinking {
                         subagent: None,
-                        text: delta.to_owned(),
+                        text: text.clone(),
                     })
                     .await;
             }
         }
         "session.next.tool.called" => {
+            stream_buffers.generation += 1;
             let call_id = safe_id(
                 data.get("callID").and_then(Value::as_str).unwrap_or(""),
                 "opencode-tool",
@@ -686,6 +714,7 @@ async fn consume_event(
                 .await;
         }
         "session.next.tool.success" | "session.next.tool.failed" => {
+            stream_buffers.generation += 1;
             let call_id = safe_id(
                 data.get("callID").and_then(Value::as_str).unwrap_or(""),
                 "opencode-tool",
@@ -1157,6 +1186,7 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let mut tools = HashMap::new();
         let mut in_flight_tools = super::super::turn_stream::InFlightTools::default();
+        let mut stream_buffers = StreamBuffers::default();
         let mut input = None;
         let mut output = None;
         let mut cost = None;
@@ -1171,6 +1201,7 @@ mod tests {
                 },
                 &mut tools,
                 &mut in_flight_tools,
+                &mut stream_buffers,
                 &mut input,
                 &mut output,
                 &mut cost,
@@ -1208,6 +1239,7 @@ mod tests {
         let mut input = None;
         let mut output = None;
         let mut cost = None;
+        let mut stream_buffers = StreamBuffers::default();
 
         assert!(
             !consume_event(
@@ -1220,10 +1252,11 @@ mod tests {
                 },
                 &mut tools,
                 &mut in_flight_tools,
+                &mut stream_buffers,
                 &mut input,
                 &mut output,
                 &mut cost,
-                json!({"type":"session.next.text.delta","data":{"sessionID":"s","assistantMessageID":"m","delta":"hello"}}),
+                json!({"type":"session.next.text.delta","data":{"sessionID":"s","assistantMessageID":"m","delta":"hel"}}),
             )
             .await
         );
@@ -1238,6 +1271,26 @@ mod tests {
                 },
                 &mut tools,
                 &mut in_flight_tools,
+                &mut stream_buffers,
+                &mut input,
+                &mut output,
+                &mut cost,
+                json!({"type":"session.next.text.delta","data":{"sessionID":"s","assistantMessageID":"m","delta":"lo"}}),
+            )
+            .await
+        );
+        assert!(
+            !consume_event(
+                EventContext {
+                    events: &tx,
+                    client: &client,
+                    base_url: "http://127.0.0.1:9",
+                    session_id: "s",
+                    auto_approve: false,
+                },
+                &mut tools,
+                &mut in_flight_tools,
+                &mut stream_buffers,
                 &mut input,
                 &mut output,
                 &mut cost,
@@ -1256,10 +1309,30 @@ mod tests {
                 },
                 &mut tools,
                 &mut in_flight_tools,
+                &mut stream_buffers,
                 &mut input,
                 &mut output,
                 &mut cost,
                 json!({"type":"session.next.tool.success","data":{"sessionID":"s","callID":"call:1","content":"ok"}}),
+            )
+            .await
+        );
+        assert!(
+            !consume_event(
+                EventContext {
+                    events: &tx,
+                    client: &client,
+                    base_url: "http://127.0.0.1:9",
+                    session_id: "s",
+                    auto_approve: false,
+                },
+                &mut tools,
+                &mut in_flight_tools,
+                &mut stream_buffers,
+                &mut input,
+                &mut output,
+                &mut cost,
+                json!({"type":"session.next.text.delta","data":{"sessionID":"s","assistantMessageID":"m","delta":"world"}}),
             )
             .await
         );
@@ -1274,6 +1347,7 @@ mod tests {
                 },
                 &mut tools,
                 &mut in_flight_tools,
+                &mut stream_buffers,
                 &mut input,
                 &mut output,
                 &mut cost,
@@ -1284,6 +1358,9 @@ mod tests {
         drop(tx);
 
         assert!(
+            matches!(rx.recv().await.unwrap(), AdapterEvent::Text { text, .. } if text == "hel")
+        );
+        assert!(
             matches!(rx.recv().await.unwrap(), AdapterEvent::Text { text, .. } if text == "hello")
         );
         assert!(
@@ -1291,6 +1368,9 @@ mod tests {
         );
         assert!(
             matches!(rx.recv().await.unwrap(), AdapterEvent::ToolResult { call_id, summary, error: false, .. } if call_id == "call1" && summary == "ok")
+        );
+        assert!(
+            matches!(rx.recv().await.unwrap(), AdapterEvent::Text { text, .. } if text == "world")
         );
         assert!(matches!(
             rx.recv().await.unwrap(),
@@ -1302,5 +1382,13 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn trim_output_buffer_respects_utf8_char_boundaries() {
+        let mut buf = "🚀".repeat(2500) + "listening on 127.0.0.1:9876\n";
+        trim_output_buffer(&mut buf, OUTPUT_LIMIT);
+        assert!(buf.len() <= OUTPUT_LIMIT);
+        assert_eq!(parse_port(&buf), Some(9876));
     }
 }

@@ -157,10 +157,11 @@ fn parse_scalar(raw: &str) -> Option<String> {
     if text.is_empty() || text == "null" || text == "~" {
         return None;
     }
-    if (text.starts_with('"') && text.ends_with('"'))
-        || (text.starts_with('\'') && text.ends_with('\''))
+    if text.len() >= 2
+        && ((text.starts_with('"') && text.ends_with('"'))
+            || (text.starts_with('\'') && text.ends_with('\'')))
     {
-        let inner = &text[1..text.len().saturating_sub(1)];
+        let inner = &text[1..text.len() - 1];
         if text.starts_with('"') {
             Some(inner.replace("\\\"", "\"").replace("\\\\", "\\"))
         } else {
@@ -185,8 +186,13 @@ fn validate_proxy_url(raw: &str) -> Result<String> {
             "代理地址格式无效".into(),
         ));
     }
-    let parsed = url::Url::parse(trimmed)
-        .map_err(|_| Error::Feature("invalid_config".into(), "代理地址必须是有效的 URL（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）".into()))?;
+    let parsed = url::Url::parse(trimmed).map_err(|_| {
+        Error::Feature(
+            "invalid_config".into(),
+            "代理地址必须是有效的 URL（如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）"
+                .into(),
+        )
+    })?;
     if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
         || parsed.host_str().is_none()
     {
@@ -716,10 +722,7 @@ pub(crate) fn save_config(
         ));
     }
     if target.model.is_some()
-        && (default_model.is_some()
-            || proxy_url.is_some()
-            || no_proxy.is_some()
-            || env.is_some())
+        && (default_model.is_some() || proxy_url.is_some() || no_proxy.is_some() || env.is_some())
     {
         return Err(Error::Feature(
             "invalid_config".into(),
@@ -859,5 +862,15 @@ mod tests {
         assert!(parse("danger: true\n", &target, true).is_err());
         assert!(parse("proxy_url: ftp://127.0.0.1:21\n", &target, true).is_err());
         assert!(parse("env:\n  PATH: /tmp\n", &target, true).is_err());
+    }
+
+    #[test]
+    fn parse_scalar_handles_single_quote_and_multibyte_without_panicking() {
+        assert_eq!(parse_scalar("\"").as_deref(), Some("\""));
+        assert_eq!(parse_scalar("'").as_deref(), Some("'"));
+        assert_eq!(parse_scalar("\"\"").as_deref(), Some(""));
+        assert_eq!(parse_scalar("''").as_deref(), Some(""));
+        assert_eq!(parse_scalar("\"中文🚀\"").as_deref(), Some("中文🚀"));
+        assert_eq!(parse_scalar("'中文🚀'").as_deref(), Some("中文🚀"));
     }
 }

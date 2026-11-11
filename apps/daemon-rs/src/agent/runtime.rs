@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -30,6 +30,309 @@ use crate::worker::Database;
 /// and the daemon request/database semaphores still provide backpressure.
 pub(crate) const MAX_TURNS: usize = 512;
 const CROSS_MODEL_CHECK_LEASE_MILLIS: i64 = 60_000;
+const STREAM_FLUSH_COALESCE_DELAY: Duration = Duration::from_millis(45);
+const FAN_IN_CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+
+struct TurnOutcome {
+    failed_error: Option<String>,
+}
+
+#[derive(Default)]
+struct StreamSegmentTracker {
+    index: usize,
+    interrupted: bool,
+    current_raw: String,
+    prior_joined: String,
+}
+
+impl StreamSegmentTracker {
+    fn mark_interrupted(&mut self) {
+        if !self.current_raw.is_empty() {
+            self.interrupted = true;
+        }
+    }
+
+    fn resolve(&mut self, incoming: String, base_id: &str) -> Option<(String, String)> {
+        if self.interrupted {
+            let candidate_prior = if self.prior_joined.is_empty() {
+                self.current_raw.clone()
+            } else if self.current_raw.is_empty() {
+                self.prior_joined.clone()
+            } else {
+                format!("{}\n\n{}", self.prior_joined, self.current_raw)
+            };
+            let post_tool_text = if !candidate_prior.is_empty() {
+                if let Some(rest) = incoming.strip_prefix(&candidate_prior) {
+                    rest.strip_prefix("\n\n").unwrap_or(rest).to_owned()
+                } else {
+                    incoming
+                }
+            } else {
+                incoming
+            };
+            if post_tool_text.is_empty() {
+                return None;
+            }
+            self.interrupted = false;
+            self.prior_joined = candidate_prior;
+            self.index += 1;
+            self.current_raw = post_tool_text.clone();
+            return Some((format!("{base_id}-{}", self.index + 1), post_tool_text));
+        }
+
+        let segment_text = if self.index > 0 && !self.prior_joined.is_empty() {
+            if let Some(rest) = incoming.strip_prefix(&self.prior_joined) {
+                rest.strip_prefix("\n\n").unwrap_or(rest).to_owned()
+            } else {
+                incoming
+            }
+        } else {
+            incoming
+        };
+        if segment_text.is_empty() && self.current_raw.is_empty() {
+            return None;
+        }
+        self.current_raw = segment_text.clone();
+        let record_id = if self.index == 0 {
+            base_id.to_owned()
+        } else {
+            format!("{base_id}-{}", self.index + 1)
+        };
+        Some((record_id, segment_text))
+    }
+}
+
+fn upsert_pending_write(
+    pending: &mut Vec<TimelineWrite>,
+    revisions: &mut HashMap<String, i64>,
+    record_id: String,
+    turn_id: String,
+    body: TimelineBody,
+    text: String,
+    subagent_id: Option<String>,
+) {
+    if let Some(existing) = pending.iter_mut().find(|w| w.id == record_id && w.replace) {
+        existing.body = body;
+        existing.text = text;
+        return;
+    }
+    let revision = revisions.get(&record_id).copied().unwrap_or(0);
+    pending.push(TimelineWrite {
+        id: record_id.clone(),
+        turn_id,
+        expected_revision: revision,
+        body,
+        text,
+        replace: true,
+        subagent_id,
+    });
+    revisions.insert(record_id, revision + 1);
+}
+
+fn contains_http_status_token(lower: &str, code: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let needle = code.as_bytes();
+    if bytes.len() < needle.len() {
+        return false;
+    }
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find(code) {
+        let idx = pos + rel;
+        let end = idx + needle.len();
+        let prev = idx.checked_sub(1).map(|i| bytes[i]);
+        let next = bytes.get(end).copied();
+        let prev_ok = match prev {
+            None => true,
+            Some(b':') => {
+                // Reject port numbers like `127.0.0.1:429` while allowing `status:429` / `code:401`.
+                let prefix = &lower[..idx - 1];
+                prefix.ends_with("status") || prefix.ends_with("code") || prefix.ends_with("http")
+            }
+            Some(b'.') | Some(b'/') | Some(b'-') | Some(b'_') => false,
+            Some(b) => !b.is_ascii_alphanumeric(),
+        };
+        let next_ok = match next {
+            None => true,
+            Some(b'.') | Some(b'-') | Some(b'_') => false,
+            Some(b) => !b.is_ascii_alphanumeric(),
+        };
+        if prev_ok && next_ok {
+            return true;
+        }
+        pos = idx + 1;
+    }
+    false
+}
+
+fn should_pause_queue_on_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    for code in ["401", "403", "429"] {
+        if contains_http_status_token(&lower, code) {
+            return true;
+        }
+    }
+    const ASCII_PATTERNS: &[&str] = &[
+        "unauthorized",
+        "authentication_error",
+        "authentication failed",
+        "auth failed",
+        "invalid api key",
+        "invalid_api_key",
+        "api key not valid",
+        "permission_error",
+        "login required",
+        "not logged in",
+        "please log in",
+        "re-authenticate",
+        "token expired",
+        "access_denied",
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "quota",
+        "insufficient_quota",
+        "insufficient balance",
+        "credit balance",
+        "usage limit",
+        "out of credits",
+        "payment required",
+    ];
+    if ASCII_PATTERNS.iter().any(|pat| lower.contains(pat)) {
+        return true;
+    }
+    const CJK_PATTERNS: &[&str] = &[
+        "未登录",
+        "请先登录",
+        "鉴权失败",
+        "认证失败",
+        "密钥无效",
+        "登录已过期",
+        "余额不足",
+        "配额",
+        "额度不足",
+        "额度已用尽",
+        "限流",
+        "请求过于频繁",
+    ];
+    CJK_PATTERNS.iter().any(|pat| message.contains(pat))
+}
+
+/// Build UTF-8-safe bracketed paste chunks (`\x1b[200~` ... `\x1b[201~`) WITHOUT
+/// the trailing `\r`. The caller sends `\r` only after every paste chunk succeeds.
+fn build_safe_pty_paste_chunks(report: &str, max_chunk_bytes: usize) -> Vec<Vec<u8>> {
+    const OPEN: &[u8] = b"\x1b[200~";
+    const CLOSE: &[u8] = b"\x1b[201~";
+    let cap = max_chunk_bytes.max(OPEN.len() + CLOSE.len() + 4);
+    if report.is_empty() {
+        let mut fallback = crate::cross_model_tool::terminal_fan_in_chunks(report, cap);
+        if let Some(last) = fallback.last_mut()
+            && last.ends_with(b"\r")
+        {
+            last.pop();
+        }
+        fallback.retain(|chunk| !chunk.is_empty());
+        if !fallback.is_empty() {
+            return fallback;
+        }
+    }
+    let sanitized: String = report
+        .trim_end_matches(['\r', '\n'])
+        .replace("\x1b[200~", "")
+        .replace("\x1b[201~", "")
+        .chars()
+        .map(|ch| if ch == '\x1b' { ' ' } else { ch })
+        .collect();
+
+    if OPEN.len() + sanitized.len() + CLOSE.len() <= cap {
+        let mut single = Vec::with_capacity(OPEN.len() + sanitized.len() + CLOSE.len());
+        single.extend_from_slice(OPEN);
+        single.extend_from_slice(sanitized.as_bytes());
+        single.extend_from_slice(CLOSE);
+        return vec![single];
+    }
+
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut offset = 0usize;
+    let mut first = true;
+    while offset < sanitized.len() {
+        let prefix_len = if first { OPEN.len() } else { 0 };
+        let budget = cap.saturating_sub(prefix_len);
+        let remaining = &sanitized[offset..];
+        let slice_len = if remaining.len() <= budget {
+            remaining.len()
+        } else {
+            let boundary = remaining.floor_char_boundary(budget);
+            if boundary > 0 {
+                boundary
+            } else {
+                remaining.chars().next().map_or(0, char::len_utf8)
+            }
+        };
+        let slice = &remaining[..slice_len];
+        offset += slice_len;
+        let is_last_body = offset >= sanitized.len();
+        let can_append_close = is_last_body && (prefix_len + slice.len() + CLOSE.len() <= cap);
+        let mut buf = Vec::with_capacity(
+            prefix_len + slice.len() + if can_append_close { CLOSE.len() } else { 0 },
+        );
+        if first {
+            buf.extend_from_slice(OPEN);
+            first = false;
+        }
+        buf.extend_from_slice(slice.as_bytes());
+        if can_append_close {
+            buf.extend_from_slice(CLOSE);
+        }
+        chunks.push(buf);
+        if is_last_body && !can_append_close {
+            chunks.push(CLOSE.to_vec());
+        }
+    }
+    if chunks.is_empty() {
+        let mut empty = Vec::with_capacity(OPEN.len() + CLOSE.len());
+        empty.extend_from_slice(OPEN);
+        empty.extend_from_slice(CLOSE);
+        chunks.push(empty);
+    }
+    chunks
+}
+
+async fn send_safe_pty_paste<F, Fut>(
+    report: &str,
+    max_chunk_bytes: usize,
+    mut send_chunk: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let paste_chunks = build_safe_pty_paste_chunks(report, max_chunk_bytes);
+    let total = paste_chunks.len();
+    let mut paste_opened = false;
+    let mut paste_closed = false;
+    for (idx, chunk) in paste_chunks.into_iter().enumerate() {
+        let closes_paste = idx + 1 == total;
+        match send_chunk(chunk).await {
+            Ok(()) => {
+                paste_opened = true;
+                if closes_paste {
+                    paste_closed = true;
+                }
+            }
+            Err(error) => {
+                if paste_opened && !paste_closed {
+                    // Best-effort close bracketed paste mode WITHOUT `\r` so the
+                    // PTY is never left stuck swallowing user keystrokes.
+                    let _ = send_chunk(b"\x1b[201~".to_vec()).await;
+                }
+                return Err(error);
+            }
+        }
+    }
+    // Only send Enter (`\r`) after every paste chunk + `\x1b[201~` succeeded!
+    send_chunk(b"\r".to_vec()).await
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParentReportDelivery {
@@ -303,7 +606,9 @@ impl Driver {
             Driver::Deepseek(driver) => driver.compact().await,
             Driver::Opencode(driver) => driver.compact().await,
             Driver::Pi(driver) => driver.compact().await,
-            Driver::Agy(_) => Err(Error::Invalid("Antigravity CLI 暂不支持手动压缩上下文".into())),
+            Driver::Agy(_) => Err(Error::Invalid(
+                "Antigravity CLI 暂不支持手动压缩上下文".into(),
+            )),
         }
     }
 
@@ -317,9 +622,7 @@ impl Driver {
             | Driver::Deepseek(_)
             | Driver::Opencode(_)
             | Driver::Pi(_)
-            | Driver::Agy(_) => {
-                Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into()))
-            }
+            | Driver::Agy(_) => Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into())),
         }
     }
 
@@ -394,6 +697,7 @@ struct Handle {
     /// closed), so busy-send/guide degrade to the front of the queue instead
     /// of trusting a write that the kernel pipe buffer may absorb silently.
     steerable: AtomicBool,
+    permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl Handle {
@@ -429,6 +733,7 @@ struct Session {
 struct State {
     database: Database,
     entries: Mutex<HashMap<String, Arc<Session>>>,
+    entry_count: AtomicUsize,
     /// Serializes claim + delivery for each parent so a later final fan-in
     /// cannot overtake an earlier incremental batch.
     fan_in_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -471,6 +776,7 @@ impl Agents {
         Self(Arc::new(State {
             database,
             entries: Mutex::new(HashMap::new()),
+            entry_count: AtomicUsize::new(0),
             fan_in_locks: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(MAX_TURNS)),
             worker_start_scheduler: AtomicBool::new(false),
@@ -518,7 +824,86 @@ impl Agents {
     }
 
     pub fn count(&self) -> usize {
+        self.0.entry_count.load(Ordering::Acquire)
+    }
+
+    pub fn active_turn_permits(&self) -> usize {
         MAX_TURNS - self.0.slots.available_permits()
+    }
+
+    fn sync_entry_count(&self, entries: &HashMap<String, Arc<Session>>) {
+        self.0.entry_count.store(entries.len(), Ordering::Release);
+    }
+
+    async fn insert_entry(&self, id: String, session: Arc<Session>) {
+        let mut entries = self.0.entries.lock().await;
+        entries.insert(id, session);
+        self.sync_entry_count(&entries);
+    }
+
+    async fn remove_entry(&self, id: &str) -> Option<Arc<Session>> {
+        let mut entries = self.0.entries.lock().await;
+        let removed = entries.remove(id);
+        self.sync_entry_count(&entries);
+        removed
+    }
+
+    async fn clear_entries(&self) {
+        let mut entries = self.0.entries.lock().await;
+        entries.clear();
+        self.sync_entry_count(&entries);
+    }
+
+    /// Deactivate a settled `cross_model_children` session's active runtime
+    /// (`active = 0`) once its turn is idle and its queue is empty, while
+    /// keeping `session_heads`, `timeline_records`, and `cross_model_children`
+    /// intact for summary/diff inspection and `follow_up_cross_model_child`.
+    async fn deactivate_settled_cross_model_child(&self, child_session_id: &str) {
+        let entry = self.session_entry(child_session_id).await.ok();
+        if let Some(entry) = entry.as_ref() {
+            if entry.execution_unknown.load(Ordering::Acquire)
+                || entry.handle.lock().await.is_some()
+            {
+                return;
+            }
+        }
+        let cid = child_session_id.to_owned();
+        let deactivated = self
+            .0
+            .database
+            .call(move |store| {
+                let Ok(child) = store.cross_model_child(&cid) else {
+                    return Ok(false);
+                };
+                if !child.is_terminal() {
+                    return Ok(false);
+                }
+                let Ok(run) = store.agent_run(&cid) else {
+                    return Ok(false);
+                };
+                if !run.active || store.agent_execution_unknown(&cid)? {
+                    return Ok(true);
+                }
+                if !store.message_queue(&cid)?.is_empty() {
+                    return Ok(false);
+                }
+                store.archive_agent_session(&cid, child.status == "failed")?;
+                Ok(true)
+            })
+            .await
+            .unwrap_or(false);
+        if deactivated {
+            if let Some(entry) = entry {
+                entry.permit.lock().await.take();
+            }
+            self.remove_entry(child_session_id).await;
+            self.0
+                .execution_environment
+                .lock()
+                .await
+                .remove(child_session_id);
+            self.publish();
+        }
     }
 
     pub(crate) fn changes(&self) -> watch::Sender<u64> {
@@ -656,12 +1041,29 @@ impl Agents {
             });
             self.write_cross_model_card(&completed, state, bounded_text(summary))
                 .await?;
-            if self
+            match self
                 .deliver_pending_cross_model_fan_in(&completed.parent_session_id)
-                .await?
+                .await
             {
-                settled += 1;
+                Ok(true) => settled += 1,
+                Ok(false) => {}
+                Err(
+                    error @ (Error::Busy
+                    | Error::Timeout
+                    | Error::Backpressure(_)
+                    | Error::Closed
+                    | Error::Conflict
+                    | Error::NotFound
+                    | Error::TerminalInput),
+                ) => {
+                    if matches!(error, Error::Busy | Error::Timeout | Error::Backpressure(_)) {
+                        self.spawn_delayed_fan_in_retry(completed.parent_session_id.clone());
+                    }
+                }
+                Err(error) => return Err(error),
             }
+            self.deactivate_settled_cross_model_child(&completed.session_id)
+                .await;
         }
         // A prior delivery can fail after it has claimed the batch. Retry all
         // durable, fully-terminal batches even when this invocation did not
@@ -672,11 +1074,34 @@ impl Agents {
             .call(|store| store.pending_cross_model_fan_in_parents())
             .await?;
         for parent_id in parents {
-            if self.deliver_pending_cross_model_fan_in(&parent_id).await? {
-                settled += 1;
+            match self.deliver_pending_cross_model_fan_in(&parent_id).await {
+                Ok(true) => settled += 1,
+                Ok(false) => {}
+                Err(
+                    error @ (Error::Busy
+                    | Error::Timeout
+                    | Error::Backpressure(_)
+                    | Error::Closed
+                    | Error::Conflict
+                    | Error::NotFound
+                    | Error::TerminalInput),
+                ) => {
+                    if matches!(error, Error::Busy | Error::Timeout | Error::Backpressure(_)) {
+                        self.spawn_delayed_fan_in_retry(parent_id);
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(settled)
+    }
+
+    fn spawn_delayed_fan_in_retry(&self, parent_id: String) {
+        let agents = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let _ = agents.deliver_pending_cross_model_fan_in(&parent_id).await;
+        });
     }
 
     async fn deliver_pending_cross_model_fan_in(&self, parent_session_id: &str) -> Result<bool> {
@@ -778,6 +1203,17 @@ impl Agents {
                 .await
             }
             SessionKind::Pty => {
+                if parent.lifecycle != SessionLifecycle::Active
+                    || matches!(
+                        parent.status,
+                        SessionStatus::Completed | SessionStatus::Failed
+                    )
+                {
+                    return Err(Error::Conflict);
+                }
+                if parent.status == SessionStatus::WaitingPermission {
+                    return Err(Error::Busy);
+                }
                 let directory = self.0.database.directory().join("terminal-hosts").join(
                     parent
                         .native_session
@@ -786,16 +1222,25 @@ impl Agents {
                         .unwrap_or(parent_session_id),
                 );
                 let host = crate::terminal::host::Host::attach(directory).await?;
-                let chunks = crate::cross_model_tool::terminal_fan_in_chunks(
-                    &report,
-                    crate::terminal::INPUT_BYTES,
-                );
-                for chunk in chunks {
-                    host.input(TerminalInput {
-                        data_b64: BASE64_STANDARD.encode(chunk),
-                    })
-                    .await?;
+                match host
+                    .get::<crate::terminal::TerminalActivity>("activity")
+                    .await
+                {
+                    Ok(activity) if activity.exited => return Err(Error::Conflict),
+                    Ok(activity) if activity.busy_since.is_some() => return Err(Error::Busy),
+                    Ok(_) | Err(Error::NotFound) => {}
+                    Err(error) => return Err(error),
                 }
+                send_safe_pty_paste(&report, crate::terminal::INPUT_BYTES, |chunk| {
+                    let host = &host;
+                    async move {
+                        host.input(TerminalInput {
+                            data_b64: BASE64_STANDARD.encode(chunk),
+                        })
+                        .await
+                    }
+                })
+                .await?;
                 if let Some(claim_id) = cross_model_claim_id.as_deref() {
                     self.mark_cross_model_fan_in_delivered(parent_session_id, claim_id)
                         .await?;
@@ -989,24 +1434,6 @@ impl Agents {
             .to_str()
             .ok_or_else(|| Error::Invalid("workspace must be Unicode".into()))?
             .to_owned();
-        let permit = self.0.slots.clone().try_acquire_owned().map_err(|_| {
-            self.0
-                .database
-                .record_rejection("agent.create", "agent_sessions");
-            self.0.database.record_recent_error(
-                "agent.create",
-                "agent_sessions",
-                "Agent session capacity exhausted",
-            );
-            Error::Backpressure(crate::error::ResourceBackpressure {
-                retry_after_ms: 1000,
-                operation: "agent.create".into(),
-                resource: "agent_sessions".into(),
-                queue_depth: self.count(),
-                queue_capacity: MAX_TURNS,
-                side_effect_committed: Some(false),
-            })
-        })?;
         let policy = if input.auto_approve {
             ApprovalPolicy::Auto
         } else {
@@ -1025,17 +1452,24 @@ impl Agents {
                 "Agent 暂未接入 Rust structured runtime".into(),
             ));
         }
-        if input.agent == crate::protocol::AgentKind::Deepseek && input.account_id.is_some() {
-            return Err(Error::Invalid(
-                "DeepSeek Harness 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
-            ));
-        }
         if input.agent == crate::protocol::AgentKind::Opencode && input.account_id.is_none() {
             return Err(Error::Invalid(
                 "OpenCode structured runtime 需要 OpenAI Chat Completions API Profile".into(),
             ));
         }
         let mut input = input;
+        if input.agent == crate::protocol::AgentKind::Deepseek {
+            match input.account_id.as_deref() {
+                None | Some("native-deepseek") => {
+                    input.account_id = None;
+                }
+                Some(_) => {
+                    return Err(Error::Invalid(
+                        "DeepSeek Harness 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
+                    ));
+                }
+            }
+        }
         if input.agent == crate::protocol::AgentKind::Codex
             && input.account_id.as_deref() == Some(crate::agent::NATIVE_CODEX_ID)
         {
@@ -1057,17 +1491,14 @@ impl Agents {
                     ));
                 }
             }
-            let (normalized_model, normalized_effort, _) =
-                super::agy::resolve_cli_model_and_effort(
-                    input.model.as_deref(),
-                    input.effort.as_deref(),
-                );
+            let (normalized_model, normalized_effort, _) = super::agy::resolve_cli_model_and_effort(
+                input.model.as_deref(),
+                input.effort.as_deref(),
+            );
             input.model = normalized_model;
             input.effort = normalized_effort;
         }
-        if input.agent == crate::protocol::AgentKind::Pi
-            && input.mode.as_deref() == Some("plan")
-        {
+        if input.agent == crate::protocol::AgentKind::Pi && input.mode.as_deref() == Some("plan") {
             return Err(Error::Invalid("Pi Agent 不支持 Plan 模式".into()));
         }
         if input.agent == crate::protocol::AgentKind::Codex {
@@ -1083,7 +1514,11 @@ impl Agents {
                             store.managed_snapshot_row(&data, &account_id)
                         })
                         .await?;
-                    match record.api_profile.as_ref().map(|profile| profile.protocol()) {
+                    match record
+                        .api_profile
+                        .as_ref()
+                        .map(|profile| profile.protocol())
+                    {
                         Some("openai_responses" | "openai_chat_completions") => {}
                         None if record.agent == crate::protocol::AgentKind::Codex => {}
                         _ => {
@@ -1262,7 +1697,9 @@ impl Agents {
                     }
                 } else {
                     let native_id = match create.agent {
-                        crate::protocol::AgentKind::Claude => Some(crate::accounts::NATIVE_CLAUDE_ID),
+                        crate::protocol::AgentKind::Claude => {
+                            Some(crate::accounts::NATIVE_CLAUDE_ID)
+                        }
                         crate::protocol::AgentKind::Codex => Some(crate::agent::NATIVE_CODEX_ID),
                         _ => None,
                     };
@@ -1289,7 +1726,7 @@ impl Agents {
                 store.create_agent_session_with_history(create, policy, id, history)
             })
             .await?;
-        self.0.entries.lock().await.insert(
+        self.insert_entry(
             head.id.clone(),
             Arc::new(Session {
                 execution_unknown: AtomicBool::new(false),
@@ -1299,9 +1736,10 @@ impl Agents {
                     ..Default::default()
                 }),
                 draining: Mutex::new(()),
-                permit: Mutex::new(Some(permit)),
+                permit: Mutex::new(None),
             }),
-        );
+        )
+        .await;
         self.publish();
         Ok(head)
     }
@@ -1339,8 +1777,7 @@ impl Agents {
             mode: run.mode,
             model: run.model.clone(),
             effort: run.effort.clone(),
-            environment: Self::account_environment(&self.0.database, effective_env_account)
-                .await?,
+            environment: Self::account_environment(&self.0.database, effective_env_account).await?,
             api_profile: Self::account_api_profile(&self.0.database, run.account_id.clone())
                 .await?,
             agent_preset: run.agent_preset.clone(),
@@ -1570,6 +2007,15 @@ impl Agents {
                         _ => None,
                     };
                     let chosen_account_id = requested_account.or(default_native_id);
+                    let (requested_model, requested_effort) = if agent == AgentKind::Agy {
+                        let (m, e, _) = super::agy::resolve_cli_model_and_effort(
+                            requested_model.as_deref(),
+                            requested_effort.as_deref(),
+                        );
+                        (m, e)
+                    } else {
+                        (requested_model, requested_effort)
+                    };
                     let account_label = if let Some(ref acc_id) = chosen_account_id {
                         if let Some(acc) = accounts.iter().find(|a| &a.id == acc_id) {
                             if acc.agent != agent {
@@ -1577,14 +2023,23 @@ impl Agents {
                             }
                             acc.name.clone()
                         } else {
-                            acc_id.clone()
+                            match acc_id.as_str() {
+                                crate::accounts::NATIVE_AGY_ID => "Antigravity 订阅".into(),
+                                crate::agent::NATIVE_CODEX_ID => "Codex 本机默认".into(),
+                                crate::accounts::NATIVE_CLAUDE_ID => "Claude 本机默认".into(),
+                                crate::accounts::NATIVE_PI_ID => "Pi 本机默认".into(),
+                                "native-deepseek" => "DeepSeek 本机默认".into(),
+                                _ => acc_id.clone(),
+                            }
                         }
                     } else {
                         agent_name.to_owned()
                     };
-                    let route_label = requested_model
-                        .clone()
-                        .unwrap_or_else(|| agent_name.to_owned());
+                    let route_label = match (&requested_model, &requested_effort) {
+                        (Some(m), Some(e)) => format!("{m} ({e})"),
+                        (Some(m), None) => m.clone(),
+                        _ => agent_name.to_owned(),
+                    };
                     let rec_account = chosen_account_id
                         .clone()
                         .unwrap_or_else(|| format!("native-{agent_name}"));
@@ -1720,23 +2175,6 @@ impl Agents {
             .database
             .call(move |store| store.cross_model_child_needs_reactivation(&parent_id, &child_id))
             .await?;
-        let permit = if needs_reactivation {
-            Some(self.0.slots.clone().try_acquire_owned().map_err(|_| {
-                self.0
-                    .database
-                    .record_rejection("agent.follow_up", "agent_sessions");
-                Error::Backpressure(crate::error::ResourceBackpressure {
-                    retry_after_ms: 1000,
-                    operation: "agent.follow_up".into(),
-                    resource: "agent_sessions".into(),
-                    queue_depth: self.count(),
-                    queue_capacity: MAX_TURNS,
-                    side_effect_committed: Some(false),
-                })
-            })?)
-        } else {
-            None
-        };
         if needs_reactivation {
             let parent_id = parent_session_id.to_owned();
             let child_id = child_session_id.to_owned();
@@ -1767,7 +2205,7 @@ impl Agents {
                 .await?
         };
         if reactivated {
-            self.0.entries.lock().await.insert(
+            self.insert_entry(
                 child_session_id.to_owned(),
                 Arc::new(Session {
                     execution_unknown: AtomicBool::new(false),
@@ -1777,9 +2215,10 @@ impl Agents {
                         ..Default::default()
                     }),
                     draining: Mutex::new(()),
-                    permit: Mutex::new(permit),
+                    permit: Mutex::new(None),
                 }),
-            );
+            )
+            .await;
         }
         let launched = async {
             self.write_cross_model_card(&child, "starting", String::new())
@@ -1965,7 +2404,9 @@ impl Agents {
                 .await?
         };
         let codex_native_skills = matches!(&*handle.driver.lock().await, Driver::Codex(_));
-        let expanded = self.expand_prompt(&workspace, &input.text, codex_native_skills).await?;
+        let expanded = self
+            .expand_prompt(&workspace, &input.text, codex_native_skills)
+            .await?;
         handle.driver.lock().await.steer(&expanded, &[]).await?;
         drop(guard);
         self.record_steer(child_session_id, &input.text, &[])
@@ -2199,7 +2640,9 @@ impl Agents {
                     .await?
             };
             let codex_native_skills = matches!(&*handle.driver.lock().await, Driver::Codex(_));
-            let expanded = self.expand_prompt(&workspace, &text, codex_native_skills).await?;
+            let expanded = self
+                .expand_prompt(&workspace, &text, codex_native_skills)
+                .await?;
             if handle
                 .driver
                 .lock()
@@ -2347,8 +2790,8 @@ impl Agents {
                 crate::skills::expand_prompt(&workspace, &prompt)
             }
         })
-            .await
-            .map_err(|_| Error::Closed)
+        .await
+        .map_err(|_| Error::Closed)
     }
 
     /// Prepare and spawn one CLI turn, install its handle under `guard`, and
@@ -2375,8 +2818,27 @@ impl Agents {
                 "Previous executor exit requires reconciliation".into(),
             ));
         }
+        let turn_permit = self.0.slots.clone().try_acquire_owned().map_err(|_| {
+            self.0
+                .database
+                .record_rejection("session.launch", "agent_turns");
+            self.0.database.record_recent_error(
+                "session.launch",
+                "agent_turns",
+                "Concurrent agent turn capacity exhausted",
+            );
+            Error::Backpressure(crate::error::ResourceBackpressure {
+                retry_after_ms: 1000,
+                operation: "session.launch".into(),
+                resource: "agent_turns".into(),
+                queue_depth: self.active_turn_permits(),
+                queue_capacity: MAX_TURNS,
+                side_effect_committed: Some(false),
+            })
+        })?;
         let run = {
             let id = id.to_owned();
+            let expected_claim = cross_model_claim_id.map(str::to_owned);
             self.0
                 .database
                 .call_control("session.launch", move |store| {
@@ -2389,6 +2851,16 @@ impl Agents {
                     }
                     if !run.active {
                         return Err(Error::Conflict);
+                    }
+                    if let Some(claim_id) = expected_claim.as_deref() {
+                        let valid: i64 = store.connection.query_row(
+                            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=?1 AND summary_claim_id=?2 AND summary_delivered=0",
+                            rusqlite::params![&id, claim_id],
+                            |row| row.get(0),
+                        )?;
+                        if valid == 0 {
+                            return Err(Error::Conflict);
+                        }
                     }
                     Ok(run)
                 })
@@ -2641,6 +3113,7 @@ impl Agents {
             questions: Mutex::new(HashMap::new()),
             compact: Mutex::new(None),
             steerable: AtomicBool::new(true),
+            permit: Mutex::new(Some(turn_permit)),
         });
         **guard = Some(handle.clone());
         Ok((turn, handle))
@@ -2654,7 +3127,7 @@ impl Agents {
             let mut turn = first_turn;
             let mut handle = first_handle;
             loop {
-                runtime.run_turn(id.clone(), turn, handle.clone()).await;
+                let outcome = runtime.run_turn(id.clone(), turn, handle.clone()).await;
                 handle.turn_finished.send_replace(true);
                 let lifecycle = handle.driver.lock().await.lifecycle();
                 if !lifecycle
@@ -2665,6 +3138,9 @@ impl Agents {
                     handle.quiescence_unknown.store(true, Ordering::Release);
                     if let Ok(session) = runtime.session_entry(&id).await {
                         session.execution_unknown.store(true, Ordering::Release);
+                        if let Some(permit) = handle.permit.lock().await.take() {
+                            *session.permit.lock().await = Some(permit);
+                        }
                     }
                     let session_id = id.clone();
                     if runtime
@@ -2683,6 +3159,7 @@ impl Agents {
                 }
                 handle.quiesced.send_replace(true);
                 let Ok(entry) = runtime.session_entry(&id).await else {
+                    handle.permit.lock().await.take();
                     break;
                 };
                 // Hold the drain lock for the whole pop+launch window so a
@@ -2693,6 +3170,7 @@ impl Agents {
                     .as_ref()
                     .is_none_or(|live| !Arc::ptr_eq(live, &handle))
                 {
+                    handle.permit.lock().await.take();
                     break;
                 }
                 let session_id = id.clone();
@@ -2707,12 +3185,17 @@ impl Agents {
                 {
                     entry.execution_unknown.store(true, Ordering::Release);
                     handle.quiescence_unknown.store(true, Ordering::Release);
+                    if let Some(permit) = handle.permit.lock().await.take() {
+                        *entry.permit.lock().await = Some(permit);
+                    }
                     runtime.0.failed.store(true, Ordering::Release);
                     runtime.publish();
                     break;
                 }
                 entry.execution_unknown.store(false, Ordering::Release);
                 handle.quiescence_unknown.store(false, Ordering::Release);
+                // Release the `MAX_TURNS` turn permit immediately upon quiesced idle transition.
+                handle.permit.lock().await.take();
                 *guard = None;
                 // A worker can deliver its task while its agent turn is still
                 // unwinding. The dispatch close archives the session, but
@@ -2741,6 +3224,20 @@ impl Agents {
                     }
                     break;
                 }
+                if outcome
+                    .failed_error
+                    .as_deref()
+                    .is_some_and(should_pause_queue_on_error)
+                {
+                    // Fatal auth (401/403) or rate-limit/quota (429) failure:
+                    // pause queue draining so queued user messages are not
+                    // popped and burned in a tight failure loop.
+                    drop(guard);
+                    drop(_drain);
+                    runtime.deactivate_settled_cross_model_child(&id).await;
+                    runtime.publish();
+                    break;
+                }
                 runtime.publish();
                 let queued = {
                     let id = id.clone();
@@ -2751,6 +3248,9 @@ impl Agents {
                         .await
                 };
                 let Some(row) = queued.unwrap_or(None) else {
+                    drop(guard);
+                    drop(_drain);
+                    runtime.deactivate_settled_cross_model_child(&id).await;
                     break;
                 };
                 match runtime
@@ -3015,16 +3515,20 @@ impl Agents {
         }
     }
 
-    async fn run_turn(&self, id: String, turn: i64, handle: Arc<Handle>) {
+    async fn run_turn(&self, id: String, turn: i64, handle: Arc<Handle>) -> TurnOutcome {
         let mut events = {
             let mut driver = handle.driver.lock().await;
             match driver.take_events() {
                 Some(events) => events,
-                None => return,
+                None => return TurnOutcome { failed_error: None },
             }
         };
         // Revision counters for streaming records that get rewritten in place.
         let mut revisions: HashMap<String, i64> = HashMap::new();
+        // Per-owner multi-step segment trackers so post-tool prose/reasoning
+        // writes to `turn{turn}-answer-2`, etc., instead of overwriting pre-tool text.
+        let mut text_segments: HashMap<Option<String>, StreamSegmentTracker> = HashMap::new();
+        let mut thinking_segments: HashMap<Option<String>, StreamSegmentTracker> = HashMap::new();
         // The single subagent card per Task-tool subagent is rewritten as
         // lifecycle frames arrive; keyed by native subagent id.
         let mut card_revisions: HashMap<String, i64> = HashMap::new();
@@ -3032,6 +3536,12 @@ impl Agents {
         // replaced wholesale on every update).
         let mut cards: HashMap<String, CardState> = HashMap::new();
         let mut pending: Vec<TimelineWrite> = Vec::new();
+        let mut flush_deadline: Option<tokio::time::Instant> = None;
+        let mut fan_in_heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + FAN_IN_CLAIM_HEARTBEAT_INTERVAL,
+            FAN_IN_CLAIM_HEARTBEAT_INTERVAL,
+        );
+        fan_in_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut native_persisted = false;
         let mut interrupted = false;
         let mut failure: Option<String> = None;
@@ -3039,6 +3549,7 @@ impl Agents {
 
         macro_rules! flush {
             () => {{
+                let _ = flush_deadline.take();
                 if !pending.is_empty() {
                     let result = self.append_timeline_resilient(&id, &pending, None).await;
                     if let Err(error) = result {
@@ -3054,7 +3565,33 @@ impl Agents {
         }
 
         loop {
-            let Some(event) = events.recv().await else {
+            let next_event = tokio::select! {
+                biased;
+                maybe_event = events.recv() => Some(maybe_event),
+                _ = async {
+                    if let Some(deadline) = flush_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if flush_deadline.is_some() => None,
+                _ = fan_in_heartbeat.tick() => {
+                    let parent_id = id.clone();
+                    let _ = self
+                        .0
+                        .database
+                        .call(move |store| store.renew_cross_model_fan_in_claims(&parent_id))
+                        .await;
+                    continue;
+                }
+            };
+
+            let Some(maybe_event) = next_event else {
+                flush!();
+                continue;
+            };
+            let Some(event) = maybe_event else {
+                flush!();
                 failure.get_or_insert_with(|| "agent stream closed".into());
                 break;
             };
@@ -3079,6 +3616,11 @@ impl Agents {
                     role,
                     task,
                 } => {
+                    text_segments.entry(None).or_default().mark_interrupted();
+                    thinking_segments
+                        .entry(None)
+                        .or_default()
+                        .mark_interrupted();
                     let slug = safe_owner(&subagent);
                     let now = crate::database::now();
                     cards.insert(
@@ -3121,6 +3663,11 @@ impl Agents {
                     can_message,
                     summary,
                 } => {
+                    text_segments.entry(None).or_default().mark_interrupted();
+                    thinking_segments
+                        .entry(None)
+                        .or_default()
+                        .mark_interrupted();
                     let slug = safe_owner(&subagent);
                     // A late progress/notification without a task_started still
                     // needs a card (matches legacy registerSubagent-on-message).
@@ -3143,7 +3690,7 @@ impl Agents {
                     card.status = status.to_owned();
                     card.can_message = can_message;
                     if let Some(text) = summary {
-                        card.summary = bounded_text(text);
+                        card.summary = super::store::cross_model_card_summary(&text);
                     }
                     let CardState {
                         name,
@@ -3180,45 +3727,57 @@ impl Agents {
                 }
                 AdapterEvent::Text { subagent, text } => {
                     let owner = subagent.map(|value| safe_owner(&value));
-                    let record = match &owner {
+                    let base = match &owner {
                         Some(slug) => format!("sub-{slug}-turn{turn}-answer"),
                         None => format!("turn{turn}-answer"),
                     };
-                    let revision = revisions.get(&record).copied().unwrap_or(0);
-                    pending.push(TimelineWrite {
-                        id: record.clone(),
-                        turn_id: format!("turn{turn}"),
-                        expected_revision: revision,
-                        body: TimelineBody::Message {
-                            role: MessageRole::Assistant,
-                            final_answer: true,
-                            attachments: Vec::new(),
-                        },
-                        text: bounded_text(text),
-                        replace: true,
-                        subagent_id: owner,
-                    });
-                    revisions.insert(record, revision + 1);
-                    flush!();
+                    if let Some((record, segment_text)) = text_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .resolve(text, &base)
+                    {
+                        upsert_pending_write(
+                            &mut pending,
+                            &mut revisions,
+                            record,
+                            format!("turn{turn}"),
+                            TimelineBody::Message {
+                                role: MessageRole::Assistant,
+                                final_answer: true,
+                                attachments: Vec::new(),
+                            },
+                            bounded_text(segment_text),
+                            owner,
+                        );
+                        flush_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + STREAM_FLUSH_COALESCE_DELAY
+                        });
+                    }
                 }
                 AdapterEvent::Thinking { subagent, text } => {
                     let owner = subagent.map(|value| safe_owner(&value));
-                    let record = match &owner {
+                    let base = match &owner {
                         Some(slug) => format!("sub-{slug}-turn{turn}-reasoning"),
                         None => format!("turn{turn}-reasoning"),
                     };
-                    let revision = revisions.get(&record).copied().unwrap_or(0);
-                    pending.push(TimelineWrite {
-                        id: record.clone(),
-                        turn_id: format!("turn{turn}"),
-                        expected_revision: revision,
-                        body: TimelineBody::Reasoning,
-                        text: bounded_text(text),
-                        replace: true,
-                        subagent_id: owner,
-                    });
-                    revisions.insert(record, revision + 1);
-                    flush!();
+                    if let Some((record, segment_text)) = thinking_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .resolve(text, &base)
+                    {
+                        upsert_pending_write(
+                            &mut pending,
+                            &mut revisions,
+                            record,
+                            format!("turn{turn}"),
+                            TimelineBody::Reasoning,
+                            bounded_text(segment_text),
+                            owner,
+                        );
+                        flush_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + STREAM_FLUSH_COALESCE_DELAY
+                        });
+                    }
                 }
                 AdapterEvent::ToolCall {
                     subagent,
@@ -3228,6 +3787,14 @@ impl Agents {
                     diff,
                 } => {
                     let owner = subagent.map(|value| safe_owner(&value));
+                    text_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .mark_interrupted();
+                    thinking_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .mark_interrupted();
                     let record = match &owner {
                         Some(slug) => format!("sub-{slug}-{call_id}"),
                         None => call_id.clone(),
@@ -3260,6 +3827,14 @@ impl Agents {
                     has_more,
                 } => {
                     let owner = subagent.map(|value| safe_owner(&value));
+                    text_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .mark_interrupted();
+                    thinking_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .mark_interrupted();
                     let record = match &owner {
                         Some(slug) => format!("sub-{slug}-{call_id}"),
                         None => call_id.clone(),
@@ -3294,6 +3869,15 @@ impl Agents {
                     summary,
                     reply,
                 } => {
+                    let owner = subagent.as_deref().map(safe_owner);
+                    text_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .mark_interrupted();
+                    thinking_segments
+                        .entry(owner)
+                        .or_default()
+                        .mark_interrupted();
                     flush!();
                     // Approvals stay on the main timeline so they can be
                     // answered there; the subagent id rides along as metadata
@@ -3345,6 +3929,15 @@ impl Agents {
                     questions,
                     reply,
                 } => {
+                    let owner = subagent.as_deref().map(safe_owner);
+                    text_segments
+                        .entry(owner.clone())
+                        .or_default()
+                        .mark_interrupted();
+                    thinking_segments
+                        .entry(owner)
+                        .or_default()
+                        .mark_interrupted();
                     flush!();
                     let record_id = format!("turn{turn}-q-{request_id}");
                     let native_by_id = questions
@@ -3453,6 +4046,7 @@ impl Agents {
                     output_tokens,
                     diffs,
                 } => {
+                    flush!();
                     handle.steerable.store(false, Ordering::Release);
                     if let Ok(session) = self.session_entry(&id).await {
                         let mut usage = session.usage.lock().await;
@@ -3479,6 +4073,16 @@ impl Agents {
                     break;
                 }
             }
+        }
+
+        if !pending.is_empty() {
+            if let Err(error) = self.append_timeline_resilient(&id, &pending, None).await {
+                if !matches!(error, Error::Closed) {
+                    self.0.failed.store(true, Ordering::Release);
+                }
+                failure.get_or_insert_with(|| error.to_string());
+            }
+            pending.clear();
         }
 
         if let Some(waiter) = handle.compact.lock().await.take() {
@@ -3538,7 +4142,9 @@ impl Agents {
             if !matches!(error, Error::Closed) {
                 self.0.failed.store(true, Ordering::Release);
             }
-            return;
+            return TurnOutcome {
+                failed_error: failure,
+            };
         }
         let status = if failure.is_some() {
             SessionStatus::Failed
@@ -3553,7 +4159,9 @@ impl Agents {
             Ok(false) | Err(Error::Closed) => {}
             Err(_) => {
                 self.0.failed.store(true, Ordering::Release);
-                return;
+                return TurnOutcome {
+                    failed_error: failure,
+                };
             }
         }
         // A cross-model child is a full independent session.  Once its first
@@ -3575,13 +4183,17 @@ impl Agents {
                     .await
             };
             let Ok(task_turn) = task_turn else {
-                return;
+                return TurnOutcome {
+                    failed_error: failure,
+                };
             };
             if task_turn != turn {
-                return;
+                return TurnOutcome {
+                    failed_error: failure,
+                };
             }
-            let result = if let Some(error) = failure {
-                Some(bounded_text(error))
+            let result = if let Some(error) = failure.as_deref() {
+                Some(super::store::truncate_utf8_bytes(error, 65_536))
             } else {
                 let id = id.clone();
                 self.0
@@ -3631,6 +4243,9 @@ impl Agents {
             } else {
                 let _ = existing;
             }
+        }
+        TurnOutcome {
+            failed_error: failure,
         }
     }
 
@@ -3890,7 +4505,9 @@ impl Agents {
                     .await?
             };
             let codex_native_skills = matches!(&*handle.driver.lock().await, Driver::Codex(_));
-            let expanded = self.expand_prompt(&workspace, &row.text, codex_native_skills).await?;
+            let expanded = self
+                .expand_prompt(&workspace, &row.text, codex_native_skills)
+                .await?;
             if handle
                 .driver
                 .lock()
@@ -4606,8 +5223,7 @@ impl Agents {
         } else {
             (run.model, run.effort)
         };
-        let current_model = run_model
-            .or_else(|| models.first().map(|model| model.id.clone()));
+        let current_model = run_model.or_else(|| models.first().map(|model| model.id.clone()));
         Ok(AgentModelCatalog {
             models,
             current_model,
@@ -4750,17 +5366,14 @@ impl Agents {
         } else {
             super::claude::fetch_launch_catalog(&environment).await?
         };
-        let (model, effort) = if run.agent == AgentKind::Agy
-            && catalog.iter().all(|entry| entry.id != model)
-        {
-            let (base, suffix_effort) = super::agy::split_model_effort_suffix(&model);
-            (
-                base.to_owned(),
-                effort.or_else(|| suffix_effort.map(str::to_owned)),
-            )
-        } else {
-            (model, effort)
-        };
+        let (model, effort) =
+            if run.agent == AgentKind::Agy && catalog.iter().all(|entry| entry.id != model) {
+                let (norm_model, norm_effort, _) =
+                    super::agy::resolve_cli_model_and_effort(Some(&model), effort.as_deref());
+                (norm_model.unwrap_or(model), norm_effort.or(effort))
+            } else {
+                (model, effort)
+            };
         let selected = catalog
             .iter()
             .find(|entry| entry.id == model)
@@ -5040,12 +5653,6 @@ impl Agents {
         if entries.contains_key(id) {
             return Err(Error::Conflict);
         }
-        let permit = self
-            .0
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Busy)?;
         let sid = id.to_owned();
         let head = self
             .0
@@ -5062,9 +5669,11 @@ impl Agents {
                     ..Default::default()
                 }),
                 draining: Mutex::new(()),
-                permit: Mutex::new(Some(permit)),
+                permit: Mutex::new(None),
             }),
         );
+        self.sync_entry_count(&entries);
+        drop(entries);
         self.publish();
         Ok(head)
     }
@@ -5106,12 +5715,9 @@ impl Agents {
             }
         };
         drop(handle);
-        self.finish_close(
-            id,
-            false,
-            !previous_memory && !previous_unknown && (local_idle || previously_stopped),
-        )
-        .await
+        let known_idle = (local_idle && previously_stopped)
+            || (!previous_memory && !previous_unknown && (local_idle || previously_stopped));
+        self.finish_close(id, false, known_idle).await
     }
 
     /// Expire only an idle worker with an overdue, still-live dispatch. The
@@ -5196,6 +5802,9 @@ impl Agents {
                 );
                 if !process_exit.permits_direct_release() || !turn_quiescence {
                     entry.execution_unknown.store(true, Ordering::Release);
+                    if let Some(permit) = handle.permit.lock().await.take() {
+                        *entry.permit.lock().await = Some(permit);
+                    }
                     let session_id = id.to_owned();
                     self.0
                         .database
@@ -5214,6 +5823,7 @@ impl Agents {
                     .await?;
                 entry.execution_unknown.store(false, Ordering::Release);
                 handle.quiesced.send_replace(true);
+                handle.permit.lock().await.take();
                 let _ = stop_effect;
                 let mut slot = entry.handle.lock().await;
                 if slot
@@ -5238,7 +5848,7 @@ impl Agents {
                 ));
             }
             entry.permit.lock().await.take();
-            self.0.entries.lock().await.remove(id);
+            self.remove_entry(id).await;
             self.0.execution_environment.lock().await.remove(id);
         } else if known_idle {
             let session_id = id.to_owned();
@@ -5384,6 +5994,7 @@ impl Agents {
                     permit: Mutex::new(Some(permit)),
                 }),
             );
+            self.sync_entry_count(&entries);
         }
         let _ = super::codex::cleanup_stale_app_servers(self.0.database.directory()).await;
         let ids: Vec<String> = self
@@ -5542,6 +6153,7 @@ impl Agents {
                         .await?;
                     session.execution_unknown.store(false, Ordering::Release);
                     handle.quiesced.send_replace(true);
+                    handle.permit.lock().await.take();
                     let mut slot = session.handle.lock().await;
                     if slot
                         .as_ref()
@@ -5552,6 +6164,9 @@ impl Agents {
                     session.permit.lock().await.take();
                 } else {
                     session.execution_unknown.store(true, Ordering::Release);
+                    if let Some(permit) = handle.permit.lock().await.take() {
+                        *session.permit.lock().await = Some(permit);
+                    }
                     let id = session_id.clone();
                     self.0
                         .database
@@ -5579,7 +6194,7 @@ impl Agents {
         if !all_confirmed {
             return Err(Error::Timeout);
         }
-        self.0.entries.lock().await.clear();
+        self.clear_entries().await;
         self.0.execution_environment.lock().await.clear();
         Ok(())
     }
@@ -5602,17 +6217,14 @@ async fn wait_for_quiescence(receiver: &mut watch::Receiver<bool>, timeout: Dura
     .unwrap_or(false)
 }
 
-/// Cap text persisted with a single streaming rewrite.
+/// Cap text persisted with a single streaming rewrite (512 KiB UTF-8-safe;
+/// `timeline.rs` slices large bodies into 64 KiB storage chunks).
 fn bounded_text(mut text: String) -> String {
-    const LIMIT: usize = 60_000;
+    const LIMIT: usize = 512 * 1024;
     if text.len() <= LIMIT {
         return text;
     }
-    let mut end = LIMIT;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
+    text.truncate(text.floor_char_boundary(LIMIT));
     text
 }
 
@@ -5894,13 +6506,287 @@ mod persistence_tests {
                 .unwrap()
         );
         let current = database
-            .read("test.archived_session", move |store| store.session(&head.id))
+            .read("test.archived_session", move |store| {
+                store.session(&head.id)
+            })
             .await
             .unwrap();
         let native = current.native_session.unwrap();
         assert_eq!(native.state, "archived");
         assert_eq!(native.native_id.as_deref(), Some("native-session-1"));
         assert_eq!(native.error, None);
+        database.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn stream_segment_tracker_preserves_pre_and_post_tool_prose_for_block_and_cumulative_drivers() {
+        // 1. Per-block driver (Claude / Codex / DeepSeek / OpenCode): resets buffer after tool call.
+        let mut block_tracker = StreamSegmentTracker::default();
+        assert_eq!(
+            block_tracker.resolve("Analyzing...".into(), "turn1-answer"),
+            Some(("turn1-answer".into(), "Analyzing...".into()))
+        );
+        assert_eq!(
+            block_tracker.resolve("Analyzing the codebase.".into(), "turn1-answer"),
+            Some(("turn1-answer".into(), "Analyzing the codebase.".into()))
+        );
+        block_tracker.mark_interrupted();
+        assert_eq!(
+            block_tracker.resolve("Done".into(), "turn1-answer"),
+            Some(("turn1-answer-2".into(), "Done".into()))
+        );
+        assert_eq!(
+            block_tracker.resolve("Done fixing!".into(), "turn1-answer"),
+            Some(("turn1-answer-2".into(), "Done fixing!".into()))
+        );
+
+        // 2. Cumulative driver (Pi / Agy): emits `seg1 + "\n\n" + seg2` after tool call.
+        let mut cumulative = StreamSegmentTracker::default();
+        assert_eq!(
+            cumulative.resolve("Step 1 analysis".into(), "turn1-answer"),
+            Some(("turn1-answer".into(), "Step 1 analysis".into()))
+        );
+        cumulative.mark_interrupted();
+        assert_eq!(
+            cumulative.resolve("Step 1 analysis\n\nStep 2 summary".into(), "turn1-answer"),
+            Some(("turn1-answer-2".into(), "Step 2 summary".into()))
+        );
+        assert_eq!(
+            cumulative.resolve(
+                "Step 1 analysis\n\nStep 2 summary complete".into(),
+                "turn1-answer"
+            ),
+            Some(("turn1-answer-2".into(), "Step 2 summary complete".into()))
+        );
+    }
+
+    #[test]
+    fn upsert_pending_write_coalesces_without_bumping_expected_revision() {
+        let mut pending = Vec::new();
+        let mut revisions = HashMap::new();
+        upsert_pending_write(
+            &mut pending,
+            &mut revisions,
+            "turn1-answer".into(),
+            "turn1".into(),
+            TimelineBody::Message {
+                role: MessageRole::Assistant,
+                final_answer: true,
+                attachments: Vec::new(),
+            },
+            "Hello".into(),
+            None,
+        );
+        upsert_pending_write(
+            &mut pending,
+            &mut revisions,
+            "turn1-answer".into(),
+            "turn1".into(),
+            TimelineBody::Message {
+                role: MessageRole::Assistant,
+                final_answer: true,
+                attachments: Vec::new(),
+            },
+            "Hello world".into(),
+            None,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].expected_revision, 0);
+        assert_eq!(pending[0].text, "Hello world");
+        assert_eq!(revisions.get("turn1-answer"), Some(&1));
+
+        // After a flush clears `pending`, the next delta advances expected_revision to 1.
+        pending.clear();
+        upsert_pending_write(
+            &mut pending,
+            &mut revisions,
+            "turn1-answer".into(),
+            "turn1".into(),
+            TimelineBody::Message {
+                role: MessageRole::Assistant,
+                final_answer: true,
+                attachments: Vec::new(),
+            },
+            "Hello world!".into(),
+            None,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].expected_revision, 1);
+        assert_eq!(revisions.get("turn1-answer"), Some(&2));
+    }
+
+    #[test]
+    fn bounded_text_lifts_60kb_cap_and_preserves_utf8() {
+        let eighty_kb = "中文🚀abc\n".repeat(9_000);
+        assert!(eighty_kb.len() > 60_000);
+        assert_eq!(bounded_text(eighty_kb.clone()), eighty_kb);
+
+        let over_512kb = "中文🚀".repeat(90_000);
+        assert!(over_512kb.len() > 512 * 1024);
+        let capped = bounded_text(over_512kb);
+        assert!(capped.len() <= 512 * 1024);
+        assert!(capped.len() + 4 > 512 * 1024);
+    }
+
+    #[test]
+    fn should_pause_queue_on_auth_and_quota_errors_only() {
+        assert!(should_pause_queue_on_error("HTTP 401 Unauthorized"));
+        assert!(should_pause_queue_on_error(
+            "API error (status:429): rate limit exceeded"
+        ));
+        assert!(should_pause_queue_on_error(
+            "403 Forbidden: permission_error"
+        ));
+        assert!(should_pause_queue_on_error(
+            "insufficient_quota: out of credits"
+        ));
+        assert!(should_pause_queue_on_error("请先登录账号后再继续"));
+        assert!(should_pause_queue_on_error("请求过于频繁，触发限流"));
+
+        // Non-auth/rate-limit errors and port numbers must NOT pause the queue.
+        assert!(!should_pause_queue_on_error(
+            "connect ECONNREFUSED 127.0.0.1:429"
+        ));
+        assert!(!should_pause_queue_on_error(
+            "file line-401-429 failed to parse"
+        ));
+        assert!(!should_pause_queue_on_error("command exited with status 1"));
+    }
+
+    #[tokio::test]
+    async fn send_safe_pty_paste_closes_bracketed_paste_without_enter_on_mid_chunk_busy() {
+        let payload = "报告第一段🚀".repeat(8);
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        let mut call_index = 0usize;
+        let result = send_safe_pty_paste(&payload, 32, |chunk| {
+            call_index += 1;
+            let fail = call_index == 2;
+            if !fail {
+                sent.push(chunk);
+            }
+            async move { if fail { Err(Error::Busy) } else { Ok(()) } }
+        })
+        .await;
+        assert!(matches!(result, Err(Error::Busy)));
+        assert!(sent[0].starts_with(b"\x1b[200~"));
+        // Must have sent best-effort `\x1b[201~` cleanup and NEVER sent `\r`.
+        assert_eq!(sent.last().map(Vec::as_slice), Some(&b"\x1b[201~"[..]));
+        assert!(!sent.iter().any(|chunk| chunk.as_slice() == b"\r"));
+
+        // Full success path sends `\x1b[200~ ... \x1b[201~` followed by `\r`.
+        let mut ok_sent: Vec<Vec<u8>> = Vec::new();
+        send_safe_pty_paste("hello中文\n", 1024, |chunk| {
+            ok_sent.push(chunk);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ok_sent.len(), 2);
+        assert_eq!(
+            ok_sent[0],
+            b"\x1b[200~hello\xe4\xb8\xad\xe6\x96\x87\x1b[201~"
+        );
+        assert_eq!(ok_sent[1], b"\r");
+    }
+
+    #[tokio::test]
+    async fn idle_sessions_hold_zero_turn_permits_and_settled_cross_model_children_deactivate() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let workspace = root.path().to_string_lossy().into_owned();
+
+        // Create > MAX_TURNS idle sessions to prove idle sessions consume 0 turn permits.
+        let mut created_ids = Vec::with_capacity(MAX_TURNS + 4);
+        for index in 0..(MAX_TURNS + 4) {
+            let head = agents
+                .create(CreateAgentSession {
+                    agent: AgentKind::Claude,
+                    title: format!("idle-{index}"),
+                    workspace: workspace.clone(),
+                    auto_approve: false,
+                    mode: None,
+                    model: None,
+                    effort: None,
+                    agent_preset: None,
+                    account_id: None,
+                    resume: None,
+                })
+                .await
+                .unwrap();
+            created_ids.push(head.id);
+        }
+        assert_eq!(agents.count(), MAX_TURNS + 4);
+        assert_eq!(agents.active_turn_permits(), 0);
+
+        // Register a completed cross-model child and verify automatic runtime deactivation
+        // sets `active = 0` while preserving child result lookup and reactivation support.
+        let parent_id = created_ids[0].clone();
+        let child_id = created_ids[1].clone();
+        {
+            let parent_id = parent_id.clone();
+            let child_id = child_id.clone();
+            database
+                .call(move |store| {
+                    store.register_cross_model_child(
+                        &child_id,
+                        &parent_id,
+                        "inspect auth flow",
+                        "native-claude",
+                        "native-claude",
+                        "native-claude",
+                    )?;
+                    let (turn, _) = store.begin_agent_turn(&child_id)?;
+                    store.append_agent_records(
+                        &child_id,
+                        vec![TimelineWrite {
+                            id: format!("turn{turn}-answer"),
+                            turn_id: format!("turn{turn}"),
+                            expected_revision: 0,
+                            body: TimelineBody::Message {
+                                role: MessageRole::Assistant,
+                                final_answer: true,
+                                attachments: Vec::new(),
+                            },
+                            text: "Auth flow verified.".into(),
+                            replace: false,
+                            subagent_id: None,
+                        }],
+                    )?;
+                    store.finish_agent_turn_status(&child_id, SessionStatus::Idle)?;
+                    store.complete_cross_model_child(
+                        &child_id,
+                        turn,
+                        "completed",
+                        Some("Auth flow verified."),
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        agents.deactivate_settled_cross_model_child(&child_id).await;
+        assert_eq!(agents.count(), MAX_TURNS + 3);
+        let (active, result, needs_reactivation) = {
+            let parent_id = parent_id.clone();
+            let child_id = child_id.clone();
+            database
+                .call(move |store| {
+                    let run = store.agent_run(&child_id)?;
+                    let result = store.cross_model_child_result(&child_id)?;
+                    let needs =
+                        store.cross_model_child_needs_reactivation(&parent_id, &child_id)?;
+                    Ok((run.active, result, needs))
+                })
+                .await
+                .unwrap()
+        };
+        assert!(!active);
+        assert_eq!(result, "Auth flow verified.");
+        assert!(needs_reactivation);
+
+        agents.shutdown().await.unwrap();
         database.shutdown().await.unwrap();
     }
 }

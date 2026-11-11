@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use portable_pty::CommandBuilder;
+use prosperod_rs::protocol::TerminalInput;
 use prosperod_rs::terminal::{Terminal, TerminalSize, spawn};
 
 fn terminal() -> Terminal {
@@ -36,6 +37,35 @@ fn inner_lease_claim_takeover_release_and_legacy_gate() {
     assert!(same_handle.legacy_control_allowed().unwrap());
     assert_eq!(terminal.epoch(), epoch);
     assert_eq!(same_handle.epoch(), epoch);
+
+    terminal.stop();
+}
+
+#[tokio::test]
+async fn system_input_bypasses_stream_controller_lease_without_revoking_owner() {
+    let terminal = terminal();
+    assert!(terminal.acquire_controller("stream-owner", false).unwrap());
+
+    assert!(
+        terminal
+            .input(TerminalInput {
+                data_b64: "eA==".into(),
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        terminal
+            .system_input(TerminalInput {
+                data_b64: "eA==".into(),
+            })
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        terminal.controller().unwrap().as_deref(),
+        Some("stream-owner")
+    );
 
     terminal.stop();
 }

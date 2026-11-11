@@ -715,12 +715,72 @@ impl Terminals {
         let mut seq = self.checkpoint_cursor(id).await?;
         let mut catching_up = false;
         let mut replay_warning = false;
+        let mut snapshot_dirty = false;
         loop {
             if !catching_up {
-                tokio::select! {
-                    _ = self.stopping(), if terminal.hosted() => return Ok(()),
-                    _ = terminal.wait_exited() => return Ok(()),
-                    _ = terminal.wait_output(seq) => {},
+                let flush_idle_snapshot = if snapshot_dirty {
+                    tokio::select! {
+                        _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                        _ = terminal.wait_exited() => return Ok(()),
+                        _ = terminal.wait_output(seq) => false,
+                        _ = tokio::time::sleep(super::LIVE_SNAPSHOT_INTERVAL) => true,
+                    }
+                } else {
+                    tokio::select! {
+                        _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                        _ = terminal.wait_exited() => return Ok(()),
+                        _ = terminal.wait_output(seq) => false,
+                    }
+                };
+                if flush_idle_snapshot {
+                    let permit = tokio::select! {
+                        _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                        _ = terminal.wait_exited() => return Ok(()),
+                        permit = self.0.checkpoints.clone().acquire_owned() => permit.map_err(|_| Error::Closed)?,
+                    };
+                    let idle_state = tokio::select! {
+                        _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                        state = async {
+                            let page = terminal.read(TerminalQuery {
+                                after_seq: Some(seq),
+                                wait_ms: Some(0),
+                            }).await?;
+                            let snapshot = terminal.snapshot().await?;
+                            Ok::<_, Error>((page, snapshot))
+                        } => state,
+                    };
+                    drop(permit);
+                    if let Ok((page, Some(snapshot))) = idle_state
+                        && !page.exited
+                        && !page.resync_required
+                        && page.latest_seq == seq
+                        && snapshot.seq == seq
+                    {
+                        let archive = Archive {
+                            snapshot: Some(snapshot),
+                            floor: page.floor_seq,
+                            start: seq,
+                            seq,
+                            latest_seq: seq,
+                            events: Vec::new(),
+                            exit_code: None,
+                        };
+                        let id = id.to_owned();
+                        if self
+                            .0
+                            .database
+                            .call_background("terminal.checkpoint", move |store| {
+                                store.checkpoint_terminal(&id, archive)
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            snapshot_dirty = false;
+                        }
+                    } else {
+                        snapshot_dirty = false;
+                    }
+                    continue;
                 }
                 tokio::select! {
                     _ = self.stopping(), if terminal.hosted() => return Ok(()),
@@ -766,6 +826,7 @@ impl Terminals {
                 return Err(Error::Conflict);
             }
             let more = archive.latest_seq > next;
+            let had_snapshot = archive.snapshot.is_some();
             let id = id.to_owned();
             match self
                 .0
@@ -778,6 +839,7 @@ impl Terminals {
                 Ok(()) => {
                     seq = next;
                     catching_up = more;
+                    snapshot_dirty = !more && !had_snapshot;
                     self.0
                         .changed
                         .send_modify(|value| *value = value.wrapping_add(1));
@@ -828,9 +890,12 @@ impl Terminals {
                 input.agent,
                 Some(crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex)
             )
-            && spec
-                .as_ref()
-                .is_some_and(|spec| !spec.args.iter().any(|arg| arg == "setup-token" || arg == "login"));
+            && spec.as_ref().is_some_and(|spec| {
+                !spec
+                    .args
+                    .iter()
+                    .any(|arg| arg == "setup-token" || arg == "login")
+            });
         let restored_native_id = restored
             .as_ref()
             .and_then(|head| head.native_session.as_ref())
@@ -1675,9 +1740,7 @@ impl Terminals {
                         .clone()
                         .unwrap_or_else(|| NATIVE_CODEX_ID.to_owned());
                     let profile_model = profile.as_ref().map(|p| p.model.clone());
-                    let profile_caps = profile
-                        .as_ref()
-                        .and_then(|p| p.model_capabilities.clone());
+                    let profile_caps = profile.as_ref().and_then(|p| p.model_capabilities.clone());
                     let has_profile = profile.is_some();
                     let override_defaults = tokio::task::spawn_blocking(move || {
                         let target = crate::accounts::config::ConfigTarget {
@@ -1929,16 +1992,16 @@ impl Terminals {
         let Some(id) = account_id else {
             let data = self.0.database.directory().to_owned();
             let (env, (default_model, default_effort)) = tokio::task::spawn_blocking(move || {
-                let env = crate::accounts::managed::native_claude_environment(&data)
-                    .unwrap_or_default();
+                let env =
+                    crate::accounts::managed::native_claude_environment(&data).unwrap_or_default();
                 let target = crate::accounts::config::ConfigTarget {
                     account_id: crate::accounts::NATIVE_CLAUDE_ID.into(),
                     model: None,
                     model_capabilities: None,
                     active_sessions: 0,
                 };
-                let defaults = crate::accounts::config::read_defaults(&data, &target)
-                    .unwrap_or((None, None));
+                let defaults =
+                    crate::accounts::config::read_defaults(&data, &target).unwrap_or((None, None));
                 (env, defaults)
             })
             .await
@@ -1948,16 +2011,16 @@ impl Terminals {
         if id == crate::accounts::NATIVE_CLAUDE_ID {
             let data = self.0.database.directory().to_owned();
             let (env, (default_model, default_effort)) = tokio::task::spawn_blocking(move || {
-                let env = crate::accounts::managed::native_claude_environment(&data)
-                    .unwrap_or_default();
+                let env =
+                    crate::accounts::managed::native_claude_environment(&data).unwrap_or_default();
                 let target = crate::accounts::config::ConfigTarget {
                     account_id: crate::accounts::NATIVE_CLAUDE_ID.into(),
                     model: None,
                     model_capabilities: None,
                     active_sessions: 0,
                 };
-                let defaults = crate::accounts::config::read_defaults(&data, &target)
-                    .unwrap_or((None, None));
+                let defaults =
+                    crate::accounts::config::read_defaults(&data, &target).unwrap_or((None, None));
                 (env, defaults)
             })
             .await
@@ -2012,7 +2075,13 @@ impl Terminals {
         })
         .await
         .map_err(|_| Error::Closed)??;
-        Ok((env, Some(account_id), default_model, default_effort, profile))
+        Ok((
+            env,
+            Some(account_id),
+            default_model,
+            default_effort,
+            profile,
+        ))
     }
 
     async fn resolve_codex_terminal_account(

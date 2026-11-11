@@ -47,8 +47,8 @@ impl Default for DatabaseOptions {
             control_queue_capacity: 64,
             background_waiter_capacity: DATABASE_QUEUE_CAPACITY,
             control_waiter_capacity: 64,
-            background_enqueue_timeout: Duration::from_millis(250),
-            control_enqueue_timeout: Duration::from_millis(500),
+            background_enqueue_timeout: Duration::from_millis(1500),
+            control_enqueue_timeout: Duration::from_millis(2500),
             control_weight: 4,
             degraded_queue_depth: DATABASE_QUEUE_CAPACITY * 3 / 4,
             recovered_queue_depth: DATABASE_QUEUE_CAPACITY / 2,
@@ -56,10 +56,10 @@ impl Default for DatabaseOptions {
             retry_after_ms: 100,
             latency_sample_capacity: 1024,
             recent_error_capacity: 32,
-            reader_threads: 2,
-            read_queue_capacity: 128,
-            read_waiter_capacity: 128,
-            read_enqueue_timeout: Duration::from_millis(250),
+            reader_threads: 4,
+            read_queue_capacity: 256,
+            read_waiter_capacity: 256,
+            read_enqueue_timeout: Duration::from_millis(1500),
         }
     }
 }

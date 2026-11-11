@@ -855,7 +855,10 @@ mod tests {
         assert_eq!(rewrite_codex_ctrl_c(b"\x1b[27;5;99~"), b"\x15");
         assert!(rewrite_codex_ctrl_c(b"\x1b[99;5:2u").is_empty());
         assert!(rewrite_codex_ctrl_c(b"\x1b[99;5:3u").is_empty());
-        assert_eq!(rewrite_codex_ctrl_c(b"abc\x1b[99;1u\x04"), b"abc\x1b[99;1u\x04");
+        assert_eq!(
+            rewrite_codex_ctrl_c(b"abc\x1b[99;1u\x04"),
+            b"abc\x1b[99;1u\x04"
+        );
     }
 
     #[test]

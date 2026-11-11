@@ -88,21 +88,27 @@ impl Store {
         if let Some(native_id) = &native.native_id {
             self.ensure_native_available(id, native_id)?;
         }
-        let old_runtime = head
-            .native_session
-            .as_ref()
-            .map(|s| s.runtime_id.clone())
-            .unwrap_or_else(|| id.to_owned());
-        let payload = serde_json::to_string(&head)?;
-        self.update_session_with_native(id, UpdateSession {
-            revision: head.revision, title: None, lifecycle: Some(SessionLifecycle::Active), status: Some(SessionStatus::Starting),
-        }, Some(native), |tx| {
-            tx.execute("INSERT OR IGNORE INTO terminal_instances(runtime_id,session_id,session_payload,snapshot,archived_at) SELECT ?1,session_id,?2,snapshot,?3 FROM terminal_runs WHERE session_id=?4 AND active=0", params![old_runtime,payload,now(),id])?;
-            if tx.execute("UPDATE terminal_runs SET active=1,floor_seq=latest_seq+1,latest_seq=latest_seq+1,exit_code=NULL,snapshot=NULL WHERE session_id=? AND active=0", [id])? != 1 { return Err(Error::Conflict); }
-            tx.execute("INSERT OR IGNORE INTO terminal_instance_output(runtime_id,seq,payload) SELECT ?1,seq,payload FROM terminal_output WHERE session_id=?2", params![old_runtime,id])?;
-            tx.execute("DELETE FROM terminal_output WHERE session_id=?", [id])?;
-            Ok(())
-        })
+        self.update_session_with_native(
+            id,
+            UpdateSession {
+                revision: head.revision,
+                title: None,
+                lifecycle: Some(SessionLifecycle::Active),
+                status: Some(SessionStatus::Starting),
+            },
+            Some(native),
+            |tx| {
+                if tx.execute(
+                    "UPDATE terminal_runs SET active=1,floor_seq=latest_seq+1,latest_seq=latest_seq+1,exit_code=NULL,snapshot=NULL WHERE session_id=? AND active=0",
+                    [id],
+                )? != 1
+                {
+                    return Err(Error::Conflict);
+                }
+                tx.execute("DELETE FROM terminal_output WHERE session_id=?", [id])?;
+                Ok(())
+            },
+        )
     }
 
     pub(crate) fn set_native_state(
@@ -192,15 +198,15 @@ mod tests {
         let resumed = store.reset_terminal_instance(&head.id, native).unwrap();
         assert_eq!(resumed.id, head.id);
         assert_eq!(resumed.lifecycle, SessionLifecycle::Active);
-        let payload: String = store
+        let dead_rows: i64 = store
             .connection
             .query_row(
-                "SELECT payload FROM terminal_instance_output WHERE runtime_id=?1 AND seq=1",
-                [&old],
+                "SELECT (SELECT count(*) FROM terminal_instance_output WHERE runtime_id=?1) + (SELECT count(*) FROM terminal_output WHERE session_id=?2)",
+                params![old, head.id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(payload.contains("aGlzdG9yeQ=="));
+        assert_eq!(dead_rows, 0);
         let cursor: i64 = store
             .connection
             .query_row(

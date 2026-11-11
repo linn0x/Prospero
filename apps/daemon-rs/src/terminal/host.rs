@@ -116,7 +116,10 @@ impl Host {
     /// cross-model fan-in: a CLI parent may be a hosted PTY rather than a
     /// structured Rust agent session.
     pub(crate) async fn input(&self, input: TerminalInput) -> Result<()> {
-        self.post("input", &input).await
+        match self.post("system-input", &input).await {
+            Err(Error::NotFound) => self.post("input", &input).await,
+            other => other,
+        }
     }
     pub async fn start_at(
         exe: PathBuf,
@@ -269,18 +272,33 @@ impl Host {
         .await
     }
     pub async fn post<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        let request = self.client.post(format!("{}/{path}", self.url)).json(body);
-        let request = if path == "input" {
-            request
+        self.post_with_input_timeout(path, body, Duration::from_secs(10))
+            .await
+    }
+    async fn post_with_input_timeout<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+        input_timeout: Duration,
+    ) -> Result<()> {
+        let is_input = path == "input" || path == "system-input";
+        let timeout = if is_input {
+            input_timeout
         } else {
-            request.timeout(Duration::from_secs(8))
+            Duration::from_secs(8)
         };
-        // Input acknowledgement may wait behind PTY backpressure. Cancellation
-        // belongs to the caller; a transport timeout must not close the host.
+        let request = self
+            .client
+            .post(format!("{}/{path}", self.url))
+            .json(body)
+            .timeout(timeout);
+        // Input acknowledgement may wait behind PTY backpressure, bounded by
+        // `input_timeout` so a stalled child stdin cannot hang forever; a
+        // transport timeout maps to `TerminalInput` and must not close the host.
         let result: Result<bool> = self.response(request).await;
         match result {
             Ok(_) => Ok(()),
-            Err(Error::Closed | Error::Timeout | Error::Json(_)) if path == "input" => {
+            Err(Error::Closed | Error::Timeout | Error::Json(_)) if is_input => {
                 Err(Error::TerminalInput)
             }
             Err(error) => Err(error),
@@ -455,6 +473,18 @@ pub fn run(directory: PathBuf) -> Result<()> {
                             if !o.terminal.legacy_control_allowed()? { return Err(ApiError(Error::Conflict)); }
                             o.terminal
                                 .input(i)
+                                .await
+                                .map(|_| Json(true))
+                                .map_err(ApiError)
+                        },
+                    ),
+                )
+                .route(
+                    "/system-input",
+                    post(
+                        |State(o): State<Owner>, Json(i): Json<TerminalInput>| async move {
+                            o.terminal
+                                .system_input(i)
                                 .await
                                 .map(|_| Json(true))
                                 .map_err(ApiError)
@@ -959,7 +989,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 4096];
             let count = socket.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..count]).starts_with("POST /input "));
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("POST /system-input "));
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx")
                 .await
@@ -991,6 +1021,46 @@ mod tests {
             .await,
             Err(Error::TerminalInput)
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_input_times_out_with_terminal_input_error() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let host = Host {
+            stream_supported: false,
+            directory: directory.path().to_owned(),
+            url: format!("http://{address}"),
+            token: "token".into(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        };
+        for path in ["system-input", "input"] {
+            let err = host
+                .post_with_input_timeout(
+                    path,
+                    &TerminalInput {
+                        data_b64: "eA==".into(),
+                    },
+                    Duration::from_millis(120),
+                )
+                .await;
+            assert!(matches!(err, Err(Error::TerminalInput)));
+        }
         server.await.unwrap();
     }
 }

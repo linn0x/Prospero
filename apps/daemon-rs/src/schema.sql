@@ -61,10 +61,12 @@ CREATE TABLE timeline_records (
     generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 9007199254740991),
     body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 8192),
     preview TEXT NOT NULL CHECK(length(CAST(preview AS BLOB)) <= 4096),
+    updated_seq INTEGER NOT NULL DEFAULT 0 CHECK(updated_seq >= 0),
     PRIMARY KEY(session_id,id),
     UNIQUE(session_id,position),
     FOREIGN KEY(session_id,id) REFERENCES content_heads(session_id,id) ON DELETE CASCADE
 ) STRICT;
+CREATE INDEX timeline_records_updated_seq ON timeline_records(session_id,updated_seq);
 CREATE TABLE terminal_runs (
     session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
     cols INTEGER NOT NULL CHECK(cols BETWEEN 20 AND 500),

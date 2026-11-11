@@ -327,7 +327,7 @@ impl Store {
         if run.active != (head.lifecycle == SessionLifecycle::Active) {
             return Err(Error::Conflict);
         }
-        if !run.active && run.native_id.is_none() {
+        if !run.active && self.agent_execution_unknown(child_session_id)? {
             return Err(Error::Conflict);
         }
         Ok(!run.active)
@@ -353,7 +353,7 @@ impl Store {
         let run = self.agent_run(child_session_id)?;
         if head.kind != SessionKind::Structured
             || run.active != (head.lifecycle == SessionLifecycle::Active)
-            || (!run.active && run.native_id.is_none())
+            || (!run.active && self.agent_execution_unknown(child_session_id)?)
         {
             return Err(Error::Conflict);
         }
@@ -413,8 +413,8 @@ impl Store {
         if task_turn <= 0 {
             return Err(Error::Invalid("跨模型子任务轮次无效".into()));
         }
-        let Some(target_status) = super::CrossModelChildStatus::from_wire(status)
-            .filter(|status| status.is_terminal())
+        let Some(target_status) =
+            super::CrossModelChildStatus::from_wire(status).filter(|status| status.is_terminal())
         else {
             return Err(Error::Invalid("跨模型子任务状态无效".into()));
         };
@@ -459,34 +459,135 @@ impl Store {
         self.cross_model_child(child_session_id)
     }
 
+    fn cross_model_child_turn_text(
+        &self,
+        child_session_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<String>> {
+        crate::database::validate_id(child_session_id)?;
+        let Some(task_turn): Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT task_turn FROM cross_model_children WHERE child_session_id=?",
+                [child_session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let turn_id = format!("turn{task_turn}");
+
+        // 1. Prefer `finalAnswer = 1` assistant message segment(s) in chronological order.
+        let final_ids: Vec<String> = {
+            let mut stmt = self.connection.prepare(
+                "SELECT id FROM timeline_records WHERE session_id=?1 AND turn_id=?2 AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position ASC",
+            )?;
+            stmt.query_map(params![child_session_id, &turn_id], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !final_ids.is_empty() {
+            let mut parts = Vec::with_capacity(final_ids.len());
+            for record_id in final_ids {
+                let page =
+                    self.timeline_text(child_session_id, &record_id, TimelineTextQuery::default())?;
+                if !page.text.trim().is_empty() {
+                    parts.push(page.text);
+                }
+            }
+            if !parts.is_empty() {
+                let joined = parts.join("\n\n");
+                return Ok(Some(super::store::truncate_utf8_bytes(&joined, max_bytes)));
+            }
+        }
+
+        // 2. Fall back to the latest error record in the task turn (e.g. 401/429/CLI crash).
+        if let Some(error_id) = self
+            .connection
+            .query_row(
+                "SELECT id FROM timeline_records WHERE session_id=?1 AND turn_id=?2 AND json_extract(body,'$.kind')='error' ORDER BY position DESC LIMIT 1",
+                params![child_session_id, &turn_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let page =
+                self.timeline_text(child_session_id, &error_id, TimelineTextQuery::default())?;
+            if !page.text.trim().is_empty() {
+                return Ok(Some(super::store::truncate_utf8_bytes(
+                    &page.text, max_bytes,
+                )));
+            }
+        }
+
+        // 3. Fall back to `agent.driver_error` event message for this turn if recorded.
+        let scope = format!("timeline:{child_session_id}");
+        let error_entity = format!("{turn_id}-error");
+        if let Some(driver_msg) = self
+            .connection
+            .query_row(
+                "SELECT json_extract(payload,'$.message') FROM change_events WHERE scope=?1 AND kind='agent.driver_error' AND entity_id=?2 ORDER BY seq DESC LIMIT 1",
+                params![scope, error_entity],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|msg| !msg.trim().is_empty())
+        {
+            return Ok(Some(super::store::truncate_utf8_bytes(
+                &driver_msg, max_bytes,
+            )));
+        }
+
+        // 4. Fall back to the last non-final assistant message in the task turn.
+        if let Some(assistant_id) = self
+            .connection
+            .query_row(
+                "SELECT id FROM timeline_records WHERE session_id=?1 AND turn_id=?2 AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' ORDER BY position DESC LIMIT 1",
+                params![child_session_id, &turn_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let page = self.timeline_text(
+                child_session_id,
+                &assistant_id,
+                TimelineTextQuery::default(),
+            )?;
+            if !page.text.trim().is_empty() {
+                return Ok(Some(super::store::truncate_utf8_bytes(
+                    &page.text, max_bytes,
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub(crate) fn cross_model_child_summary(
         &self,
         child_session_id: &str,
     ) -> Result<Option<String>> {
-        crate::database::validate_id(child_session_id)?;
-        let text = self.connection.query_row(
-            "SELECT preview FROM timeline_records WHERE session_id=?1 AND turn_id='turn' || (SELECT task_turn FROM cross_model_children WHERE child_session_id=?1) AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position DESC LIMIT 1",
-            [child_session_id], |row| row.get::<_, String>(0),
-        ).optional()?;
-        Ok(text)
+        self.cross_model_child_turn_text(child_session_id, 65_536)
     }
 
     pub(crate) fn cross_model_child_result(&self, child_session_id: &str) -> Result<String> {
-        crate::database::validate_id(child_session_id)?;
-        let record_id = self
+        if let Some(text) = self.cross_model_child_turn_text(child_session_id, 65_536)? {
+            return Ok(text);
+        }
+        let stored: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM timeline_records WHERE session_id=?1 AND turn_id='turn' || (SELECT task_turn FROM cross_model_children WHERE child_session_id=?1) AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position DESC LIMIT 1",
+                "SELECT result FROM cross_model_children WHERE child_session_id=? AND status IN ('completed','failed','stopped')",
                 [child_session_id],
-                |row| row.get::<_, String>(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?;
-        let Some(record_id) = record_id else {
-            return Ok(String::new());
-        };
-        let page =
-            self.timeline_text(child_session_id, &record_id, TimelineTextQuery::default())?;
-        Ok(super::store::truncate_utf8_bytes(&page.text, 65_536))
+            .optional()?
+            .flatten()
+            .filter(|text| !text.trim().is_empty());
+        Ok(stored
+            .map(|text| truncate_utf8_bytes(&text, 65_536))
+            .unwrap_or_default())
     }
 
     pub(crate) fn cross_model_child_diffs(&self, child_session_id: &str) -> Result<Vec<FileDiff>> {
@@ -558,6 +659,27 @@ impl Store {
             transaction.commit()?;
             return Ok(None);
         }
+        // Coalesce newly completed sibling results with any still-unpopped
+        // queued fan-in report for this parent so a busy parent receives one
+        // combined fan-in turn instead of N consecutive turns.
+        let unpopped_released = transaction.execute(
+            "UPDATE cross_model_children SET summary_claim_id=NULL,summary_claimed_at=NULL,updated_at=?1 \
+             WHERE parent_session_id=?2 AND summary_delivered=0 AND summary_claim_id IN ( \
+                 SELECT cross_model_claim_id FROM agent_message_queue \
+                 WHERE session_id=?2 AND cross_model_claim_id IS NOT NULL \
+             )",
+            params![now, parent_session_id],
+        )?;
+        if unpopped_released > 0 {
+            transaction.execute(
+                "DELETE FROM agent_message_queue WHERE session_id=?1 AND cross_model_claim_id IS NOT NULL",
+                [parent_session_id],
+            )?;
+        }
+        let undelivered: i64 = transaction.query_row(
+            "SELECT count(*) FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND summary_claim_id IS NULL AND status IN ('completed','failed','stopped')",
+            [parent_session_id], |row| row.get(0),
+        )?;
         let mut rows = Vec::new();
         {
             let mut statement = transaction.prepare(
@@ -675,6 +797,27 @@ impl Store {
         let changed = self.connection.execute(
             "UPDATE cross_model_children SET summary_delivered=1,summary_delivered_at=?1,updated_at=?1 WHERE parent_session_id=?2 AND summary_claim_id=?3 AND summary_delivered=0",
             params![now, parent_session_id, claim_id],
+        )?;
+        Ok(changed)
+    }
+
+    /// Heartbeat active queued/in-flight fan-in claims while the parent session
+    /// is actively running so a >60s parent turn never causes lease expiry and
+    /// duplicate fan-in turns.
+    pub(crate) fn renew_cross_model_fan_in_claims(
+        &mut self,
+        parent_session_id: &str,
+    ) -> Result<usize> {
+        crate::database::validate_id(parent_session_id)?;
+        let now = crate::database::now();
+        let changed = self.connection.execute(
+            "UPDATE cross_model_children SET summary_claimed_at=?1,updated_at=?1 \
+             WHERE parent_session_id=?2 AND summary_delivered=0 AND summary_claim_id IS NOT NULL \
+             AND summary_claim_id IN ( \
+                 SELECT cross_model_claim_id FROM agent_message_queue \
+                 WHERE session_id=?2 AND cross_model_claim_id IS NOT NULL \
+             )",
+            params![now, parent_session_id],
         )?;
         Ok(changed)
     }
@@ -1806,31 +1949,46 @@ impl Store {
     pub(crate) fn pop_message(&mut self, session_id: &str) -> Result<Option<QueuedRow>> {
         crate::database::validate_id(session_id)?;
         let transaction = self.connection.transaction()?;
-        let row = transaction
-            .query_row(
-                "SELECT queue_id,kind,text,created_at,attachments,cross_model_claim_id FROM agent_message_queue \
-                 WHERE session_id=?1 ORDER BY position ASC LIMIT 1",
-                [session_id],
-                |row| {
-                    Ok(QueuedRow {
-                        id: row.get(0)?,
-                        kind: row.get(1)?,
-                        text: row.get(2)?,
-                        created_at: row.get(3)?,
-                        attachments: decode_attachments(&row.get::<_, String>(4)?),
-                        cross_model_claim_id: row.get(5)?,
-                    })
-                },
-            )
-            .optional()?;
-        if let Some(row) = &row {
+        loop {
+            let row = transaction
+                .query_row(
+                    "SELECT queue_id,kind,text,created_at,attachments,cross_model_claim_id FROM agent_message_queue \
+                     WHERE session_id=?1 ORDER BY position ASC LIMIT 1",
+                    [session_id],
+                    |row| {
+                        Ok(QueuedRow {
+                            id: row.get(0)?,
+                            kind: row.get(1)?,
+                            text: row.get(2)?,
+                            created_at: row.get(3)?,
+                            attachments: decode_attachments(&row.get::<_, String>(4)?),
+                            cross_model_claim_id: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(row) = row else {
+                transaction.commit()?;
+                return Ok(None);
+            };
             transaction.execute(
                 "DELETE FROM agent_message_queue WHERE session_id=?1 AND queue_id=?2",
                 rusqlite::params![session_id, row.id],
             )?;
+            if let Some(claim_id) = row.cross_model_claim_id.as_deref() {
+                let now = crate::database::now();
+                let renewed = transaction.execute(
+                    "UPDATE cross_model_children SET summary_claimed_at=?1,updated_at=?1 \
+                     WHERE parent_session_id=?2 AND summary_claim_id=?3 AND summary_delivered=0",
+                    rusqlite::params![now, session_id, claim_id],
+                )?;
+                if renewed == 0 {
+                    continue;
+                }
+            }
+            transaction.commit()?;
+            return Ok(Some(row));
         }
-        transaction.commit()?;
-        Ok(row)
     }
 }
 
@@ -3182,7 +3340,12 @@ mod tests {
 
         let first = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
         assert_eq!(first.children, vec![(child.clone(), 1)]);
-        assert!(store.pending_cross_model_fan_in_parents().unwrap().is_empty());
+        assert!(
+            store
+                .pending_cross_model_fan_in_parents()
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.claim_cross_model_fan_in(&parent).unwrap().is_none());
         assert!(matches!(
             store.acknowledge_cross_model_child(&parent, &child),
@@ -3237,5 +3400,158 @@ mod tests {
         assert_eq!(resumed.lifecycle, SessionLifecycle::Active);
         assert_eq!(resumed.status, SessionStatus::Idle);
         assert!(store.agent_run(&session_id).unwrap().active);
+    }
+
+    #[test]
+    fn child_summary_falls_back_to_error_record_and_joins_multi_segment_answers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = session(&mut store, "parent");
+        let failed_child = active_child_session(&mut store, "failed-child");
+        store
+            .register_cross_model_child(
+                &failed_child,
+                &parent,
+                "task",
+                "source",
+                "route",
+                "account",
+            )
+            .unwrap();
+        store
+            .append_agent_records(
+                &failed_child,
+                vec![TimelineWrite {
+                    id: "turn1-error".into(),
+                    turn_id: "turn1".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::Error { driver_error: None },
+                    text: "429 Too Many Requests: quota exhausted".into(),
+                    replace: false,
+                    subagent_id: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .cross_model_child_summary(&failed_child)
+                .unwrap()
+                .as_deref(),
+            Some("429 Too Many Requests: quota exhausted")
+        );
+        assert_eq!(
+            store.cross_model_child_result(&failed_child).unwrap(),
+            "429 Too Many Requests: quota exhausted"
+        );
+
+        let multi_child = active_child_session(&mut store, "multi-child");
+        store
+            .register_cross_model_child(&multi_child, &parent, "task", "source", "route", "account")
+            .unwrap();
+        store
+            .append_agent_records(
+                &multi_child,
+                vec![
+                    TimelineWrite {
+                        id: "turn1-answer".into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::Assistant,
+                            final_answer: true,
+                            attachments: Vec::new(),
+                        },
+                        text: "Pre-tool analysis".into(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                    TimelineWrite {
+                        id: "turn1-answer-2".into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::Assistant,
+                            final_answer: true,
+                            attachments: Vec::new(),
+                        },
+                        text: "Post-tool conclusion".into(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .cross_model_child_summary(&multi_child)
+                .unwrap()
+                .as_deref(),
+            Some("Pre-tool analysis\n\nPost-tool conclusion")
+        );
+        assert_eq!(
+            store.cross_model_child_result(&multi_child).unwrap(),
+            "Pre-tool analysis\n\nPost-tool conclusion"
+        );
+    }
+
+    #[test]
+    fn queued_fan_in_coalesces_siblings_and_renews_lease_during_long_parent_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let parent = active_child_session(&mut store, "parent");
+        let child_a = active_child_session(&mut store, "child-a");
+        let child_b = active_child_session(&mut store, "child-b");
+        for (child, task) in [(&child_a, "task A"), (&child_b, "task B")] {
+            store
+                .register_cross_model_child(child, &parent, task, "source", "route", "account")
+                .unwrap();
+        }
+        store
+            .complete_cross_model_child(&child_a, 1, "completed", Some("result A"))
+            .unwrap();
+        let first = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(first.children, vec![(child_a.clone(), 1)]);
+        store
+            .enqueue_message(
+                &parent,
+                &QueuedRow {
+                    id: "fan-in-1".into(),
+                    kind: "queue".into(),
+                    text: first.report.clone(),
+                    created_at: crate::database::now(),
+                    attachments: Vec::new(),
+                    cross_model_claim_id: Some(first.claim_id.clone()),
+                },
+                false,
+            )
+            .unwrap();
+
+        // Simulate >60s passing while parent turn is still running, with active heartbeat renewal:
+        let near_expired = crate::database::now().saturating_sub(50_000);
+        store
+            .connection
+            .execute(
+                "UPDATE cross_model_children SET summary_claimed_at=?1 WHERE child_session_id=?2",
+                params![near_expired, child_a],
+            )
+            .unwrap();
+        assert_eq!(store.renew_cross_model_fan_in_claims(&parent).unwrap(), 1);
+        assert!(
+            store
+                .pending_cross_model_fan_in_parents()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Now sibling B completes while A's fan-in is still unpopped in the queue:
+        store
+            .complete_cross_model_child(&child_b, 1, "completed", Some("result B"))
+            .unwrap();
+        let combined = store.claim_cross_model_fan_in(&parent).unwrap().unwrap();
+        assert_eq!(combined.children.len(), 2);
+        assert!(combined.report.contains("result A"));
+        assert!(combined.report.contains("result B"));
+        // Previous unpopped queue entry was replaced so only one combined turn runs:
+        assert!(store.message_queue(&parent).unwrap().is_empty());
     }
 }

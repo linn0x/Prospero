@@ -143,8 +143,8 @@ impl Store {
             }
         }
         let mut connection = Connection::open(&database)?;
-        connection.busy_timeout(Duration::from_millis(1000))?;
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA cache_size=-8192; PRAGMA mmap_size=0;")?;
+        connection.busy_timeout(Duration::from_millis(2500))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA cache_size=-65536; PRAGMA mmap_size=0;")?;
         let application: i64 = connection.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if application == 0 && version == 0 {
@@ -153,6 +153,7 @@ impl Store {
             if tables != 0 {
                 return Err(Error::Schema);
             }
+            connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
             let transaction = connection.transaction()?;
             transaction.execute_batch(include_str!("schema.sql"))?;
             transaction.execute_batch(include_str!("orchestration/schema.sql"))?;
@@ -192,6 +193,7 @@ impl Store {
                     revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0)
                 ) STRICT;",
             )?;
+            Self::ensure_auxiliary_schema(&transaction)?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -290,7 +292,14 @@ impl Store {
                 transaction.execute_batch(include_str!("orchestration/schema-v35.sql"))?;
             }
             if version <= 35 {
-                transaction.execute_batch(include_str!("terminal/schema-v36.sql"))?;
+                let has_terminal_instances: i64 = transaction.query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='terminal_instances'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_terminal_instances == 0 {
+                    transaction.execute_batch(include_str!("terminal/schema-v36.sql"))?;
+                }
             }
             transaction.execute_batch(
                 "CREATE TABLE IF NOT EXISTS workspace_tabs (
@@ -400,6 +409,7 @@ impl Store {
                     END;",
                 )?;
             }
+            Self::ensure_auxiliary_schema(&transaction)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -412,7 +422,7 @@ impl Store {
         if parts.as_slice() < [3, 51, 3].as_slice() {
             return Err(Error::Schema);
         }
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=8388608;")?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=4096; PRAGMA journal_size_limit=16777216;")?;
         connection.execute(
             "DELETE FROM session_search WHERE rowid NOT IN (SELECT rowid FROM session_heads)",
             [],
@@ -428,10 +438,78 @@ impl Store {
         connection.prepare(
             "SELECT id,created_at,lifecycle,revision,payload FROM session_heads LIMIT 0",
         )?;
-        Ok(Self {
+        let mut store = Self {
             connection,
             _lock: lock,
-        })
+        };
+        store.prune_terminal_storage()?;
+        Ok(store)
+    }
+
+    fn ensure_auxiliary_schema(transaction: &Transaction<'_>) -> Result<()> {
+        let has_updated_seq: i64 = transaction.query_row(
+            "SELECT count(*) FROM pragma_table_info('timeline_records') WHERE name='updated_seq'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_updated_seq == 0 {
+            transaction.execute_batch(
+                "ALTER TABLE timeline_records ADD COLUMN updated_seq INTEGER NOT NULL DEFAULT 0 CHECK(updated_seq >= 0);
+                 UPDATE timeline_records SET updated_seq = position WHERE updated_seq = 0;",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS timeline_records_updated_seq ON timeline_records(session_id, updated_seq);
+             CREATE TRIGGER IF NOT EXISTS timeline_records_bump_updated_seq
+             AFTER UPDATE OF body, preview, revision, generation ON timeline_records
+             WHEN NEW.updated_seq = OLD.updated_seq
+             BEGIN
+                 UPDATE timeline_records
+                 SET updated_seq = COALESCE((SELECT MAX(updated_seq) FROM timeline_records WHERE session_id = NEW.session_id), 0) + 1
+                 WHERE session_id = NEW.session_id AND id = NEW.id;
+             END;
+             CREATE TABLE IF NOT EXISTS orch_change_stamp (
+                 id INTEGER PRIMARY KEY CHECK(id = 1),
+                 revision INTEGER NOT NULL DEFAULT 0
+             ) STRICT;
+             INSERT OR IGNORE INTO orch_change_stamp(id, revision) VALUES(1, 0);",
+        )?;
+        let orch_tables: Vec<String> = {
+            let mut stmt = transaction.prepare(
+                "SELECT name FROM sqlite_schema \
+                 WHERE type='table' AND name LIKE 'orch_%' AND name <> 'orch_change_stamp'",
+            )?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for table in orch_tables {
+            if !table
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                continue;
+            }
+            for (suffix, op) in [("ins", "INSERT"), ("upd", "UPDATE"), ("del", "DELETE")] {
+                let trigger = format!("orch_stamp_{table}_{suffix}");
+                transaction.execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {op} ON {table} \
+                     BEGIN UPDATE orch_change_stamp SET revision = revision + 1 WHERE id = 1; END;"
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn orchestration_revision(&self) -> Result<i64> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT revision FROM orch_change_stamp WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
     }
 
     pub(crate) fn owner_lock(&self) -> Arc<OwnerLock> {
@@ -444,8 +522,8 @@ impl Store {
             database,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        connection.busy_timeout(Duration::from_millis(1000))?;
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA cache_size=-8192; PRAGMA mmap_size=0; PRAGMA query_only=ON;")?;
+        connection.busy_timeout(Duration::from_millis(2500))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA cache_size=-16384; PRAGMA mmap_size=0; PRAGMA query_only=ON;")?;
         let application: i64 =
             connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -516,7 +594,12 @@ impl Store {
         let transaction = self.connection.transaction()?;
         Self::insert_session(&transaction, &session)?;
         extra(&transaction, &session)?;
-        Self::record_workspace_session_opened(&transaction, &session.workspace, &session.id, timestamp)?;
+        Self::record_workspace_session_opened(
+            &transaction,
+            &session.workspace,
+            &session.id,
+            timestamp,
+        )?;
         Self::append_event(
             &transaction,
             "sessions",
@@ -539,12 +622,7 @@ impl Store {
         transaction.execute("DELETE FROM session_search WHERE rowid=?1", [rowid])?;
         transaction.execute(
             "INSERT INTO session_search(rowid,id,title,workspace) VALUES(?1,?2,?3,?4)",
-            params![
-                rowid,
-                session.id,
-                session.title,
-                session.workspace
-            ],
+            params![rowid, session.id, session.title, session.workspace],
         )?;
         Self::adjust_counts(transaction, session, 1)?;
         Ok(())
@@ -693,9 +771,21 @@ impl Store {
                 && previous.lifecycle != SessionLifecycle::Archived
                 && !(session.status == SessionStatus::Failed && session.native_session.is_some())
             {
-                Self::record_workspace_session_closed(&transaction, &session.workspace, &session.id, timestamp)?;
-            } else if session.lifecycle == SessionLifecycle::Active && previous.lifecycle != SessionLifecycle::Active {
-                Self::record_workspace_session_opened(&transaction, &session.workspace, &session.id, timestamp)?;
+                Self::record_workspace_session_closed(
+                    &transaction,
+                    &session.workspace,
+                    &session.id,
+                    timestamp,
+                )?;
+            } else if session.lifecycle == SessionLifecycle::Active
+                && previous.lifecycle != SessionLifecycle::Active
+            {
+                Self::record_workspace_session_opened(
+                    &transaction,
+                    &session.workspace,
+                    &session.id,
+                    timestamp,
+                )?;
             }
         } else {
             for (scope, workspace) in [(0, ""), (1, session.workspace.as_str())] {
@@ -852,9 +942,8 @@ impl Store {
                 .filter(|id| ids.contains(id))
                 .or_else(|| ids.first().cloned())
         };
-        let next_split = split_id.filter(|id| {
-            id != session_id && next_active.as_ref() != Some(id) && ids.contains(id)
-        });
+        let next_split = split_id
+            .filter(|id| id != session_id && next_active.as_ref() != Some(id) && ids.contains(id));
         let encoded = serde_json::to_string(&ids)?;
         transaction.execute(
             "UPDATE workspace_tabs SET open_session_ids=?1,active_session_id=?2,split_session_id=?3,updated_at=?4,revision=revision+1 WHERE workspace=?5",
@@ -866,7 +955,9 @@ impl Store {
     pub fn set_workspace_tabs(&mut self, input: WorkspaceTabsUpdate) -> Result<WorkspaceTabsEntry> {
         validate_text(&input.workspace, 4096, false)?;
         if input.open_session_ids.len() > 64 {
-            return Err(Error::Invalid("workspace open tabs must be at most 64".into()));
+            return Err(Error::Invalid(
+                "workspace open tabs must be at most 64".into(),
+            ));
         }
         for id in &input.open_session_ids {
             validate_id(id)?;
@@ -1268,5 +1359,45 @@ impl Store {
         Ok(self
             .connection
             .query_row("PRAGMA quick_check", [], |r| r.get(0))?)
+    }
+}
+
+#[cfg(test)]
+mod pragma_and_migration_tests {
+    use super::*;
+
+    #[test]
+    fn open_configures_wal_pragmas_incremental_autovacuum_and_migrates_updated_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let sync_mode: i64 = store
+            .connection
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        let cache_size: i64 = store
+            .connection
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        let autocheckpoint: i64 = store
+            .connection
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        let auto_vacuum: i64 = store
+            .connection
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync_mode, 1); // NORMAL
+        assert_eq!(cache_size, -65536);
+        assert_eq!(autocheckpoint, 4096);
+        assert_eq!(auto_vacuum, 2); // INCREMENTAL
+        let has_updated_seq: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('timeline_records') WHERE name='updated_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_updated_seq, 1);
     }
 }

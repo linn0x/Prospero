@@ -9,9 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use super::claude::{
-    AdapterEvent, QuestionOptionSpec, QuestionReply, QuestionSpec, TurnOptions,
-};
+use super::claude::{AdapterEvent, QuestionOptionSpec, QuestionReply, QuestionSpec, TurnOptions};
 use super::lifecycle::{ChildGuard, ProcessLifecycle, Quiescence, await_child_exit};
 use super::store::ApprovalPolicy;
 use super::{AgentModelCatalog, LaunchModelCatalog, LaunchModelInfo};
@@ -42,10 +40,7 @@ pub(crate) fn binary() -> String {
         }
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for candidate in [
-            home.join(".local/bin/pi"),
-            home.join(".pi/agent/bin/pi"),
-        ] {
+        for candidate in [home.join(".local/bin/pi"), home.join(".pi/agent/bin/pi")] {
             if candidate.is_file() {
                 return candidate.to_string_lossy().into_owned();
             }
@@ -127,9 +122,8 @@ pub(crate) fn fork_session_file(
     workspace: &str,
     source_native_id: &str,
 ) -> Result<String> {
-    let source_path = find_session_file(environment, source_native_id).ok_or_else(|| {
-        Error::Invalid(format!("未找到 Pi 原生会话文件: {source_native_id}"))
-    })?;
+    let source_path = find_session_file(environment, source_native_id)
+        .ok_or_else(|| Error::Invalid(format!("未找到 Pi 原生会话文件: {source_native_id}")))?;
     let raw = std::fs::read_to_string(&source_path)?;
     let mut lines = raw.lines();
     let header_line = lines
@@ -294,7 +288,10 @@ fn parse_models_list(models_value: &Value, current_model: Option<&str>) -> Vec<L
         let label = if raw_name == id {
             raw_name.chars().take(300).collect()
         } else {
-            format!("{raw_name} ({provider})").chars().take(300).collect()
+            format!("{raw_name} ({provider})")
+                .chars()
+                .take(300)
+                .collect()
         };
         let reasoning = item
             .get("reasoning")
@@ -331,10 +328,13 @@ fn parse_models_list(models_value: &Value, current_model: Option<&str>) -> Vec<L
 
 const PI_CATALOG_TTL: Duration = Duration::from_secs(300);
 
-fn pi_catalog_cache()
--> &'static std::sync::Mutex< std::collections::HashMap<String, (std::time::Instant, LaunchModelCatalog)>> {
+fn pi_catalog_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, LaunchModelCatalog)>,
+> {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, LaunchModelCatalog)>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, (std::time::Instant, LaunchModelCatalog)>,
+        >,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -408,7 +408,7 @@ pub(super) async fn launch_catalog(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(false)
+        .kill_on_drop(true)
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env("PI_TELEMETRY", "0");
     for (key, value) in environment {
@@ -719,8 +719,8 @@ pub(super) async fn spawn_turn(
                         && let Some(waiter) = reader_controls.lock().await.remove(req_id)
                     {
                         if ok {
-                            let _ = waiter
-                                .send(Ok(frame.get("data").cloned().unwrap_or(Value::Null)));
+                            let _ =
+                                waiter.send(Ok(frame.get("data").cloned().unwrap_or(Value::Null)));
                         } else {
                             let msg = frame
                                 .get("error")
@@ -737,9 +737,7 @@ pub(super) async fn spawn_turn(
                             .and_then(Value::as_str)
                         && !sid.is_empty()
                     {
-                        let _ = events_tx
-                            .send(AdapterEvent::NativeId(sid.to_owned()))
-                            .await;
+                        let _ = events_tx.send(AdapterEvent::NativeId(sid.to_owned())).await;
                     } else if command == "prompt" && !ok {
                         let msg = frame
                             .get("error")
@@ -792,9 +790,7 @@ pub(super) async fn spawn_turn(
                                 if let Some(delta) = evt.get("delta").and_then(Value::as_str)
                                     && !delta.is_empty()
                                 {
-                                    if !accumulated_thinking.is_empty()
-                                        && needs_paragraph_break
-                                    {
+                                    if !accumulated_thinking.is_empty() && needs_paragraph_break {
                                         accumulated_thinking.push_str("\n\n");
                                     }
                                     accumulated_thinking.push_str(delta);
@@ -945,8 +941,7 @@ pub(super) async fn spawn_turn(
                     let _ = events_tx
                         .send(AdapterEvent::Compact {
                             ok: !aborted && error_message.is_none(),
-                            message: error_message
-                                .unwrap_or_else(|| "已完成上下文压缩".to_owned()),
+                            message: error_message.unwrap_or_else(|| "已完成上下文压缩".to_owned()),
                         })
                         .await;
                 }

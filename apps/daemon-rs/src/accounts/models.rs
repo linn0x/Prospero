@@ -125,7 +125,8 @@ fn models_url(base_url: &str) -> std::result::Result<url::Url, FeatureError> {
     let normalized = if stripped.is_empty() {
         "/v1".into()
     } else if !stripped.rsplit('/').next().is_some_and(|last| {
-        last.len() >= 2 && &last[..1] == "v" && last[1..].chars().all(char::is_numeric)
+        last.strip_prefix('v')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(char::is_numeric))
     }) {
         format!("{stripped}/v1")
     } else {

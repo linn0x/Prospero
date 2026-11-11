@@ -7,9 +7,12 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use super::{PAGE_BYTES, TerminalEvent};
 use crate::error::{Error, Result};
 
+pub(crate) const MAX_REPLAY_EVENTS: i64 = 4_096;
+const REPLAY_PRUNE_BATCH: i64 = 512;
+
 pub(crate) struct Replay {
     connection: Connection,
-    base: i64,
+    floor: i64,
     _directory: TempDir,
 }
 
@@ -43,10 +46,10 @@ impl Replay {
         )
         .map_err(|_| unavailable())?;
         connection
-            .pragma_update(None, "journal_mode", "WAL")
+            .pragma_update(None, "journal_mode", "MEMORY")
             .map_err(|_| unavailable())?;
         connection
-            .pragma_update(None, "synchronous", "NORMAL")
+            .pragma_update(None, "synchronous", "OFF")
             .map_err(|_| unavailable())?;
         connection
             .pragma_update(None, "cache_size", -4096)
@@ -58,10 +61,14 @@ impl Replay {
             .execute_batch("CREATE TABLE events(seq INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
             .map_err(|_| unavailable())?;
         Ok(Self {
-            base,
+            floor: base,
             connection,
             _directory: directory,
         })
+    }
+
+    pub(crate) const fn floor(&self) -> i64 {
+        self.floor
     }
 
     pub(crate) fn append(&mut self, seq: i64, event: &TerminalEvent) -> Result<()> {
@@ -72,13 +79,20 @@ impl Replay {
                 params![seq, payload],
             )
             .map_err(|_| unavailable())?;
+        if seq.saturating_sub(self.floor) >= MAX_REPLAY_EVENTS + REPLAY_PRUNE_BATCH {
+            let next_floor = seq - MAX_REPLAY_EVENTS;
+            self.connection
+                .execute("DELETE FROM events WHERE seq<=?1", [next_floor])
+                .map_err(|_| unavailable())?;
+            self.floor = next_floor;
+        }
         Ok(())
     }
 
     pub(crate) fn page(&self, after: i64, latest: i64) -> Result<(i64, Vec<TerminalEvent>)> {
         if after < 0 || after >= latest {
             if after == latest {
-                return Ok((0, Vec::new()));
+                return Ok((self.floor, Vec::new()));
             }
             return Err(unavailable());
         }
@@ -89,8 +103,8 @@ impl Replay {
             })
             .map_err(|_| unavailable())?
             .map(|seq| seq - 1)
-            .unwrap_or(0);
-        if floor != self.base || after < self.base {
+            .unwrap_or(self.floor);
+        if floor != self.floor || after < self.floor {
             return Err(unavailable());
         }
         let mut statement = self
@@ -184,5 +198,27 @@ mod tests {
         }
         drop(replay);
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn journal_prunes_in_batches_and_advances_floor() {
+        let mut replay = Replay::new_at(10).unwrap();
+        let event = TerminalEvent::Output {
+            data_b64: "eA==".into(),
+        };
+        let total = MAX_REPLAY_EVENTS + REPLAY_PRUNE_BATCH + 25;
+        for offset in 1..=total {
+            replay.append(10 + offset, &event).unwrap();
+        }
+        assert!(replay.floor() > 10);
+        let retained: i64 = replay
+            .connection
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert!(retained <= MAX_REPLAY_EVENTS + REPLAY_PRUNE_BATCH);
+        assert!(replay.page(10, 10 + total).is_err());
+        let (floor, events) = replay.page(replay.floor(), 10 + total).unwrap();
+        assert_eq!(floor, replay.floor());
+        assert_eq!(events.len(), 64);
     }
 }

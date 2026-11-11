@@ -9,11 +9,15 @@ use crate::protocol::*;
 const MAX_POSITION: i64 = 9_007_199_254_740_991;
 const MAX_BODY: i64 = 1024 * 1024 * 1024;
 const PREVIEW_BYTES: usize = 4096;
+const MAX_METADATA_BYTES: usize = 8192;
+pub(crate) const REMOTE_SNAPSHOT_RECORD_LIMIT: usize = 400;
+const REMOTE_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 fn fit_diff_metadata(mut body: TimelineBody) -> Result<TimelineBody> {
     if serde_json::to_vec(&body)?.len() > 1024 * 1024 {
         return Err(Error::Invalid("timeline metadata exceeds limit".into()));
     }
-    while serde_json::to_vec(&body)?.len() > 8192 {
+    while serde_json::to_vec(&body)?.len() > MAX_METADATA_BYTES {
         let diff = match &mut body {
             TimelineBody::Tool { diff, .. } => diff.as_mut(),
             TimelineBody::TurnEnd { diffs, .. } => {
@@ -21,15 +25,51 @@ fn fit_diff_metadata(mut body: TimelineBody) -> Result<TimelineBody> {
             }
             _ => None,
         };
-        let Some(diff) = diff.filter(|diff| !diff.patch.is_empty()) else {
-            return Err(Error::Invalid("timeline metadata exceeds limit".into()));
-        };
-        let mut boundary = diff.patch.len() / 2;
-        while !diff.patch.is_char_boundary(boundary) {
-            boundary -= 1;
+        if let Some(diff) = diff.filter(|diff| !diff.patch.is_empty()) {
+            let mut boundary = diff.patch.len() / 2;
+            while !diff.patch.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            diff.patch.truncate(boundary);
+            diff.truncated = true;
+            continue;
         }
-        diff.patch.truncate(boundary);
-        diff.truncated = true;
+        break;
+    }
+    if serde_json::to_vec(&body)?.len() > MAX_METADATA_BYTES {
+        if matches!(&body, TimelineBody::TurnEnd { .. }) {
+            let mut dropped_files = 0usize;
+            let mut dropped_additions = 0_i64;
+            let mut dropped_deletions = 0_i64;
+            let mut has_summary = false;
+            while serde_json::to_vec(&body)?.len() > MAX_METADATA_BYTES {
+                let TimelineBody::TurnEnd { diffs, .. } = &mut body else {
+                    unreachable!();
+                };
+                if has_summary {
+                    diffs.pop();
+                }
+                let Some(popped) = diffs.pop() else {
+                    return Err(Error::Invalid("timeline metadata exceeds limit".into()));
+                };
+                dropped_files += 1;
+                dropped_additions = dropped_additions.saturating_add(popped.additions);
+                dropped_deletions = dropped_deletions.saturating_add(popped.deletions);
+                diffs.push(FileDiff {
+                    path: format!("... (+{dropped_files} truncated files)"),
+                    patch: String::new(),
+                    additions: dropped_additions,
+                    deletions: dropped_deletions,
+                    truncated: true,
+                });
+                has_summary = true;
+                if diffs.len() == 1 && serde_json::to_vec(&body)?.len() > MAX_METADATA_BYTES {
+                    return Err(Error::Invalid("timeline metadata exceeds limit".into()));
+                }
+            }
+            return Ok(body);
+        }
+        return Err(Error::Invalid("timeline metadata exceeds limit".into()));
     }
     Ok(body)
 }
@@ -498,7 +538,42 @@ impl Store {
             _ => preview(input.text),
         };
         let revision = input.expected_revision + 1;
-        transaction.execute("INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview,subagent_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(session_id,id) DO UPDATE SET revision=excluded.revision,generation=excluded.generation,body=excluded.body,preview=excluded.preview", params![session_id, input.id, input.turn_id, position, revision, generation, body, preview, input.subagent_id])?;
+        let event_seq = Self::append_event(
+            transaction,
+            &format!("timeline:{session_id}"),
+            "timeline.updated",
+            &input.id,
+            serde_json::json!({"position":position,"revision":revision}),
+        )?;
+        let max_updated_seq: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(updated_seq), 0) FROM timeline_records WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let step = if matches!(input.body, TimelineBody::Tool { .. }) {
+            2
+        } else {
+            1
+        };
+        let updated_seq = event_seq.max(max_updated_seq + step);
+        transaction.execute(
+            "INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview,subagent_id,updated_seq) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+             ON CONFLICT(session_id,id) DO UPDATE SET \
+             revision=excluded.revision,generation=excluded.generation,body=excluded.body,preview=excluded.preview,updated_seq=excluded.updated_seq",
+            params![
+                session_id,
+                input.id,
+                input.turn_id,
+                position,
+                revision,
+                generation,
+                body,
+                preview,
+                input.subagent_id,
+                updated_seq,
+            ],
+        )?;
         transaction.execute(
             "INSERT INTO timeline_checkpoints(session_id,last_output_at,last_progress_at) VALUES(?1,?2,?3) \
              ON CONFLICT(session_id) DO UPDATE SET \
@@ -562,13 +637,6 @@ impl Store {
                     i64::from(*can_message), summary, created_at, updated_at],
             )?;
         }
-        Self::append_event(
-            transaction,
-            &format!("timeline:{session_id}"),
-            "timeline.updated",
-            &input.id,
-            serde_json::json!({"position":position,"revision":revision}),
-        )?;
         Ok(TimelineRecord {
             id: input.id,
             turn_id: input.turn_id,
@@ -794,6 +862,83 @@ impl Store {
             })
             .collect();
         Ok((events, page.revision))
+    }
+
+    pub(crate) fn remote_timeline_snapshot(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<(i64, Vec<(i64, TimelineRecord)>)> {
+        self.read_snapshot(|| {
+            self.timeline_head(session_id)?;
+            let cap = limit.clamp(1, REMOTE_SNAPSHOT_RECORD_LIMIT);
+            let latest_updated_seq: i64 = self.connection.query_row(
+                "SELECT COALESCE(MAX(updated_seq), 0) FROM timeline_records WHERE session_id=?1 AND subagent_id IS NULL",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            let mut stmt = self.connection.prepare_cached(&format!(
+                "SELECT {COLUMNS}, r.updated_seq FROM {SOURCE} \
+                 WHERE r.session_id=?1 AND r.subagent_id IS NULL \
+                 ORDER BY r.position DESC LIMIT ?2"
+            ))?;
+            let mut items = Vec::new();
+            let mut bytes = 0usize;
+            for row in stmt.query_map(params![session_id, cap as i64], |row| {
+                Ok((row.get::<_, i64>(9)?, record(row)?))
+            })? {
+                let (seq, item) = row?;
+                let estimated = item.bytes.max(item.preview.len() as i64) as usize
+                    + serde_json::to_vec(&item.body)?.len()
+                    + 128;
+                if !items.is_empty() && bytes.saturating_add(estimated) > REMOTE_SNAPSHOT_MAX_BYTES {
+                    break;
+                }
+                bytes = bytes.saturating_add(estimated);
+                items.push((seq, item));
+            }
+            items.reverse();
+            Ok((latest_updated_seq, items))
+        })
+    }
+
+    pub(crate) fn remote_timeline_updates_after(
+        &self,
+        session_id: &str,
+        after_updated_seq: i64,
+        limit: usize,
+    ) -> Result<(i64, bool, Vec<(i64, TimelineRecord)>)> {
+        self.read_snapshot(|| {
+            self.timeline_head(session_id)?;
+            let latest_updated_seq: i64 = self.connection.query_row(
+                "SELECT COALESCE(MAX(updated_seq), 0) FROM timeline_records WHERE session_id=?1 AND subagent_id IS NULL",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            if after_updated_seq < 0 || after_updated_seq > latest_updated_seq {
+                return Ok((latest_updated_seq, true, Vec::new()));
+            }
+            if after_updated_seq == latest_updated_seq {
+                return Ok((latest_updated_seq, false, Vec::new()));
+            }
+            let cap = limit.clamp(1, REMOTE_SNAPSHOT_RECORD_LIMIT);
+            let mut stmt = self.connection.prepare_cached(&format!(
+                "SELECT {COLUMNS}, r.updated_seq FROM {SOURCE} \
+                 WHERE r.session_id=?1 AND r.subagent_id IS NULL AND r.updated_seq>?2 \
+                 ORDER BY r.updated_seq ASC, r.position ASC LIMIT ?3"
+            ))?;
+            let mut items = Vec::new();
+            for row in stmt.query_map(
+                params![session_id, after_updated_seq, (cap + 1) as i64],
+                |row| Ok((row.get::<_, i64>(9)?, record(row)?)),
+            )? {
+                items.push(row?);
+            }
+            if items.len() > cap {
+                return Ok((latest_updated_seq, true, Vec::new()));
+            }
+            Ok((latest_updated_seq, false, items))
+        })
     }
 
     /// Full persisted text of a timeline record (used by the on-demand
@@ -1112,5 +1257,103 @@ mod diff_metadata_tests {
         assert!(store.write_timeline(&id, single).is_err());
         assert!(store.append_agent_records(&id, vec![input]).is_err());
         assert!(store.timeline_record(&id, "oversized").is_err());
+    }
+
+    #[test]
+    fn turn_end_with_150_files_truncates_file_list_within_metadata_limit() {
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let id = session(&mut store);
+        let diffs: Vec<FileDiff> = (0..150)
+            .map(|idx| FileDiff {
+                path: format!(
+                    "apps/daemon-rs/src/modules/subsystem_{:03}/deeply/nested/component_{:03}.rs",
+                    idx / 10,
+                    idx
+                ),
+                patch: format!("@@ -1,2 +1,3 @@\n+line {idx}\n"),
+                additions: 3,
+                deletions: 1,
+                truncated: false,
+            })
+            .collect();
+        let mut end = write("many-files-end", 0, "");
+        end.body = TimelineBody::TurnEnd {
+            finish: "completed".into(),
+            diffs,
+        };
+        let stored = store.write_timeline(&id, end).unwrap();
+        let encoded = serde_json::to_vec(&stored.body).unwrap();
+        assert!(encoded.len() <= MAX_METADATA_BYTES);
+        match stored.body {
+            TimelineBody::TurnEnd { finish, diffs } => {
+                assert_eq!(finish, "completed");
+                assert!(diffs.len() < 150);
+                let total_additions: i64 = diffs.iter().map(|d| d.additions).sum();
+                let total_deletions: i64 = diffs.iter().map(|d| d.deletions).sum();
+                assert_eq!(total_additions, 150 * 3);
+                assert_eq!(total_deletions, 150);
+                let last = diffs.last().unwrap();
+                assert!(last.truncated);
+                assert!(last.path.contains("truncated files"));
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_timeline_updates_capture_in_place_streaming_and_tool_transitions() {
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let id = session(&mut store);
+
+        let mut msg = write("assistant-1", 0, "Hello");
+        msg.replace = true;
+        store.write_timeline(&id, msg).unwrap();
+
+        let mut tool = write("tool-1", 0, "");
+        tool.body = TimelineBody::Tool {
+            name: "bash".into(),
+            state: ToolState::Running,
+            summary: "cargo test".into(),
+            diff: None,
+            has_more: false,
+        };
+        store.write_timeline(&id, tool).unwrap();
+
+        let (cursor, snapshot) = store.remote_timeline_snapshot(&id, 400).unwrap();
+        assert_eq!(snapshot.len(), 2);
+
+        // Stream a second token into assistant-1 in-place and finish tool-1 in-place.
+        let mut msg_delta = write("assistant-1", 1, "Hello, world!");
+        msg_delta.replace = true;
+        store.write_timeline(&id, msg_delta).unwrap();
+
+        let mut tool_done = write("tool-1", 1, "ok\n");
+        tool_done.body = TimelineBody::Tool {
+            name: "bash".into(),
+            state: ToolState::Success,
+            summary: "cargo test".into(),
+            diff: None,
+            has_more: false,
+        };
+        store.write_timeline(&id, tool_done).unwrap();
+
+        let (next_cursor, resync, updates) = store
+            .remote_timeline_updates_after(&id, cursor, 400)
+            .unwrap();
+        assert!(!resync);
+        assert!(next_cursor > cursor);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].1.id, "assistant-1");
+        assert_eq!(updates[0].1.preview, "Hello, world!");
+        assert_eq!(updates[1].1.id, "tool-1");
+        assert!(matches!(
+            updates[1].1.body,
+            TimelineBody::Tool {
+                state: ToolState::Success,
+                ..
+            }
+        ));
     }
 }

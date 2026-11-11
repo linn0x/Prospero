@@ -320,21 +320,25 @@ impl Store {
         } else {
             None
         };
-        let mut clauses = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         if let Some(lifecycle) = query.lifecycle {
-            clauses.push("h.lifecycle=?");
+            clauses.push("h.lifecycle=?".into());
             values.push(label(lifecycle)?.into());
         }
         if let Some(workspace) = &query.workspace {
-            clauses.push("h.workspace=?");
+            clauses.push("h.workspace=?".into());
             values.push(workspace.clone().into());
         }
         if exclude_cross_model_children {
             clauses.push(
-                "NOT EXISTS(SELECT 1 FROM cross_model_children c WHERE c.child_session_id=h.id)",
+                "NOT EXISTS(SELECT 1 FROM cross_model_children c WHERE c.child_session_id=h.id)"
+                    .into(),
             );
         }
+        let text_clause_start = clauses.len();
+        let text_value_start = values.len();
+        let mut has_cjk_search = false;
         if let Some(text) = &query.text {
             let tokens: Vec<_> = text
                 .split(|c: char| !c.is_alphanumeric())
@@ -343,14 +347,36 @@ impl Store {
             if tokens.is_empty() {
                 return Err(Error::Invalid("search requires letters or numbers".into()));
             }
-            let terms = tokens
-                .iter()
-                .map(|token| format!("\"{token}\"*"))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            clauses
-                .push("h.rowid IN (SELECT rowid FROM session_search WHERE session_search MATCH ?)");
-            values.push(terms.into());
+            let (cjk_tokens, fts_tokens): (Vec<_>, Vec<_>) = tokens
+                .into_iter()
+                .partition(|token| token.chars().any(is_cjk_char));
+            has_cjk_search = !cjk_tokens.is_empty();
+            if !fts_tokens.is_empty() {
+                let terms = fts_tokens
+                    .iter()
+                    .map(|token| format!("\"{token}\"*"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                clauses.push(
+                    "h.rowid IN (SELECT rowid FROM session_search WHERE session_search MATCH ?)"
+                        .into(),
+                );
+                values.push(terms.into());
+            }
+            for token in cjk_tokens {
+                let pattern = format!("%{}%", escape_like(token));
+                clauses.push(
+                    "(h.rowid IN (SELECT rowid FROM session_search WHERE title LIKE ? ESCAPE '\\' OR workspace LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\') \
+                     OR EXISTS(SELECT 1 FROM timeline_records r WHERE r.session_id=h.id AND r.subagent_id IS NULL AND r.preview LIKE ? ESCAPE '\\'))"
+                        .into(),
+                );
+                values.extend([
+                    pattern.clone().into(),
+                    pattern.clone().into(),
+                    pattern.clone().into(),
+                    pattern.into(),
+                ]);
+            }
         }
         self.query_budget(|| {
             let summary = self.session_summary(query.workspace.as_deref())?;
@@ -360,7 +386,7 @@ impl Store {
                 let sql = format!("SELECT count(*) FROM session_heads h WHERE {}", clauses.join(" AND "));
                 self.connection.query_row(&sql, params_from_iter(&values), |row| row.get(0))?
             } else if query.text.is_some() {
-                if available == global_total {
+                if !has_cjk_search && available == global_total {
                     self.connection.query_row("SELECT count(*) FROM session_search WHERE session_search MATCH ?", [values.last().unwrap()], |row| row.get(0))?
                 } else {
                     let sql = format!("SELECT count(*) FROM session_heads h WHERE {}", clauses.join(" AND "));
@@ -372,7 +398,8 @@ impl Store {
             if total == 0 { return Ok(SessionPage { items: vec![], next_cursor: None, previous_cursor: None, has_more: false, total, latest_seq: summary.latest_seq }); }
             let mut source = "session_heads h".to_owned();
             if !exclude_cross_model_children && query.text.is_some() && total == available {
-                clauses.pop(); values.pop();
+                clauses.truncate(text_clause_start);
+                values.truncate(text_value_start);
             } else if query.text.is_some() && total > available / 4 {
                 let index = match (query.workspace.is_some(), query.lifecycle.is_some()) {
                     (true, true) => "session_workspace_lifecycle_page",
@@ -385,7 +412,7 @@ impl Store {
             let before = cursor.as_ref().is_some_and(|cursor| cursor.before);
             let base_clauses = clauses.clone();
             let base_values = values.clone();
-            clauses.push(if before { "(h.created_at,h.id)>(?,?)" } else { "(h.created_at,h.id)<(?,?)" });
+            clauses.push(if before { "(h.created_at,h.id)>(?,?)".into() } else { "(h.created_at,h.id)<(?,?)".into() });
             let (time, id) = cursor.as_ref().map_or((i64::MAX, "~"), |cursor| (cursor.created_at, cursor.id.as_str()));
             values.extend([time.into(), id.to_owned().into(), ((limit + 1) as i64).into()]);
             let order = if before { "ASC" } else { "DESC" };
@@ -404,7 +431,7 @@ impl Store {
                 if let Some(head) = if before { items.last() } else { items.first() } {
                     let mut filters = base_clauses;
                     let mut parameters = base_values;
-                    filters.push(if before { "(h.created_at,h.id)<(?,?)" } else { "(h.created_at,h.id)>(?,?)" });
+                    filters.push(if before { "(h.created_at,h.id)<(?,?)".into() } else { "(h.created_at,h.id)>(?,?)".into() });
                     parameters.extend([head.created_at.into(), head.id.clone().into()]);
                     self.connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {source} WHERE {} LIMIT 1)", filters.join(" AND ")), params_from_iter(parameters), |row| row.get::<_, bool>(0))?
                 } else { false }
@@ -417,6 +444,31 @@ impl Store {
             Ok(SessionPage { items, next_cursor, previous_cursor, has_more: has_next, total, latest_seq: summary.latest_seq })
         })
     }
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x2FFF
+            | 0x3040..=0x30FF
+            | 0x3100..=0x318F
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2FA1F
+    )
+}
+
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -441,5 +493,63 @@ mod tests {
             .unwrap();
         assert_eq!(store.session_summary(None).unwrap().total, 1);
         assert_eq!(store.check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn cjk_and_hybrid_session_search_matches_titles_workspaces_and_timeline_previews() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let first = store
+            .create_session(CreateSession {
+                agent: AgentKind::Codex,
+                kind: SessionKind::Structured,
+                title: "修复终端数据库膨胀问题".into(),
+                workspace: "/Users/dev/项目甲".into(),
+            })
+            .unwrap();
+        let second = store
+            .create_session(CreateSession {
+                agent: AgentKind::Claude,
+                kind: SessionKind::Structured,
+                title: "Mobile sync debugging".into(),
+                workspace: "/Users/dev/prospero".into(),
+            })
+            .unwrap();
+        store
+            .write_timeline(
+                &second.id,
+                TimelineWrite {
+                    id: "msg-1".into(),
+                    turn_id: "turn-1".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::Message {
+                        role: MessageRole::User,
+                        final_answer: false,
+                        attachments: Vec::new(),
+                    },
+                    text: "排查移动端流式卡死和定时任务问题".into(),
+                    replace: false,
+                    subagent_id: None,
+                },
+            )
+            .unwrap();
+
+        let by_title_substring = store
+            .sessions(SessionQuery {
+                text: Some("数据库膨胀".into()),
+                ..SessionQuery::default()
+            })
+            .unwrap();
+        assert_eq!(by_title_substring.total, 1);
+        assert_eq!(by_title_substring.items[0].id, first.id);
+
+        let by_preview_and_ascii = store
+            .sessions(SessionQuery {
+                text: Some("Mobile 流式卡死".into()),
+                ..SessionQuery::default()
+            })
+            .unwrap();
+        assert_eq!(by_preview_and_ascii.total, 1);
+        assert_eq!(by_preview_and_ascii.items[0].id, second.id);
     }
 }

@@ -540,10 +540,7 @@ pub async fn run(
             .iter()
             .any(|arg| arg.starts_with("tui.keymap.editor.kill_line_start="))
         {
-            args.extend([
-                "-c".into(),
-                "tui.keymap.editor.kill_line_start=[]".into(),
-            ]);
+            args.extend(["-c".into(), "tui.keymap.editor.kill_line_start=[]".into()]);
         }
         if !args
             .iter()
@@ -724,11 +721,14 @@ mod tests {
         compact_oversized_rpc_line(&mut line).unwrap();
         assert!(line.len() <= MAX_PASSTHROUGH_FRAME_BYTES);
         let compacted: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(compacted["result"]["thread"]["id"].as_str(), Some(thread_id.as_str()));
-        let compacted_output = compacted["result"]["thread"]["turns"][0]["items"][0]
-            ["aggregatedOutput"]
-            .as_str()
-            .unwrap();
+        assert_eq!(
+            compacted["result"]["thread"]["id"].as_str(),
+            Some(thread_id.as_str())
+        );
+        let compacted_output =
+            compacted["result"]["thread"]["turns"][0]["items"][0]["aggregatedOutput"]
+                .as_str()
+                .unwrap();
         assert!(compacted_output.contains("oversized output truncated"));
         assert!(compacted_output.starts_with("中文输出-abc123\n"));
         assert!(compacted_output.ends_with("中文输出-abc123\n"));
