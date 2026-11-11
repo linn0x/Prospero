@@ -286,6 +286,7 @@ export class NativeGhosttyManager {
           await waitForNativeAck(filtered.subarray(offset, Math.min(filtered.byteLength, offset + MAX_NATIVE_CHUNK)));
         }
       };
+      let streamFailure: string | undefined;
       const terminalController = new TerminalStreamController({
         sessionId,
         cursor: () => undefined,
@@ -304,8 +305,8 @@ export class NativeGhosttyManager {
             this.publishState(sessionRef);
           }
         },
-        onError: message => { if (sessionRef) this.publishError(sessionRef, message); },
-        onHistoryGap: message => { if (sessionRef) this.publishError(sessionRef, message); },
+        onError: message => { streamFailure = message; if (sessionRef) this.publishError(sessionRef, message); },
+        onHistoryGap: message => { streamFailure = message; if (sessionRef) this.publishError(sessionRef, message); },
       });
       controller = terminalController;
       const operations = new NativeTerminalOperationQueue((operation: NativeTerminalOperation) => {
@@ -405,7 +406,7 @@ export class NativeGhosttyManager {
           catch (error) { nativeOutput = `readText failed: ${error instanceof Error ? error.message : String(error)}`; }
           process.stderr.write(`[native-ghostty] websocket closed code=${code} reason=${reason.toString("utf8")} peer=${Boolean(session.peer && !session.peer.destroyed)} queuedRelayBytes=${session.preSurfaceBytes}\n${nativeOutput.slice(-2000)}\n`);
         }
-        this.failSession(session.id, `Terminal stream closed unexpectedly (code ${code}${reason.byteLength ? `: ${reason.toString("utf8").slice(0, 256)}` : ""})`);
+        this.failSession(session.id, streamFailure ?? `Terminal stream closed unexpectedly (code ${code}${reason.byteLength ? `: ${reason.toString("utf8").slice(0, 256)}` : ""})`);
       });
 
       server.on("connection", peer => {

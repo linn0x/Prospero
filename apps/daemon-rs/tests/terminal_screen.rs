@@ -2,6 +2,29 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use prosperod_rs::terminal::{TerminalSize, screen::Screen};
 
 #[test]
+fn codex_activity_markers_preserve_checkpoint_and_cursor() {
+    for terminator in ["\x07", "\x1b\\"] {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let mut screen = Screen::new(size);
+        screen.process(b"previous\r\n");
+        // Markers can be split across PTY reads.
+        screen.process(b"\x1b]7501;state=work");
+        screen.process(format!("ing:app=codex{terminator}latest").as_bytes());
+        screen.process(format!("\x1b]7501;state=idle:app=codex{terminator}").as_bytes());
+        let snapshot = screen.snapshot(42).unwrap();
+        let bytes = STANDARD.decode(snapshot.data_b64).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("7501"));
+        let mut restored = Screen::new(size);
+        restored.process(&bytes);
+        assert_eq!(restored.visible_tail_text(24), screen.visible_tail_text(24));
+        assert_eq!(restored.cursor_position(), screen.cursor_position());
+        // Unsupported palette changes must still require lossless replay.
+        screen.process(b"\x1b]4;1;rgb:ff/00/00\x07");
+        assert!(screen.snapshot(43).is_err());
+    }
+}
+
+#[test]
 fn bounded_scrollback_and_pending_controls_do_not_grow_with_stream_length() {
     let mut screen = Screen::new(TerminalSize { cols: 80, rows: 24 });
     for _ in 0..1000 {

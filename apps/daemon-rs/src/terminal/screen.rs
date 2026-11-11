@@ -415,7 +415,10 @@ impl Screen {
         if let Some(value) = sequence.strip_prefix("\x1b]") {
             let code = value.split(';').next().unwrap_or("");
             let color_query = value.starts_with("10;?") || value.starts_with("11;?");
-            if !color_query && !["0", "1", "2", "7", "8", "52", "133", "633"].contains(&code) {
+            // OSC 7501 reports agent activity (e.g. state=working:app=codex).
+            // It does not change the screen or input modes, so it must not
+            // permanently disable checkpoints and force full-history replay.
+            if !color_query && !["0", "1", "2", "7", "8", "52", "133", "633", "7501"].contains(&code) {
                 self.compatible = false;
             }
         }
