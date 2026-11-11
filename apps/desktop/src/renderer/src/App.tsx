@@ -4409,7 +4409,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <SettingsPane snapshot={sessionSnapshot} />
             )}
           </Suspense>
-          {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
+          {(localWorkspaceVisited || localWorkspaceVisible) && <Suspense fallback={localWorkspaceVisible ? (
+            <div className="boot-screen" role="status" aria-live="polite">
+              <Spinner />
+              <span>{t("正在加载工作区…", "Loading workspace…")}</span>
+            </div>
+          ) : null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
               {!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} botSession={botSession} botBusy={botCreating} onSelectBot={openBotSession} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => { const next = [...ids, ...current.filter(id => !ids.includes(id))]; const first = sessionSnapshot.daemon.sessions.find(item => item.id === ids[0]); persistWorkspaceTabs(first ? (projectForSession(snapshotRef.current.projects, first) ?? first.cwd) : undefined, next, activeId); return next; })} onNewSession={openNewSession} />}
               <WorkspacePane
                 active={localWorkspaceVisible}
