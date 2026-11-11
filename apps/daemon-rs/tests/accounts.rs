@@ -70,7 +70,7 @@ async fn logged_in_native_claude_account_carries_method_and_provider() {
     assert_eq!(result.action, "list");
     assert_eq!(result.request_id, "req-1");
     assert!(result.ok);
-    assert_eq!(result.accounts.len(), 2);
+    assert_eq!(result.accounts.len(), 4);
     let codex = result
         .accounts
         .iter()

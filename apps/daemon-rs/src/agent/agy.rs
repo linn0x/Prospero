@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::orchestration::reliability::ControlEffectState;
 
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(1800);
-const CATALOG_CMD_TIMEOUT: Duration = Duration::from_secs(6);
+const CATALOG_CMD_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) fn binary() -> String {
     if let Ok(explicit) = std::env::var("PROSPERO_AGY_BIN") {
@@ -66,7 +66,10 @@ fn strip_label_effort_suffix(label: &str) -> String {
 }
 
 fn default_effort_for_base(base_id: &str, supported: &[String]) -> String {
-    let preferred = if base_id == "gemini-4-argon" || base_id == "gpt-oss-120b" {
+    let preferred = if matches!(
+        base_id,
+        "gemini-4-carbon" | "gemini-4-argon" | "gpt-oss-120b"
+    ) {
         "medium"
     } else {
         "high"
@@ -99,6 +102,48 @@ fn clamp_effort_for_base(base_id: &str, effort: &str) -> String {
     }
 }
 
+fn normalize_model_alias(raw_model: &str) -> String {
+    let mut text = raw_model.trim().to_ascii_lowercase();
+    if let Some(stripped) = text.strip_prefix("antigravity/") {
+        text = stripped.trim().to_owned();
+    } else if let Some(stripped) = text.strip_prefix("agy/") {
+        text = stripped.trim().to_owned();
+    }
+    let mut trailing_paren_effort = None;
+    for effort in KNOWN_EFFORTS {
+        let paren = format!("({effort})");
+        if let Some(prefix) = text.strip_suffix(&paren) {
+            text = prefix.trim().to_owned();
+            trailing_paren_effort = Some(*effort);
+            break;
+        }
+    }
+    let mut slug = String::with_capacity(text.len());
+    let mut prev_dash = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+            slug.push(ch);
+            prev_dash = false;
+        } else if (ch == '-' || ch.is_whitespace()) && !prev_dash && !slug.is_empty() {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    let (raw_base, suffix_effort) = split_model_effort_suffix(slug);
+    let canonical_base = match raw_base {
+        "argon-4" | "argon" | "gemini-argon-4" => "gemini-4-argon",
+        "carbon-4" | "carbon" | "gemini-carbon-4" => "gemini-4-carbon",
+        "claude-opus-5.5" => "claude-opus-5-5",
+        "claude-sonnet-5.5" => "claude-sonnet-5-5",
+        other => other,
+    };
+    match suffix_effort.or(trailing_paren_effort) {
+        Some(effort) => format!("{canonical_base}-{effort}"),
+        None => canonical_base.to_owned(),
+    }
+}
+
 /// Resolves a `(model, effort)` selection into `(canonical_base_model, canonical_effort, cli_args)`
 /// so that `agy` never receives a conflicting `--model <slug>-<effort1> --effort <effort2>` pair.
 pub(crate) fn resolve_cli_model_and_effort(
@@ -120,7 +165,8 @@ pub(crate) fn resolve_cli_model_and_effort(
         return (None, None, Vec::new());
     };
 
-    let (base_id, embedded_effort) = split_model_effort_suffix(raw_model);
+    let normalized_model = normalize_model_alias(raw_model);
+    let (base_id, embedded_effort) = split_model_effort_suffix(&normalized_model);
     let effective_effort = match clean_effort.or(embedded_effort) {
         Some(chosen) => clamp_effort_for_base(base_id, chosen),
         None => default_effort_for_base(
@@ -139,6 +185,14 @@ pub(crate) fn resolve_cli_model_and_effort(
 pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
     let std_efforts: Vec<String> = vec!["low".into(), "medium".into(), "high".into()];
     vec![
+        LaunchModelInfo {
+            id: "gemini-4-carbon".into(),
+            label: "Gemini 4 Carbon".into(),
+            description: Some("Antigravity 订阅模型".into()),
+            supported_efforts: std_efforts.clone(),
+            default_effort: Some("medium".into()),
+            is_default: false,
+        },
         LaunchModelInfo {
             id: "gemini-4-argon".into(),
             label: "Gemini 4 Argon".into(),
@@ -224,7 +278,11 @@ pub(crate) fn parse_models_output(output: &str) -> Vec<LaunchModelInfo> {
             if let Some(effort) = suffix_effort {
                 supported_efforts.push(effort.to_owned());
             } else {
-                supported_efforts.extend(["low".to_owned(), "medium".to_owned(), "high".to_owned()]);
+                supported_efforts.extend([
+                    "low".to_owned(),
+                    "medium".to_owned(),
+                    "high".to_owned(),
+                ]);
             }
             models.push(LaunchModelInfo {
                 id: base_id.to_owned(),
@@ -251,8 +309,10 @@ pub(crate) fn parse_models_output(output: &str) -> Vec<LaunchModelInfo> {
     models
 }
 
-fn catalog_cache() -> &'static Mutex<Option<(Instant, Vec<LaunchModelInfo>)>> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, Vec<LaunchModelInfo>)>>> = OnceLock::new();
+type AgyCatalogCache = Mutex<Option<(Instant, Vec<LaunchModelInfo>)>>;
+
+fn catalog_cache() -> &'static AgyCatalogCache {
+    static CACHE: OnceLock<AgyCatalogCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
@@ -294,10 +354,7 @@ fn refresh_catalog_in_background() {
 
 pub(crate) async fn launch_catalog() -> Result<LaunchModelCatalog> {
     let models = {
-        let cached = catalog_cache()
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        let cached = catalog_cache().lock().ok().and_then(|guard| guard.clone());
         match cached {
             Some((updated_at, models)) if updated_at.elapsed() < CATALOG_CACHE_TTL => models,
             Some((_, models)) => {
@@ -416,9 +473,9 @@ pub(super) async fn spawn_turn(
     }
 
     super::lifecycle::configure_process_group(&mut command);
-    let child = command.spawn().map_err(|err| {
-        Error::Invalid(format!("无法启动 Antigravity CLI (agy): {err}"))
-    })?;
+    let child = command
+        .spawn()
+        .map_err(|err| Error::Invalid(format!("无法启动 Antigravity CLI (agy): {err}")))?;
     let mut guard = ChildGuard::new(child)?;
     let lifecycle = guard.lifecycle();
     let stdout = guard.child_mut().stdout.take().ok_or(Error::Closed)?;
@@ -560,7 +617,9 @@ impl AgyTranslator {
                 }
             }
             "step_update" => {
-                if let Some(step) = message.get("step_update").or_else(|| message.get("stepUpdate"))
+                if let Some(step) = message
+                    .get("step_update")
+                    .or_else(|| message.get("stepUpdate"))
                 {
                     self.feed_step_update(step, &mut out);
                 }
@@ -642,7 +701,8 @@ impl AgyTranslator {
         }
 
         // Tool calls / results inside step_update
-        if let Some((tool_name, call_summary, result_summary)) = extract_step_tool(step, step_type) {
+        if let Some((tool_name, call_summary, result_summary)) = extract_step_tool(step, step_type)
+        {
             let call_id = format!("agy-step-{step_index}-{tool_name}");
             let is_done = state.contains("DONE") || state.contains("COMPLETE");
             let is_error = state.contains("ERROR") || state.contains("FAIL");
@@ -721,7 +781,11 @@ fn extract_step_tool(step: &Value, step_type: &str) -> Option<(String, String, S
         .get("tool_name")
         .or_else(|| step.get("toolName"))
         .and_then(Value::as_str)
-        .or_else(|| tool_info.and_then(|info| info.get("name")).and_then(Value::as_str))
+        .or_else(|| {
+            tool_info
+                .and_then(|info| info.get("name"))
+                .and_then(Value::as_str)
+        })
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
@@ -888,6 +952,22 @@ Usage: agy --model <id> [prompt]
         assert_eq!(model, None);
         assert_eq!(effort.as_deref(), Some("high"));
         assert_eq!(args, vec!["--effort", "high"]);
+
+        let (model, effort, args) =
+            resolve_cli_model_and_effort(Some("Gemini 4 Argon (High)"), None);
+        assert_eq!(model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(args, vec!["--model", "gemini-4-argon-high"]);
+
+        let (model, effort, args) = resolve_cli_model_and_effort(Some("Argon 4 High"), None);
+        assert_eq!(model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(args, vec!["--model", "gemini-4-argon-high"]);
+
+        let (model, effort, args) = resolve_cli_model_and_effort(Some("gemini-4-carbon"), None);
+        assert_eq!(model.as_deref(), Some("gemini-4-carbon"));
+        assert_eq!(effort.as_deref(), Some("medium"));
+        assert_eq!(args, vec!["--model", "gemini-4-carbon-medium"]);
     }
 
     #[test]

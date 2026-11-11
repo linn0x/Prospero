@@ -1517,6 +1517,7 @@ async fn serve(
     let api = Api::with_guard(database.clone(), token, Some(current_exe)).with_dev_mode(dev_mode);
     let control_token_path = directory.join("control.token");
     std::fs::write(&control_token_path, &control_token)?;
+    prosperod_rs::cross_model_tool::refresh_codex_skills_in_daemon_home(&directory);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

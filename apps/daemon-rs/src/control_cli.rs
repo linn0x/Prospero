@@ -294,102 +294,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
             wait_operation(&client, &id, wait, Duration::from_secs(timeout.min(86400))).await
         }
         "cross_model.child.sources" | "cross_model.child.workspaces" => {
-            let sources: Value = client.post(
-                "/v1/model-sources",
-                json!({"type":"model.source.action","requestId":"cli-cross-model-sources","action":{"kind":"list"}}),
-            ).await?;
-            let items = sources.get("sources").and_then(Value::as_array).cloned().unwrap_or_default()
-                .into_iter().filter_map(|source| {
-                    let enabled = source.get("enabled").and_then(Value::as_bool).unwrap_or(false);
-                    if !enabled { return None; }
-                    let source_id = source.get("id").and_then(Value::as_str)?;
-                    let revision = source.get("revision").and_then(Value::as_i64)?;
-                    let name = source.get("name").and_then(Value::as_str).unwrap_or(source_id);
-                    let routes = source.get("routes").and_then(Value::as_array)?.iter().filter_map(|route| {
-                        if !route.get("enabled").and_then(Value::as_bool).unwrap_or(false) || route.pointer("/modelCapabilities/tools") == Some(&Value::Bool(false)) { return None; }
-                        let protocol = route.get("protocol").and_then(Value::as_str)?;
-                        let agent = match protocol { "anthropic" => "claude", "openai_chat_completions" => "opencode", "openai_responses" => "codex", _ => return None };
-                        Some(json!({"sourceId":source_id,"sourceName":name,"revision":revision,"routeId":route.get("id"),"routeName":route.get("name"),"model":route.get("model"),"agent":agent,"yolo":true}))
-                    }).collect::<Vec<_>>();
-                    Some(routes)
-                }).flatten().collect::<Vec<_>>();
-            let accounts_raw = client
-                .post::<Value>(
-                    "/v1/accounts",
-                    json!({"type":"agent.accounts.list","requestId":"cli-cross-model-accounts"}),
-                )
-                .await
-                .unwrap_or_else(|_| json!({}));
-            let accounts = accounts_raw
-                .get("accounts")
-                .and_then(Value::as_array)
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|row| {
-                            if row.get("status").and_then(Value::as_str) != Some("ready") {
-                                return None;
-                            }
-                            if row.get("authMode").and_then(Value::as_str) == Some("api_profile") {
-                                return None;
-                            }
-                            Some(json!({
-                                "accountId": row.get("id"),
-                                "name": row.get("name"),
-                                "agent": row.get("agent"),
-                                "authMode": row.get("authMode"),
-                                "default": row.get("isDefault"),
-                            }))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let sessions_raw = client
-                .get::<Value>("/v1/sessions?limit=50")
-                .await
-                .unwrap_or_else(|_| json!({}));
-            let mut workspace_set = std::collections::BTreeSet::new();
-            if let Some(rows) = sessions_raw.get("items").and_then(Value::as_array) {
-                for row in rows {
-                    if let Some(ws) = row
-                        .get("workspace")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|ws| !ws.is_empty())
-                    {
-                        workspace_set.insert(ws.to_owned());
-                    }
-                }
-            }
-            for candidate in [
-                home.join("desktop-state.json"),
-                std::env::var_os("HOME")
-                    .map(|h| PathBuf::from(h).join(".prospero").join("desktop-state.json"))
-                    .unwrap_or_default(),
-            ] {
-                if let Ok(raw) = fs::read_to_string(&candidate)
-                    && let Ok(parsed) = serde_json::from_str::<Value>(&raw)
-                    && let Some(projects) = parsed.get("projects").and_then(Value::as_array)
-                {
-                    for project in projects {
-                        if let Some(ws) = project
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|ws| !ws.is_empty())
-                        {
-                            workspace_set.insert(ws.to_owned());
-                        }
-                    }
-                }
-            }
-            let workspaces = workspace_set.into_iter().collect::<Vec<_>>();
-            Ok(
-                json!({
-                    "items": items,
-                    "accounts": accounts,
-                    "workspaces": workspaces,
-                    "hint": "Start with model source: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> [--workspace <path>] --task <task>. Start with subscription/native account: prospero child start --agent <codex|claude|opencode|pi|deepseek|agy> [--account <accountId>] [--model <model>] [--effort <effort>] [--workspace <path>] --task <task>. Inspect: prospero child list|get|logs|result. Guide a running child: prospero child message --child <sessionId> --text <text>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Stop: prospero child cancel --child <sessionId>. Re-deliver: prospero child redeliver --child <sessionId>. Mark processed: prospero child ack --child <sessionId>. Recheck later: prospero child check --after <seconds>. Children always use YOLO auto-approval."
-                }),
-            )
+            fetch_cross_model_child_sources(&client, home).await
         }
         "cross_model.child.list" => {
             let parent = optional_text(&params, "parentSessionId");
@@ -470,10 +375,7 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
             let parent = required_id(&params, "parentSessionId")?;
             let source = optional_text(&params, "sourceId").unwrap_or_default();
             let route = optional_text(&params, "routeId").unwrap_or_default();
-            let revision = params
-                .get("revision")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
+            let revision = params.get("revision").and_then(Value::as_i64).unwrap_or(0);
             if !source.is_empty() && !matches!(source.as_str(), "subscription" | "native") {
                 let _ = required_id(&params, "sourceId")?;
                 let _ = required_id(&params, "routeId")?;
@@ -1427,6 +1329,206 @@ async fn submit_host_delivery(method: &str, params: &Value) -> Result<Value> {
     )
 }
 
+async fn fetch_cross_model_child_sources(client: &ControlClient, home: &Path) -> Result<Value> {
+    crate::cross_model_tool::refresh_codex_skills_in_daemon_home(home);
+    let sources: Value = client
+        .post(
+            "/v1/model-sources",
+            json!({"type":"model.source.action","requestId":"cli-cross-model-sources","action":{"kind":"list"}}),
+        )
+        .await?;
+    let items = sources
+        .get("sources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|source| {
+            let enabled = source
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !enabled {
+                return None;
+            }
+            let source_id = source.get("id").and_then(Value::as_str)?;
+            let revision = source.get("revision").and_then(Value::as_i64)?;
+            let name = source
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(source_id);
+            let routes = source
+                .get("routes")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(|route| {
+                    if !route
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        || route.pointer("/modelCapabilities/tools") == Some(&Value::Bool(false))
+                    {
+                        return None;
+                    }
+                    let protocol = route.get("protocol").and_then(Value::as_str)?;
+                    let agent = match protocol {
+                        "anthropic" => "claude",
+                        "openai_chat_completions" => "opencode",
+                        "openai_responses" => "codex",
+                        _ => return None,
+                    };
+                    Some(json!({
+                        "sourceId": source_id,
+                        "sourceName": name,
+                        "revision": revision,
+                        "routeId": route.get("id"),
+                        "routeName": route.get("name"),
+                        "model": route.get("model"),
+                        "agent": agent,
+                        "yolo": true,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            Some(routes)
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let accounts_raw = client
+        .post::<Value>(
+            "/v1/accounts",
+            json!({"type":"agent.accounts.list","requestId":"cli-cross-model-accounts"}),
+        )
+        .await
+        .unwrap_or_else(|_| json!({}));
+    let eligible_rows = accounts_raw
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| {
+            let status = row.get("status").and_then(Value::as_str);
+            if !matches!(status, Some("signed_in" | "ready")) {
+                return false;
+            }
+            if row.get("apiProfile").is_some_and(|v| !v.is_null())
+                || row.get("modelSource").is_some_and(|v| !v.is_null())
+                || row.get("authMode").and_then(Value::as_str) == Some("api_profile")
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+
+    let fast_client = client.clone().with_timeout(Duration::from_secs(4));
+    let account_futures = eligible_rows.into_iter().map(|row| {
+        let fast_client = fast_client.clone();
+        async move {
+            let account_id = row
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let agent = row
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let launch_path = match agent.as_str() {
+                "agy" => Some("/v1/launch/models?agent=agy".to_owned()),
+                "codex" | "claude" | "pi" | "deepseek" => Some(format!(
+                    "/v1/launch/models?agent={}&accountId={}",
+                    query_component(&agent),
+                    query_component(&account_id),
+                )),
+                _ => None,
+            };
+            let models = if let Some(path) = launch_path
+                && let Ok(catalog) = fast_client.get::<Value>(&path).await
+            {
+                catalog
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let id = entry.get("id")?.as_str()?;
+                                Some(json!({
+                                    "id": id,
+                                    "label": entry.get("label").and_then(Value::as_str).unwrap_or(id),
+                                    "supportedEfforts": entry.get("supportedEfforts").cloned().unwrap_or_else(|| json!([])),
+                                    "defaultEffort": entry.get("defaultEffort").cloned().unwrap_or(Value::Null),
+                                }))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            json!({
+                "accountId": account_id,
+                "name": row.get("name").cloned().unwrap_or(Value::Null),
+                "agent": agent,
+                "authMethod": row.get("authMethod").or_else(|| row.get("authMode")).cloned().unwrap_or(Value::Null),
+                "default": row.get("isDefault").cloned().unwrap_or(Value::Bool(false)),
+                "yolo": true,
+                "models": models,
+            })
+        }
+    });
+    let accounts = futures_util::future::join_all(account_futures).await;
+
+    let sessions_raw = client
+        .get::<Value>("/v1/sessions?limit=50")
+        .await
+        .unwrap_or_else(|_| json!({}));
+    let mut workspace_set = std::collections::BTreeSet::new();
+    if let Some(rows) = sessions_raw.get("items").and_then(Value::as_array) {
+        for row in rows {
+            if let Some(ws) = row
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|ws| !ws.is_empty())
+            {
+                workspace_set.insert(ws.to_owned());
+            }
+        }
+    }
+    for candidate in [
+        home.join("desktop-state.json"),
+        std::env::var_os("HOME")
+            .map(|h| {
+                PathBuf::from(h)
+                    .join(".prospero")
+                    .join("desktop-state.json")
+            })
+            .unwrap_or_default(),
+    ] {
+        if let Ok(raw) = fs::read_to_string(&candidate)
+            && let Ok(parsed) = serde_json::from_str::<Value>(&raw)
+            && let Some(projects) = parsed.get("projects").and_then(Value::as_array)
+        {
+            for project in projects {
+                if let Some(ws) = project.as_str().map(str::trim).filter(|ws| !ws.is_empty()) {
+                    workspace_set.insert(ws.to_owned());
+                }
+            }
+        }
+    }
+    let workspaces = workspace_set.into_iter().collect::<Vec<_>>();
+    Ok(json!({
+        "items": items,
+        "accounts": accounts,
+        "workspaces": workspaces,
+        "hint": "Start with subscription/native account (e.g. Antigravity agy, Codex, Claude, Pi, DeepSeek): prospero child start --agent <codex|claude|opencode|pi|deepseek|agy> [--account <accountId>] [--model <model>] [--effort <effort>] [--workspace <path>] --task <task>. Start with API model source: prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> [--workspace <path>] --task <task>. Inspect: prospero child list|get|logs|result. Guide a running child: prospero child message --child <sessionId> --text <text>. Continue an existing completed child: prospero child follow-up --child <sessionId> --task <task>. Stop: prospero child cancel --child <sessionId>. Re-deliver: prospero child redeliver --child <sessionId>. Mark processed: prospero child ack --child <sessionId>. Recheck later: prospero child check --after <seconds>. Children always use YOLO auto-approval."
+    }))
+}
+
 #[cfg(test)]
 mod operation_wait_tests {
     use super::*;
@@ -1495,6 +1597,120 @@ mod operation_wait_tests {
             .unwrap();
         assert_eq!(result["state"], "OUTCOME_UNKNOWN");
         assert_eq!(count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn child_sources_includes_signed_in_agy_subscription_and_models() {
+        use axum::routing::post;
+        let router = Router::new()
+            .route(
+                "/v1/model-sources",
+                post(|| async {
+                    Json(json!({
+                        "sources": [{
+                            "id": "src-api",
+                            "name": "Antigravity API Proxy",
+                            "revision": 2,
+                            "enabled": true,
+                            "routes": [{
+                                "id": "rt-flash",
+                                "name": "antigravity/gemini-3.8-flash",
+                                "model": "antigravity/gemini-3.8-flash",
+                                "protocol": "openai_chat_completions",
+                                "enabled": true,
+                                "modelCapabilities": { "tools": true }
+                            }]
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/accounts",
+                post(|| async {
+                    Json(json!({
+                        "ok": true,
+                        "accounts": [
+                            {
+                                "id": "native-agy",
+                                "agent": "agy",
+                                "name": "Antigravity 订阅",
+                                "managed": false,
+                                "isDefault": true,
+                                "status": "signed_in",
+                                "authMethod": "Antigravity 订阅"
+                            },
+                            {
+                                "id": "acct-api",
+                                "agent": "opencode",
+                                "name": "API Profile",
+                                "managed": true,
+                                "isDefault": false,
+                                "status": "signed_in",
+                                "apiProfile": { "model": "antigravity/gemini-3.8-flash" }
+                            },
+                            {
+                                "id": "native-pi",
+                                "agent": "pi",
+                                "name": "本机默认",
+                                "managed": false,
+                                "isDefault": true,
+                                "status": "signed_out"
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/launch/models",
+                get(|| async {
+                    Json(json!({
+                        "models": [
+                            {
+                                "id": "gemini-4-argon",
+                                "label": "Gemini 4 Argon",
+                                "supportedEfforts": ["low", "medium", "high"],
+                                "defaultEffort": "medium"
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route("/v1/sessions", get(|| async { Json(json!({"items": []})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ControlClient {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test".into(),
+            timeout: Duration::from_secs(2),
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("agent-accounts/codex/native-codex");
+        std::fs::create_dir_all(codex_home.join("skills/prospero-cross-model")).unwrap();
+        std::fs::write(
+            codex_home.join("skills/prospero-cross-model/SKILL.md"),
+            "stale skill",
+        )
+        .unwrap();
+
+        let out = fetch_cross_model_child_sources(&client, home.path())
+            .await
+            .unwrap();
+        let accounts = out["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["accountId"], "native-agy");
+        assert_eq!(accounts[0]["agent"], "agy");
+        assert_eq!(accounts[0]["models"][0]["id"], "gemini-4-argon");
+        assert_eq!(
+            accounts[0]["models"][0]["supportedEfforts"],
+            json!(["low", "medium", "high"])
+        );
+
+        let refreshed_skill =
+            std::fs::read_to_string(codex_home.join("skills/prospero-cross-model/SKILL.md"))
+                .unwrap();
+        assert!(refreshed_skill.contains("--agent agy"));
         server.abort();
     }
 }

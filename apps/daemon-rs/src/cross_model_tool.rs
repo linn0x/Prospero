@@ -11,26 +11,27 @@ use std::path::Path;
 use crate::error::Result;
 
 #[doc(hidden)]
-pub const CODEX_DEVELOPER_INSTRUCTIONS: &str = r#"Prospero cross-model & cross-workspace child tool is available in this session. When the user asks to delegate or dispatch work through Prospero (including dispatching sessions to specific workspaces or using external model sources/subscriptions), use the shell CLI `prospero child sources` (or `prospero child workspaces`) and then `prospero child start`; do not use Codex's internal sub-agent/Task model catalog for that request. `prospero child sources` returns live `items` (API model sources), `accounts` (subscription/native accounts), and `workspaces` (known workspace paths). For an API model source route, run `prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> [--workspace <path>] --task <complete task>`. For a subscription/native account, run `prospero child start --agent <codex|claude|opencode|pi|deepseek|agy> [--account <accountId>] [--model <model>] [--effort <effort>] [--workspace <path>] --task <complete task>`. Pass `--workspace <path>` whenever dispatching a task to another workspace/project directory. Use `prospero child list`, `prospero child get`, `prospero child logs`, and `prospero child result` to inspect child state and outputs. To guide a running child, use `prospero child message --child <sessionId> --text <guidance>`; if the child already completed, reuse its context with `prospero child follow-up --child <sessionId> --task <complete follow-up>` instead of starting a replacement. To stop a running child, use `prospero child cancel --child <sessionId> --reason <reason>`. To re-deliver a missed result, use `prospero child redeliver --child <sessionId>`; after synthesizing a child result, mark it processed with `prospero child ack --child <sessionId>`. To revisit child progress after a delay without blocking this turn, run `prospero child check --after <seconds>`; Prospero persistently schedules a one-shot parent wakeup. PROSPERO_SESSION_ID supplies the parent automatically. Each child is YOLO/auto-approved. Do not send premature stop, summarize-now, or no-more-exploration instructions. End the parent turn after dispatch. Prospero injects each completed child as an incremental fan-in; the last result is marked final, and any scheduled check injects a fresh status snapshot. Continue by synthesizing each report for the user."#;
+pub const CODEX_DEVELOPER_INSTRUCTIONS: &str = r#"Prospero cross-model & cross-workspace child tool is available in this session. When the user asks to delegate or dispatch work through Prospero (including dispatching sessions to specific workspaces or using external model sources or subscription agents such as Antigravity/agy, Claude, Codex, Pi, or DeepSeek), use the shell CLI `prospero child sources` (or `prospero child workspaces`) and then `prospero child start`; do not use Codex's internal sub-agent/Task model catalog for that request. `prospero child sources` returns live `items` (API model sources), `accounts` (subscription/native accounts, including `agent: "agy"` / `accountId: "native-agy"` for Antigravity subscription along with its `models` and `supportedEfforts`), and `workspaces` (known workspace paths). Never confuse third-party API routes in `items` with the native Antigravity (`agy`) subscription in `accounts`. For an API model source route, run `prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> [--workspace <path>] --task <complete task>`. For a subscription/native account (such as Antigravity `agy` with `gemini-4-argon` / `gemini-4-carbon`), run `prospero child start --agent <codex|claude|opencode|pi|deepseek|agy> [--account <accountId>] [--model <model>] [--effort <effort>] [--workspace <path>] --task <complete task>`. Pass `--workspace <path>` whenever dispatching a task to another workspace/project directory. Use `prospero child list`, `prospero child get`, `prospero child logs`, and `prospero child result` to inspect child state and outputs. To guide a running child, use `prospero child message --child <sessionId> --text <guidance>`; if the child already completed, reuse its context with `prospero child follow-up --child <sessionId> --task <complete follow-up>` instead of starting a replacement. To stop a running child, use `prospero child cancel --child <sessionId> --reason <reason>`. To re-deliver a missed result, use `prospero child redeliver --child <sessionId>`; after synthesizing a child result, mark it processed with `prospero child ack --child <sessionId>`. To revisit child progress after a delay without blocking this turn, run `prospero child check --after <seconds>`; Prospero persistently schedules a one-shot parent wakeup. PROSPERO_SESSION_ID supplies the parent automatically. Each child is YOLO/auto-approved. Do not send premature stop, summarize-now, or no-more-exploration instructions. End the parent turn after dispatch. Prospero injects each completed child as an incremental fan-in; the last result is marked final, and any scheduled check injects a fresh status snapshot. Continue by synthesizing each report for the user."#;
 
 pub(crate) const SKILL_NAME: &str = "prospero-cross-model";
 
 const SKILL: &str = r#"---
 name: prospero-cross-model
-description: Dispatch independent YOLO child sessions through Prospero across workspaces or to a requested model source or subscription account, then continue after Prospero fan-in. Use whenever the user asks to delegate, dispatch, send a task to a workspace, or run work with a named model/source through Prospero. Do not use Codex internal sub-agents for these requests.
+description: Dispatch independent YOLO child sessions through Prospero across workspaces or to a requested model source or subscription account (including Antigravity/agy, Claude, Codex, Pi, DeepSeek), then continue after Prospero fan-in. Use whenever the user asks to delegate, dispatch, send a task to a workspace, or run work with a named model/source through Prospero. Do not use Codex internal sub-agents for these requests.
 ---
 # Prospero cross-model & cross-workspace child orchestration
 
 Use Prospero's own child-session layer for cross-model and cross-workspace delegation.
 
-1. Run `prospero child sources` (or `prospero child workspaces`). Treat its JSON output (`items` for API model sources, `accounts` for subscription accounts, `workspaces` for known project directories) as the live source of truth.
-2. Match the user's requested workspace (`workspaces`), subscription account (`accounts`), or model source route (`items`: `sourceName`, `routeName`, `model`). Never cache or hardcode IDs or revisions.
+1. Run `prospero child sources` (or `prospero child workspaces`). Treat its JSON output (`items` for API model sources, `accounts` for subscription/native accounts and their `models`/`supportedEfforts`, `workspaces` for known project directories) as the live source of truth.
+2. Match the user's requested workspace (`workspaces`), subscription account (`accounts`: check `agent`, `accountId`, `name`, and `models[]`), or API model source route (`items`: `sourceName`, `routeName`, `model`). Note: Antigravity (`agy`, `accountId: "native-agy"`) is a subscription agent in `accounts` (with models such as `gemini-4-argon`, `gemini-4-carbon`, `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`, `gpt-oss-120b`); do not confuse it with third-party API routes in `items`. Never cache or hardcode IDs or revisions.
 3. For each independent task, run either:
 
-   - Model source route:
-     `prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> [--workspace <path>] --task <complete task>`
-   - Subscription / native account:
+   - Subscription / native account (e.g. Antigravity `agy`, Codex, Claude, Pi, DeepSeek):
      `prospero child start --agent <codex|claude|opencode|pi|deepseek|agy> [--account <accountId>] [--model <model>] [--effort <effort>] [--workspace <path>] --task <complete task>`
+     (Example for Antigravity Argon 4 High: `prospero child start --agent agy --account native-agy --model gemini-4-argon --effort high --task "<complete task>"`)
+   - API model source route:
+     `prospero child start --source <sourceId> --route <routeId> --revision <revision> --agent <agent> [--workspace <path>] --task <complete task>`
 
    `PROSPERO_SESSION_ID` supplies the parent session. Only pass `--parent` when explicitly operating for another session. Pass `--workspace <path>` when dispatching into a specific workspace directory.
 4. Children always run in YOLO/auto-approval mode. Give each child a complete objective and acceptance criteria. Do not tell it to stop exploring, summarize immediately, or otherwise force an early answer.
@@ -42,7 +43,7 @@ Use Prospero's own child-session layer for cross-model and cross-workspace deleg
 10. After all requested children are started, end the current parent turn. Do not poll or use Codex internal Task/sub-agent tools. Prospero injects each completed child as an incremental fan-in and marks the last fan-in final.
 11. When a fan-in or scheduled status report arrives, continue the parent work and synthesize it for the user.
 
-If no route matches, report the live routes returned by `prospero child sources` and ask the user to choose.
+If no route or subscription model matches, report the live `accounts` (with their `models`) and `items` returned by `prospero child sources` and ask the user to choose.
 "#;
 
 /// Install the built-in skill into an isolated Codex home. Existing content is
@@ -61,6 +62,21 @@ pub(crate) fn install_codex_skill(codex_home: &Path) -> Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+/// Best-effort refresh of `SKILL.md` across existing isolated Codex homes inside a daemon directory
+/// so already-running Codex PTY sessions see updated orchestration instructions immediately.
+pub fn refresh_codex_skills_in_daemon_home(daemon_home: &Path) {
+    let codex_accounts_dir = daemon_home.join("agent-accounts").join("codex");
+    let Ok(entries) = std::fs::read_dir(&codex_accounts_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = install_codex_skill(&path);
+        }
+    }
 }
 
 /// Encode a possibly-long fan-in report as bounded PTY writes. Bracketed
