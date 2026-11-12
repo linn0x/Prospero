@@ -128,7 +128,16 @@ index 4d66622..d56ff31 100644
          break :x .{ .delta = delta };
      };
  
-@@ -3548,6 +3520,88 @@ pub fn scrollCallback(
+@@ -3538,6 +3510,8 @@ pub fn scrollCallback(
+         }
+ 
+         if (y.delta != 0) {
++            self.io.terminal.modes.set(.synchronized_output, false);
++
+             // Modify our viewport, this requires a lock since it affects
+             // rendering. We have to switch signs here because our delta
+             // is negative down but our viewport is positive down.
+@@ -3548,6 +3522,88 @@ pub fn scrollCallback(
      try self.queueRender();
  }
  

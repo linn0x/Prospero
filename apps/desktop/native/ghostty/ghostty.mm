@@ -105,6 +105,7 @@ static_assert(scrollMomentum(NSEventPhaseMayBegin) == GHOSTTY_MOUSE_MOMENTUM_MAY
 @interface ProsperoGhosttyView : NSView<NSTextInputClient>
 @property(nonatomic, assign) ghostty_surface_t surface;
 @property(nonatomic, assign) uint32_t surfaceId;
+@property(nonatomic, assign) uint64_t scrollFrameCount;
 @property(nonatomic, assign) BOOL readOnly;
 @property(nonatomic, assign) BOOL ghosttyFocused;
 @property(nonatomic, assign) NSUInteger mouseFocusGeneration;
@@ -591,7 +592,16 @@ static bool notifyImagePaste(ProsperoGhosttyView *view) {
   if (status != napi_ok) return false;
   return handled;
 }
-static bool action(ghostty_app_t, ghostty_target_s, ghostty_action_s) { return false; }
+static bool action(ghostty_app_t, ghostty_target_s target, ghostty_action_s act) {
+  if (act.tag != GHOSTTY_ACTION_SCROLLBAR || target.tag != GHOSTTY_TARGET_SURFACE || !target.target.surface) return false;
+  for (ProsperoGhosttyView *view in views.allValues) {
+    if (view.surface == target.target.surface) {
+      view.scrollFrameCount += 1;
+      return true;
+    }
+  }
+  return false;
+}
 static uint64_t clipboardReadCount = 0;
 static bool readClipboard(void *userdata, ghostty_clipboard_e location, void *state) {
   ProsperoGhosttyView *view = (__bridge ProsperoGhosttyView *)userdata;
@@ -944,6 +954,41 @@ static napi_value setReadOnly(napi_env e, napi_callback_info info) {
   if (readOnly && v.hasMarkedText) [v unmarkText];
   return undefined(e);
 }
+static napi_value testMouseMove(napi_env e, napi_callback_info info) {
+  size_t n = 4; napi_value args[4]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
+  uint32_t id, modifiers = 0; double x = 0, y = 0; ProsperoGhosttyView *v;
+  if (n < 3 || !surfaceFor(e, args[0], &id, &v) ||
+      napi_get_value_double(e, args[1], &x) != napi_ok ||
+      napi_get_value_double(e, args[2], &y) != napi_ok) {
+    return fail(e, "Expected (id, x, y[, modifierFlags])");
+  }
+  if (n >= 4) napi_get_value_uint32(e, args[3], &modifiers);
+  NSPoint windowPoint = [v convertPoint:NSMakePoint(x, y) toView:nil];
+  NSEvent *event = [NSEvent mouseEventWithType:NSEventTypeMouseMoved
+                                      location:windowPoint
+                                 modifierFlags:(NSEventModifierFlags)modifiers
+                                     timestamp:NSProcessInfo.processInfo.systemUptime
+                                  windowNumber:v.window ? v.window.windowNumber : 0
+                                       context:nil
+                                   eventNumber:0
+                                    clickCount:0
+                                      pressure:0.0];
+  if (!event) return fail(e, "Could not synthesize mouse move NSEvent");
+  [v mouseMoved:event];
+  return undefined(e);
+}
+static napi_value testScroll(napi_env e, napi_callback_info info) {
+  size_t n = 4; napi_value args[4]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
+  uint32_t id; ProsperoGhosttyView *v; double x, y; bool precise;
+  if (n != 4 || !surfaceFor(e, args[0], &id, &v) ||
+      napi_get_value_double(e, args[1], &x) != napi_ok ||
+      napi_get_value_double(e, args[2], &y) != napi_ok ||
+      napi_get_value_bool(e, args[3], &precise) != napi_ok || !std::isfinite(x) || !std::isfinite(y)) {
+    return fail(e, "Expected surface ID, x/y scroll deltas, and precision");
+  }
+  ghostty_surface_mouse_scroll(v.surface, x * (precise ? 2 : 1), y * (precise ? 2 : 1), precise ? 1 : 0);
+  return undefined(e);
+}
 static napi_value inspect(napi_env e, napi_callback_info info) {
   size_t n = 1; napi_value arg; napi_get_cb_info(e, info, &n, &arg, nullptr, nullptr);
   uint32_t id; ProsperoGhosttyView *v;
@@ -960,6 +1005,7 @@ static napi_value inspect(napi_env e, napi_callback_info info) {
     napi_value field; const char *utf8 = value.UTF8String ?: "";
     napi_create_string_utf8(e, utf8, NAPI_AUTO_LENGTH, &field); napi_set_named_property(e, result, key, field);
   };
+  setNumber("scrollFrameCount", v.scrollFrameCount);
   setBool("hidden", v.hidden);
   setBool("hiddenByAncestor", [v isHiddenOrHasHiddenAncestor]);
   setBool("readOnly", v.readOnly);
@@ -1028,6 +1074,6 @@ static napi_value setPasteImageHandler(napi_env e, napi_callback_info info) {
   return undefined(e);
 }
 NAPI_MODULE_INIT() {
-  napi_property_descriptor props[] = {{"initialize", 0, initialize, 0, 0, 0, napi_default, 0}, {"create", 0, create, 0, 0, 0, napi_default, 0}, {"update", 0, update, 0, 0, 0, napi_default, 0}, {"destroy", 0, destroy, 0, 0, 0, napi_default, 0}, {"size", 0, size, 0, 0, 0, napi_default, 0}, {"setGrid", 0, setGrid, 0, 0, 0, napi_default, 0}, {"readText", 0, readText, 0, 0, 0, napi_default, 0}, {"inputText", 0, inputText, 0, 0, 0, napi_default, 0}, {"testIMECommit", 0, testIMECommit, 0, 0, 0, napi_default, 0}, {"testSetMarkedText", 0, testSetMarkedText, 0, 0, 0, napi_default, 0}, {"testKeyDown", 0, testKeyDown, 0, 0, 0, napi_default, 0}, {"isVisible", 0, isVisible, 0, 0, 0, napi_default, 0}, {"setReadOnly", 0, setReadOnly, 0, 0, 0, napi_default, 0}, {"inspect", 0, inspect, 0, 0, 0, napi_default, 0}, {"bindingAction", 0, bindingAction, 0, 0, 0, napi_default, 0}, {"setShortcutHandler", 0, setShortcutHandler, 0, 0, 0, napi_default, 0}, {"setFocusHandler", 0, setFocusHandler, 0, 0, 0, napi_default, 0}, {"setPasteImageHandler", 0, setPasteImageHandler, 0, 0, 0, napi_default, 0}};
+  napi_property_descriptor props[] = {{"initialize", 0, initialize, 0, 0, 0, napi_default, 0}, {"create", 0, create, 0, 0, 0, napi_default, 0}, {"update", 0, update, 0, 0, 0, napi_default, 0}, {"destroy", 0, destroy, 0, 0, 0, napi_default, 0}, {"size", 0, size, 0, 0, 0, napi_default, 0}, {"setGrid", 0, setGrid, 0, 0, 0, napi_default, 0}, {"readText", 0, readText, 0, 0, 0, napi_default, 0}, {"inputText", 0, inputText, 0, 0, 0, napi_default, 0}, {"testIMECommit", 0, testIMECommit, 0, 0, 0, napi_default, 0}, {"testSetMarkedText", 0, testSetMarkedText, 0, 0, 0, napi_default, 0}, {"testKeyDown", 0, testKeyDown, 0, 0, 0, napi_default, 0}, {"testMouseMove", 0, testMouseMove, 0, 0, 0, napi_default, 0}, {"testScroll", 0, testScroll, 0, 0, 0, napi_default, 0}, {"isVisible", 0, isVisible, 0, 0, 0, napi_default, 0}, {"setReadOnly", 0, setReadOnly, 0, 0, 0, napi_default, 0}, {"inspect", 0, inspect, 0, 0, 0, napi_default, 0}, {"bindingAction", 0, bindingAction, 0, 0, 0, napi_default, 0}, {"setShortcutHandler", 0, setShortcutHandler, 0, 0, 0, napi_default, 0}, {"setFocusHandler", 0, setFocusHandler, 0, 0, 0, napi_default, 0}, {"setPasteImageHandler", 0, setPasteImageHandler, 0, 0, 0, napi_default, 0}};
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props); return exports;
 }
