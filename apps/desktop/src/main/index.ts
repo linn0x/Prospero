@@ -186,6 +186,11 @@ const nativeGhosttyManager = new NativeGhosttyManager(
     }
     return sendToMainWindow("native-terminal:shortcut", { id, action: "paste-image" });
   },
+  undefined,
+  sessionId => {
+    if (!(runtime instanceof RustRuntime)) throw new Error("Native terminals require the Rust daemon backend");
+    return runtime.terminalSnapshot(sessionId);
+  },
 );
 let daemonStartRequest: Promise<{ ok: boolean; error?: string }> | undefined;
 function publishRuntimeSwitch(): void {

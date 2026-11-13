@@ -69,7 +69,22 @@ app.on('browser-window-created', (_event, window) => window.webContents.once('di
     const connectionFile = path.join(rustHome, 'daemon/connection.json');
     await wait(() => fs.existsSync(connectionFile), 'isolated daemon');
     connection = JSON.parse(fs.readFileSync(connectionFile, 'utf8'));
-    const session = await request('/v1/terminals', { title: 'Native Ghostty fixture', agent: 'custom', workspace: project, size: { cols: 80, rows: 24 }, command: "stty raw -echo; printf 'NATIVE_READY\r\n中文显示\r\n'; cat" });
+    const fixtureProgram = path.join(project, 'terminal-fixture.py');
+    fs.writeFileSync(fixtureProgram, `import os, select, sys, tty, pathlib
+p = pathlib.Path(__file__).with_name('resize-output')
+tty.setraw(sys.stdin.fileno())
+os.write(1, 'NATIVE_READY\\r\\n中文显示\\r\\n'.encode())
+while True:
+    if p.exists():
+        data = p.read_bytes()
+        p.unlink()
+        os.write(1, data)
+    if select.select([0], [], [], 0.02)[0]:
+        data = os.read(0, 8192)
+        if not data: break
+        os.write(1, data)
+`);
+    const session = await request('/v1/terminals', { title: 'Native Ghostty fixture', agent: 'custom', workspace: project, size: { cols: 80, rows: 24 }, command: `/usr/bin/python3 -u '${fixtureProgram}'` });
     sessionIds.push(session.id);
     await run(`localStorage.setItem('prospero.activeView','workspaces');localStorage.setItem('prospero.activeSession',${JSON.stringify(session.id)});localStorage.setItem('prospero.openSessions',JSON.stringify([${JSON.stringify(session.id)}]));localStorage.setItem('prospero.workspaceFocus','true')`);
     await new Promise(resolve => { wc.once('did-finish-load', resolve); wc.reload(); });
@@ -82,9 +97,16 @@ app.on('browser-window-created', (_event, window) => window.webContents.once('di
     assert.equal(await run("Boolean(document.querySelector('.workspace-focus-controls'))"), false, 'native focus has no mouse-mode toolbar');
     assert.equal(await run("Boolean(document.querySelector('#workspace-session-panel .terminal-status, #workspace-session-panel .native-terminal-footer'))"), false, 'native terminal has no persistent status or error bars');
     const sizeBefore = native.size(id);
+    await wait(() => !native.inspect(id).readOnly, 'native input ready');
     native.inputText(id, 'NATIVE_INPUT_中文');
     await wait(() => native.readText(id).includes('NATIVE_INPUT_中文'), 'input through native PTY relay');
-    window.setSize(1050, 750);
+    // Put content below the cursor: avt and Ghostty shrink this screen
+    // differently unless the viewer reconciles to the daemon checkpoint.
+    const rows = native.size(id).rows;
+    const seed = '\x1bc' + Array.from({ length: rows }, (_, i) => `resize-row-${i + 1}`).join('\r\n') + `\x1b[${rows - 4};1HNATIVE_INPUT_中文`;
+    fs.writeFileSync(path.join(project, 'resize-output'), seed);
+    await wait(() => native.readText(id).includes(`resize-row-${rows}`), 'resize fixture');
+    window.setSize(1050, 500);
     await wait(() => native.size(id).columns !== sizeBefore.columns, 'native resize');
     // A modal must cover the native surface; hidden native views must not steal
     // focus from Chromium. Removing it restores the same surface/session.
@@ -96,14 +118,51 @@ app.on('browser-window-created', (_event, window) => window.webContents.once('di
     assert.equal(await hostId(), id, 'modal must not recreate the terminal');
     fs.writeFileSync(path.join(output, 'electron-shell.png'), (await wc.capturePage()).toPNG());
     if (native.capture) native.capture(id, path.join(output, 'native-terminal.png'));
+    // Allow the resize response and its authoritative checkpoint to settle.
+    await delay(500);
+    const viewportBeforeReload = native.readText(id, true).split('\n').map(line => line.trimEnd()).join('\n');
     // Recreating the renderer must detach rather than terminate the session.
     await new Promise(resolve => { wc.once('did-finish-load', resolve); wc.reload(); });
     await wait(async () => (await hostId()) > 0 && (await hostId()) !== id, 'native reattach');
     const restoredId = await hostId();
     await wait(() => native.readText(restoredId).includes('NATIVE_INPUT_中文'), 'daemon snapshot restore');
+    await delay(500);
+    const viewportAfterReload = native.readText(restoredId, true).split('\n').map(line => line.trimEnd()).join('\n');
+    assert.equal(viewportBeforeReload, viewportAfterReload, 'live resize must match authoritative snapshot reattach');
     const health = await request('/v1/health');
     assert.equal(health.activeRuntimeSessions, 1, 'surface recreation did not launch a second agent');
-    const result = { ok: true, checks: ['native surface (no xterm)', 'Chinese output', 'native input through relay', 'resize', 'modal occlusion', 'snapshot reattach', 'same daemon session'], size: native.size(restoredId), output };
+    const other = await request('/v1/terminals', { title: 'Switch fixture', agent: 'custom', workspace: project, size: { cols: 80, rows: 24 }, command: "stty raw -echo; printf 'SWITCH_READY'; cat" });
+    sessionIds.push(other.id);
+    const selectTitle = async title => {
+      const expression = `Array.from(document.querySelectorAll('.workspace-session-link')).find(button => button.title === ${JSON.stringify(title)})`;
+      await wait(() => run(`Boolean(${expression})`), 'session row ' + title);
+      await run(`${expression}.click()`);
+      await wait(async () => (await hostId()) > 0 && await run("document.querySelector('#workspace-session-panel .native-terminal-host')?.dataset.nativeState === 'connected'"), 'connected session ' + title);
+    };
+    await selectTitle('Switch fixture');
+    const otherId = await hostId();
+    for (let i = 0; i < 5; i++) {
+      await delay(1700); // Exceeds the old 1.5-second disconnect threshold.
+      await selectTitle('Native Ghostty fixture');
+      assert.equal(await hostId(), restoredId, 'switch back retains original native surface');
+      await selectTitle('Switch fixture');
+      assert.equal(await hostId(), otherId, 'switch retains second native surface');
+      assert.equal(await run("Boolean(document.querySelector('.native-terminal-disconnected-banner'))"), false, 'no disconnected banner during session switches');
+    }
+    await selectTitle('Native Ghostty fixture');
+    const resumeRows = native.size(restoredId).rows;
+    fs.writeFileSync(path.join(project, 'resize-output'), '\x1bc' + Array.from({length: resumeRows}, (_, i) => `\x1b[${i + 1};1Hretained-row-${i + 1}`).join('') + `\x1b[${resumeRows - 2};3HBEFORE_RESUME`);
+    await wait(() => native.readText(restoredId, true).includes('BEFORE_RESUME'), 'retained grid fixture');
+    const retainedViewport = native.readText(restoredId, true);
+    await selectTitle('Switch fixture');
+    await delay(31_000);
+    fs.writeFileSync(path.join(project, 'resize-output'), '\x1b[0m'.repeat(65536) + `\x1b[${resumeRows - 2};3HAFTER_RESUME!` + '\x1b[0m'.repeat(65536));
+    await wait(() => !fs.existsSync(path.join(project, 'resize-output')), 'output while suspended');
+    await selectTitle('Native Ghostty fixture');
+    await delay(500);
+    assert.equal(await hostId(), restoredId, 'suspended resume retains original surface');
+    assert.equal(native.readText(restoredId, true), retainedViewport.replace('BEFORE_RESUME', 'AFTER_RESUME!'), 'resume must preserve current grid rather than reset to the initial Hello size');
+    const result = { ok: true, checks: ['native surface (no xterm)', 'Chinese output', 'native input through relay', 'resize', 'modal occlusion', 'snapshot reattach', 'same daemon session', 'resize checkpoint equivalence', 'repeated session switching', 'suspended resume grid and bottom-row delta'], size: native.size(restoredId), output };
     fs.writeFileSync(path.join(output, 'integration.json'), JSON.stringify(result, null, 2));
     console.log(JSON.stringify(result));
     clearTimeout(deadline);

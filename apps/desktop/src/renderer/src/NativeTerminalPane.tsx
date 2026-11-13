@@ -281,6 +281,10 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
         return;
       }
       if (autoRetryCount.current < 3) {
+        const syncing = { ...stateRef.current, connected: false, syncing: true, controller: false, readOnly: true };
+        stateRef.current = syncing;
+        setState(syncing);
+        onNativeStateChange(syncing);
         autoRetryCount.current += 1;
         if (autoRetryTimer.current !== undefined) window.clearTimeout(autoRetryTimer.current);
         autoRetryTimer.current = window.setTimeout(() => {

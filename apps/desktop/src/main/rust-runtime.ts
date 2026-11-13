@@ -421,6 +421,7 @@ export class RustRuntime {
 
   get managed(): boolean { return this.process.managed; }
   createTerminalStreamSocket(id: string): WebSocket { return this.current().client.createTerminalStreamSocket(id); }
+  terminalSnapshot(id: string) { return this.current().client.terminalSnapshot(id, AbortSignal.timeout(5_000)); }
   async supportsTerminalStream(id: string): Promise<boolean> {
     const client = this.current().client;
     if (!(await client.health()).capabilities.includes(TERMINAL_STREAM_V1_CAPABILITY)) return false;

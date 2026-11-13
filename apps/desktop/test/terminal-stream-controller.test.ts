@@ -6,7 +6,10 @@ class Port {
   onmessage: ((event: MessageEvent) => void) | null = null;
   onmessageerror: (() => void) | null = null;
   sent: ArrayBuffer[] = []; closed = false;
+  private readonly closeListeners = new Set<() => void>();
   start(): void {} close(): void { this.closed = true; }
+  addEventListener(type: string, listener: () => void): void { if (type === "close") this.closeListeners.add(listener); }
+  emitClose(): void { this.closed = true; for (const listener of this.closeListeners) listener(); }
   postMessage(value: ArrayBuffer): void { this.sent.push(value); }
   receive(value: ArrayBuffer): void { this.onmessage?.({ data: value } as MessageEvent); }
 }
@@ -162,10 +165,39 @@ describe("TerminalStreamController", () => {
     const unmatched = setup(); unmatched.hello(); await tick(); unmatched.ready(); await tick(); unmatched.port.receive(frame(TerminalStreamKind.Result, 77, json({ ok: true }))); await tick(); expect(unmatched.errors[0]).toMatch(/did not match/);
   });
 
-  it("keeps a clean Exit visible when the port closes afterwards", async () => {
+  it("keeps a clean Exit visible when the port closes afterwards or in the exact same tick", async () => {
     const current = setup(); current.hello(); await tick(); current.ready(); await tick();
     current.port.receive(frame(TerminalStreamKind.Exit, 0, json({ exitCode: 0 }))); await tick();
     current.port.onmessageerror?.(); await tick();
     expect(current.errors).toEqual([]);
+
+    // Same-tick replay tail + Ready + Exit + State + close must drain all output without error.
+    const consumed: number[] = [];
+    const states: Array<{ connected: boolean; syncing: boolean; exited: boolean; readOnly: boolean }> = [];
+    const port = new Port();
+    const errors: string[] = [];
+    const controller = new TerminalStreamController({
+      sessionId: "term-same-tick-exit",
+      cursor: () => 0,
+      epoch: () => undefined,
+      wantControl: true,
+      consume: async item => {
+        consumed.push(item.sequence);
+      },
+      onState: state => states.push({ ...state }),
+      onError: message => errors.push(message),
+      onHistoryGap: () => undefined,
+    });
+    controller.attach(port as unknown as MessagePort);
+    port.receive(frame(TerminalStreamKind.Hello, 0, json({ epoch: "e1", clientId: "me", controllerId: null, cols: 80, rows: 24, exited: true })));
+    port.receive(frame(TerminalStreamKind.Output, 1, new Uint8Array([65, 66])));
+    port.receive(frame(TerminalStreamKind.Ready, 1));
+    port.receive(frame(TerminalStreamKind.Exit, 0, json({ exitCode: 0 })));
+    port.receive(frame(TerminalStreamKind.State, 1, json({ controllerId: null, readOnly: true, exited: true })));
+    port.emitClose();
+    await tick();
+    expect(errors).toEqual([]);
+    expect(consumed).toEqual([1]);
+    expect(states.at(-1)).toMatchObject({ connected: false, syncing: false, exited: true, readOnly: true });
   });
 });

@@ -28,6 +28,8 @@ export type TerminalStreamControllerOptions = {
   cursor: () => number | undefined;
   epoch: () => string | undefined;
   wantControl: boolean;
+  /** Keep output batches on one side of an ahead-of-stream checkpoint. */
+  renderedThrough?: () => number | undefined;
   onHello?: (hello: { cols: number; rows: number }) => void;
   consume: (frame: TerminalStreamFrame) => Promise<void>;
   onState: (state: TerminalStreamState) => void;
@@ -65,7 +67,9 @@ export class TerminalStreamController {
   private ready = false;
   private committedCursor: number;
   private helloSeen = false;
+  private exitReceived = false;
   private cleanExit = false;
+  private transportClosed = false;
   private freshReloadRequired = false;
   private attachmentGeneration = 0;
 
@@ -83,12 +87,23 @@ export class TerminalStreamController {
     this.committedCursor = this.options.cursor() ?? 0;
     this.ready = false;
     this.helloSeen = false;
+    this.exitReceived = false;
+    this.cleanExit = false;
+    this.transportClosed = false;
+    this.freshReloadRequired = false;
     port.onmessage = event => this.receive(event.data);
     port.onmessageerror = () => this.fail("Terminal stream message could not be decoded", true);
     // Chromium/Electron ports may emit close; plain web MessagePort typings do
     // not expose it, so feature-detect without relying on a browser-only type.
     const closeAware = port as unknown as { addEventListener?: (type: string, listener: () => void) => void };
-    closeAware.addEventListener?.("close", () => { if (this.port === port) this.fail("Terminal stream port closed", true); });
+    closeAware.addEventListener?.("close", () => {
+      if (this.port !== port) return;
+      if (this.hasExit()) {
+        void this.finishCleanExit();
+      } else {
+        this.fail("Terminal stream port closed", true);
+      }
+    });
     port.start();
     this.state = { ...this.state, connected: false, syncing: true, controller: false };
     this.publish();
@@ -126,6 +141,27 @@ export class TerminalStreamController {
     this.publish();
   }
 
+  hasExit(): boolean {
+    return this.cleanExit || this.exitReceived;
+  }
+
+  async finishCleanExit(): Promise<boolean> {
+    if (this.disposed || this.freshReloadRequired || !this.hasExit()) return false;
+    const generation = this.attachmentGeneration;
+    this.transportClosed = true;
+    this.rejectPending(new Error("Terminal session exited"));
+    await this.flushReceivedQueue();
+    if (this.disposed || this.freshReloadRequired || generation !== this.attachmentGeneration || !this.cleanExit) {
+      return false;
+    }
+    this.state = { ...this.state, connected: false, syncing: false, exited: true, readOnly: true, controller: false };
+    this.publish();
+    this.port?.close();
+    this.port = undefined;
+    this.attachmentGeneration += 1;
+    return true;
+  }
+
   close(): void {
     this.disposed = true;
     this.attachmentGeneration += 1;
@@ -136,18 +172,37 @@ export class TerminalStreamController {
     this.publish();
   }
 
+  private flushReceivedQueue(): Promise<void> {
+    if (this.drainTimer !== undefined) {
+      clearTimeout(this.drainTimer);
+      this.drainTimer = undefined;
+    }
+    if (this.received.length > 0) {
+      const batch = this.received.splice(0);
+      const bytes = this.receivedBytes;
+      this.receivedBytes = 0;
+      this.processingBytes += bytes;
+      this.writeChain = this.writeChain
+        .then(() => this.handleBatch(batch))
+        .catch(error => this.fail(error instanceof Error ? error.message : "Terminal stream failed", false))
+        .finally(() => {
+          this.processingBytes = Math.max(0, this.processingBytes - bytes);
+        });
+    }
+    return this.writeChain;
+  }
+
   private receive(value: unknown): void {
     let frame: TerminalStreamFrame;
     try {
       if (!(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value)) throw new Error("Terminal stream message was not binary");
       frame = decodeTerminalStreamFrame(value as ArrayBuffer | ArrayBufferView, "server");
     } catch (error) { this.fail(error instanceof Error ? error.message : "Malformed terminal stream frame", false); return; }
+    if (frame.kind === TerminalStreamKind.Exit) this.exitReceived = true;
     this.received.push(frame); this.receivedBytes += frame.payload.byteLength;
     if (this.receivedBytes + this.processingBytes > MAX_QUEUED_FRAME_BYTES) { this.fail("Terminal stream renderer queue is full", false); return; }
     if (this.drainTimer === undefined) this.drainTimer = setTimeout(() => {
-      this.drainTimer = undefined;
-      const batch = this.received.splice(0); const bytes = this.receivedBytes; this.receivedBytes = 0; this.processingBytes += bytes;
-      this.writeChain = this.writeChain.then(() => this.handleBatch(batch)).catch(error => this.fail(error instanceof Error ? error.message : "Terminal stream failed", false)).finally(() => { this.processingBytes = Math.max(0, this.processingBytes - bytes); });
+      void this.flushReceivedQueue();
     }, 0);
   }
 
@@ -157,7 +212,11 @@ export class TerminalStreamController {
       const frame = frames[index]!;
       if (frame.kind !== TerminalStreamKind.Output) { await this.handle(frame); continue; }
       const outputs = [frame];
-      while (index + 1 < frames.length && frames[index + 1]!.kind === TerminalStreamKind.Output) outputs.push(frames[++index]!);
+      const renderedThrough = this.options.renderedThrough?.();
+      while (index + 1 < frames.length && frames[index + 1]!.kind === TerminalStreamKind.Output) {
+        if (renderedThrough !== undefined && frame.sequence <= renderedThrough && frames[index + 1]!.sequence > renderedThrough) break;
+        outputs.push(frames[++index]!);
+      }
       if (this.disposed || this.freshReloadRequired) return;
       let expected = this.committedCursor;
       for (const output of outputs) {
@@ -251,7 +310,9 @@ export class TerminalStreamController {
     // new attachment or advance its wire cursor.
     if (this.disposed || this.freshReloadRequired || !port || this.port !== port || generation !== this.attachmentGeneration) return;
     // consume resolves after the complete xterm write, including snapshots.
-    this.send(TerminalStreamKind.Applied, frame.sequence, new Uint8Array());
+    if (!this.transportClosed) {
+      this.send(TerminalStreamKind.Applied, frame.sequence, new Uint8Array());
+    }
     this.committedCursor = frame.sequence;
     this.state = { ...this.state, syncing: !this.ready };
     this.publish();
