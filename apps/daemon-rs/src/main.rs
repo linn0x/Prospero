@@ -56,6 +56,11 @@ enum Command {
         directory: PathBuf,
     },
     #[command(hide = true)]
+    TerminalMuxHost {
+        #[arg(long)]
+        directory: PathBuf,
+    },
+    #[command(hide = true)]
     AgentTerminal {
         #[arg(long)]
         agent: String,
@@ -383,6 +388,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(prosperod_rs::terminal::guard::run(parent, shell, args)?);
         }
         Command::TerminalHost { directory } => prosperod_rs::terminal::host::run(directory)?,
+        Command::TerminalMuxHost { directory } => {
+            prosperod_rs::terminal::host::run_mux(&directory)?
+        }
         Command::AgentTerminal {
             agent,
             cli,

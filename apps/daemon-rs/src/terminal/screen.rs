@@ -37,6 +37,19 @@ fn is_proxy(ch: char) -> bool {
         || (WIDE_PROXY..WIDE_PROXY + PROXY_COUNT).contains(&value)
 }
 
+fn is_stateless_osc_prefix(sequence: &str) -> bool {
+    let Some(rest) = sequence.strip_prefix("\x1b]") else {
+        return false;
+    };
+    let Some((code, _)) = rest.split_once(';') else {
+        return false;
+    };
+    matches!(
+        code,
+        "0" | "1" | "2" | "7" | "9" | "22" | "52" | "99" | "133" | "633" | "777" | "7501"
+    )
+}
+
 pub fn width_tables() -> String {
     [0, 2].map(|width| {
         let mut ranges = Vec::<(u32, u32)>::new();
@@ -65,11 +78,16 @@ pub struct Screen {
     size: TerminalSize,
     escape: Escape,
     pending: String,
+    pending_overflow: bool,
+    osc_clean_overflow: bool,
+    prev_was_esc: bool,
     utf8: Vec<u8>,
     compatible: bool,
     modes: BTreeSet<u16>,
+    alt_screen: bool,
     keypad: bool,
     modify_other_keys: Option<u8>,
+    kitty_keyboard: [Vec<u16>; 2],
     osc: bool,
     cursor_style: String,
     glyphs: HashMap<char, Glyph>,
@@ -97,11 +115,16 @@ impl Screen {
             size,
             escape: Escape::Ground,
             pending: String::new(),
+            pending_overflow: false,
+            osc_clean_overflow: false,
+            prev_was_esc: false,
             utf8: Vec::new(),
             compatible: true,
             modes: BTreeSet::new(),
+            alt_screen: false,
             keypad: false,
             modify_other_keys: None,
+            kitty_keyboard: [Vec::new(), Vec::new()],
             osc: false,
             cursor_style: String::new(),
             glyphs: HashMap::new(),
@@ -111,6 +134,24 @@ impl Screen {
             link: None,
             join_width: 0,
         }
+    }
+
+    pub const fn size(&self) -> TerminalSize {
+        self.size
+    }
+
+    pub fn kitty_keyboard_flags(&self) -> u16 {
+        self.kitty_keyboard[usize::from(self.alt_screen)]
+            .last()
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn mode_enabled(&self, mode: u16) -> bool {
+        if matches!(mode, 47 | 1047 | 1049) {
+            return self.alt_screen;
+        }
+        self.modes.contains(&mode)
     }
 
     pub fn resize(&mut self, size: TerminalSize) {
@@ -195,6 +236,9 @@ impl Screen {
         if self.escape == Escape::Ground {
             if ch == '\x1b' {
                 self.pending.push(ch);
+                self.pending_overflow = false;
+                self.osc_clean_overflow = false;
+                self.prev_was_esc = true;
                 self.escape = Escape::Start;
             } else {
                 if ch.is_control() {
@@ -211,10 +255,17 @@ impl Screen {
             }
             return;
         }
-        if self.pending.len() + ch.len_utf8() <= MAX_PENDING {
+        let was_esc = self.prev_was_esc;
+        self.prev_was_esc = ch == '\x1b';
+        if !self.pending_overflow && self.pending.len() + ch.len_utf8() <= MAX_PENDING {
             self.pending.push(ch);
-        } else {
-            self.compatible = false;
+        } else if !self.pending_overflow {
+            self.pending_overflow = true;
+            self.osc_clean_overflow = self.escape == Escape::String
+                && self.osc
+                && !matches!(ch, '\x18' | '\x1a' | '\x1b');
+        } else if matches!(ch, '\x18' | '\x1a') || (was_esc && ch != '\\') {
+            self.osc_clean_overflow = false;
         }
         if matches!(ch, '\x18' | '\x1a') {
             self.escape = Escape::Ground;
@@ -239,11 +290,20 @@ impl Screen {
         }
         if self.escape == Escape::Ground {
             let sequence = std::mem::take(&mut self.pending);
-            if sequence.ends_with("\x1bc") {
+            let overflowed = std::mem::replace(&mut self.pending_overflow, false);
+            let osc_clean_overflow = std::mem::replace(&mut self.osc_clean_overflow, false);
+            self.prev_was_esc = false;
+            if (was_esc && ch == 'c') || (!overflowed && sequence.ends_with("\x1bc")) {
                 *self = Self::new(self.size);
                 return;
             }
             self.join_width = 0;
+            if overflowed {
+                if !(osc_clean_overflow && is_stateless_osc_prefix(&sequence)) {
+                    self.compatible = false;
+                }
+                return;
+            }
             self.input_modes(&sequence);
             for ch in sequence.chars() {
                 self.feed(ch);
@@ -394,6 +454,7 @@ impl Screen {
         if sequence == "\x1b[!p" {
             self.link = None;
             self.modify_other_keys = None;
+            self.kitty_keyboard[usize::from(self.alt_screen)].clear();
         }
         if let Some(value) = sequence.strip_prefix("\x1b]8;").and_then(|value| {
             value
@@ -413,12 +474,25 @@ impl Screen {
             self.compatible = false;
         }
         if let Some(value) = sequence.strip_prefix("\x1b]") {
-            let code = value.split(';').next().unwrap_or("");
-            let color_query = value.starts_with("10;?") || value.starts_with("11;?");
-            // OSC 7501 reports agent activity (e.g. state=working:app=codex).
-            // It does not change the screen or input modes, so it must not
-            // permanently disable checkpoints and force full-history replay.
-            if !color_query && !["0", "1", "2", "7", "8", "52", "133", "633", "7501"].contains(&code) {
+            let body = value
+                .strip_suffix('\x07')
+                .or_else(|| value.strip_suffix("\x1b\\"))
+                .unwrap_or(value);
+            let code = body.split(';').next().unwrap_or("");
+            let color_query =
+                matches!(body, "10;?" | "11;?" | "12;?") || (code == "4" && body.ends_with(";?"));
+            // Transient metadata, notifications, progress bars, pointer shapes,
+            // clipboard writes, dynamic-color resets to default, shell markers,
+            // and agent activity markers do not mutate persistent cell/input
+            // state beyond defaults, so they must not permanently disable
+            // checkpoints and force full-history replay.
+            if !color_query
+                && ![
+                    "0", "1", "2", "7", "8", "9", "22", "52", "99", "110", "111", "112", "133",
+                    "633", "777", "7501",
+                ]
+                .contains(&code)
+            {
                 self.compatible = false;
             }
         }
@@ -445,6 +519,71 @@ impl Screen {
                 _ => {}
             }
         }
+        if let Some(rest) = sequence
+            .strip_prefix("\x1b[>")
+            .and_then(|rest| rest.strip_suffix('u'))
+        {
+            let flags = if rest.is_empty() {
+                Some(0_u16)
+            } else {
+                rest.parse::<u16>().ok()
+            };
+            if let Some(flags) = flags {
+                let stack = &mut self.kitty_keyboard[usize::from(self.alt_screen)];
+                if stack.len() >= 16 {
+                    stack.remove(0);
+                }
+                stack.push(flags & 0x1f);
+            }
+        } else if let Some(rest) = sequence
+            .strip_prefix("\x1b[<")
+            .and_then(|rest| rest.strip_suffix('u'))
+        {
+            let count = if rest.is_empty() {
+                Some(1_usize)
+            } else {
+                rest.parse::<usize>().ok()
+            };
+            if let Some(count) = count {
+                let stack = &mut self.kitty_keyboard[usize::from(self.alt_screen)];
+                let next_len = stack.len().saturating_sub(count.max(1));
+                stack.truncate(next_len);
+            }
+        } else if let Some(rest) = sequence
+            .strip_prefix("\x1b[=")
+            .and_then(|rest| rest.strip_suffix('u'))
+        {
+            let mut parts = rest.split(';');
+            let flags_part = parts.next().unwrap_or("");
+            let mode_part = parts.next().unwrap_or("1");
+            if parts.next().is_none()
+                && let (Ok(flags), Ok(mode)) = (
+                    if flags_part.is_empty() {
+                        Ok(0_u16)
+                    } else {
+                        flags_part.parse::<u16>()
+                    },
+                    mode_part.parse::<u8>(),
+                )
+            {
+                let masked = flags & 0x1f;
+                let stack = &mut self.kitty_keyboard[usize::from(self.alt_screen)];
+                let current = stack.last().copied().unwrap_or(0);
+                let next = match mode {
+                    1 => Some(masked),
+                    2 => Some(current | masked),
+                    3 => Some(current & !masked),
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    if let Some(top) = stack.last_mut() {
+                        *top = next;
+                    } else {
+                        stack.push(next);
+                    }
+                }
+            }
+        }
         if let Some(sequence) = sequence.strip_prefix("\x1b[?") {
             let enabled = sequence.ends_with('h');
             if !enabled && !sequence.ends_with('l') {
@@ -454,8 +593,12 @@ impl Screen {
                 .split(';')
                 .filter_map(|value| value.parse::<u16>().ok())
             {
+                if [47, 1047, 1049].contains(&code) {
+                    self.alt_screen = enabled;
+                }
                 if [
-                    9, 12, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1034, 2004, 2026,
+                    9, 12, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1034, 2004, 2026,
+                    2027, 2031, 2048,
                 ]
                 .contains(&code)
                 {
@@ -465,11 +608,20 @@ impl Screen {
                                 self.modes.remove(&mode);
                             }
                         }
+                        if [1005, 1006, 1015, 1016].contains(&code) {
+                            for mode in [1005, 1006, 1015, 1016] {
+                                self.modes.remove(&mode);
+                            }
+                        }
                         self.modes.insert(code);
                     } else {
                         self.modes.remove(&code);
                     }
-                } else if ![1, 6, 7, 12, 25, 47, 1047, 1048, 1049, 2026, 2031].contains(&code) {
+                } else if ![
+                    1, 6, 7, 12, 25, 47, 1047, 1048, 1049, 2026, 2027, 2031, 2048,
+                ]
+                .contains(&code)
+                {
                     self.compatible = false;
                 }
             }
@@ -480,7 +632,7 @@ impl Screen {
         let terminal = self
             .terminal
             .as_ref()
-            .filter(|_| self.compatible)
+            .filter(|_| self.compatible && !self.pending_overflow)
             .ok_or_else(|| Error::Invalid("terminal state cannot be checkpointed yet".into()))?;
         let cursor = terminal.cursor();
         if self.join_width > 0 && !terminal.last_print_succeeded() && cursor.col > 0 {
@@ -491,7 +643,13 @@ impl Screen {
                 ));
             }
         }
-        let mut ansi = self.expand_dump(&normalize_xterm_dump(&terminal.dump()), None)?;
+        let mut ansi = String::new();
+        if self.alt_screen
+            && let Some(&primary_flags) = self.kitty_keyboard[0].last().filter(|&&f| f > 0)
+        {
+            ansi.push_str(&format!("\x1b[>{primary_flags}u"));
+        }
+        ansi.push_str(&self.expand_dump(&normalize_xterm_dump(&terminal.dump()), None)?);
         for mode in &self.modes {
             ansi.push_str(&format!("\x1b[?{mode}h"));
         }
@@ -500,6 +658,12 @@ impl Screen {
         }
         if let Some(level) = self.modify_other_keys {
             ansi.push_str(&format!("\x1b[>4;{level}m"));
+        }
+        if let Some(&active_flags) = self.kitty_keyboard[usize::from(self.alt_screen)]
+            .last()
+            .filter(|&&f| f > 0)
+        {
+            ansi.push_str(&format!("\x1b[>{active_flags}u"));
         }
         ansi.push_str(&self.cursor_style);
         ansi.push_str(

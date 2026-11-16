@@ -324,21 +324,14 @@ pub(crate) async fn search_claude_conversations(
         .map_err(|_| Error::Closed)?
 }
 
-fn parse_pi_file(
-    path: &Path,
-    needle: &str,
-    fallback_cwd: &str,
-) -> Option<ResumableConversation> {
+fn parse_pi_file(path: &Path, needle: &str, fallback_cwd: &str) -> Option<ResumableConversation> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
         return None;
     }
     let raw = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_str()?;
-    let default_id = stem
-        .rsplit_once('_')
-        .map_or(stem, |(_, id)| id)
-        .to_owned();
+    let default_id = stem.rsplit_once('_').map_or(stem, |(_, id)| id).to_owned();
     let mut session_id = default_id;
     let mut cwd = fallback_cwd.to_owned();
     let mut first_prompt = String::new();
@@ -470,11 +463,13 @@ pub(crate) async fn search_pi_conversations(
 ) -> Result<Vec<ResumableConversation>> {
     let data = database.directory().to_owned();
     let config_dir = match account_id.as_deref() {
-        None | Some(crate::accounts::NATIVE_PI_ID) => {
-            std::env::var_os("PI_CODING_AGENT_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home_dir().unwrap_or_else(|_| PathBuf::from("/")).join(".pi/agent"))
-        }
+        None | Some(crate::accounts::NATIVE_PI_ID) => std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home_dir()
+                    .unwrap_or_else(|_| PathBuf::from("/"))
+                    .join(".pi/agent")
+            }),
         Some(id) => {
             crate::database::validate_id(id)?;
             crate::accounts::managed::profile_account_root_for_agent(&data, id, AgentKind::Pi)?
@@ -507,7 +502,9 @@ fn file_uri_to_path(uri: &str) -> Option<String> {
         bytes.push(src[idx]);
         idx += 1;
     }
-    String::from_utf8(bytes).ok().filter(|path| !path.trim().is_empty())
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
 }
 
 fn extract_agy_cwd(workspace_uris: Option<&str>, fallback_cwd: &str) -> String {
@@ -596,17 +593,13 @@ pub(crate) fn search_agy_dbs(
                 },
                 500,
             );
-            let preview = (!preview_raw.trim().is_empty()).then(|| trim_chars(preview_raw.trim(), 4_000));
+            let preview =
+                (!preview_raw.trim().is_empty()).then(|| trim_chars(preview_raw.trim(), 4_000));
             let cwd = extract_agy_cwd(workspace_uris.as_deref(), &fallback);
             if !needle.is_empty() {
-                let matches = [
-                    display_title.as_str(),
-                    preview_raw.trim(),
-                    cwd.trim(),
-                    id,
-                ]
-                .iter()
-                .any(|value| value.to_lowercase().contains(&needle));
+                let matches = [display_title.as_str(), preview_raw.trim(), cwd.trim(), id]
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&needle));
                 if !matches {
                     continue;
                 }
@@ -614,9 +607,7 @@ pub(crate) fn search_agy_dbs(
             let normalized_ts = last_modified
                 .as_deref()
                 .map(|raw| raw.trim().replace(' ', "T"));
-            let parsed_ts = normalized_ts
-                .as_deref()
-                .and_then(chrono_like_parse_millis);
+            let parsed_ts = normalized_ts.as_deref().and_then(chrono_like_parse_millis);
             let updated_at = parsed_ts.unwrap_or(fallback_updated_at);
             let candidate = ResumableConversation {
                 id: trim_chars(id, 256),

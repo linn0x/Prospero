@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { basename, extname, isAbsolute, resolve as resolvePath } from "node:path";
-import type { SessionHead, TimelineQuery, TimelineTextQuery, AttachmentInput, ScheduleCreate, ScheduleUpdate } from "@prospero/protocol/rust-daemon";
+import type { ChangeEvent, SessionHead, TimelineQuery, TimelineTextQuery, AttachmentInput, ScheduleCreate, ScheduleUpdate } from "@prospero/protocol/rust-daemon";
 import type { QueuedMessage, SessionAgentControls } from "@prospero/protocol/rust-daemon";
 import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import type { FilePreview, GitHistoryEntry, GitMutation, ProjectFile, ProjectGitStatus } from "../shared/project-tools";
@@ -18,6 +18,9 @@ const BASE64_RE = /^[A-Za-z0-9+/=]+$/;
 const PROJECT_IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".ico": "image/x-icon", ".bmp": "image/bmp", ".svg": "image/svg+xml" };
 const ACTIVE_SESSION_PAGE_LIMIT = 100;
 export const ACTIVE_SESSION_WINDOW_LIMIT = 500;
+export const EVENT_COALESCE_WINDOW_MS = 16;
+export const TIMELINE_LONG_POLL_WAIT_MS = 15_000;
+const SSE_MAINTENANCE_INTERVAL_MS = 2_000;
 
 async function readActiveSessionWindow(
   client: RustConnection["client"],
@@ -404,6 +407,13 @@ export class RustRuntime {
   private cachedHealth: Awaited<ReturnType<RustConnection["client"]["health"]>> | undefined;
   private cachedDevices: { items: unknown[] } | undefined;
   private cachedSchedules: unknown[] | undefined;
+  private eventBatchTimer: ReturnType<typeof setTimeout> | undefined;
+  private flushingEventBatch: Promise<void> | undefined;
+  private pendingSessionEvents: ChangeEvent[] = [];
+  private pendingFullRefresh = false;
+  private sseStreamConnection: RustConnection | undefined;
+  private sseStreamController: AbortController | undefined;
+  private readonly sseHealthyScopes = new Set<"sessions" | "orchestration">();
   private ready = false;
   private readonly terminalRecovery: TerminalRecovery;
   flushTerminalRecovery(): Promise<void> { return this.terminalRecovery.flush(); }
@@ -413,6 +423,7 @@ export class RustRuntime {
     this.terminalRecovery = new TerminalRecovery(resolvePath(directory, "desktop-recovery"));
     if (store.backend !== "api") throw new Error("Rust requires API-only desktop state");
     this.process = new RustProcess(binary, directory, () => {
+      this.stopEventStreams();
       this.controller.abort(); clearTimeout(this.timer); this.ready = false; this.connection = undefined;
       this.clearState();
       this.store.setManagedState(undefined, false, this.stopping ? undefined : "Rust 服务已退出");
@@ -450,7 +461,8 @@ export class RustRuntime {
       await this.refresh();
       this.ready = true;
       this.store.setManagedState(this.managed ? this.connection.pid : undefined, false);
-      this.schedule();
+      this.ensureEventStreams();
+      this.schedule(this.hasEventStreamSupport() ? SSE_MAINTENANCE_INTERVAL_MS : 500);
       return { ok: true };
     } catch (cause) {
       await this.process.stop();
@@ -468,10 +480,12 @@ export class RustRuntime {
   }
 
   private async terminate(): Promise<{ ok: boolean; error?: string }> {
+    this.stopEventStreams();
     this.controller.abort(); clearTimeout(this.timer); this.ready = false;
     try {
       await this.process.stop();
       await this.starting;
+      await this.flushingEventBatch?.catch(() => {});
       await this.refreshing?.catch(() => {});
       this.connection = undefined; this.clearState(); this.store.setManagedState(undefined, false);
       return { ok: true };
@@ -651,6 +665,241 @@ export class RustRuntime {
     } });
   }
 
+  private hasEventStreamSupport(): boolean {
+    return typeof (this.connection?.client as { subscribeEvents?: unknown } | undefined)?.subscribeEvents === "function";
+  }
+
+  private stopEventStreams(): void {
+    clearTimeout(this.eventBatchTimer);
+    this.eventBatchTimer = undefined;
+    this.pendingSessionEvents = [];
+    this.pendingFullRefresh = false;
+    this.sseHealthyScopes.clear();
+    this.sseStreamConnection = undefined;
+    this.sseStreamController?.abort();
+    this.sseStreamController = undefined;
+  }
+
+  private ensureEventStreams(): void {
+    if (!this.ready || this.controller.signal.aborted || !this.connection) return;
+    if (!this.hasEventStreamSupport()) return;
+    if (this.sseStreamConnection === this.connection && this.sseStreamController && !this.sseStreamController.signal.aborted) {
+      return;
+    }
+    this.stopEventStreams();
+    const connection = this.connection;
+    const streamController = new AbortController();
+    this.sseStreamConnection = connection;
+    this.sseStreamController = streamController;
+    const signal = AbortSignal.any([this.controller.signal, streamController.signal]);
+    void this.runScopeEventStream("sessions", connection, signal);
+    void this.runScopeEventStream("orchestration", connection, signal);
+  }
+
+  private waitWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      timer.unref?.();
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private async runScopeEventStream(
+    scope: "sessions" | "orchestration",
+    connection: RustConnection,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const client = connection.client as RustConnection["client"] & {
+      subscribeEvents: NonNullable<RustConnection["client"]["subscribeEvents"]>;
+    };
+    let failures = 0;
+    while (this.ready && !signal.aborted && this.connection === connection) {
+      let receivedResync = false;
+      const afterSeq = scope === "sessions" ? this.sequence : this.orchestrationSequence;
+      this.sseHealthyScopes.add(scope);
+      try {
+        await client.subscribeEvents(
+          { scope, afterSeq },
+          {
+            onChange: (event) => {
+              failures = 0;
+              if (scope === "sessions") {
+                this.pendingSessionEvents.push(event);
+              } else {
+                this.pendingFullRefresh = true;
+              }
+              this.scheduleEventBatch();
+            },
+            onResync: () => {
+              failures = 0;
+              receivedResync = true;
+              this.pendingFullRefresh = true;
+              this.scheduleEventBatch();
+            },
+          },
+          signal,
+        );
+        if (signal.aborted || !this.ready || this.connection !== connection) break;
+        if (receivedResync) {
+          await this.flushEventBatchNow().catch(() => {});
+          continue;
+        }
+        this.sseHealthyScopes.delete(scope);
+        failures += 1;
+      } catch {
+        this.sseHealthyScopes.delete(scope);
+        if (signal.aborted || !this.ready || this.connection !== connection) break;
+        failures += 1;
+        this.schedule(0);
+      }
+      const backoffMs = Math.min(2_000, 250 * 2 ** Math.min(Math.max(0, failures - 1), 3));
+      await this.waitWithAbort(backoffMs, signal);
+    }
+    this.sseHealthyScopes.delete(scope);
+  }
+
+  private scheduleEventBatch(): void {
+    if (!this.ready || this.controller.signal.aborted || this.eventBatchTimer !== undefined) return;
+    this.eventBatchTimer = setTimeout(() => {
+      this.eventBatchTimer = undefined;
+      void this.flushEventBatchNow().catch(() => {});
+    }, EVENT_COALESCE_WINDOW_MS);
+    this.eventBatchTimer.unref?.();
+  }
+
+  private flushEventBatchNow(): Promise<void> {
+    if (this.flushingEventBatch) return this.flushingEventBatch;
+    clearTimeout(this.eventBatchTimer);
+    this.eventBatchTimer = undefined;
+    const run = this.processEventBatch().finally(() => {
+      this.flushingEventBatch = undefined;
+      if ((this.pendingSessionEvents.length > 0 || this.pendingFullRefresh) && this.ready && !this.controller.signal.aborted) {
+        this.scheduleEventBatch();
+      }
+    });
+    this.flushingEventBatch = run;
+    return run;
+  }
+
+  private async processEventBatch(): Promise<void> {
+    if (!this.ready || this.controller.signal.aborted || !this.connection) return;
+    const events = this.pendingSessionEvents.splice(0);
+    const fullRefresh = this.pendingFullRefresh;
+    this.pendingFullRefresh = false;
+    if (events.length === 0 && !fullRefresh) return;
+
+    if (
+      !fullRefresh
+      && !this.refreshing
+      && this.orchestrationReady
+      && !this.orchestrationRetryPending
+      && events.length > 0
+      && events.every((event) => event.kind === "workspace.tabs")
+    ) {
+      await this.refresh(true, { tabsOnly: true });
+      return;
+    }
+
+    if (
+      !fullRefresh
+      && !this.refreshing
+      && this.orchestrationReady
+      && !this.orchestrationRetryPending
+      && events.length > 0
+      && events.every((event) => event.kind === "session.updated" && typeof event.entityId === "string" && event.entityId.length > 0)
+    ) {
+      const applied = await this.tryTargetedSessionPatch(events);
+      if (applied) return;
+    }
+
+    await this.refresh();
+  }
+
+  private async tryTargetedSessionPatch(events: ChangeEvent[]): Promise<boolean> {
+    const { client, pid } = this.current();
+    if (typeof client.sidebarLookup !== "function" || typeof this.store.patchApiSessions !== "function") {
+      return false;
+    }
+    const ordered = [...events].sort((left, right) => left.seq - right.seq);
+    let nextSeq = this.sequence;
+    for (const event of ordered) {
+      if (event.seq <= nextSeq) continue;
+      if (event.seq !== nextSeq + 1) {
+        // Sequence gap detected; reconcile with a full window refresh.
+        return false;
+      }
+      nextSeq = event.seq;
+    }
+
+    const ids = [...new Set(events.map((event) => event.entityId))];
+    if (ids.length === 0 || ids.length > 100) return false;
+
+    const currentSessions = this.store.snapshot().daemon.sessions;
+    const existingById = new Map(currentSessions.map((session) => [session.id, session]));
+    for (const sessionId of ids) {
+      if (!existingById.has(sessionId)) return false;
+    }
+
+    let lookup: Awaited<ReturnType<typeof client.sidebarLookup>>;
+    try {
+      lookup = await client.sidebarLookup(ids, this.controller.signal);
+    } catch {
+      return false;
+    }
+    if (this.controller.signal.aborted || lookup.items.length !== ids.length) {
+      return false;
+    }
+
+    const upserts: SessionInfo[] = [];
+    for (const head of lookup.items) {
+      const existing = existingById.get(head.id);
+      if (!existing) return false;
+      const nextArchived = head.lifecycle === "archived" && head.nativeSession?.state !== "archiving";
+      const prevArchived = Boolean(existing.archived);
+      const nextAttention = head.status === "waiting_permission" || head.status === "waiting_input";
+      const prevAttention = (existing.pendingPermissions ?? 0) > 0
+        || (existing.pendingQuestions ?? 0) > 0
+        || existing.status === "waiting_approval"
+        || existing.status === "waiting_input";
+      if (nextArchived !== prevArchived || nextAttention !== prevAttention || existing.cwd !== head.workspace) {
+        // Summary or workspace counts changed; use full refresh to keep counts exact.
+        return false;
+      }
+      const projected = rustSessionInfo(head);
+      const merged: SessionInfo = {
+        ...projected,
+        ...(existing.messageQueue?.length ? { messageQueue: existing.messageQueue } : {}),
+        ...(existing.agentControls ? {
+          agentControls: {
+            ...existing.agentControls,
+            ...(head.model ? { currentModel: head.model } : {}),
+            ...(head.effort ? { currentEffort: head.effort } : {}),
+          },
+        } : {}),
+      };
+      if (existing.nativeSession?.runtimeId !== merged.nativeSession?.runtimeId) {
+        await this.terminalRecovery.forget(merged.id);
+      }
+      upserts.push(merged);
+    }
+
+    if (nextSeq > this.sequence) {
+      this.sequence = nextSeq;
+    }
+    this.store.patchApiSessions(upserts, [], {
+      metadataRevision: `${pid}:${this.sequence}`,
+    });
+    return true;
+  }
+
   private schedule(delay = 500): void {
     clearTimeout(this.timer);
     if (!this.ready || this.controller.signal.aborted) return;
@@ -659,25 +908,45 @@ export class RustRuntime {
   }
 
   private async poll(): Promise<void> {
-    let delay = 500;
+    const sseHealthy = this.hasEventStreamSupport()
+      && this.sseHealthyScopes.has("sessions")
+      && this.sseHealthyScopes.has("orchestration");
+    let delay = sseHealthy ? SSE_MAINTENANCE_INTERVAL_MS : 500;
     try {
       if (this.process.upgradePending && !this.starting && !this.stopping) {
         const connection = await this.process.completeDeferredUpgrade();
         if (connection && !connection.upgradeDeferred) {
           this.connection = connection;
           await this.refresh();
+          this.ensureEventStreams();
           return;
         }
         if (!connection) {
           this.connection = await this.process.start();
           await this.refresh();
+          this.ensureEventStreams();
           return;
         }
       }
+      this.ensureEventStreams();
       const { client } = this.current();
       const now = Date.now();
       const shouldPollDevices = now >= this.nextDevicesPollAt;
       if (shouldPollDevices) this.nextDevicesPollAt = now + 2_000;
+      if (sseHealthy) {
+        const devices = shouldPollDevices ? await client.devices(this.controller.signal).catch(() => null) : null;
+        if (devices && typeof this.store.setApiDevices === "function") {
+          this.store.setApiDevices(devices as unknown as JsonObject);
+        }
+        const hasActiveOrchestration = this.store.snapshot().orchestration?.runs?.some(
+          (run) => run["status"] === "active" || run["status"] === "running",
+        ) === true;
+        if (this.orchestrationRetryPending || !this.orchestrationReady || hasActiveOrchestration) {
+          await this.refresh();
+        }
+        delay = SSE_MAINTENANCE_INTERVAL_MS;
+        return;
+      }
       const [sessions, orchestration, devices] = await Promise.all([
         client.events({ scope: "sessions", afterSeq: this.sequence, limit: 100 }, this.controller.signal),
         client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 100 }, this.controller.signal),
@@ -696,6 +965,7 @@ export class RustRuntime {
         if (reattached) {
           this.connection = reattached;
           await this.refresh().catch(() => {});
+          this.ensureEventStreams();
         }
       }
     }
@@ -755,7 +1025,12 @@ export class RustRuntime {
   }
 
   readTimeline(id: string, query: TimelineQuery, signal: AbortSignal) { return this.current().client.timeline(id, query, AbortSignal.any([signal, this.controller.signal])); }
-  readTimelineChanges(id: string, after: number, signal: AbortSignal) { return this.current().client.events({ scope: `timeline:${id}`, afterSeq: after, limit: 100 }, AbortSignal.any([signal, this.controller.signal])); }
+  readTimelineChanges(id: string, after: number, signal: AbortSignal, waitMs = TIMELINE_LONG_POLL_WAIT_MS) {
+    return this.current().client.events(
+      { scope: `timeline:${id}`, afterSeq: after, limit: 100, ...(after >= 0 && waitMs > 0 ? { waitMs } : {}) },
+      AbortSignal.any([signal, this.controller.signal]),
+    );
+  }
   lookupTimeline(id: string, ids: string[], signal: AbortSignal) { return this.current().client.timelineLookup(id, ids, AbortSignal.any([signal, this.controller.signal])); }
   readTimelineText(id: string, record: string, query: TimelineTextQuery, signal: AbortSignal) { return this.current().client.timelineText(id, record, query, AbortSignal.any([signal, this.controller.signal])); }
 

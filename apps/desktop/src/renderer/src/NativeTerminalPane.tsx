@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { isReadOnlyTerminalStatus } from "../../shared/session-state";
 import type { NativeTerminalState, SessionInfo } from "../../shared/types";
 import { useLocale } from "./locale";
@@ -32,7 +32,6 @@ export const OVERLAY_SELECTORS = [
   '[data-slot="combobox-content"]',
   '[data-slot="menubar-content"]',
   '[data-slot="hover-card-content"]',
-  '[data-slot="tooltip-content"]',
   '[data-slot="sheet-content"]',
   '[data-slot="dialog-content"]',
   '[data-slot="alert-dialog-content"]',
@@ -40,21 +39,14 @@ export const OVERLAY_SELECTORS = [
   '[data-base-ui-portal] [role="alertdialog"]',
   '[data-base-ui-portal] [role="menu"]',
   '[data-base-ui-portal] [role="listbox"]',
-  '[data-base-ui-portal] [role="tooltip"]',
   '[data-radix-popper-content-wrapper]',
-  '.desktop-toast',
 ].join(",");
 
 const CLOSING_OR_HIDDEN_OVERLAY_SELECTOR = '[data-closed], [data-ending-style], [data-state="closed"], [aria-hidden="true"], [hidden], [inert]';
-const TOOLTIP_OVERLAY_SELECTOR = '[data-slot="tooltip-content"], [role="tooltip"]';
 
 function nodeIntersectsOverlay(node: Node): boolean {
   if (!(node instanceof Element)) return false;
   return node.matches(OVERLAY_SELECTORS) || Boolean(node.closest(OVERLAY_SELECTORS) || node.querySelector(OVERLAY_SELECTORS));
-}
-
-function isTooltipOverlay(element: HTMLElement): boolean {
-  return element.matches(TOOLTIP_OVERLAY_SELECTOR) || Boolean(element.closest(TOOLTIP_OVERLAY_SELECTOR));
 }
 
 export function overlayCovers(rect: DOMRect, hostElement?: HTMLElement | null): boolean {
@@ -66,10 +58,9 @@ export function overlayCovers(rect: DOMRect, hostElement?: HTMLElement | null): 
     const box = element.getBoundingClientRect();
     if (box.width <= 0 || box.height <= 0 || box.left >= rect.right || box.right <= rect.left || box.top >= rect.bottom || box.bottom <= rect.top) continue;
     const style = getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden") continue;
+    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") continue;
     const opacity = Number.parseFloat(style.opacity);
     if (style.opacity === "0" || (Number.isFinite(opacity) && opacity <= 0)) continue;
-    if (style.pointerEvents === "none" && !isTooltipOverlay(element)) continue;
     return true;
   }
   return false;
@@ -112,6 +103,33 @@ function requestSharedFlush(dirtyAll: boolean): void {
 
 function handleGlobalLayoutEvent(): void {
   requestSharedFlush(true);
+}
+
+function handleScrollEvent(event: Event): void {
+  const target = event.target;
+  if (
+    !target ||
+    target === document ||
+    target === document.documentElement ||
+    target === document.body
+  ) {
+    requestSharedFlush(true);
+    return;
+  }
+  if (target instanceof Node) {
+    if (nodeIntersectsOverlay(target)) {
+      requestSharedFlush(true);
+      return;
+    }
+    for (const subscriber of layoutSubscribers) {
+      const element = subscriber.getElement();
+      if (element && target.contains(element)) {
+        sharedDirtyTargets.add(target);
+        requestSharedFlush(false);
+        return;
+      }
+    }
+  }
 }
 
 function subscribeTerminalLayoutChanges(subscriber: TerminalLayoutSubscriber): () => void {
@@ -166,7 +184,7 @@ function subscribeTerminalLayoutChanges(subscriber: TerminalLayoutSubscriber): (
       ],
     });
     window.addEventListener("resize", handleGlobalLayoutEvent);
-    window.addEventListener("scroll", handleGlobalLayoutEvent, true);
+    window.addEventListener("scroll", handleScrollEvent, true);
     document.addEventListener("visibilitychange", handleGlobalLayoutEvent);
     document.documentElement.addEventListener("transitionend", handleGlobalLayoutEvent, true);
     document.documentElement.addEventListener("animationend", handleGlobalLayoutEvent, true);
@@ -185,7 +203,7 @@ function subscribeTerminalLayoutChanges(subscriber: TerminalLayoutSubscriber): (
       sharedDirtyTargets.clear();
       if (typeof document !== "undefined") {
         window.removeEventListener("resize", handleGlobalLayoutEvent);
-        window.removeEventListener("scroll", handleGlobalLayoutEvent, true);
+        window.removeEventListener("scroll", handleScrollEvent, true);
         document.removeEventListener("visibilitychange", handleGlobalLayoutEvent);
         document.documentElement.removeEventListener("transitionend", handleGlobalLayoutEvent, true);
         document.documentElement.removeEventListener("animationend", handleGlobalLayoutEvent, true);
@@ -281,6 +299,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
         return;
       }
       if (autoRetryCount.current < 3) {
+        // A scheduled recovery is connecting, not a terminal failure banner.
         const syncing = { ...stateRef.current, connected: false, syncing: true, controller: false, readOnly: true };
         stateRef.current = syncing;
         setState(syncing);
@@ -438,8 +457,25 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     const id = nativeId.current;
     const element = host.current;
     if (id === undefined || !element?.isConnected) return;
+    if (!activeRef.current || document.visibilityState !== "visible") {
+      if (occludedRef.current) {
+        occludedRef.current = false;
+        setOccluded(false);
+      }
+      pendingFocus.current = undefined;
+      const hiddenBounds = { x: 0, y: 0, width: 0, height: 0, visible: false, focus: false };
+      const hiddenKey = '{"x":0,"y":0,"width":0,"height":0,"visible":false,"focus":false}';
+      if (lastBounds.current === hiddenKey) return;
+      lastBounds.current = hiddenKey;
+      void window.prospero.nativeTerminal.update(id, hiddenBounds)
+        .catch(reason => {
+          const message = displayError(reason);
+          if (nativeId.current === id && !closedNativeIds.current.has(id) && !message.toLowerCase().includes("no longer open")) lastNativeError.current = message;
+        });
+      return;
+    }
     const rect = element.getBoundingClientRect();
-    const hasArea = activeRef.current && document.visibilityState === "visible" && rect.width > 0 && rect.height > 0;
+    const hasArea = rect.width > 0 && rect.height > 0;
     const isOccluded = hasArea && overlayCovers(rect, element);
     if (occludedRef.current !== isOccluded) {
       occludedRef.current = isOccluded;
@@ -467,7 +503,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     });
   }, [flushBounds]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (mode !== "native") {
       if (occludedRef.current) {
         occludedRef.current = false;
@@ -487,7 +523,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
       getElement: () => host.current,
       onFlush: flushBounds,
     });
-    scheduleBounds();
+    flushBounds();
     return () => {
       resizeObserver.disconnect();
       unsubscribeLayout();
@@ -496,10 +532,10 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     };
   }, [mode, active, focused, flushBounds, scheduleBounds]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     pendingFocus.current = focused;
-    scheduleBounds();
-  }, [focused, scheduleBounds]);
+    flushBounds();
+  }, [focused, flushBounds]);
 
   useEffect(() => {
     if (mode !== "native" || nativeIdValue === undefined) return;

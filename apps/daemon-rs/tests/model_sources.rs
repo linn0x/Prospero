@@ -606,4 +606,3 @@ async fn source_enriches_glm_routes_with_published_effort_levels() {
         1_048_576
     );
 }
-

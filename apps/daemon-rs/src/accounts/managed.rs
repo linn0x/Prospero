@@ -867,7 +867,11 @@ impl crate::database::Store {
         let label = match agent {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
-            _ => return Err(Error::Invalid("当前仅支持 Claude 与 Codex 订阅账号托管".into())),
+            _ => {
+                return Err(Error::Invalid(
+                    "当前仅支持 Claude 与 Codex 订阅账号托管".into(),
+                ));
+            }
         };
         let name = clean_name(raw_name)?;
         let existing = self.list_managed_accounts(data)?;

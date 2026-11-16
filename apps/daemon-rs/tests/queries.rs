@@ -557,10 +557,18 @@ fn workspace_tabs_track_open_sessions_archive_and_explicit_reordering() {
     let b = create(&mut store, "Second", "/alpha");
     let c = create(&mut store, "Third", "/beta");
     let tabs = store.workspace_tabs().unwrap();
-    let alpha = tabs.items.iter().find(|item| item.workspace == "/alpha").unwrap();
+    let alpha = tabs
+        .items
+        .iter()
+        .find(|item| item.workspace == "/alpha")
+        .unwrap();
     assert_eq!(alpha.open_session_ids, vec![a.id.clone(), b.id.clone()]);
     assert_eq!(alpha.active_session_id.as_deref(), Some(b.id.as_str()));
-    let beta = tabs.items.iter().find(|item| item.workspace == "/beta").unwrap();
+    let beta = tabs
+        .items
+        .iter()
+        .find(|item| item.workspace == "/beta")
+        .unwrap();
     assert_eq!(beta.open_session_ids, vec![c.id.clone()]);
     assert_eq!(beta.active_session_id.as_deref(), Some(c.id.as_str()));
 
@@ -588,7 +596,11 @@ fn workspace_tabs_track_open_sessions_archive_and_explicit_reordering() {
         )
         .unwrap();
     let tabs = store.workspace_tabs().unwrap();
-    let alpha = tabs.items.iter().find(|item| item.workspace == "/alpha").unwrap();
+    let alpha = tabs
+        .items
+        .iter()
+        .find(|item| item.workspace == "/alpha")
+        .unwrap();
     assert_eq!(alpha.open_session_ids, vec![b.id.clone()]);
     assert_eq!(alpha.active_session_id.as_deref(), Some(b.id.as_str()));
     assert_eq!(alpha.split_session_id, None);

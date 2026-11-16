@@ -503,11 +503,8 @@ impl Store {
     pub(crate) fn orchestration_revision(&self) -> Result<i64> {
         Ok(self
             .connection
-            .query_row(
-                "SELECT revision FROM orch_change_stamp WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT revision FROM orch_change_stamp WHERE id = 1")?
+            .query_row([], |row| row.get(0))
             .optional()?
             .unwrap_or(0))
     }
@@ -632,9 +629,8 @@ impl Store {
         validate_id(id)?;
         let json: String = self
             .connection
-            .query_row("SELECT payload FROM session_heads WHERE id=?", [id], |r| {
-                r.get(0)
-            })
+            .prepare_cached("SELECT payload FROM session_heads WHERE id=?")?
+            .query_row([id], |r| r.get(0))
             .optional()?
             .ok_or(Error::NotFound)?;
         Ok(serde_json::from_str(&json)?)
@@ -1054,29 +1050,30 @@ impl Store {
                 "event metadata too large; use content chunks".into(),
             ));
         }
-        transaction.execute("INSERT INTO stream_heads(scope,last_seq,floor_seq) VALUES(?1,0,0) ON CONFLICT(scope) DO NOTHING", [scope])?;
-        let previous: i64 = transaction.query_row(
-            "SELECT last_seq FROM stream_heads WHERE scope=?",
-            [scope],
-            |r| r.get(0),
-        )?;
+        transaction
+            .prepare_cached(
+                "INSERT INTO stream_heads(scope,last_seq,floor_seq) VALUES(?1,0,0) ON CONFLICT(scope) DO NOTHING",
+            )?
+            .execute([scope])?;
+        let previous: i64 = transaction
+            .prepare_cached("SELECT last_seq FROM stream_heads WHERE scope=?")?
+            .query_row([scope], |r| r.get(0))?;
         if previous >= MAX_SAFE_INTEGER {
             return Err(Error::Conflict);
         }
         let seq = previous + 1;
         let floor = seq.saturating_sub(EVENT_RETENTION).max(0);
-        transaction.execute(
-            "INSERT INTO change_events(scope,seq,kind,entity_id,payload) VALUES(?1,?2,?3,?4,?5)",
-            params![scope, seq, kind, id, json],
-        )?;
-        transaction.execute(
-            "UPDATE stream_heads SET last_seq=?1,floor_seq=?2 WHERE scope=?3",
-            params![seq, floor, scope],
-        )?;
-        transaction.execute(
-            "DELETE FROM change_events WHERE scope=?1 AND seq<=?2",
-            params![scope, floor],
-        )?;
+        transaction
+            .prepare_cached(
+                "INSERT INTO change_events(scope,seq,kind,entity_id,payload) VALUES(?1,?2,?3,?4,?5)",
+            )?
+            .execute(params![scope, seq, kind, id, json])?;
+        transaction
+            .prepare_cached("UPDATE stream_heads SET last_seq=?1,floor_seq=?2 WHERE scope=?3")?
+            .execute(params![seq, floor, scope])?;
+        transaction
+            .prepare_cached("DELETE FROM change_events WHERE scope=?1 AND seq<=?2")?
+            .execute(params![scope, floor])?;
         Ok(seq)
     }
 
@@ -1087,11 +1084,8 @@ impl Store {
         }
         let transaction = self.connection.transaction()?;
         let (latest, floor): (i64, i64) = transaction
-            .query_row(
-                "SELECT last_seq,floor_seq FROM stream_heads WHERE scope=?",
-                [scope],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .prepare_cached("SELECT last_seq,floor_seq FROM stream_heads WHERE scope=?")?
+            .query_row([scope], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?
             .unwrap_or((0, 0));
         if after > latest {
@@ -1174,32 +1168,32 @@ impl Store {
             return Err(Error::Invalid("invalid content chunk size".into()));
         }
         let transaction = self.connection.transaction()?;
-        let present: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?)",
-            [session_id],
-            |r| r.get(0),
-        )?;
+        let present: bool = transaction
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?)")?
+            .query_row([session_id], |r| r.get(0))?;
         if !present {
             return Err(Error::NotFound);
         }
-        transaction.execute("INSERT INTO content_heads(session_id,id,bytes) VALUES(?1,?2,0) ON CONFLICT(session_id,id) DO NOTHING", params![session_id, content_id])?;
-        let offset: i64 = transaction.query_row(
-            "SELECT bytes FROM content_heads WHERE session_id=?1 AND id=?2",
-            params![session_id, content_id],
-            |r| r.get(0),
-        )?;
+        transaction
+            .prepare_cached(
+                "INSERT INTO content_heads(session_id,id,bytes) VALUES(?1,?2,0) ON CONFLICT(session_id,id) DO NOTHING",
+            )?
+            .execute(params![session_id, content_id])?;
+        let offset: i64 = transaction
+            .prepare_cached("SELECT bytes FROM content_heads WHERE session_id=?1 AND id=?2")?
+            .query_row(params![session_id, content_id], |r| r.get(0))?;
         if offset != expected_offset {
             return Err(Error::Conflict);
         }
         let next = offset + bytes.len() as i64;
-        transaction.execute(
-            "INSERT INTO content_chunks(session_id,content_id,offset,body) VALUES(?1,?2,?3,?4)",
-            params![session_id, content_id, offset, bytes],
-        )?;
-        transaction.execute(
-            "UPDATE content_heads SET bytes=?1 WHERE session_id=?2 AND id=?3",
-            params![next, session_id, content_id],
-        )?;
+        transaction
+            .prepare_cached(
+                "INSERT INTO content_chunks(session_id,content_id,offset,body) VALUES(?1,?2,?3,?4)",
+            )?
+            .execute(params![session_id, content_id, offset, bytes])?;
+        transaction
+            .prepare_cached("UPDATE content_heads SET bytes=?1 WHERE session_id=?2 AND id=?3")?
+            .execute(params![next, session_id, content_id])?;
         transaction.commit()?;
         Ok(next)
     }
@@ -1226,11 +1220,10 @@ impl Store {
         if !(1..=MAX_PAGE_ITEMS).contains(&limit) {
             return Err(Error::Invalid("invalid content page limit".into()));
         }
-        let exists: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?)",
-            [session_id],
-            |row| row.get(0),
-        )?;
+        let exists: bool = self
+            .connection
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?)")?
+            .query_row([session_id], |row| row.get(0))?;
         if !exists {
             return Err(Error::NotFound);
         }
@@ -1274,11 +1267,8 @@ impl Store {
         }
         let length: i64 = self
             .connection
-            .query_row(
-                "SELECT bytes FROM content_heads WHERE session_id=?1 AND id=?2",
-                params![session_id, content_id],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT bytes FROM content_heads WHERE session_id=?1 AND id=?2")?
+            .query_row(params![session_id, content_id], |r| r.get(0))
             .optional()?
             .ok_or(Error::NotFound)?;
         if offset > length {

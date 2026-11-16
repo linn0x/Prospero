@@ -1,7 +1,7 @@
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MARKDOWN_STREAM_THROTTLE_MS, MarkdownContent, createMarkdownStreamThrottle } from "../src/renderer/src/chat/MarkdownContent";
+import { MARKDOWN_STREAM_THROTTLE_MS, MarkdownContent, createMarkdownStreamThrottle, splitStreamingMarkdown } from "../src/renderer/src/chat/MarkdownContent";
 import { LocaleProvider } from "../src/renderer/src/locale";
 
 function render(value: string, projectRoot?: string): string {
@@ -44,6 +44,16 @@ describe("Markdown rendering", () => {
 
     const labelled = render("```js\nfunction demo() { return 42; }\n```");
     expect(labelled).toContain("hljs-keyword");
+
+    for (const sample of [
+      "```ts\nconst x: number = 1;\n```",
+      "```rust\npub fn main() {}\n```",
+      "```toml\n[package]\nname = \"demo\"\n```",
+      "```dockerfile\nFROM alpine:3.20\nRUN echo ok\n```",
+      "```zig\npub fn main() void { const x = @import(\"std\"); _ = x; }\n```",
+    ]) {
+      expect(render(sample)).toContain("hljs-");
+    }
   });
   it("throttles rapid streaming Markdown deltas to ~65ms intervals and flushes final text via trailing timer or completion", () => {
     vi.useFakeTimers();
@@ -70,5 +80,13 @@ describe("Markdown rendering", () => {
 
     throttle.dispose();
     vi.useRealTimers();
+  });
+  it("splits long streaming markdown at completed top-level block boundaries without breaking open code fences", () => {
+    const completedPrefix = `${"Paragraph one with detailed technical explanation. ".repeat(6)}\n\n${"Paragraph two with another completed block. ".repeat(6)}\n\n`;
+    const activeTail = "```ts\nconst streaming = true;\n\nconst stillInsideFence = 1;";
+    const split = splitStreamingMarkdown(completedPrefix + activeTail);
+    expect(split).not.toBeNull();
+    expect(split?.prefix).toBe(completedPrefix);
+    expect(split?.tail).toBe(activeTail);
   });
 });

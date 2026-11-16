@@ -5,6 +5,8 @@ import remarkMath from "remark-math";
 import remarkGemoji from "remark-gemoji";
 import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
+import { common, type LanguageFn } from "lowlight";
+import dockerfile from "highlight.js/lib/languages/dockerfile";
 import { Check, Copy, FileImage } from "lucide-react";
 import type { Element, Nodes } from "hast";
 import { Button } from "../components/ui/button";
@@ -18,10 +20,42 @@ import "katex/dist/katex.min.css";
 
 export const MARKDOWN_STREAM_THROTTLE_MS = 65;
 
+const zigLanguage: LanguageFn = (hljs) => ({
+  name: "Zig",
+  aliases: ["zig"],
+  keywords: {
+    keyword:
+      "addrspace align allowzero and anyframe anytype asm async await break callconv catch comptime const continue defer else enum errdefer error export extern fn for if inline noalias nosuspend noinline opaque or orelse packed pub resume return linksection struct suspend switch test threadlocal try union unreachable usingnamespace var volatile while",
+    literal: "true false null undefined",
+    type:
+      "bool f16 f32 f64 f80 f128 usize isize c_char c_short c_ushort c_int c_uint c_long c_ulong c_longlong c_ulonglong c_longdouble anyerror void noreturn type comptime_int comptime_float",
+  },
+  contains: [
+    hljs.C_LINE_COMMENT_MODE,
+    hljs.QUOTE_STRING_MODE,
+    hljs.APOS_STRING_MODE,
+    hljs.C_NUMBER_MODE,
+    { className: "built_in", begin: /@[A-Za-z_]\w*/ },
+    { className: "type", begin: /\b[iu]\d+\b/ },
+  ],
+});
+
+export const MARKDOWN_HIGHLIGHT_LANGUAGES: Record<string, LanguageFn> = {
+  ...common,
+  dockerfile,
+  ...(common.ini ? { toml: common.ini } : {}),
+  zig: zigLanguage,
+};
+
+const highlightAliases: Record<string, string[]> = {
+  dockerfile: ["docker"],
+  ini: ["toml"],
+};
+
 const remarkPlugins: NonNullable<ComponentProps<typeof ReactMarkdown>["remarkPlugins"]> = [remarkGfm, remarkMath, remarkGemoji];
 const rehypePlugins: NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]> = [
   rehypeKatex,
-  [rehypeHighlight, { detect: false }],
+  [rehypeHighlight, { detect: false, languages: MARKDOWN_HIGHLIGHT_LANGUAGES, aliases: highlightAliases }],
 ];
 
 function nodeText(node: Nodes): string {
@@ -119,17 +153,73 @@ function useThrottledMarkdownValue(value: string, streaming?: boolean): string {
   return streaming === false ? value : rendered;
 }
 
-const MemoizedMarkdownBody = memo(function MemoizedMarkdownBody({
-  value,
+export function splitStreamingMarkdown(content: string): { prefix: string; tail: string } | null {
+  if (content.length < 400) return null;
+  if (/^\s*\[[^\]]+\]:/m.test(content) || /\[\^[^\]]+\]/.test(content)) return null;
+
+  const lines = content.split("\n");
+  let inFence: { char: string; length: number } | null = null;
+  let inMathBlock = false;
+  let offset = 0;
+  let lastSafeSplitOffset = -1;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+
+    if (inFence) {
+      const closeMatch = trimmed.match(/^(`{3,}|~{3,})\s*$/);
+      if (closeMatch && closeMatch[1]![0] === inFence.char && closeMatch[1]!.length >= inFence.length) {
+        inFence = null;
+      }
+    } else {
+      const openMatch = trimmed.match(/^(`{3,}|~{3,})/);
+      if (openMatch) {
+        const marker = openMatch[1]!;
+        const rest = trimmed.slice(marker.length);
+        if (!rest.includes(marker)) {
+          inFence = { char: marker[0]!, length: marker.length };
+        }
+      } else {
+        const mathMatches = line.match(/\$\$/g);
+        if (mathMatches && mathMatches.length % 2 === 1) {
+          inMathBlock = !inMathBlock;
+        }
+      }
+    }
+
+    const lineEndOffset = offset + line.length + (i < lines.length - 1 ? 1 : 0);
+    if (!inFence && !inMathBlock && trimmed === "" && i + 1 < lines.length) {
+      const nextLine = lines[i + 1]!;
+      const nextTrimmed = nextLine.trim();
+      if (
+        nextTrimmed.length > 0 &&
+        !/^(?: {2,}|\t)/.test(nextLine) &&
+        !/^\s*(?:[-*+]|\d+[.)]|\||>)/.test(nextLine)
+      ) {
+        lastSafeSplitOffset = lineEndOffset;
+      }
+    }
+    offset = lineEndOffset;
+  }
+
+  if (lastSafeSplitOffset <= 0 || lastSafeSplitOffset >= content.length) return null;
+  return {
+    prefix: content.slice(0, lastSafeSplitOffset),
+    tail: content.slice(lastSafeSplitOffset),
+  };
+}
+
+const MemoizedMarkdownChunk = memo(function MemoizedMarkdownChunk({
+  content,
   onError,
   projectRoot,
 }: {
-  value: string;
+  content: string;
   onError: (message?: string) => void;
   projectRoot?: string | undefined;
 }) {
   const { t } = useLocale();
-  const content = useMemo(() => normalizeMathDelimiters(terminalPlainText(value)), [value]);
   const components = useMemo<Components>(() => {
     const open = (href: string): void => { void window.prospero.openExternal(href).catch((reason: unknown) => onError(reportError(reason))); };
     return {
@@ -155,10 +245,35 @@ const MemoizedMarkdownBody = memo(function MemoizedMarkdownBody({
     [projectRoot],
   );
   return (
+    <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={components} urlTransform={urlTransform} skipHtml>
+      {content}
+    </ReactMarkdown>
+  );
+});
+
+const MemoizedMarkdownBody = memo(function MemoizedMarkdownBody({
+  value,
+  onError,
+  projectRoot,
+  streaming,
+}: {
+  value: string;
+  onError: (message?: string) => void;
+  projectRoot?: string | undefined;
+  streaming?: boolean | undefined;
+}) {
+  const content = useMemo(() => normalizeMathDelimiters(terminalPlainText(value)), [value]);
+  const split = useMemo(() => (streaming ? splitStreamingMarkdown(content) : null), [content, streaming]);
+  return (
     <div className="chat-prose chat-markdown">
-      <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={components} urlTransform={urlTransform} skipHtml>
-        {content}
-      </ReactMarkdown>
+      {split ? (
+        <>
+          <MemoizedMarkdownChunk content={split.prefix} onError={onError} projectRoot={projectRoot} />
+          <MemoizedMarkdownChunk content={split.tail} onError={onError} projectRoot={projectRoot} />
+        </>
+      ) : (
+        <MemoizedMarkdownChunk content={content} onError={onError} projectRoot={projectRoot} />
+      )}
     </div>
   );
 });
@@ -175,5 +290,5 @@ export const MarkdownContent = memo(function MarkdownContent({
   streaming?: boolean | undefined;
 }) {
   const throttled = useThrottledMarkdownValue(value, streaming);
-  return <MemoizedMarkdownBody value={throttled} onError={onError} projectRoot={projectRoot} />;
+  return <MemoizedMarkdownBody value={throttled} onError={onError} projectRoot={projectRoot} streaming={streaming} />;
 });

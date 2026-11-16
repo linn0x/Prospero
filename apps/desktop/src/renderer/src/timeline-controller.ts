@@ -6,7 +6,16 @@ import { pageRequest } from "./page-request";
 type TimelineApi = Pick<DesktopApi, "readTimeline" | "readTimelineChanges" | "lookupTimeline" | "cancelSessionPage">;
 export type TimelineState = { page: TimelinePage | undefined; loading: boolean; error: string | undefined; live: boolean };
 export const MAX_TURN_CONTINUATION_PAGES = 8;
+export const IDLE_POLL_MS = 500;
+export const ACTIVE_POLL_MS = 32;
+export const LONG_POLL_REENTER_MS = 20;
+const LONG_POLL_HELD_THRESHOLD_MS = 1000;
 const latest: TimelineQuery = { before: null, after: null, limit: 40 };
+
+export type TimelineControllerOptions = {
+  initialPage?: TimelinePage;
+  onPage?: (page: TimelinePage) => void;
+};
 
 export class TimelineController {
   private state: TimelineState = { page: undefined, loading: false, error: undefined, live: true };
@@ -19,11 +28,30 @@ export class TimelineController {
   private loadFailed = false;
   private sequence = 0;
   private failures = 0;
+  private readonly onPage: ((page: TimelinePage) => void) | undefined;
 
-  constructor(private readonly api: TimelineApi, readonly sessionId: string) {}
+  constructor(private readonly api: TimelineApi, readonly sessionId: string, options?: TimelineControllerOptions) {
+    this.onPage = options?.onPage;
+    if (options?.initialPage) {
+      this.state = { page: options.initialPage, loading: false, error: undefined, live: true };
+      this.sequence = options.initialPage.revision;
+    }
+  }
   getSnapshot = (): TimelineState => this.state;
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener); };
-  start(): void { if (!this.active) { this.active = true; void this.load(latest, true); } }
+  start(): void {
+    if (!this.active) {
+      this.active = true;
+      if (this.state.page) {
+        this.controller.abort();
+        clearTimeout(this.timer);
+        this.controller = new AbortController();
+        void this.poll();
+      } else {
+        void this.load(latest, true);
+      }
+    }
+  }
   stop(): void { this.active = false; this.controller.abort(); clearTimeout(this.timer); this.publish({ page: undefined, loading: false, error: undefined, live: true }); }
   older(): Promise<void> { return this.state.page?.older ? this.load({ before: this.state.page.older, after: null, limit: 40 }, false) : Promise.resolve(); }
   newer(): Promise<void> { return this.state.page?.newer ? this.load({ before: null, after: this.state.page.newer, limit: 40 }, false) : Promise.resolve(); }
@@ -37,7 +65,11 @@ export class TimelineController {
     }
   }
 
-  private publish(state: TimelineState): void { this.state = state; for (const listener of this.listeners) listener(); }
+  private publish(state: TimelineState): void {
+    this.state = state;
+    if (state.page && state.live) this.onPage?.(state.page);
+    for (const listener of this.listeners) listener();
+  }
 
   private async load(query: TimelineQuery, live: boolean, silent = false): Promise<void> {
     if (!this.active) return;
@@ -56,7 +88,12 @@ export class TimelineController {
       this.query = query; this.sequence = page.revision; this.failures = 0; this.loadFailed = false;
       this.publish({ page, loading: false, error: undefined, live });
     } catch { if (!controller.signal.aborted) { this.failures++; this.loadFailed = true; this.publish({ ...this.state, loading: false, error: silent && this.state.page ? "会话更新暂不可用，正在重试" : "无法读取会话记录，请重试" }); } }
-    finally { if (!controller.signal.aborted) this.schedule(Math.min(8000, 500 * 2 ** Math.min(this.failures, 4))); }
+    finally {
+      if (!controller.signal.aborted) {
+        const baseDelay = silent && this.failures === 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+        this.schedule(Math.min(8000, baseDelay * 2 ** Math.min(this.failures, 4)));
+      }
+    }
   }
 
   private validate(items: TimelineRecord[]): void {
@@ -112,18 +149,20 @@ export class TimelineController {
     };
   }
 
-  private schedule(delay = 500): void {
+  private schedule(delay = IDLE_POLL_MS): void {
     clearTimeout(this.timer);
     if (this.active && !this.controller.signal.aborted) this.timer = setTimeout(() => { void this.poll(); }, delay);
   }
 
   private async poll(): Promise<void> {
     const controller = this.controller;
-    let delay = 500;
+    let delay = IDLE_POLL_MS;
     try {
       const page = this.state.page;
       if (!page || this.loadFailed) { await this.load(this.attemptedQuery, this.state.live, Boolean(page)); return; }
+      const startedAt = Date.now();
       const changes = await pageRequest(this.api, controller.signal, id => this.api.readTimelineChanges(this.sessionId, this.sequence, id));
+      const elapsed = Date.now() - startedAt;
       if (controller.signal.aborted) return;
       if (changes.resyncRequired) { await this.load(this.query, this.state.live, true); return; }
       const notices = changes.items.filter(event => event.kind === "timeline.updated" && event.scope === `timeline:${this.sessionId}`);
@@ -150,7 +189,10 @@ export class TimelineController {
         this.publish({ ...this.state, error: undefined, page: { ...page, items, latestPosition, revision: changes.nextSeq, newer: last && last < latestPosition ? last : null } });
       }
       if (changes.hasMore) delay = 0;
-    } catch { if (!controller.signal.aborted) { this.failures++; delay = Math.min(8000, 500 * 2 ** Math.min(this.failures, 4)); this.publish({ ...this.state, error: "会话更新暂不可用，正在重试" }); } }
+      else if (changes.items.length > 0) delay = ACTIVE_POLL_MS;
+      else if (elapsed >= LONG_POLL_HELD_THRESHOLD_MS) delay = LONG_POLL_REENTER_MS;
+      else delay = IDLE_POLL_MS;
+    } catch { if (!controller.signal.aborted) { this.failures++; delay = Math.min(8000, IDLE_POLL_MS * 2 ** Math.min(this.failures, 4)); this.publish({ ...this.state, error: "会话更新暂不可用，正在重试" }); } }
     finally { if (!controller.signal.aborted) this.schedule(delay); }
   }
 }

@@ -28,6 +28,7 @@ class FakeDaemonSocket extends EventEmitter {
       latestSeq?: number;
       exited?: boolean;
       historyGapOnAfterSeq?: boolean;
+      fatalErrorMessage?: string;
     } = {},
   ) {
     super();
@@ -54,6 +55,23 @@ class FakeDaemonSocket extends EventEmitter {
       const controller = Boolean(payload.wantControl) && !exited;
       queueMicrotask(() => {
         if (this.closed) return;
+        if (this.behavior.fatalErrorMessage) {
+          this.emit(
+            "message",
+            Buffer.from(
+              encodeTerminalFrame({
+                kind: TerminalStreamKind.Error,
+                sequence: 0,
+                payload: new TextEncoder().encode(
+                  JSON.stringify({ code: "busy", message: this.behavior.fatalErrorMessage, recoverable: false }),
+                ),
+              }),
+            ),
+          );
+          this.closed = true;
+          this.emit("close", 1006, Buffer.alloc(0));
+          return;
+        }
         if (payload.epoch && payload.epoch !== epoch) {
           this.emit(
             "message",
@@ -67,6 +85,8 @@ class FakeDaemonSocket extends EventEmitter {
               }),
             ),
           );
+          this.closed = true;
+          this.emit("close", 1006, Buffer.alloc(0));
           return;
         }
         if (payload.afterSeq !== undefined && this.behavior.historyGapOnAfterSeq) {
@@ -82,6 +102,8 @@ class FakeDaemonSocket extends EventEmitter {
               }),
             ),
           );
+          this.closed = true;
+          this.emit("close", 1006, Buffer.alloc(0));
           return;
         }
         this.emit(
@@ -206,7 +228,7 @@ class FakeDaemonSocket extends EventEmitter {
   }
 }
 
-describe("NativeGhosttyManager retained streams", () => {
+describe("NativeGhosttyManager optimizations & URL handling", () => {
   it("formats direct: command when paths have no whitespace and falls back to /bin/sh without /bin/zsh -l", () => {
     expect(surfaceCommand("/opt/prospero/prospero-terminal-relay", "/tmp/prospero-sock/relay.sock")).toBe(
       "direct:/opt/prospero/prospero-terminal-relay /tmp/prospero-sock/relay.sock",
@@ -219,6 +241,46 @@ describe("NativeGhosttyManager retained streams", () => {
     expect(withSpaces.startsWith("/bin/sh -c ")).toBe(true);
     expect(withSpaces).not.toContain("zsh");
     expect(withSpaces).toContain("exec ");
+  });
+
+  it("normalizes URLs from addon.onOpenUrl and rejects unsafe schemes", () => {
+    let openUrlHandler: ((id: number, url: string) => void) | undefined;
+    const openedUrls: string[] = [];
+    const addon: NativeGhosttyAddon = {
+      initialize: vi.fn(),
+      create: vi.fn(() => 1),
+      update: vi.fn(),
+      destroy: vi.fn(),
+      onOpenUrl: handler => {
+        openUrlHandler = handler;
+      },
+    };
+
+    const manager = new NativeGhosttyManager(
+      tmpdir(),
+      () => new FakeDaemonSocket() as never,
+      async () => true,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => false,
+      url => {
+        openedUrls.push(url);
+      },
+      addon,
+    );
+
+    expect(manager.availability().available).toBe(true);
+    expect(openUrlHandler).toBeTypeOf("function");
+
+    openUrlHandler!(1, "https://example.com/docs");
+    openUrlHandler!(1, "mailto:team@example.com");
+    openUrlHandler!(1, "javascript:alert(1)");
+    openUrlHandler!(1, "data:text/html,<h1>x</h1>");
+
+    expect(openedUrls).toEqual(["https://example.com/docs", "mailto:team@example.com"]);
+    manager.shutdown();
   });
 
   it("keeps legacy hosts attached, resumes checkpoint-capable hosts, and reconciles resize checkpoints", async () => {
@@ -285,6 +347,7 @@ describe("NativeGhosttyManager retained streams", () => {
       () => undefined,
       () => undefined,
       () => false,
+      undefined,
       addon,
       readSnapshot,
     );
@@ -359,10 +422,19 @@ describe("NativeGhosttyManager retained streams", () => {
       expect(addon.setGrid).toHaveBeenLastCalledWith(id, 80, 12);
       expect(errors).toEqual([]);
 
-      // Do not detach while a resize checkpoint is still being consumed.
+      // Do not detach while a resize checkpoint is still being consumed, and allow user input during resize reconciliation without read-only errors.
       let resolveCheckpoint!: (value: Awaited<ReturnType<typeof readSnapshot>>) => void;
       readSnapshot.mockImplementationOnce(() => new Promise(resolve => { resolveCheckpoint = resolve; }));
       emit(TerminalStreamKind.Resize, 6, new Uint8Array([0, 80, 0, 10]));
+      await flushIo();
+      const sendRelayInput = (text: string) => {
+        const body = Buffer.from(text, "utf8");
+        const header = Buffer.alloc(5);
+        header[0] = "I".charCodeAt(0);
+        header.writeUInt32BE(body.byteLength, 1);
+        peers[0]!.write(Buffer.concat([header, body]));
+      };
+      sendRelayInput("\x1bP>|ghostty 1.3.1\x1b\\\x1b[?2026;2$y\x1b[?7u");
       await flushIo();
       manager.update(id, { x: 0, y: 0, width: 0, height: 0, visible: false });
       await vi.advanceTimersByTimeAsync(HIDDEN_STREAM_SUSPEND_DELAY_MS + 50);
@@ -373,6 +445,9 @@ describe("NativeGhosttyManager retained streams", () => {
       await vi.advanceTimersByTimeAsync(HIDDEN_STREAM_SUSPEND_DELAY_MS + 50);
       await flushIo();
       expect(sockets[1]!.closed).toBe(true);
+      // Automatic focus/mouse events while suspended must not emit spurious read-only errors.
+      sendRelayInput("\x1b[I\x1b[O");
+      await flushIo();
       expect(errors).toEqual([]);
     } finally {
       for (const peer of peers) peer.destroy();
@@ -433,7 +508,7 @@ describe("NativeGhosttyManager retained streams", () => {
       setGrid: vi.fn(),
     };
 
-    let socketMode: "normal" | "gap" | "exited" = "normal";
+    let socketMode: "normal" | "gap" | "exited" | "fatal" = "normal";
     const manager = new NativeGhosttyManager(
       tmpdir(),
       () => {
@@ -442,7 +517,9 @@ describe("NativeGhosttyManager retained streams", () => {
             ? new FakeDaemonSocket({ epoch: "e2", latestSeq: 5 })
             : socketMode === "exited"
               ? new FakeDaemonSocket({ epoch: "e3", latestSeq: 3, exited: true })
-              : new FakeDaemonSocket({ epoch: "e1", latestSeq: 2 });
+              : socketMode === "fatal"
+                ? new FakeDaemonSocket({ fatalErrorMessage: "Too many terminal viewers" })
+                : new FakeDaemonSocket({ epoch: "e1", latestSeq: 2 });
         if (socketMode === "gap") socketMode = "normal";
         sockets.push(sock);
         queueMicrotask(() => sock.open());
@@ -458,6 +535,7 @@ describe("NativeGhosttyManager retained streams", () => {
       () => undefined,
       () => undefined,
       () => false,
+      undefined,
       addon,
     );
 
@@ -504,6 +582,19 @@ describe("NativeGhosttyManager retained streams", () => {
         exited: true,
         readOnly: true,
         controller: false,
+      });
+
+      // 3. Same-tick fatal Error + WebSocket close(1006) preserves server error message instead of masking with code 1006.
+      socketMode = "fatal";
+      const fatalId = await manager.open(fakeWindow as never, 9, "sess-fatal", 13);
+      await flushIo();
+      expect(errors).toContain("Too many terminal viewers");
+      expect(errors.some(msg => msg.includes("1006"))).toBe(false);
+      expect(statesBySurface.get(fatalId)?.at(-1)).toMatchObject({
+        connected: false,
+        syncing: false,
+        exited: false,
+        readOnly: true,
       });
     } finally {
       for (const peer of peers) peer.destroy();

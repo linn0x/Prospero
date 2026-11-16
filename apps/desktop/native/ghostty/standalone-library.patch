@@ -1,5 +1,5 @@
 diff --git a/build.zig b/build.zig
-index f9d861b..7ddfb28 100644
+index f9d861b19..7ddfb282d 100644
 --- a/build.zig
 +++ b/build.zig
 @@ -138,7 +138,11 @@ pub fn build(b: *std.Build) !void {
@@ -34,7 +34,7 @@ index f9d861b..7ddfb28 100644
                  b,
                  &deps,
 diff --git a/pkg/macos/video/display_link.zig b/pkg/macos/video/display_link.zig
-index 7d6b437..a335eaa 100644
+index 7d6b437f9..a335eaa6c 100644
 --- a/pkg/macos/video/display_link.zig
 +++ b/pkg/macos/video/display_link.zig
 @@ -1,21 +1,27 @@
@@ -72,10 +72,197 @@ index 7d6b437..a335eaa 100644
  
      pub fn release(self: *DisplayLink) void {
 diff --git a/src/Surface.zig b/src/Surface.zig
-index 4d66622..d56ff31 100644
+index 4d66622e3..8ffd3bbbf 100644
 --- a/src/Surface.zig
 +++ b/src/Surface.zig
-@@ -3415,28 +3415,10 @@ pub fn scrollCallback(
+@@ -250,6 +250,10 @@ const Mouse = struct {
+     /// True if the mouse position is currently over a link.
+     over_link: bool = false,
+ 
++    /// True when a left mouse press was consumed by a link so the matching
++    /// drag/release is not forwarded to terminal mouse reporting.
++    link_press_swallowed: bool = false,
++
+     /// The last x/y in the cursor position for links. We use this to
+     /// only process link hover events when the mouse actually moves cells.
+     link_point: ?terminal.point.Coordinate = null,
+@@ -607,7 +611,7 @@ pub fn init(
+     };
+ 
+     // The command we're going to execute
+-    const command: ?configpkg.Command = command: {
++    const raw_command: ?configpkg.Command = command: {
+         if (app.first) {
+             if (config.@"initial-command") |command| {
+                 break :command command;
+@@ -616,6 +620,30 @@ pub fn init(
+         break :command config.command;
+     };
+ 
++    var cmd_arena = ArenaAllocator.init(alloc);
++    defer cmd_arena.deinit();
++    var parsed_cli_command = false;
++    const command: ?configpkg.Command = command: {
++        if (raw_command) |raw| switch (raw) {
++            .shell => |s| {
++                const trimmed = std.mem.trim(u8, s, " ");
++                if (std.mem.startsWith(u8, trimmed, "direct:") or
++                    std.mem.startsWith(u8, trimmed, "shell:"))
++                {
++                    var parsed: configpkg.Command = undefined;
++                    if (parsed.parseCLI(cmd_arena.allocator(), trimmed)) |_| {
++                        parsed_cli_command = true;
++                        break :command parsed;
++                    } else |err| {
++                        log.warn("failed to parse CLI command prefix err={}", .{err});
++                    }
++                }
++            },
++            .direct => {},
++        };
++        break :command raw_command;
++    };
++
+     // Start our IO implementation
+     // This separate block ({}) is important because our errdefers must
+     // be scoped here to be valid.
+@@ -647,6 +675,15 @@ pub fn init(
+         });
+         errdefer io_exec.deinit();
+ 
++        if (parsed_cli_command) {
++            const sub_alloc = io_exec.subprocess.arena.allocator();
++            const owned_args = try sub_alloc.alloc([:0]const u8, io_exec.subprocess.args.len);
++            for (io_exec.subprocess.args, 0..) |arg, i| {
++                owned_args[i] = try sub_alloc.dupeZ(u8, arg);
++            }
++            io_exec.subprocess.args = owned_args;
++        }
++
+         // Initialize our IO mailbox
+         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+         errdefer io_mailbox.deinit(alloc);
+@@ -1507,11 +1544,19 @@ fn searchCallback_(
+ ///
+ /// The renderer state mutex MUST NOT be held.
+ fn modsChanged(self: *Surface, mods: input.Mods) void {
++    // The mouse mods only contain binding modifiers since we don't
++    // want caps/num lock or sided modifiers to affect the mouse.
++    const binding_mods = mods.binding();
++
+     // The only place we keep track of mods currently is on the mouse.
+-    if (!self.mouse.mods.equal(mods)) {
+-        // The mouse mods only contain binding modifiers since we don't
+-        // want caps/num lock or sided modifiers to affect the mouse.
+-        self.mouse.mods = mods.binding();
++    if (!self.mouse.mods.equal(binding_mods)) {
++        self.mouse.mods = binding_mods;
++        self.mouse.link_point = null;
++        const over_link = self.mouse.over_link;
++        self.mouse.over_link = false;
++
++        const cursor_pos: ?apprt.CursorPos = self.rt_surface.getCursorPos() catch null;
++        var clear_outside_link = false;
+ 
+         // We also need to update the renderer so it knows if it should
+         // highlight links. Additionally, mark the screen as dirty so
+@@ -1520,12 +1565,49 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
+             self.renderer_state.mutex.lock();
+             defer self.renderer_state.mutex.unlock();
+             self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
++            self.renderer_state.mouse.point = null;
+ 
+             // We use the clear screen dirty flag to force a rebuild of all
+             // rows because changing mouse mods can affect the highlight state
+             // of a link. If there is no link this seems very wasteful but
+             // its really only one frame so it's not so bad.
+             self.renderer_state.terminal.flags.dirty.clear = true;
++
++            if (cursor_pos) |pos| {
++                if (pos.x >= 0 and pos.y >= 0) {
++                    if (over_link or
++                        self.io.terminal.flags.mouse_event == .none or
++                        self.mouse.mods.ctrlOrSuper() or
++                        (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
++                    {
++                        self.mouseRefreshLinks(
++                            pos,
++                            self.posToViewport(pos.x, pos.y),
++                            over_link,
++                        ) catch |err| {
++                            log.warn("failed to refresh links on mods change err={}", .{err});
++                        };
++                    }
++                } else if (over_link) {
++                    self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
++                    clear_outside_link = true;
++                }
++            } else if (over_link) {
++                clear_outside_link = true;
++            }
++        }
++
++        if (clear_outside_link) {
++            _ = self.rt_app.performAction(
++                .{ .surface = self },
++                .mouse_shape,
++                self.io.terminal.mouse_shape,
++            ) catch {};
++            _ = self.rt_app.performAction(
++                .{ .surface = self },
++                .mouse_over_link,
++                .{ .url = "" },
++            ) catch {};
+         }
+ 
+         self.queueRender() catch |err| {
+@@ -2670,44 +2752,7 @@ pub fn keyCallback(
+ 
+     // If our mouse modifiers change we may need to change our
+     // link highlight state.
+-    if (!self.mouse.mods.equal(event.mods)) mouse_mods: {
+-        // Update our modifiers, this will update mouse mods too
+-        self.modsChanged(event.mods);
+-
+-        // We only refresh links if
+-        // 1. mouse reporting is off
+-        // OR
+-        // 2. mouse reporting is on and we are not reporting shift to the terminal
+-        if (self.io.terminal.flags.mouse_event == .none or
+-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
+-        {
+-            // Refresh our link state
+-            const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
+-            self.renderer_state.mutex.lock();
+-            defer self.renderer_state.mutex.unlock();
+-            self.mouseRefreshLinks(
+-                pos,
+-                self.posToViewport(pos.x, pos.y),
+-                self.mouse.over_link,
+-            ) catch |err| {
+-                log.warn("failed to refresh links err={}", .{err});
+-                break :mouse_mods;
+-            };
+-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
+-            // If we have mouse reports on and we don't have shift pressed, we reset state
+-            _ = try self.rt_app.performAction(
+-                .{ .surface = self },
+-                .mouse_shape,
+-                self.io.terminal.mouse_shape,
+-            );
+-            _ = try self.rt_app.performAction(
+-                .{ .surface = self },
+-                .mouse_over_link,
+-                .{ .url = "" },
+-            );
+-            try self.queueRender();
+-        }
+-    }
++    self.modsChanged(event.mods);
+ 
+     // Process the cursor state logic. This will update the cursor shape if
+     // needed, depending on the key state.
+@@ -3415,28 +3460,10 @@ pub fn scrollCallback(
              break :yoff_adjusted yoff_max * cell_size * self.config.mouse_scroll_multiplier.discrete;
          };
  
@@ -108,7 +295,7 @@ index 4d66622..d56ff31 100644
  
          break :y .{ .delta = delta };
      };
-@@ -3448,18 +3430,8 @@ pub fn scrollCallback(
+@@ -3448,18 +3475,8 @@ pub fn scrollCallback(
              break :x .{ .delta = x_delta_isize };
          }
  
@@ -128,7 +315,7 @@ index 4d66622..d56ff31 100644
          break :x .{ .delta = delta };
      };
  
-@@ -3538,6 +3510,8 @@ pub fn scrollCallback(
+@@ -3538,6 +3555,8 @@ pub fn scrollCallback(
          }
  
          if (y.delta != 0) {
@@ -137,7 +324,7 @@ index 4d66622..d56ff31 100644
              // Modify our viewport, this requires a lock since it affects
              // rendering. We have to switch signs here because our delta
              // is negative down but our viewport is positive down.
-@@ -3548,6 +3522,88 @@ pub fn scrollCallback(
+@@ -3548,6 +3567,88 @@ pub fn scrollCallback(
      try self.queueRender();
  }
  
@@ -226,8 +413,197 @@ index 4d66622..d56ff31 100644
  /// This is called when the content scale of the surface changes. The surface
  /// can then update any DPI-sensitive state.
  pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !void {
+@@ -3899,6 +4000,8 @@ pub fn mouseButtonCallback(
+     // cursorPosCallback will also do a mouse report so we don't need to do any
+     // of the logic below.
+     if (button == .left and action == .press) {
++        self.mouse.link_press_swallowed = false;
++
+         // We could do all the conditionals in one but I find it more
+         // readable as a human to break this one up.
+         if (mods.shift and
+@@ -3932,9 +4035,57 @@ pub fn mouseButtonCallback(
+             try self.cursorPosCallback(pos, null);
+             return true;
+         }
++
++        // Swallow left-press on an active link (or when ctrl/super is held
++        // directly over a link) before mouse reporting so TUI mouse tracking
++        // never receives a stray press sequence on Cmd/Ctrl+Click.
++        swallow_link: {
++            const pos = self.rt_surface.getCursorPos() catch break :swallow_link;
++            if (pos.x < 0 or pos.y < 0) break :swallow_link;
++
++            var on_link = self.mouse.over_link;
++            if (!on_link and self.mouse.mods.ctrlOrSuper()) {
++                self.renderer_state.mutex.lock();
++                defer self.renderer_state.mutex.unlock();
++                if (self.linkAtPos(pos) catch null) |_| {
++                    self.mouse.over_link = true;
++                    on_link = true;
++                }
++            }
++
++            if (on_link) {
++                {
++                    self.renderer_state.mutex.lock();
++                    defer self.renderer_state.mutex.unlock();
++                    const t: *terminal.Terminal = self.renderer_state.terminal;
++                    const screen: *terminal.Screen = t.screens.active;
++                    if (self.mouse.left_click_pin) |prev| {
++                        if (t.screens.get(self.mouse.left_click_screen)) |pin_screen| {
++                            pin_screen.pages.untrackPin(prev);
++                        }
++                        self.mouse.left_click_pin = null;
++                    }
++                    const pt_viewport = self.posToViewport(pos.x, pos.y);
++                    if (screen.pages.pin(.{ .viewport = pt_viewport })) |raw_pin| {
++                        if (screen.pages.trackPin(raw_pin) catch null) |tracked| {
++                            self.mouse.left_click_pin = tracked;
++                            self.mouse.left_click_screen = t.screens.active_key;
++                        }
++                    }
++                    self.mouse.left_click_xpos = pos.x;
++                    self.mouse.left_click_ypos = pos.y;
++                }
++                self.mouse.left_click_count = 0;
++                self.mouse.link_press_swallowed = true;
++                return true;
++            }
++        }
+     }
+ 
+     if (button == .left and action == .release) {
++        const swallowed = self.mouse.link_press_swallowed;
++        self.mouse.link_press_swallowed = false;
++
+         // Stop selection scrolling when releasing the left mouse button
+         // but only when selection scrolling is active.
+         if (self.selection_scroll_active) {
+@@ -3963,7 +4114,7 @@ pub fn mouseButtonCallback(
+         // Handle link clicking. We want to do this before we do mouse
+         // reporting or any other mouse handling because a successfully
+         // clicked link will swallow the event.
+-        if (self.mouse.over_link) {
++        if (self.mouse.over_link or self.mouse.mods.ctrlOrSuper()) {
+             const pos = try self.rt_surface.getCursorPos();
+             if (self.processLinks(pos)) |processed| {
+                 if (processed) return true;
+@@ -3972,6 +4123,8 @@ pub fn mouseButtonCallback(
+             }
+         }
+ 
++        if (swallowed) return true;
++
+         // Handle prompt clicking. If we released our mouse on a prompt
+         // and we support some kind of click events, then we need to
+         // move to it.
+@@ -4495,33 +4648,45 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
+ /// Attempt to invoke the action of any link that is under the
+ /// given position.
+ ///
+-/// Requires the renderer state mutex is held.
++/// The renderer state mutex MUST NOT be held; this function acquires it
++/// while inspecting terminal screen state and releases it before invoking
++/// `openUrl` so host callbacks cannot deadlock.
+ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
+-    const link = try self.linkAtPos(pos) orelse return false;
+-    switch (link.action) {
+-        .open => {
+-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
+-                .sel = link.selection,
+-                .trim = false,
+-            });
+-            defer self.alloc.free(str);
++    if (pos.x < 0 or pos.y < 0) return false;
+ 
+-            const resolved_path = try self.resolvePathForOpening(str);
+-            defer if (resolved_path) |p| self.alloc.free(p);
++    const url_owned: []const u8 = url: {
++        self.renderer_state.mutex.lock();
++        defer self.renderer_state.mutex.unlock();
+ 
+-            const url_to_open = resolved_path orelse str;
+-            try self.openUrl(.{ .kind = .unknown, .url = url_to_open });
+-        },
++        const link = try self.linkAtPos(pos) orelse return false;
++        switch (link.action) {
++            .open => {
++                const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
++                    .sel = link.selection,
++                    .trim = false,
++                });
++                errdefer self.alloc.free(str);
+ 
+-        ._open_osc8 => {
+-            const uri = self.osc8URI(link.selection.start()) orelse {
+-                log.warn("failed to get URI for OSC8 hyperlink", .{});
+-                return false;
+-            };
+-            try self.openUrl(.{ .kind = .unknown, .url = uri });
+-        },
+-    }
++                if (try self.resolvePathForOpening(str)) |resolved_path| {
++                    self.alloc.free(str);
++                    break :url resolved_path;
++                }
+ 
++                break :url str;
++            },
++
++            ._open_osc8 => {
++                const uri = self.osc8URI(link.selection.start()) orelse {
++                    log.warn("failed to get URI for OSC8 hyperlink", .{});
++                    return false;
++                };
++                break :url try self.alloc.dupe(u8, uri);
++            },
++        }
++    };
++    defer self.alloc.free(url_owned);
++
++    try self.openUrl(.{ .kind = .unknown, .url = url_owned });
+     return true;
+ }
+ 
+@@ -4708,13 +4873,19 @@ pub fn cursorPosCallback(
+     // 2. the cursor position has changed (either we have no previous state, or the state has
+     //    changed)
+     // AND
+-    // 1. mouse reporting is off
++    // 1. we were previously over a link (so hover state clears when modifiers change)
++    // OR
++    // 2. mouse reporting is off
++    // OR
++    // 3. ctrl/super is held for link activation
+     // OR
+-    // 2. mouse reporting is on and we are not reporting shift to the terminal
++    // 4. mouse reporting is on and we are not reporting shift to the terminal
+     if ((over_link or
+         self.mouse.link_point == null or
+         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
+-        (self.io.terminal.flags.mouse_event == .none or
++        (over_link or
++            self.io.terminal.flags.mouse_event == .none or
++            self.mouse.mods.ctrlOrSuper() or
+             (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+     {
+         // If we were previously over a link, we always update. We do this so that if the text
+@@ -4724,6 +4895,12 @@ pub fn cursorPosCallback(
+ 
+     // Do a mouse report
+     if (self.isMouseReporting()) report: {
++        if (self.mouse.link_press_swallowed and
++            self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press)
++        {
++            break :report;
++        }
++
+         // Shift overrides mouse "grabbing" in the window, taken from Kitty.
+         // This only applies if there is a mouse button pressed so that
+         // movement reports are not affected.
 diff --git a/src/build/MetallibStep.zig b/src/build/MetallibStep.zig
-index fcf3055..cefdfaf 100644
+index fcf3055f8..cefdfaf0b 100644
 --- a/src/build/MetallibStep.zig
 +++ b/src/build/MetallibStep.zig
 @@ -55,6 +55,11 @@ pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
@@ -251,7 +627,7 @@ index fcf3055..cefdfaf 100644
      const output_lib = run_lib.addOutputFileArg(b.fmt("{s}.metallib", .{opts.name}));
      run_lib.addFileArg(output_ir);
 diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
-index ff632f6..d9d9b0f 100644
+index ff632f64a..d9d9b0f8e 100644
 --- a/src/renderer/generic.zig
 +++ b/src/renderer/generic.zig
 @@ -690,10 +690,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {

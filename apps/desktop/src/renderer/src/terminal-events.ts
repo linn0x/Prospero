@@ -2,7 +2,7 @@ import type { Terminal } from "@xterm/xterm";
 import { terminalBytes } from "./terminal-bytes";
 
 type QueryParser = {
-  registerCsiHandler: (id: { final: string; prefix?: string }, handler: (params: (number | number[])[]) => boolean) => { dispose(): void };
+  registerCsiHandler: (id: { final: string; prefix?: string; intermediates?: string }, handler: (params: (number | number[])[]) => boolean) => { dispose(): void };
   registerOscHandler: (ident: number, handler: (data: string) => boolean) => { dispose(): void };
 };
 
@@ -13,10 +13,16 @@ type QueryParser = {
  */
 export function suppressDaemonTerminalQueries(parser: QueryParser): () => void {
   const disposables = [
+    parser.registerCsiHandler({ prefix: ">", final: "c" }, params => params.length === 0 || (params.length === 1 && params[0] === 0)), // DA2
     parser.registerCsiHandler({ final: "c" }, params => params.length === 0 || (params.length === 1 && params[0] === 0)), // DA1
+    parser.registerCsiHandler({ prefix: "?", final: "n" }, params => params.length === 1 && params[0] === 6), // DECXCPR cursor position
     parser.registerCsiHandler({ final: "n" }, params => params.length === 1 && params[0] === 6), // DSR cursor position
+    parser.registerCsiHandler({ prefix: ">", final: "q" }, params => params.length === 0 || (params.length === 1 && params[0] === 0)), // XTVERSION
+    parser.registerCsiHandler({ prefix: "?", final: "u" }, params => params.length === 0 || (params.length === 1 && params[0] === 0)), // Kitty keyboard query
+    parser.registerCsiHandler({ prefix: "?", intermediates: "$", final: "p" }, params => params.length === 1 && typeof params[0] === "number"), // DECRQM
     parser.registerOscHandler(10, data => data === "?"),
     parser.registerOscHandler(11, data => data === "?"),
+    parser.registerOscHandler(12, data => data === "?"),
   ];
   return () => disposables.forEach(disposable => disposable.dispose());
 }

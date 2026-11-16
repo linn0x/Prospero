@@ -1,4 +1,4 @@
-import { preferLocalTerminalSelection } from "./terminal-mouse";
+import { bindTerminalMouseAndLinks, type TerminalMouseTargetLike } from "./terminal-mouse";
 import { scheduleTerminalCache } from "./terminal-cache-scheduler";
 import "./workspace/terminal-status.css";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -499,8 +499,15 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
       readingStateRef.current = saveTerminalReadingState(session.id, { viewport, followBottom });
     });
     const mouseHost = host.current;
-    const selectLocally = (event: MouseEvent) => preferLocalTerminalSelection(event, isMac, localSelectionRef.current, terminal.modes.mouseTrackingMode);
-    mouseHost.addEventListener("mousedown", selectLocally, true);
+    const disposeMouseAndLinks = bindTerminalMouseAndLinks(
+      mouseHost,
+      terminal as unknown as TerminalMouseTargetLike,
+      {
+        isMac,
+        isLocalSelection: () => localSelectionRef.current,
+        onOpenUrl: openTerminalExternalUrl,
+      },
+    );
     const fitVisibleSoon = (): void => {
       window.requestAnimationFrame(() => {
         if (terminalRef.current !== terminal) return;
@@ -721,7 +728,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
       disposeDaemonQueries();
       osc52Disposable.dispose();
       bellDisposable.dispose();
-      mouseHost.removeEventListener("mousedown", selectLocally, true);
+      disposeMouseAndLinks();
       mouseHost.removeEventListener("input", scrollForUserInput, true);
       mouseHost.removeEventListener("compositionend", scrollForUserInput, true);
       terminal.dispose();

@@ -193,7 +193,10 @@ impl SessionHead {
     pub fn needs_native_binding(&self) -> bool {
         !self.is_login_session()
             && self.kind == SessionKind::Pty
-            && matches!(self.agent, AgentKind::Claude | AgentKind::Codex | AgentKind::Agy)
+            && matches!(
+                self.agent,
+                AgentKind::Claude | AgentKind::Codex | AgentKind::Agy
+            )
             && self
                 .native_session
                 .as_ref()
@@ -618,6 +621,8 @@ pub struct EventQuery {
     #[ts(type = "number | null")]
     pub after_seq: Option<i64>,
     pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

@@ -23,6 +23,7 @@ struct NapiCallback {
 static NapiCallback shortcutCallback;
 static NapiCallback focusCallback;
 static NapiCallback imagePasteCallback;
+static NapiCallback openUrlCallback;
 
 static bool setCallback(NapiCallback *callback, napi_env env, napi_value function) {
   if (callback->asyncContext) napi_async_destroy(callback->env, callback->asyncContext);
@@ -107,6 +108,10 @@ static_assert(scrollMomentum(NSEventPhaseMayBegin) == GHOSTTY_MOUSE_MOMENTUM_MAY
 @property(nonatomic, assign) uint32_t surfaceId;
 @property(nonatomic, assign) uint64_t scrollFrameCount;
 @property(nonatomic, assign) BOOL readOnly;
+@property(nonatomic, assign) BOOL surfaceReadOnly;
+@property(nonatomic, assign) BOOL cursorPosInitialized;
+@property(nonatomic, strong) NSCursor *currentCursor;
+@property(nonatomic, copy) NSString *cursorShape;
 @property(nonatomic, assign) BOOL ghosttyFocused;
 @property(nonatomic, assign) NSUInteger mouseFocusGeneration;
 @property(nonatomic, assign) BOOL pendingMouseFocus;
@@ -140,6 +145,8 @@ static bool notifyImagePaste(ProsperoGhosttyView *);
     self.marked = [[NSMutableAttributedString alloc] initWithString:@""];
     self.markedSelectedRange = NSMakeRange(0, 0);
     self.pendingClipboardConfirmations = [[NSMutableArray alloc] init];
+    self.currentCursor = NSCursor.IBeamCursor;
+    self.cursorShape = @"text";
     self.accessibilityElement = YES;
     self.accessibilityRole = NSAccessibilityTextAreaRole;
     self.accessibilityLabel = @"Terminal";
@@ -330,6 +337,9 @@ static bool notifyImagePaste(ProsperoGhosttyView *);
   self.tracking = [[NSTrackingArea alloc] initWithRect:NSZeroRect options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect owner:self userInfo:nil];
   [self addTrackingArea:_tracking];
 }
+- (void)resetCursorRects {
+  [self addCursorRect:self.bounds cursor:self.currentCursor ?: NSCursor.IBeamCursor];
+}
 - (void)mouseEntered:(NSEvent *)e {
   [super mouseEntered:e];
   [self mouseMoved:e];
@@ -337,11 +347,13 @@ static bool notifyImagePaste(ProsperoGhosttyView *);
 - (void)mouseExited:(NSEvent *)e {
   [super mouseExited:e];
   if (!_surface || NSEvent.pressedMouseButtons != 0) return;
+  self.cursorPosInitialized = NO;
   ghostty_surface_mouse_pos(_surface, -1, -1, mods(e.modifierFlags));
 }
 - (void)mouseMoved:(NSEvent *)e {
   if (!_surface) return;
   NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+  self.cursorPosInitialized = YES;
   // This view is flipped, so AppKit has already converted the mouse position
   // to Ghostty's top-left origin. The upstream non-flipped view must invert Y.
   ghostty_surface_mouse_pos(_surface, p.x, p.y, mods(e.modifierFlags));
@@ -365,7 +377,11 @@ static bool notifyImagePaste(ProsperoGhosttyView *);
   // scheduling focus restoration so the AppKit activation observers finish.
   if (_surface) ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods(e.modifierFlags));
 }
-- (void)mouseUp:(NSEvent *)e { if (_surface) ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods(e.modifierFlags)); }
+- (void)mouseUp:(NSEvent *)e {
+  if (!_surface) return;
+  [self mouseMoved:e];
+  ghostty_surface_mouse_button(_surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods(e.modifierFlags));
+}
 - (void)rightMouseDown:(NSEvent *)e {
   [self.window makeFirstResponder:self];
   NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Terminal"];
@@ -509,7 +525,7 @@ static NSString *pasteboardFilePaths(NSPasteboard *pasteboard) {
   ghostty_surface_key(_surface, key);
 }
 - (void)flagsChanged:(NSEvent *)e {
-  if (!_surface || _readOnly || self.hasMarkedText) return;
+  if (!_surface || self.hasMarkedText) return;
   ghostty_input_mods_e modifier = GHOSTTY_MODS_NONE;
   switch (e.keyCode) {
     case 0x39: modifier = GHOSTTY_MODS_CAPS; break;
@@ -519,10 +535,19 @@ static NSString *pasteboardFilePaths(NSPasteboard *pasteboard) {
     case 0x37: case 0x36: modifier = GHOSTTY_MODS_SUPER; break;
     default: return;
   }
+  ghostty_input_mods_e currentMods = mods(e.modifierFlags);
+  if (self.window && !self.cursorPosInitialized) {
+    NSPoint windowPoint = [self.window convertPointFromScreen:NSEvent.mouseLocation];
+    NSPoint viewPoint = [self convertPoint:windowPoint fromView:nil];
+    if (NSPointInRect(viewPoint, self.bounds)) {
+      self.cursorPosInitialized = YES;
+      ghostty_surface_mouse_pos(_surface, viewPoint.x, viewPoint.y, currentMods);
+    }
+  }
   ghostty_input_key_s key = {};
-  key.action = (mods(e.modifierFlags) & modifier) ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE;
+  key.action = (currentMods & modifier) ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE;
   key.keycode = e.keyCode;
-  key.mods = mods(e.modifierFlags);
+  key.mods = currentMods;
   ghostty_surface_key(_surface, key);
 }
 - (void)insertText:(id)value replacementRange:(NSRange)range {
@@ -592,15 +617,99 @@ static bool notifyImagePaste(ProsperoGhosttyView *view) {
   if (status != napi_ok) return false;
   return handled;
 }
+static ProsperoGhosttyView *viewForTarget(ghostty_target_s target) {
+  if (target.tag != GHOSTTY_TARGET_SURFACE || !views || !target.target.surface) return nil;
+  for (ProsperoGhosttyView *candidate in views.allValues) {
+    if (candidate.surface == target.target.surface) return candidate;
+  }
+  return nil;
+}
+
+static void syncSurfaceReadOnly(ProsperoGhosttyView *view) {
+  if (!view || !view.surface) return;
+  if (view.surfaceReadOnly != view.readOnly) {
+    if (ghostty_surface_binding_action(view.surface, "toggle_readonly", 15)) {
+      view.surfaceReadOnly = view.readOnly;
+    }
+  }
+}
+
 static bool action(ghostty_app_t, ghostty_target_s target, ghostty_action_s act) {
-  if (act.tag != GHOSTTY_ACTION_SCROLLBAR || target.tag != GHOSTTY_TARGET_SURFACE || !target.target.surface) return false;
-  for (ProsperoGhosttyView *view in views.allValues) {
-    if (view.surface == target.target.surface) {
+  ProsperoGhosttyView *view = viewForTarget(target);
+  switch (act.tag) {
+    case GHOSTTY_ACTION_SCROLLBAR: {
+      if (!view) return false;
       view.scrollFrameCount += 1;
       return true;
     }
+    case GHOSTTY_ACTION_READONLY: {
+      if (!view) return false;
+      view.surfaceReadOnly = (act.action.readonly == GHOSTTY_READONLY_ON);
+      return true;
+    }
+    case GHOSTTY_ACTION_MOUSE_SHAPE: {
+      if (!view) return false;
+      NSCursor *cursor = nil;
+      NSString *shapeName = @"arrow";
+      switch (act.action.mouse_shape) {
+        case GHOSTTY_MOUSE_SHAPE_POINTER:
+          cursor = NSCursor.pointingHandCursor;
+          shapeName = @"pointer";
+          break;
+        case GHOSTTY_MOUSE_SHAPE_TEXT:
+        case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT:
+          cursor = NSCursor.IBeamCursor;
+          shapeName = @"text";
+          break;
+        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR:
+          cursor = NSCursor.crosshairCursor;
+          shapeName = @"crosshair";
+          break;
+        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED:
+        case GHOSTTY_MOUSE_SHAPE_NO_DROP:
+          cursor = NSCursor.operationNotAllowedCursor;
+          shapeName = @"not-allowed";
+          break;
+        default:
+          cursor = NSCursor.arrowCursor;
+          shapeName = @"arrow";
+          break;
+      }
+      view.currentCursor = cursor;
+      view.cursorShape = shapeName;
+      if (view.window) [view.window invalidateCursorRectsForView:view];
+      [view.currentCursor set];
+      return true;
+    }
+    case GHOSTTY_ACTION_OPEN_URL: {
+      const char *rawUrl = act.action.open_url.url;
+      size_t len = (size_t)act.action.open_url.len;
+      if (!rawUrl || len == 0) return true;
+      if (openUrlCallback.function) {
+        napi_handle_scope handleScope;
+        if (napi_open_handle_scope(openUrlCallback.env, &handleScope) == napi_ok) {
+          napi_value args[2], result;
+          uint32_t surfaceId = view ? view.surfaceId : 0;
+          if (napi_create_uint32(openUrlCallback.env, surfaceId, &args[0]) == napi_ok &&
+              napi_create_string_utf8(openUrlCallback.env, rawUrl, len, &args[1]) == napi_ok) {
+            callCallback(&openUrlCallback, 2, args, &result);
+          }
+          napi_close_handle_scope(openUrlCallback.env, handleScope);
+        }
+        return true;
+      }
+      NSString *urlString = [[NSString alloc] initWithBytes:rawUrl length:len encoding:NSUTF8StringEncoding];
+      if (!urlString || urlString.length == 0) return true;
+      NSURL *nsUrl = [NSURL URLWithString:urlString];
+      NSString *scheme = nsUrl.scheme.lowercaseString;
+      if (nsUrl && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"] || [scheme isEqualToString:@"mailto"])) {
+        [NSWorkspace.sharedWorkspace openURL:nsUrl];
+      }
+      return true;
+    }
+    default:
+      return false;
   }
-  return false;
 }
 static uint64_t clipboardReadCount = 0;
 static bool readClipboard(void *userdata, ghostty_clipboard_e location, void *state) {
@@ -752,6 +861,7 @@ static napi_value create(napi_env e, napi_callback_info info) {
     if (surfaceConfig) ghostty_config_free(surfaceConfig); [view removeFromSuperview]; return fail(e, "Ghostty surface creation failed");
   }
   if (surfaceConfig) { ghostty_surface_update_config(view.surface, surfaceConfig); ghostty_config_free(surfaceConfig); }
+  syncSurfaceReadOnly(view);
   [view updateDisplayID];
   [view syncSize]; uint32_t id = nextId++; view.surfaceId = id; views[@(id)] = view;
   napi_value result; napi_create_uint32(e, id, &result); return result;
@@ -763,14 +873,20 @@ static napi_value update(napi_env e, napi_callback_info info) {
   if (!v) return undefined(e);
   double x = number(e, args[1], "x"), y = number(e, args[1], "y"), w = number(e, args[1], "width"), h = number(e, args[1], "height");
   if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) || !std::isfinite(h) || w < 0 || h < 0) return fail(e, "Invalid surface bounds");
-  if (!v.superview.isFlipped) y = v.superview.bounds.size.height - y - h;
-  ghostty_surface_size_s preservedSize = {};
-  bool hasPreserveGrid; napi_has_named_property(e, args[1], "preserveGrid", &hasPreserveGrid);
-  bool preserveGrid = hasPreserveGrid && boolean(e, args[1], "preserveGrid");
-  if (preserveGrid) preservedSize = ghostty_surface_size(v.surface);
-  v.frame = NSMakeRect(x, y, w, h);
-  if (preserveGrid) ghostty_surface_set_size(v.surface, preservedSize.width_px, preservedSize.height_px);
   BOOL visible = boolean(e, args[1], "visible") && w > 0 && h > 0;
+  if (w > 0 && h > 0) {
+    if (!v.superview.isFlipped) y = v.superview.bounds.size.height - y - h;
+    ghostty_surface_size_s preservedSize = {};
+    bool hasPreserveGrid; napi_has_named_property(e, args[1], "preserveGrid", &hasPreserveGrid);
+    bool preserveGrid = hasPreserveGrid && boolean(e, args[1], "preserveGrid");
+    if (preserveGrid) preservedSize = ghostty_surface_size(v.surface);
+    v.frame = NSMakeRect(x, y, w, h);
+    if (preserveGrid && preservedSize.width_px > 0 && preservedSize.height_px > 0) {
+      ghostty_surface_set_size(v.surface, preservedSize.width_px, preservedSize.height_px);
+    } else {
+      [v syncSize];
+    }
+  }
   v.hidden = !visible; ghostty_surface_set_occlusion(v.surface, visible);
   if (!visible) [v cancelNativeActivationFocus];
   if (!visible && v.window.firstResponder == v) [v.window makeFirstResponder:v.superview];
@@ -938,22 +1054,6 @@ static napi_value testKeyDown(napi_env e, napi_callback_info info) {
   [v keyDown:event];
   return undefined(e);
 }
-static napi_value isVisible(napi_env e, napi_callback_info info) {
-  size_t n = 1; napi_value arg; napi_get_cb_info(e, info, &n, &arg, nullptr, nullptr);
-  uint32_t id; ProsperoGhosttyView *v;
-  if (n != 1 || !surfaceFor(e, arg, &id, &v)) return fail(e, "Invalid Ghostty surface ID");
-  napi_value result;
-  napi_get_boolean(e, !v.hidden && ![v isHiddenOrHasHiddenAncestor] && v.window.isVisible, &result);
-  return result;
-}
-static napi_value setReadOnly(napi_env e, napi_callback_info info) {
-  size_t n = 2; napi_value args[2]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
-  uint32_t id; ProsperoGhosttyView *v; bool readOnly;
-  if (n != 2 || !surfaceFor(e, args[0], &id, &v) || napi_get_value_bool(e, args[1], &readOnly) != napi_ok) return fail(e, "Expected a valid surface ID and read-only state");
-  v.readOnly = readOnly;
-  if (readOnly && v.hasMarkedText) [v unmarkText];
-  return undefined(e);
-}
 static napi_value testMouseMove(napi_env e, napi_callback_info info) {
   size_t n = 4; napi_value args[4]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
   uint32_t id, modifiers = 0; double x = 0, y = 0; ProsperoGhosttyView *v;
@@ -977,6 +1077,40 @@ static napi_value testMouseMove(napi_env e, napi_callback_info info) {
   [v mouseMoved:event];
   return undefined(e);
 }
+static napi_value testMouseClick(napi_env e, napi_callback_info info) {
+  size_t n = 4; napi_value args[4]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
+  uint32_t id, modifiers = 0; double x = 0, y = 0; ProsperoGhosttyView *v;
+  if (n < 3 || !surfaceFor(e, args[0], &id, &v) ||
+      napi_get_value_double(e, args[1], &x) != napi_ok ||
+      napi_get_value_double(e, args[2], &y) != napi_ok) {
+    return fail(e, "Expected (id, x, y[, modifierFlags])");
+  }
+  if (n >= 4) napi_get_value_uint32(e, args[3], &modifiers);
+  NSPoint windowPoint = [v convertPoint:NSMakePoint(x, y) toView:nil];
+  NSInteger windowNumber = v.window ? v.window.windowNumber : 0;
+  NSEvent *downEvent = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                          location:windowPoint
+                                     modifierFlags:(NSEventModifierFlags)modifiers
+                                         timestamp:NSProcessInfo.processInfo.systemUptime
+                                      windowNumber:windowNumber
+                                           context:nil
+                                       eventNumber:0
+                                        clickCount:1
+                                          pressure:1.0];
+  NSEvent *upEvent = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+                                        location:windowPoint
+                                   modifierFlags:(NSEventModifierFlags)modifiers
+                                       timestamp:NSProcessInfo.processInfo.systemUptime
+                                    windowNumber:windowNumber
+                                         context:nil
+                                     eventNumber:0
+                                      clickCount:1
+                                        pressure:0.0];
+  if (!downEvent || !upEvent) return fail(e, "Could not synthesize mouse click NSEvent");
+  [v mouseDown:downEvent];
+  [v mouseUp:upEvent];
+  return undefined(e);
+}
 static napi_value testScroll(napi_env e, napi_callback_info info) {
   size_t n = 4; napi_value args[4]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
   uint32_t id; ProsperoGhosttyView *v; double x, y; bool precise;
@@ -987,6 +1121,45 @@ static napi_value testScroll(napi_env e, napi_callback_info info) {
     return fail(e, "Expected surface ID, x/y scroll deltas, and precision");
   }
   ghostty_surface_mouse_scroll(v.surface, x * (precise ? 2 : 1), y * (precise ? 2 : 1), precise ? 1 : 0);
+  return undefined(e);
+}
+static napi_value testFlagsChanged(napi_env e, napi_callback_info info) {
+  size_t n = 3; napi_value args[3]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
+  uint32_t id, keyCode = 0, modifiers = 0; ProsperoGhosttyView *v;
+  if (n != 3 || !surfaceFor(e, args[0], &id, &v) ||
+      napi_get_value_uint32(e, args[1], &keyCode) != napi_ok ||
+      napi_get_value_uint32(e, args[2], &modifiers) != napi_ok) {
+    return fail(e, "Expected (id, keyCode, modifierFlags)");
+  }
+  NSEvent *event = [NSEvent keyEventWithType:NSEventTypeFlagsChanged
+                                    location:NSZeroPoint
+                               modifierFlags:(NSEventModifierFlags)modifiers
+                                   timestamp:NSProcessInfo.processInfo.systemUptime
+                                windowNumber:v.window ? v.window.windowNumber : 0
+                                     context:nil
+                                  characters:@""
+                 charactersIgnoringModifiers:@""
+                                   isARepeat:NO
+                                     keyCode:(unsigned short)keyCode];
+  if (!event) return fail(e, "Could not synthesize flagsChanged NSEvent");
+  [v flagsChanged:event];
+  return undefined(e);
+}
+static napi_value isVisible(napi_env e, napi_callback_info info) {
+  size_t n = 1; napi_value arg; napi_get_cb_info(e, info, &n, &arg, nullptr, nullptr);
+  uint32_t id; ProsperoGhosttyView *v;
+  if (n != 1 || !surfaceFor(e, arg, &id, &v)) return fail(e, "Invalid Ghostty surface ID");
+  napi_value result;
+  napi_get_boolean(e, !v.hidden && ![v isHiddenOrHasHiddenAncestor] && v.window.isVisible, &result);
+  return result;
+}
+static napi_value setReadOnly(napi_env e, napi_callback_info info) {
+  size_t n = 2; napi_value args[2]; napi_get_cb_info(e, info, &n, args, nullptr, nullptr);
+  uint32_t id; ProsperoGhosttyView *v; bool readOnly;
+  if (n != 2 || !surfaceFor(e, args[0], &id, &v) || napi_get_value_bool(e, args[1], &readOnly) != napi_ok) return fail(e, "Expected a valid surface ID and read-only state");
+  v.readOnly = readOnly;
+  syncSurfaceReadOnly(v);
+  if (readOnly && v.hasMarkedText) [v unmarkText];
   return undefined(e);
 }
 static napi_value inspect(napi_env e, napi_callback_info info) {
@@ -1009,6 +1182,8 @@ static napi_value inspect(napi_env e, napi_callback_info info) {
   setBool("hidden", v.hidden);
   setBool("hiddenByAncestor", [v isHiddenOrHasHiddenAncestor]);
   setBool("readOnly", v.readOnly);
+  setBool("surfaceReadOnly", v.surfaceReadOnly);
+  setString("cursorShape", v.cursorShape ?: @"text");
   setBool("ghosttyFocused", v.ghosttyFocused);
   setBool("isFlipped", v.isFlipped);
   setBool("hasWindow", v.window != nil);
@@ -1073,7 +1248,68 @@ static napi_value setPasteImageHandler(napi_env e, napi_callback_info info) {
   if (!setCallback(&imagePasteCallback, e, arg)) return fail(e, "Image paste callback must be a function or null");
   return undefined(e);
 }
+static napi_value setOpenUrlHandler(napi_env e, napi_callback_info info) {
+  size_t n = 1; napi_value arg; napi_get_cb_info(e, info, &n, &arg, nullptr, nullptr);
+  if (n != 1) return fail(e, "Expected an open URL callback or null");
+  if (!setCallback(&openUrlCallback, e, arg)) return fail(e, "Open URL callback must be a function or null");
+  return undefined(e);
+}
+static napi_value shutdown(napi_env e, napi_callback_info) {
+  napi_value nullVal = undefined(e);
+  setCallback(&shortcutCallback, e, nullVal);
+  setCallback(&focusCallback, e, nullVal);
+  setCallback(&imagePasteCallback, e, nullVal);
+  setCallback(&openUrlCallback, e, nullVal);
+  if (views) {
+    for (ProsperoGhosttyView *v in [views.allValues copy]) {
+      cancelPendingClipboardConfirmations(v);
+      [v cancelNativeActivationFocus];
+      if (v.window.firstResponder == v) [v.window makeFirstResponder:v.superview];
+      if (v.surface) {
+        ghostty_surface_free(v.surface);
+        v.surface = nullptr;
+      }
+      [v removeFromSuperview];
+    }
+    [views removeAllObjects];
+  }
+  if (app) {
+    ghostty_app_free(app);
+    app = nullptr;
+  }
+  if (config) {
+    ghostty_config_free(config);
+    config = nullptr;
+  }
+  return undefined(e);
+}
 NAPI_MODULE_INIT() {
-  napi_property_descriptor props[] = {{"initialize", 0, initialize, 0, 0, 0, napi_default, 0}, {"create", 0, create, 0, 0, 0, napi_default, 0}, {"update", 0, update, 0, 0, 0, napi_default, 0}, {"destroy", 0, destroy, 0, 0, 0, napi_default, 0}, {"size", 0, size, 0, 0, 0, napi_default, 0}, {"setGrid", 0, setGrid, 0, 0, 0, napi_default, 0}, {"readText", 0, readText, 0, 0, 0, napi_default, 0}, {"inputText", 0, inputText, 0, 0, 0, napi_default, 0}, {"testIMECommit", 0, testIMECommit, 0, 0, 0, napi_default, 0}, {"testSetMarkedText", 0, testSetMarkedText, 0, 0, 0, napi_default, 0}, {"testKeyDown", 0, testKeyDown, 0, 0, 0, napi_default, 0}, {"testMouseMove", 0, testMouseMove, 0, 0, 0, napi_default, 0}, {"testScroll", 0, testScroll, 0, 0, 0, napi_default, 0}, {"isVisible", 0, isVisible, 0, 0, 0, napi_default, 0}, {"setReadOnly", 0, setReadOnly, 0, 0, 0, napi_default, 0}, {"inspect", 0, inspect, 0, 0, 0, napi_default, 0}, {"bindingAction", 0, bindingAction, 0, 0, 0, napi_default, 0}, {"setShortcutHandler", 0, setShortcutHandler, 0, 0, 0, napi_default, 0}, {"setFocusHandler", 0, setFocusHandler, 0, 0, 0, napi_default, 0}, {"setPasteImageHandler", 0, setPasteImageHandler, 0, 0, 0, napi_default, 0}};
+  napi_property_descriptor props[] = {
+    {"initialize", 0, initialize, 0, 0, 0, napi_default, 0},
+    {"shutdown", 0, shutdown, 0, 0, 0, napi_default, 0},
+    {"create", 0, create, 0, 0, 0, napi_default, 0},
+    {"update", 0, update, 0, 0, 0, napi_default, 0},
+    {"destroy", 0, destroy, 0, 0, 0, napi_default, 0},
+    {"size", 0, size, 0, 0, 0, napi_default, 0},
+    {"setGrid", 0, setGrid, 0, 0, 0, napi_default, 0},
+    {"readText", 0, readText, 0, 0, 0, napi_default, 0},
+    {"inputText", 0, inputText, 0, 0, 0, napi_default, 0},
+    {"testIMECommit", 0, testIMECommit, 0, 0, 0, napi_default, 0},
+    {"testSetMarkedText", 0, testSetMarkedText, 0, 0, 0, napi_default, 0},
+    {"testKeyDown", 0, testKeyDown, 0, 0, 0, napi_default, 0},
+    {"testMouseMove", 0, testMouseMove, 0, 0, 0, napi_default, 0},
+    {"testMouseClick", 0, testMouseClick, 0, 0, 0, napi_default, 0},
+    {"testScroll", 0, testScroll, 0, 0, 0, napi_default, 0},
+    {"testFlagsChanged", 0, testFlagsChanged, 0, 0, 0, napi_default, 0},
+    {"isVisible", 0, isVisible, 0, 0, 0, napi_default, 0},
+    {"setReadOnly", 0, setReadOnly, 0, 0, 0, napi_default, 0},
+    {"inspect", 0, inspect, 0, 0, 0, napi_default, 0},
+    {"bindingAction", 0, bindingAction, 0, 0, 0, napi_default, 0},
+    {"setShortcutHandler", 0, setShortcutHandler, 0, 0, 0, napi_default, 0},
+    {"setFocusHandler", 0, setFocusHandler, 0, 0, 0, napi_default, 0},
+    {"setPasteImageHandler", 0, setPasteImageHandler, 0, 0, 0, napi_default, 0},
+    {"onOpenUrl", 0, setOpenUrlHandler, 0, 0, 0, napi_default, 0},
+    {"setOpenUrlHandler", 0, setOpenUrlHandler, 0, 0, 0, napi_default, 0},
+  };
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props); return exports;
 }

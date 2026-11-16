@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateStore, type ApiState } from "../src/main/state-store";
+import { diffDesktopSnapshot } from "../src/shared/snapshot-patch";
+import type { SessionInfo } from "../src/shared/types";
 
 const homes: string[] = [];
 function home(): string { const path = mkdtempSync(resolve(tmpdir(), "prospero-api-state-")); homes.push(path); return path; }
@@ -103,5 +105,68 @@ describe("API-only desktop state", () => {
     expect(() => store.setApiState(rawPayload)).not.toThrow();
     expect(store.snapshot().daemon.sessions).toHaveLength(200);
     expect(store.snapshot().orchestration.tasks).toHaveLength(120);
+  });
+
+  it("skips full JSON.stringify below budget and preserves 599/600 SessionInfo references via patchApiSessions", () => {
+    const store = new StateStore(home(), "api");
+    const initialSessions: SessionInfo[] = Array.from({ length: 600 }, (_, index) => ({
+      id: `session-${index}`,
+      agent: "codex",
+      kind: "structured",
+      historyMode: "paged",
+      archived: false,
+      title: `Session ${index}`,
+      cwd: "/synthetic",
+      status: "idle",
+      createdAt: index + 1,
+      pendingPermissions: 0,
+      pendingQuestions: 0,
+      approvalPolicy: "standard",
+      subagents: [],
+    }));
+
+    const stringifySpy = vi.spyOn(JSON, "stringify");
+    try {
+      store.setApiState({
+        ...data(),
+        status: {
+          ...data().status,
+          metadataRevision: "test:10",
+          sessions: initialSessions,
+        },
+      });
+      // Normal 600-session updates are well below 9 MiB and must not call JSON.stringify on the snapshot
+      expect(stringifySpy).not.toHaveBeenCalled();
+
+      const before = store.snapshot();
+      expect(before.daemon.sessions).toHaveLength(600);
+
+      const updatedTarget: SessionInfo = {
+        ...before.daemon.sessions[42]!,
+        status: "running",
+        busySince: 999,
+      };
+      stringifySpy.mockClear();
+      store.patchApiSessions([updatedTarget], [], { metadataRevision: "test:11" });
+      expect(stringifySpy).not.toHaveBeenCalled();
+
+      const after = store.snapshot();
+      expect(after.daemon.metadataRevision).toBe("test:11");
+      expect(after.daemon.sessions[42]?.status).toBe("running");
+      expect(after.daemon.sessions[42]?.busySince).toBe(999);
+      for (let index = 0; index < 600; index++) {
+        if (index === 42) continue;
+        expect(after.daemon.sessions[index]).toBe(before.daemon.sessions[index]);
+      }
+
+      const patch = diffDesktopSnapshot(before, after);
+      expect(patch).not.toBeNull();
+      expect(patch?.daemon?.sessions).toBeUndefined();
+      expect(patch?.daemon?.sessionUpserts).toHaveLength(1);
+      expect(patch?.daemon?.sessionUpserts?.[0]?.id).toBe("session-42");
+      expect(patch?.daemon?.removedSessionIds).toBeUndefined();
+    } finally {
+      stringifySpy.mockRestore();
+    }
   });
 });

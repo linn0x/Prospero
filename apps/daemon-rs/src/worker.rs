@@ -221,6 +221,14 @@ struct Inner {
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        self.state.stopping.store(true, Ordering::Release);
+        self.worker.unpark();
+    }
+}
+
 #[derive(Clone)]
 pub struct Database(Arc<Inner>);
 
@@ -761,10 +769,12 @@ impl Database {
                                     *current = Some(message);
                                 }
                             }
-                        } else if control_receiver.is_closed() && background_receiver.is_closed() {
+                        } else if control_receiver.is_closed() && background_receiver.is_closed()
+                            || worker_state.stopping.load(Ordering::Acquire)
+                        {
                             break;
                         } else {
-                            thread::park_timeout(Duration::from_millis(2));
+                            thread::park_timeout(Duration::from_millis(500));
                         }
                     }
                 }));

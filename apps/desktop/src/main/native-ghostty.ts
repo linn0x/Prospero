@@ -7,8 +7,14 @@ import { randomUUID } from "node:crypto";
 import type { BrowserWindow } from "electron";
 import type WebSocket from "ws";
 import type { TerminalSnapshot } from "@prospero/protocol/rust-daemon";
+import { normalizeExternalUrl } from "../shared/external-url";
 import { TerminalStreamKind, decodeTerminalFrame, encodeTerminalFrame, type TerminalStreamFrame } from "../shared/terminal-stream";
-import { NativeRelayDecoder, NativeTerminalQueryFilter } from "./native-terminal-wire";
+import {
+  NativeRelayDecoder,
+  NativeTerminalQueryFilter,
+  isOnlyAutomaticTerminalEvents,
+  stripAutomaticTerminalReplies,
+} from "./native-terminal-wire";
 import { NativeTerminalOperationQueue, type NativeTerminalOperation } from "./native-terminal-operation-queue";
 import { TerminalStreamController, type TerminalStreamState } from "../renderer/src/terminal-stream-controller";
 
@@ -27,6 +33,7 @@ export type NativeGhosttyAddon = {
   setFocusHandler?(handler: (id: number, focused: boolean) => void): void;
   setReadOnly?(id: number, readOnly: boolean): void;
   setPasteImageHandler?(handler: (id: number) => boolean): void;
+  onOpenUrl?(handler: (id: number, url: string) => void): void;
   inputText?(id: number, text: string): void;
   readText?(id: number, viewport?: boolean): string;
 };
@@ -95,6 +102,13 @@ export function surfaceCommand(relayPath: string, socketPath: string): string {
   return `/bin/sh -c ${shellQuote(`exec ${shellQuote(relayPath)} ${shellQuote(socketPath)}`)}`;
 }
 
+function defaultOpenExternal(url: string): Promise<void> | void {
+  const electronModule = require("electron") as typeof import("electron") | string;
+  if (typeof electronModule === "object" && electronModule !== null && electronModule.shell?.openExternal) {
+    return electronModule.shell.openExternal(url);
+  }
+}
+
 export function parseFontFamilies(value: string | undefined): string[] | undefined {
   if (value === undefined) return undefined;
   if (/[\u0000-\u001f\u007f]/.test(value)) throw new Error("Native terminal font family is invalid");
@@ -152,9 +166,17 @@ export class NativeGhosttyManager {
     private readonly publishShortcut: (id: number, action: "toggle-focus" | "project-search" | "terminal-search") => void,
     private readonly publishFocus: (id: number, focused: boolean) => void,
     private readonly publishPasteImage: (id: number) => boolean,
+    private readonly openExternal?: (url: string) => Promise<void> | void,
     private readonly addonOverride?: NativeGhosttyAddon,
     private readonly readSnapshot?: (sessionId: string) => Promise<TerminalSnapshot | null>,
   ) {}
+
+  private handleOpenUrl(rawUrl: string): void {
+    const normalized = normalizeExternalUrl(rawUrl);
+    if (!normalized) return;
+    const opener = this.openExternal ?? defaultOpenExternal;
+    void Promise.resolve(opener(normalized)).catch(() => undefined);
+  }
 
   private publishState(session: NativeSession): void {
     if (session.closing || session.surfacePhase !== "mounted") return;
@@ -274,13 +296,7 @@ export class NativeGhosttyManager {
       try { await consumeFrame(frame); }
       finally {
         session.consuming -= 1;
-        if (session.reconcilingResize) {
-          session.reconcilingResize = false;
-          if (!session.closing && session.streamGeneration === generation) {
-            const state = session.controllerState;
-            this.setReadOnly(session, session.suspended || !state.connected || state.syncing || !state.controller || state.exited);
-          }
-        }
+        session.reconcilingResize = false;
       }
     };
     const consumeFrame = async (frame: TerminalStreamFrame): Promise<void> => {
@@ -295,7 +311,6 @@ export class NativeGhosttyManager {
       if (frame.kind === TerminalStreamKind.Resize) {
         if (this.readSnapshot) {
           session.reconcilingResize = true;
-          this.setReadOnly(session, true);
           const snapshot = await this.readSnapshot(session.sessionId);
           if (session.closing || session.streamGeneration !== generation) return;
           if (snapshot && snapshot.seq >= frame.sequence) {
@@ -432,40 +447,37 @@ export class NativeGhosttyManager {
     });
     streamSocket.on("close", (code, reason) => {
       if (session.closing || session.streamGeneration !== generation) return;
+      const reasonText = reason.byteLength ? `: ${reason.toString("utf8").slice(0, 256)}` : "";
       if (process.env["PROSPERO_NATIVE_GHOSTTY_DEBUG"] === "1") {
         let nativeOutput = "";
         try { nativeOutput = this.loadAddon().readText?.(session.id) ?? ""; }
         catch (error) { nativeOutput = `readText failed: ${error instanceof Error ? error.message : String(error)}`; }
         process.stderr.write(`[native-ghostty] websocket closed code=${code} reason=${reason.toString("utf8")} peer=${Boolean(session.peer && !session.peer.destroyed)} queuedRelayBytes=${session.preSurfaceBytes}\n${nativeOutput.slice(-2000)}\n`);
       }
-      const closeMessage = streamFailure ?? `Terminal stream closed unexpectedly (code ${code}${reason.byteLength ? `: ${reason.toString("utf8").slice(0, 256)}` : ""})`;
-      if (terminalController.hasExit()) {
-        void terminalController.finishCleanExit().then(cleanExit => {
-          if (session.closing || session.streamGeneration !== generation) return;
-          if (!cleanExit) {
-            this.failSession(session.id, closeMessage);
-            return;
-          }
-          delete session.controller;
-          delete session.streamSocket;
-          session.controllerAttached = false;
-          session.controllerState = {
-            ...session.controllerState,
-            connected: false,
-            syncing: false,
-            controller: false,
-            exited: true,
-            readOnly: true,
-          };
-          if (session.surfaceReady) {
-            this.setReadOnly(session, true);
-            this.restoreSurfaceBounds(session);
-          }
-          this.publishState(session);
-        });
-        return;
-      }
-      this.failSession(session.id, closeMessage);
+      void terminalController.finishTransportClose().then(outcome => {
+        if (session.closing || session.streamGeneration !== generation) return;
+        const closeMessage = streamFailure ?? `Terminal stream closed unexpectedly (code ${code}${reasonText})`;
+        if (outcome !== "clean_exit") {
+          this.failSession(session.id, closeMessage);
+          return;
+        }
+        delete session.controller;
+        delete session.streamSocket;
+        session.controllerAttached = false;
+        session.controllerState = {
+          ...session.controllerState,
+          connected: false,
+          syncing: false,
+          controller: false,
+          exited: true,
+          readOnly: true,
+        };
+        if (session.surfaceReady) {
+          this.setReadOnly(session, true);
+          this.restoreSurfaceBounds(session);
+        }
+        this.publishState(session);
+      });
     });
 
     terminalController.attach(controllerPortLike as unknown as MessagePort);
@@ -654,12 +666,15 @@ export class NativeGhosttyManager {
         try {
           for (const frame of session.decoder.push(bytes)) {
             if (frame.kind === "I") {
-              if (session.suspended || session.reconcilingResize || !session.controllerState.connected || !session.controllerState.controller || session.controllerState.exited) {
+              const payload = stripAutomaticTerminalReplies(frame.payload);
+              if (!payload.byteLength) continue;
+              if (session.suspended || !session.controllerState.connected || !session.controllerState.controller || session.controllerState.exited) {
+                if (isOnlyAutomaticTerminalEvents(payload)) continue;
                 if (!session.readOnlyInputFailureNotified) {
                   session.readOnlyInputFailureNotified = true;
                   this.publishError(session, "Terminal input is disabled while this session is read-only");
                 }
-              } else void session.operations.enqueueInput(frame.payload).then(() => {
+              } else void session.operations.enqueueInput(payload).then(() => {
                 session.busyInputNotified = false;
                 session.inputQueueFullNotified = false;
               }).catch(error => {
@@ -847,7 +862,7 @@ export class NativeGhosttyManager {
 
   inputText(id: number, text: string): void {
     const session = this.requireSession(id);
-    if (session.suspended || session.reconcilingResize || !session.controllerState.connected || !session.controllerState.controller || session.controllerState.exited) throw new Error("Native terminal input is unavailable while observing");
+    if (session.suspended || !session.controllerState.connected || !session.controllerState.controller || session.controllerState.exited) throw new Error("Native terminal input is unavailable while observing");
     if (Buffer.byteLength(text, "utf8") > 8192 || text.includes("\0")) throw new Error("Native terminal input is invalid");
     const inputText = this.loadAddon().inputText;
     if (!inputText) throw new Error("Native terminal text input is unavailable");
@@ -953,6 +968,9 @@ export class NativeGhosttyManager {
       this.publishFocus(id, focused);
     });
     addon.setPasteImageHandler?.(id => this.sessions.has(id) && this.publishPasteImage(id));
+    addon.onOpenUrl?.((_id, rawUrl) => {
+      this.handleOpenUrl(rawUrl);
+    });
   }
 
   private setAuthoritativeGrid(session: NativeSession, columns: number, rows: number): void {
@@ -1001,7 +1019,7 @@ export class NativeGhosttyManager {
   }
 
   private setReadOnly(session: NativeSession, readOnly: boolean): void {
-    try { this.loadAddon().setReadOnly?.(session.id, readOnly || session.reconcilingResize); }
+    try { this.loadAddon().setReadOnly?.(session.id, readOnly); }
     catch (error) { this.publishError(session, error instanceof Error ? error.message : String(error)); }
   }
 

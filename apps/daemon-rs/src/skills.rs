@@ -328,7 +328,9 @@ fn scan_skill_root(root: &SkillRoot) -> Vec<DiscoveredSkill> {
                 Ok(kind) => (kind.is_file(), kind.is_dir(), kind.is_symlink()),
                 Err(_) => (false, false, false),
             };
-            if name == "SKILL.md" && (is_file || (is_symlink && actual.join(name.as_ref()).is_file())) {
+            if name == "SKILL.md"
+                && (is_file || (is_symlink && actual.join(name.as_ref()).is_file()))
+            {
                 skill_file = Some(actual.join(name.as_ref()));
                 continue;
             }

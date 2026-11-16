@@ -69,6 +69,7 @@ export class TerminalStreamController {
   private helloSeen = false;
   private exitReceived = false;
   private cleanExit = false;
+  private errorReceived = false;
   private transportClosed = false;
   private freshReloadRequired = false;
   private attachmentGeneration = 0;
@@ -89,6 +90,7 @@ export class TerminalStreamController {
     this.helloSeen = false;
     this.exitReceived = false;
     this.cleanExit = false;
+    this.errorReceived = false;
     this.transportClosed = false;
     this.freshReloadRequired = false;
     port.onmessage = event => this.receive(event.data);
@@ -98,11 +100,11 @@ export class TerminalStreamController {
     const closeAware = port as unknown as { addEventListener?: (type: string, listener: () => void) => void };
     closeAware.addEventListener?.("close", () => {
       if (this.port !== port) return;
-      if (this.hasExit()) {
-        void this.finishCleanExit();
-      } else {
-        this.fail("Terminal stream port closed", true);
-      }
+      void this.finishTransportClose().then(outcome => {
+        if (outcome === "unexpected" && this.port === port && !this.disposed) {
+          this.fail("Terminal stream port closed", true);
+        }
+      });
     });
     port.start();
     this.state = { ...this.state, connected: false, syncing: true, controller: false };
@@ -145,21 +147,40 @@ export class TerminalStreamController {
     return this.cleanExit || this.exitReceived;
   }
 
-  async finishCleanExit(): Promise<boolean> {
-    if (this.disposed || this.freshReloadRequired || !this.hasExit()) return false;
+  async finishTransportClose(): Promise<"clean_exit" | "reloading" | "failed" | "unexpected"> {
+    if (this.disposed) return "failed";
     const generation = this.attachmentGeneration;
     this.transportClosed = true;
-    this.rejectPending(new Error("Terminal session exited"));
+    this.rejectPending(new Error(this.hasExit() ? "Terminal session exited" : "Terminal stream closed"));
     await this.flushReceivedQueue();
-    if (this.disposed || this.freshReloadRequired || generation !== this.attachmentGeneration || !this.cleanExit) {
-      return false;
+    if (this.disposed || this.freshReloadRequired) {
+      return this.freshReloadRequired ? "reloading" : "failed";
     }
-    this.state = { ...this.state, connected: false, syncing: false, exited: true, readOnly: true, controller: false };
-    this.publish();
-    this.port?.close();
-    this.port = undefined;
-    this.attachmentGeneration += 1;
-    return true;
+    if (generation !== this.attachmentGeneration) {
+      return "failed";
+    }
+    if (this.cleanExit) {
+      this.state = { ...this.state, connected: false, syncing: false, exited: true, readOnly: true, controller: false };
+      this.publish();
+      this.port?.close();
+      this.port = undefined;
+      this.attachmentGeneration += 1;
+      return "clean_exit";
+    }
+    if (!this.port || this.errorReceived) {
+      this.state = { ...this.state, connected: false, syncing: false, controller: false };
+      this.publish();
+      this.port?.close();
+      this.port = undefined;
+      this.attachmentGeneration += 1;
+      return "failed";
+    }
+    return "unexpected";
+  }
+
+  async finishCleanExit(): Promise<boolean> {
+    if (!this.hasExit()) return false;
+    return (await this.finishTransportClose()) === "clean_exit";
   }
 
   close(): void {
@@ -280,6 +301,7 @@ export class TerminalStreamController {
       return;
     }
     if (frame.kind === TerminalStreamKind.Error) {
+      this.errorReceived = true;
       const value = json(frame.payload);
       const code = string(value.code) ?? "stream_error";
       const message = string(value.message) ?? "Terminal stream error";
@@ -287,8 +309,8 @@ export class TerminalStreamController {
         this.requireFreshReload(message);
         return;
       }
-      else this.options.onError(message, bool(value.recoverable) === true);
-      if (bool(value.recoverable) !== true) this.fail(message, false);
+      if (bool(value.recoverable) === true) this.options.onError(message, true);
+      else this.fail(message, false);
       return;
     }
     if (frame.kind === TerminalStreamKind.Result) {

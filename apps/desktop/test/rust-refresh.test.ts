@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { StateStore } from '../src/main/state-store';
-import { RustRuntime } from '../src/main/rust-runtime';
+import type { ChangeEvent, ResyncRequired, SessionHead } from '@prospero/protocol/rust-daemon';
+import { StateStore } from '../src/main/state-store';
+import { EVENT_COALESCE_WINDOW_MS, RustRuntime, TIMELINE_LONG_POLL_WAIT_MS } from '../src/main/rust-runtime';
 const projection = vi.hoisted(() => vi.fn());
 vi.mock('../src/main/rust-orchestration', () => ({ readOrchestrationWindow: projection, orchestrationAction: vi.fn(), settleDispatchInput: vi.fn() }));
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
@@ -139,5 +140,137 @@ describe('Rust desktop orchestration refresh', () => {
     expect(apiState.status.sessions).toHaveLength(240);
     expect(apiState.status.sessions[239].id).toBe('active-240');
     expect(apiState.status.sessionSummary.activeLimit).toBe(500);
+  });
+
+  it('passes waitMs: 15_000 when reading timeline changes from the daemon', async () => {
+    const { internal, connection } = fixture();
+    const runtime = internal as unknown as RustRuntime;
+    const abort = new AbortController();
+    await runtime.readTimelineChanges('session-1', 42, abort.signal);
+    expect(connection.client.events).toHaveBeenCalledWith(
+      { scope: 'timeline:session-1', afterSeq: 42, limit: 100, waitMs: TIMELINE_LONG_POLL_WAIT_MS },
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('coalesces bursty SSE session.updated events over 16ms into a single targeted sidebarLookup + patchApiSessions', async () => {
+    vi.useFakeTimers();
+    const sessionHeads: SessionHead[] = Array.from({ length: 5 }, (_, index) => ({
+      id: `s-${index + 1}`,
+      agent: 'codex',
+      kind: 'structured',
+      title: `Session ${index + 1}`,
+      workspace: '/synthetic',
+      lifecycle: 'active',
+      status: 'idle',
+      createdAt: index + 1,
+      updatedAt: index + 1,
+      revision: 1,
+    }));
+
+    const streamHandlers = new Map<string, { onChange: (event: ChangeEvent) => void; onResync: (resync: ResyncRequired) => void }>();
+    const subscribeEvents = vi.fn((
+      query: { scope: string; afterSeq: number },
+      handlers: { onChange: (event: ChangeEvent) => void; onResync: (resync: ResyncRequired) => void },
+      signal: AbortSignal,
+    ) => {
+      streamHandlers.set(query.scope, handlers);
+      return new Promise<void>((resolve) => {
+        signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+    const sidebarLookup = vi.fn(async (ids: string[]) => ({
+      items: ids.map((id) => {
+        const base = sessionHeads.find((head) => head.id === id)!;
+        return { ...base, status: 'running' as const, busySince: 500, revision: 2 };
+      }),
+    }));
+
+    const client = {
+      events: vi.fn(async () => ({ latestSeq: 10, resyncRequired: false })),
+      subscribeEvents,
+      sidebarLookup,
+      summary: vi.fn(async () => ({ latestSeq: 10, total: 5, active: 5, archived: 0, attention: 0 })),
+      sidebarSessions: vi.fn(async (query?: { lifecycle?: string }) => ({
+        latestSeq: 10,
+        items: query?.lifecycle === 'archived' ? [] : sessionHeads,
+      })),
+      workspaces: vi.fn(async () => ({
+        latestSeq: 10,
+        items: [{ workspace: '/synthetic', summary: { revision: 10, total: 5, active: 5, archived: 0, attention: 0 } }],
+      })),
+      health: vi.fn(async () => ({ capabilities: ['session.lifecycle.v1'], persistence: { pty: true, structured: true } })),
+      devices: vi.fn(async () => ({ items: [] })),
+      schedules: vi.fn(async () => []),
+      agentQueues: vi.fn(async () => ({ queues: [] })),
+      agentControls: vi.fn(async () => ({ controls: [] })),
+    };
+
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { resolve } = await import('node:path');
+    const tempHome = mkdtempSync(resolve(tmpdir(), 'prospero-sse-runtime-'));
+    try {
+      const store = new StateStore(tempHome, 'api');
+      const patchSpy = vi.spyOn(store, 'patchApiSessions');
+      const setApiSpy = vi.spyOn(store, 'setApiState');
+      projection.mockResolvedValue({ runs: [] });
+
+      const runtime = new RustRuntime(store, '/synthetic/binary', tempHome);
+      const internal = runtime as unknown as {
+        connection: unknown;
+        ready: boolean;
+        refresh: (force?: boolean) => Promise<void>;
+        ensureEventStreams: () => void;
+        stopEventStreams: () => void;
+      };
+      internal.connection = { client, pid: 77, baseUrl: 'http://127.0.0.1:1234' };
+      await internal.refresh();
+      internal.ready = true;
+      internal.ensureEventStreams();
+
+      expect(subscribeEvents).toHaveBeenCalledTimes(2);
+      const beforeSnapshot = store.snapshot();
+      client.sidebarSessions.mockClear();
+      client.summary.mockClear();
+      client.workspaces.mockClear();
+      setApiSpy.mockClear();
+      patchSpy.mockClear();
+
+      const sessionStream = streamHandlers.get('sessions')!;
+      // Emit 3 rapid session.updated ticks within the 16ms micro-batch window (2 for s-2, 1 for s-4)
+      sessionStream.onChange({ scope: 'sessions', seq: 11, kind: 'session.updated', entityId: 's-2', data: {} });
+      sessionStream.onChange({ scope: 'sessions', seq: 12, kind: 'session.updated', entityId: 's-4', data: {} });
+      sessionStream.onChange({ scope: 'sessions', seq: 13, kind: 'session.updated', entityId: 's-2', data: {} });
+
+      await vi.advanceTimersByTimeAsync(EVENT_COALESCE_WINDOW_MS);
+
+      expect(sidebarLookup).toHaveBeenCalledTimes(1);
+      expect(sidebarLookup.mock.calls[0]?.[0]).toEqual(['s-2', 's-4']);
+      expect(patchSpy).toHaveBeenCalledTimes(1);
+      expect(setApiSpy).not.toHaveBeenCalled();
+      expect(client.sidebarSessions).not.toHaveBeenCalled();
+      expect(client.summary).not.toHaveBeenCalled();
+      expect(client.workspaces).not.toHaveBeenCalled();
+
+      const afterSnapshot = store.snapshot();
+      expect(afterSnapshot.daemon.metadataRevision).toBe('77:13');
+      expect(afterSnapshot.daemon.sessions.find((item) => item.id === 's-2')?.status).toBe('running');
+      expect(afterSnapshot.daemon.sessions.find((item) => item.id === 's-4')?.status).toBe('running');
+      // Untouched sessions retain exact === object identity
+      expect(afterSnapshot.daemon.sessions[0]).toBe(beforeSnapshot.daemon.sessions[0]);
+      expect(afterSnapshot.daemon.sessions[2]).toBe(beforeSnapshot.daemon.sessions[2]);
+      expect(afterSnapshot.daemon.sessions[4]).toBe(beforeSnapshot.daemon.sessions[4]);
+
+      // Non-targeted session.created falls back to full refresh()
+      sessionStream.onChange({ scope: 'sessions', seq: 14, kind: 'session.created', entityId: 's-new', data: {} });
+      await vi.advanceTimersByTimeAsync(EVENT_COALESCE_WINDOW_MS);
+      expect(client.sidebarSessions).toHaveBeenCalled();
+      expect(setApiSpy).toHaveBeenCalledTimes(1);
+
+      internal.stopEventStreams();
+    } finally {
+      rmSync(tempHome, { recursive: true, force: true });
+    }
   });
 });

@@ -77,6 +77,7 @@ const COLUMNS: &str =
     "r.id,r.turn_id,r.position,r.revision,r.generation,r.body,r.preview,c.bytes,r.subagent_id";
 const SOURCE: &str =
     "timeline_records r JOIN content_heads c ON c.session_id=r.session_id AND c.id=r.id";
+const RECORD_BY_ID_SQL: &str = "SELECT r.id,r.turn_id,r.position,r.revision,r.generation,r.body,r.preview,c.bytes,r.subagent_id FROM timeline_records r JOIN content_heads c ON c.session_id=r.session_id AND c.id=r.id WHERE r.session_id=?1 AND r.id=?2";
 
 fn record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineRecord> {
     let json: String = row.get(5)?;
@@ -300,11 +301,8 @@ impl Store {
         validate_id(session_id)?;
         validate_id(id)?;
         self.connection
-            .query_row(
-                &format!("SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND r.id=?2"),
-                params![session_id, id],
-                record,
-            )
+            .prepare_cached(RECORD_BY_ID_SQL)?
+            .query_row(params![session_id, id], record)
             .optional()?
             .ok_or(Error::NotFound)
     }
@@ -435,11 +433,8 @@ impl Store {
             input.body = fit_diff_metadata(input.body)?;
             let body = serde_json::to_string(&input.body)?;
             let previous = transaction
-                .query_row(
-                    &format!("SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND r.id=?2"),
-                    params![session_id, input.id],
-                    record,
-                )
+                .prepare_cached(RECORD_BY_ID_SQL)?
+                .query_row(params![session_id, input.id], record)
                 .optional()?;
             if previous
                 .as_ref()
@@ -474,12 +469,19 @@ impl Store {
         let position = if let Some(previous) = &previous {
             previous.position
         } else {
-            transaction.execute("INSERT INTO timeline_heads(session_id,position) VALUES(?1,0) ON CONFLICT DO NOTHING", [session_id])?;
-            transaction.execute(
-                "INSERT INTO content_heads(session_id,id,bytes) VALUES(?1,?2,0)",
-                params![session_id, input.id],
-            )?;
-            transaction.query_row("UPDATE timeline_heads SET position=position+1 WHERE session_id=?1 RETURNING position", [session_id], |row| row.get(0))?
+            transaction
+                .prepare_cached(
+                    "INSERT INTO timeline_heads(session_id,position) VALUES(?1,0) ON CONFLICT DO NOTHING",
+                )?
+                .execute([session_id])?;
+            transaction
+                .prepare_cached("INSERT INTO content_heads(session_id,id,bytes) VALUES(?1,?2,0)")?
+                .execute(params![session_id, input.id])?;
+            transaction
+                .prepare_cached(
+                    "UPDATE timeline_heads SET position=position+1 WHERE session_id=?1 RETURNING position",
+                )?
+                .query_row([session_id], |row| row.get(0))?
         };
         let old_bytes = if input.replace {
             0
@@ -494,15 +496,18 @@ impl Store {
             .as_ref()
             .map_or(1, |record| record.generation + i64::from(input.replace));
         if input.replace {
-            transaction.execute(
-                "DELETE FROM content_chunks WHERE session_id=?1 AND content_id=?2",
-                params![session_id, input.id],
-            )?;
+            transaction
+                .prepare_cached("DELETE FROM content_chunks WHERE session_id=?1 AND content_id=?2")?
+                .execute(params![session_id, input.id])?;
         }
         if !input.text.is_empty() {
             let tail_offset = old_bytes / CONTENT_CHUNK_BYTES as i64 * CONTENT_CHUNK_BYTES as i64;
             let mut tail: Vec<u8> = if old_bytes % CONTENT_CHUNK_BYTES as i64 != 0 {
-                transaction.query_row("SELECT body FROM content_chunks WHERE session_id=?1 AND content_id=?2 AND offset=?3", params![session_id, input.id, tail_offset], |row| row.get(0))?
+                transaction
+                    .prepare_cached(
+                        "SELECT body FROM content_chunks WHERE session_id=?1 AND content_id=?2 AND offset=?3",
+                    )?
+                    .query_row(params![session_id, input.id, tail_offset], |row| row.get(0))?
             } else {
                 Vec::new()
             };
@@ -510,14 +515,21 @@ impl Store {
                 return Err(Error::Schema);
             }
             tail.extend(input.text.as_bytes());
+            let mut upsert_chunk = transaction.prepare_cached(
+                "INSERT INTO content_chunks(session_id,content_id,offset,body) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id,content_id,offset) DO UPDATE SET body=excluded.body",
+            )?;
             for (index, chunk) in tail.chunks(CONTENT_CHUNK_BYTES).enumerate() {
-                transaction.execute("INSERT INTO content_chunks(session_id,content_id,offset,body) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id,content_id,offset) DO UPDATE SET body=excluded.body", params![session_id, input.id, tail_offset + (index * CONTENT_CHUNK_BYTES) as i64, chunk])?;
+                upsert_chunk.execute(params![
+                    session_id,
+                    input.id,
+                    tail_offset + (index * CONTENT_CHUNK_BYTES) as i64,
+                    chunk
+                ])?;
             }
         }
-        transaction.execute(
-            "UPDATE content_heads SET bytes=?1 WHERE session_id=?2 AND id=?3",
-            params![bytes, session_id, input.id],
-        )?;
+        transaction
+            .prepare_cached("UPDATE content_heads SET bytes=?1 WHERE session_id=?2 AND id=?3")?
+            .execute(params![bytes, session_id, input.id])?;
         let preview = match &previous {
             Some(previous) if !input.replace && previous.bytes < PREVIEW_BYTES as i64 => {
                 // Reparse the bounded raw prefix: a sanitized preview loses trailing
@@ -525,11 +537,13 @@ impl Store {
                 let prefix: Vec<u8> = if previous.bytes == 0 {
                     Vec::new()
                 } else {
-                    transaction.query_row(
-                        "SELECT substr(body, 1, ?3) FROM content_chunks WHERE session_id=?1 AND content_id=?2 AND offset=0",
-                        params![session_id, input.id, previous.bytes],
-                        |row| row.get(0),
-                    )?
+                    transaction
+                        .prepare_cached(
+                            "SELECT substr(body, 1, ?3) FROM content_chunks WHERE session_id=?1 AND content_id=?2 AND offset=0",
+                        )?
+                        .query_row(params![session_id, input.id, previous.bytes], |row| {
+                            row.get(0)
+                        })?
                 };
                 let prefix = String::from_utf8(prefix).map_err(|_| Error::Schema)?;
                 preview(format!("{prefix}{}", input.text))
@@ -545,23 +559,25 @@ impl Store {
             &input.id,
             serde_json::json!({"position":position,"revision":revision}),
         )?;
-        let max_updated_seq: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(updated_seq), 0) FROM timeline_records WHERE session_id=?1",
-            [session_id],
-            |row| row.get(0),
-        )?;
+        let max_updated_seq: i64 = transaction
+            .prepare_cached(
+                "SELECT COALESCE(MAX(updated_seq), 0) FROM timeline_records WHERE session_id=?1",
+            )?
+            .query_row([session_id], |row| row.get(0))?;
         let step = if matches!(input.body, TimelineBody::Tool { .. }) {
             2
         } else {
             1
         };
         let updated_seq = event_seq.max(max_updated_seq + step);
-        transaction.execute(
-            "INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview,subagent_id,updated_seq) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
-             ON CONFLICT(session_id,id) DO UPDATE SET \
-             revision=excluded.revision,generation=excluded.generation,body=excluded.body,preview=excluded.preview,updated_seq=excluded.updated_seq",
-            params![
+        transaction
+            .prepare_cached(
+                "INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview,subagent_id,updated_seq) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(session_id,id) DO UPDATE SET \
+                 revision=excluded.revision,generation=excluded.generation,body=excluded.body,preview=excluded.preview,updated_seq=excluded.updated_seq",
+            )?
+            .execute(params![
                 session_id,
                 input.id,
                 input.turn_id,
@@ -572,20 +588,20 @@ impl Store {
                 preview,
                 input.subagent_id,
                 updated_seq,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO timeline_checkpoints(session_id,last_output_at,last_progress_at) VALUES(?1,?2,?3) \
-             ON CONFLICT(session_id) DO UPDATE SET \
-             last_output_at=CASE \
-               WHEN excluded.last_output_at IS NULL THEN timeline_checkpoints.last_output_at \
-               WHEN timeline_checkpoints.last_output_at IS NULL THEN excluded.last_output_at \
-               ELSE max(timeline_checkpoints.last_output_at,excluded.last_output_at) END, \
-             last_progress_at=CASE \
-               WHEN timeline_checkpoints.last_progress_at IS NULL THEN excluded.last_progress_at \
-               ELSE max(timeline_checkpoints.last_progress_at,excluded.last_progress_at) END",
-            params![session_id, output.then_some(timestamp), timestamp],
-        )?;
+            ])?;
+        transaction
+            .prepare_cached(
+                "INSERT INTO timeline_checkpoints(session_id,last_output_at,last_progress_at) VALUES(?1,?2,?3) \
+                 ON CONFLICT(session_id) DO UPDATE SET \
+                 last_output_at=CASE \
+                   WHEN excluded.last_output_at IS NULL THEN timeline_checkpoints.last_output_at \
+                   WHEN timeline_checkpoints.last_output_at IS NULL THEN excluded.last_output_at \
+                   ELSE max(timeline_checkpoints.last_output_at,excluded.last_output_at) END, \
+                 last_progress_at=CASE \
+                   WHEN timeline_checkpoints.last_progress_at IS NULL THEN excluded.last_progress_at \
+                   ELSE max(timeline_checkpoints.last_progress_at,excluded.last_progress_at) END",
+            )?
+            .execute(params![session_id, output.then_some(timestamp), timestamp])?;
         if let TimelineBody::Subagent {
             subagent_id,
             name,
@@ -653,30 +669,23 @@ impl Store {
 
     fn timeline_head(&self, session_id: &str) -> Result<(i64, i64)> {
         validate_id(session_id)?;
-        let exists: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?)",
-            [session_id],
-            |row| row.get(0),
-        )?;
+        let exists: bool = self
+            .connection
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?)")?
+            .query_row([session_id], |row| row.get(0))?;
         if !exists {
             return Err(Error::NotFound);
         }
         let position = self
             .connection
-            .query_row(
-                "SELECT position FROM timeline_heads WHERE session_id=?",
-                [session_id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT position FROM timeline_heads WHERE session_id=?")?
+            .query_row([session_id], |row| row.get(0))
             .optional()?
             .unwrap_or(0);
         let revision = self
             .connection
-            .query_row(
-                "SELECT last_seq FROM stream_heads WHERE scope=?",
-                [format!("timeline:{session_id}")],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT last_seq FROM stream_heads WHERE scope=?")?
+            .query_row([format!("timeline:{session_id}")], |row| row.get(0))
             .optional()?
             .unwrap_or(0);
         Ok((position, revision))
@@ -902,6 +911,7 @@ impl Store {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn remote_timeline_updates_after(
         &self,
         session_id: &str,

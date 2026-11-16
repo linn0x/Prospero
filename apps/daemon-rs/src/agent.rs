@@ -1,3 +1,4 @@
+pub(crate) mod agy;
 mod claude;
 pub(crate) mod codex;
 pub(crate) mod conversations;
@@ -5,7 +6,6 @@ mod deepseek;
 pub(crate) mod lifecycle;
 mod opencode;
 pub(crate) mod pi;
-pub(crate) mod agy;
 mod runtime;
 mod store;
 mod turn_stream;
@@ -17,13 +17,13 @@ use ts_rs::TS;
 
 use crate::error::{Error, Result};
 
+pub(crate) use claude::fast_claude_catalog_for_account;
 pub use codex::{
     AppServerDiagnostic, AppServerDiagnosticPage, app_server_diagnostics,
     app_server_diagnostics_page,
 };
 pub use runtime::Agents;
 pub use store::{ApprovalPolicy, PermissionMode};
-pub(crate) use claude::fast_claude_catalog_for_account;
 pub(crate) use usage::{
     NATIVE_CODEX_ID, fast_codex_catalog_for_account, native_codex_environment,
     native_codex_terminal_environment, read_codex_models_for_account, read_native_codex_models,

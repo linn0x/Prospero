@@ -1554,8 +1554,9 @@ impl ModelSources {
                                     .as_ref()
                                     .and_then(|caps| caps.reasoning)
                                     != Some(false)
-                                && super::profile::known_codex_model(&route.model)
-                                    .is_some_and(|(_, efforts, _)| efforts.contains(&effort.as_str()))
+                                && super::profile::known_codex_model(&route.model).is_some_and(
+                                    |(_, efforts, _)| efforts.contains(&effort.as_str()),
+                                )
                         });
                     if !ALLOWED_EFFORTS.contains(&effort.as_str()) || !supported {
                         return Err(Error::Invalid("推理档位不受此模型路由支持".into()));
@@ -1804,12 +1805,8 @@ fn enrich_route_capabilities(route: &mut SourceRoute) {
             caps.reasoning = Some(true);
         }
         if caps.supported_efforts.is_none() && !efforts.is_empty() {
-            caps.supported_efforts = Some(
-                efforts
-                    .iter()
-                    .map(|effort| (*effort).to_owned())
-                    .collect(),
-            );
+            caps.supported_efforts =
+                Some(efforts.iter().map(|effort| (*effort).to_owned()).collect());
         }
     }
     if caps != super::ModelCapabilities::default() {

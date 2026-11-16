@@ -245,6 +245,19 @@ impl Output {
     }
 
     fn terminal_query_responses(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum QueryKind {
+            CursorPosition { dec: bool },
+            Da1,
+            Da2,
+            XtVersion,
+            KittyKeyboard,
+            DecRqm(u16),
+            OscFg,
+            OscBg,
+            OscCursor,
+        }
+
         let carry_len = self.query_carry.len();
         let mut text = std::mem::take(&mut self.query_carry);
         text.extend_from_slice(bytes);
@@ -255,18 +268,51 @@ impl Output {
             if text[start] != 0x1b || !matches!(text[start + 1], b'[' | b']') {
                 continue;
             }
-            let mut end = start + 2;
+            let prefix = match (text[start + 1], text.get(start + 2)) {
+                (b'[', Some(&b'?')) => Some(b'?'),
+                (b'[', Some(&b'>')) => Some(b'>'),
+                _ => None,
+            };
+            let digits_start = start + 2 + usize::from(prefix.is_some());
+            let mut end = digits_start;
             while end < text.len() && text[end].is_ascii_digit() {
                 end += 1;
             }
-            let parameter = text[start + 2..end].iter().try_fold(0_u32, |value, digit| {
-                value.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
-            });
-            let kind = match (text[start + 1], parameter, text.get(end)) {
-                (b'[', Some(6), Some(b'n')) => Some((end + 1, 0)),
-                (b'[', Some(0), Some(b'c')) => Some((end + 1, 1)),
-                (b']', Some(10 | 11), Some(b';')) if text.get(end + 1) == Some(&b'?') => {
-                    Some((end + 2, if parameter == Some(10) { 2 } else { 3 }))
+            let has_digits = end > digits_start;
+            let parameter = text[digits_start..end]
+                .iter()
+                .try_fold(0_u32, |value, digit| {
+                    value.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
+                });
+            let kind = match (text[start + 1], prefix, parameter, text.get(end)) {
+                (b'[', None, Some(6), Some(b'n')) => {
+                    Some((end + 1, QueryKind::CursorPosition { dec: false }))
+                }
+                (b'[', Some(b'?'), Some(6), Some(b'n')) => {
+                    Some((end + 1, QueryKind::CursorPosition { dec: true }))
+                }
+                (b'[', None, Some(0), Some(b'c')) => Some((end + 1, QueryKind::Da1)),
+                (b'[', Some(b'>'), Some(0), Some(b'c')) => Some((end + 1, QueryKind::Da2)),
+                (b'[', Some(b'>'), Some(0), Some(b'q')) => Some((end + 1, QueryKind::XtVersion)),
+                (b'[', Some(b'?'), Some(0), Some(b'u')) if !has_digits => {
+                    Some((end + 1, QueryKind::KittyKeyboard))
+                }
+                (b'[', Some(b'?'), Some(mode), Some(b'$'))
+                    if has_digits
+                        && u16::try_from(mode).is_ok()
+                        && text.get(end + 1) == Some(&b'p') =>
+                {
+                    Some((end + 2, QueryKind::DecRqm(mode as u16)))
+                }
+                (b']', None, Some(10..=12), Some(b';')) if text.get(end + 1) == Some(&b'?') => {
+                    Some((
+                        end + 2,
+                        match parameter {
+                            Some(10) => QueryKind::OscFg,
+                            Some(11) => QueryKind::OscBg,
+                            _ => QueryKind::OscCursor,
+                        },
+                    ))
                 }
                 _ => None,
             };
@@ -284,13 +330,38 @@ impl Output {
                 processed = current_end;
             }
             responses.push(match kind {
-                0 => {
+                QueryKind::CursorPosition { dec } => {
                     let (row, col) = self.screen.cursor_position();
-                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                    if dec {
+                        format!("\x1b[?{};{}R", row + 1, col + 1).into_bytes()
+                    } else {
+                        format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                    }
                 }
-                1 => b"\x1b[?6c".to_vec(),
-                2 => b"\x1b]10;rgb:c0c0/caca/f5f5\x1b\\".to_vec(),
-                _ => b"\x1b]11;rgb:1a1a/1b1b/2626\x1b\\".to_vec(),
+                QueryKind::Da1 => b"\x1b[?6c".to_vec(),
+                QueryKind::Da2 => b"\x1b[>1;10;0c".to_vec(),
+                QueryKind::XtVersion => b"\x1bP>|ghostty 1.3.1\x1b\\".to_vec(),
+                QueryKind::KittyKeyboard => {
+                    format!("\x1b[?{}u", self.screen.kitty_keyboard_flags()).into_bytes()
+                }
+                QueryKind::DecRqm(mode) => {
+                    let recognized = [
+                        1, 6, 7, 9, 12, 25, 47, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015,
+                        1016, 1034, 1047, 1048, 1049, 2004, 2026, 2027, 2031, 2048,
+                    ]
+                    .contains(&mode);
+                    let pm = if !recognized {
+                        0
+                    } else if self.screen.mode_enabled(mode) {
+                        1
+                    } else {
+                        2
+                    };
+                    format!("\x1b[?{mode};{pm}$y").into_bytes()
+                }
+                QueryKind::OscFg => b"\x1b]10;rgb:c0c0/caca/f5f5\x1b\\".to_vec(),
+                QueryKind::OscBg => b"\x1b]11;rgb:1a1a/1b1b/2626\x1b\\".to_vec(),
+                QueryKind::OscCursor => b"\x1b]12;rgb:c0c0/caca/f5f5\x1b\\".to_vec(),
             });
         }
         if processed < text.len() {
@@ -303,7 +374,16 @@ impl Output {
             .filter(|start| {
                 let suffix = &text[*start + 1..];
                 match suffix.first() {
-                    Some(b'[') => suffix[1..].iter().all(u8::is_ascii_digit),
+                    Some(b'[') => {
+                        let rest = suffix[1..]
+                            .strip_prefix(b"?")
+                            .or_else(|| suffix[1..].strip_prefix(b">"))
+                            .unwrap_or(&suffix[1..]);
+                        rest.strip_suffix(b"$")
+                            .unwrap_or(rest)
+                            .iter()
+                            .all(u8::is_ascii_digit)
+                    }
                     Some(b']') => suffix[1..]
                         .strip_suffix(b";")
                         .unwrap_or(&suffix[1..])
@@ -620,6 +700,10 @@ impl Terminal {
         let output = self.0.output.lock().map_err(|_| Error::Closed)?;
         Ok(output.screen.snapshot(output.seq).ok())
     }
+    pub fn size(&self) -> Result<TerminalSize> {
+        let output = self.0.output.lock().map_err(|_| Error::Closed)?;
+        Ok(output.screen.size())
+    }
 
     pub(crate) fn activity(&self) -> Result<TerminalActivity> {
         Ok(self
@@ -879,7 +963,7 @@ mod tests {
     fn unsupported_checkpoint_state_preserves_output_and_cursor_replies() {
         let mut output = Output::new(TerminalSize { cols: 24, rows: 8 }).unwrap();
         let replies = output.write(
-            b"\x1b]9;notification\x07\x1b]8;;https://example.com\x07ABC\x1b]8;;\x07Z\x1b[6n",
+            b"\x1b]4;1;rgb:ff/00/00\x07\x1b]8;;https://example.com\x07ABC\x1b]8;;\x07Z\x1b[6n",
         );
         assert_eq!(replies, vec![b"\x1b[1;5R".to_vec()]);
         assert!(output.screen.visible_tail_text(8).contains("ABCZ"));
@@ -889,7 +973,7 @@ mod tests {
     #[test]
     fn journal_replays_beyond_memory_retention_after_snapshot_failure() {
         let mut output = Output::new(TerminalSize { cols: 24, rows: 8 }).unwrap();
-        output.write(b"\x1b]9;notification\x07base");
+        output.write(b"\x1b]4;1;rgb:ff/00/00\x07base");
         for _ in 0..(RETAINED_EVENTS + 64) {
             output.write(b"x");
         }
@@ -976,6 +1060,27 @@ mod tests {
         let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
         assert_eq!(output.write(b"x\x1b[06n"), vec![b"\x1b[1;2R".to_vec()]);
         assert_eq!(output.write(b"\x1b[00c"), vec![b"\x1b[?6c".to_vec()]);
+    }
+
+    #[test]
+    fn tui_extended_queries_are_answered_across_chunks() {
+        let mut output = Output::new(TerminalSize { cols: 80, rows: 24 }).unwrap();
+        let stream = b"\x1b[?2027h\x1b[>q\x1b[>0c\x1b[?2026$p\x1b[?2027$p\x1b[>7u\x1b[?u\x1b[?6n";
+        let mut responses = Vec::new();
+        for byte in stream {
+            responses.extend(output.write(&[*byte]));
+        }
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1bP>|ghostty 1.3.1\x1b\\".to_vec(),
+                b"\x1b[>1;10;0c".to_vec(),
+                b"\x1b[?2026;2$y".to_vec(),
+                b"\x1b[?2027;1$y".to_vec(),
+                b"\x1b[?7u".to_vec(),
+                b"\x1b[?1;1R".to_vec(),
+            ]
+        );
     }
 
     #[test]

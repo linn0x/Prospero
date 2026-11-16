@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EventPage, TimelinePage, TimelineQuery, TimelineRecord } from "@prospero/protocol/rust-daemon";
-import { MAX_TURN_CONTINUATION_PAGES, TimelineController, TimelineViewCache, timelineEvent } from "../src/renderer/src/timeline-controller";
+import { ACTIVE_POLL_MS, IDLE_POLL_MS, LONG_POLL_REENTER_MS, MAX_TURN_CONTINUATION_PAGES, TimelineController, TimelineViewCache, timelineEvent } from "../src/renderer/src/timeline-controller";
 
 function entry(position: number, revision = 1, preview = `Record ${position}`): TimelineRecord {
   return { id: `record-${position}`, turnId: `turn-${position}`, position, revision, body: { kind: "message", role: "assistant", finalAnswer: true }, preview, bytes: preview.length, generation: 1, truncated: false };
@@ -206,6 +206,100 @@ describe("paged materialized timelines", () => {
     expect(controller.getSnapshot().error).toBeUndefined();
     expect(controller.getSnapshot().page?.items[2]?.preview).toBe("updated 3");
     expect(controller.getSnapshot().page?.items[86]?.preview).toBe("updated 87");
+    controller.stop();
+  });
+
+  it("uses 32ms active batching on changes, 20ms re-entry after held long-polls, and 500ms fallback on instant empty mocks", async () => {
+    vi.useFakeTimers();
+    expect(ACTIVE_POLL_MS).toBe(32);
+    expect(LONG_POLL_REENTER_MS).toBe(20);
+    expect(IDLE_POLL_MS).toBe(500);
+
+    let callIndex = 0;
+    const readTimelineChanges = vi.fn(async () => {
+      callIndex += 1;
+      if (callIndex === 1) {
+        // Active streaming update -> should schedule next poll at 32ms
+        return changes(11, [100]);
+      }
+      if (callIndex === 2) {
+        // Held long-poll timeout (>= 1000ms) with 0 changes -> should re-enter in 20ms
+        return new Promise<EventPage>((resolve) => {
+          setTimeout(() => resolve(changes(11)), 15_000);
+        });
+      }
+      // Instant empty response (< 200ms) -> should fall back to 500ms without busy-spinning
+      return changes(11);
+    });
+    const lookupTimeline = vi.fn(async () => ({ items: [entry(100, 2, "Streamed")], latestPosition: 100, revision: 11 }));
+    const controller = new TimelineController({
+      readTimeline: vi.fn(async (_id: string, query: TimelineQuery) => page(query, 100)),
+      readTimelineChanges,
+      lookupTimeline,
+      cancelSessionPage: vi.fn(async () => {}),
+    }, "session");
+
+    controller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(readTimelineChanges).not.toHaveBeenCalled();
+
+    // First poll fires at 500ms -> returns 1 item -> schedules 32ms
+    await vi.advanceTimersByTimeAsync(500);
+    expect(readTimelineChanges).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(31);
+    expect(readTimelineChanges).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(readTimelineChanges).toHaveBeenCalledTimes(2);
+
+    // Second poll holds for 15_000ms on daemon -> resolves empty -> re-enters in 20ms
+    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(19);
+    expect(readTimelineChanges).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(readTimelineChanges).toHaveBeenCalledTimes(3);
+
+    // Third poll returned empty in 0ms -> must NOT busy-spin at 20ms; waits full 500ms
+    await vi.advanceTimersByTimeAsync(499);
+    expect(readTimelineChanges).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(readTimelineChanges).toHaveBeenCalledTimes(4);
+
+    controller.stop();
+  });
+
+  it("hydrates synchronously from initialPage without full reload when switching back to a cached chat session", async () => {
+    vi.useFakeTimers();
+    const initial = page({ before: null, after: null, limit: 40 }, 40, 10);
+    let latestCached: TimelinePage | undefined;
+    const api = {
+      readTimeline: vi.fn(async (_id: string, query: TimelineQuery) => page(query, 41, 11)),
+      readTimelineChanges: vi
+        .fn()
+        .mockResolvedValueOnce(changes(10))
+        .mockResolvedValueOnce(changes(11, [41]))
+        .mockResolvedValue(changes(11)),
+      lookupTimeline: vi.fn(),
+      cancelSessionPage: vi.fn(async () => {}),
+    };
+    const controller = new TimelineController(api, "session", {
+      initialPage: initial,
+      onPage: nextPage => {
+        latestCached = nextPage;
+      },
+    });
+    expect(controller.getSnapshot()).toEqual({ page: initial, loading: false, error: undefined, live: true });
+
+    controller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    // Unchanged timeline: zero full readTimeline calls and loading remained false!
+    expect(api.readTimeline).not.toHaveBeenCalled();
+    expect(api.readTimelineChanges).toHaveBeenCalledWith("session", 10, expect.any(String));
+    expect(controller.getSnapshot().loading).toBe(false);
+
+    // When a new position arrives on subsequent poll, it silently updates and notifies onPage.
+    await vi.advanceTimersByTimeAsync(IDLE_POLL_MS);
+    expect(api.readTimeline.mock.calls.filter(([, query]) => query.before === null && query.after === null)).toHaveLength(1);
+    expect(latestCached?.latestPosition).toBe(41);
     controller.stop();
   });
 });

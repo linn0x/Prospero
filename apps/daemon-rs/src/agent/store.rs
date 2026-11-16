@@ -394,7 +394,7 @@ impl Store {
     /// these rows and settles the ones whose session has reached a terminal
     /// state.
     pub(crate) fn unsettled_cross_model_children(&self) -> Result<Vec<super::CrossModelChild>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT child_session_id,parent_session_id,task,source_id,route_id,account_id,status,result,summary_delivered,summary_delivered_at,summary_acknowledged,summary_acknowledged_at,created_at,updated_at \
              FROM cross_model_children WHERE status IN ('starting','running') ORDER BY created_at,child_session_id",
         )?;
@@ -480,7 +480,7 @@ impl Store {
 
         // 1. Prefer `finalAnswer = 1` assistant message segment(s) in chronological order.
         let final_ids: Vec<String> = {
-            let mut stmt = self.connection.prepare(
+            let mut stmt = self.connection.prepare_cached(
                 "SELECT id FROM timeline_records WHERE session_id=?1 AND turn_id=?2 AND json_extract(body,'$.kind')='message' AND json_extract(body,'$.role')='assistant' AND coalesce(json_extract(body,'$.finalAnswer'),0)=1 ORDER BY position ASC",
             )?;
             stmt.query_map(params![child_session_id, &turn_id], |row| row.get(0))?
@@ -682,7 +682,7 @@ impl Store {
         )?;
         let mut rows = Vec::new();
         {
-            let mut statement = transaction.prepare(
+            let mut statement = transaction.prepare_cached(
                 "SELECT child_session_id,task_generation,status,source_id,route_id,task,coalesce(result,'') FROM cross_model_children WHERE parent_session_id=? AND summary_delivered=0 AND summary_claim_id IS NULL AND status IN ('completed','failed','stopped') ORDER BY updated_at,child_session_id LIMIT ?2",
             )?;
             for row in statement.query_map(
@@ -961,7 +961,7 @@ impl Store {
         )?;
         let mut rows = Vec::new();
         {
-            let mut statement = self.connection.prepare(
+            let mut statement = self.connection.prepare_cached(
                 "SELECT child_session_id,task_generation,status,task,coalesce(result,'') \
                  FROM cross_model_children WHERE parent_session_id=?1 AND status IN ('starting','running') \
                  ORDER BY updated_at DESC,child_session_id LIMIT ?2",
@@ -1101,7 +1101,7 @@ impl Store {
         }
         let expired_before =
             crate::database::now().saturating_sub(CROSS_MODEL_FAN_IN_CLAIM_LEASE_MILLIS);
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT c.parent_session_id FROM cross_model_children c \
              JOIN session_heads h ON h.id=c.parent_session_id \
              WHERE h.lifecycle='active' AND (?1 IS NULL OR c.parent_session_id>?1) \
@@ -1513,7 +1513,7 @@ impl Store {
     /// Active structured sessions' persisted selections, for the desktop
     /// `agentControls` projection in the session list.
     pub(crate) fn agent_controls(&self) -> Result<Vec<crate::agent::SessionAgentControls>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT ar.session_id,ar.agent,ar.permission_mode,ar.model,ar.effort,ar.approval_policy,
                     ma.api_profile IS NOT NULL
              FROM agent_runs ar
@@ -1666,7 +1666,7 @@ impl Store {
         session_id: &str,
     ) -> Result<usize> {
         let pending = {
-            let mut statement = transaction.prepare("SELECT id,position,revision FROM timeline_records WHERE session_id=?1 AND json_extract(body,'$.kind') IN ('permission_request','question') AND coalesce(json_extract(body,'$.resolved'),0)=0 ORDER BY position")?;
+            let mut statement = transaction.prepare_cached("SELECT id,position,revision FROM timeline_records WHERE session_id=?1 AND json_extract(body,'$.kind') IN ('permission_request','question') AND coalesce(json_extract(body,'$.resolved'),0)=0 ORDER BY position")?;
             statement
                 .query_map([session_id], |row| {
                     Ok((
@@ -1825,7 +1825,7 @@ impl Store {
     /// Read the queue in dispatch order (guide rows first, otherwise FIFO).
     pub(crate) fn message_queue(&self, session_id: &str) -> Result<Vec<QueuedRow>> {
         crate::database::validate_id(session_id)?;
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT queue_id,kind,text,created_at,attachments,cross_model_claim_id FROM agent_message_queue \
              WHERE session_id=?1 ORDER BY position ASC",
         )?;
@@ -1846,7 +1846,7 @@ impl Store {
     /// Attachment bytes are not decoded here — the projection only carries the
     /// count; `message_queue` returns a single session's full rows.
     pub(crate) fn message_queues(&self) -> Result<Vec<(String, Vec<QueuedRow>)>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT q.session_id,q.queue_id,q.kind,q.text,q.created_at,q.attachments,q.cross_model_claim_id \
              FROM agent_message_queue q \
              JOIN session_heads h ON h.id=q.session_id \

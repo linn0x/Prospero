@@ -416,8 +416,10 @@ fn probe_agy_status(agy_runtime_ok: bool) -> AuthProbe {
     }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let has_state = home.as_ref().is_some_and(|h| {
-        h.join(".gemini/antigravity-cli/jetski_state.pbtxt").is_file()
-            || h.join(".gemini/antigravity/antigravity_state.pbtxt").is_file()
+        h.join(".gemini/antigravity-cli/jetski_state.pbtxt")
+            .is_file()
+            || h.join(".gemini/antigravity/antigravity_state.pbtxt")
+                .is_file()
             || h.join(".gemini/antigravity-cli/installation_id").is_file()
     });
     if has_state {
@@ -510,9 +512,8 @@ fn env_files_fingerprint(
     out
 }
 
-fn auth_probe_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, (std::time::Instant, AuthProbe)>,
-> {
+fn auth_probe_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, AuthProbe)>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, AuthProbe)>>,
     > = std::sync::OnceLock::new();
@@ -553,7 +554,12 @@ async fn probe_codex_status_with_env(
             env_files_fingerprint(
                 environment,
                 "CODEX_HOME",
-                &["auth.json", "config.toml", ".codex/auth.json", ".codex/config.toml"],
+                &[
+                    "auth.json",
+                    "config.toml",
+                    ".codex/auth.json",
+                    ".codex/config.toml"
+                ],
             )
         )
     });
@@ -1015,7 +1021,15 @@ async fn snapshot_with(
 ) -> Result<AccountListResult> {
     let db = database.clone();
     let data = database.directory().to_owned();
-    let (managed, native_active, native_codex_active, native_pi_active, native_agy_active, mut managed_active, bindings) = db
+    let (
+        managed,
+        native_active,
+        native_codex_active,
+        native_pi_active,
+        native_agy_active,
+        mut managed_active,
+        bindings,
+    ) = db
         .call({
             let data = data.clone();
             move |store| {
@@ -1024,10 +1038,8 @@ async fn snapshot_with(
                 let (native_active, managed_active) = store.account_active_counts(&ids)?;
                 let native_codex_active =
                     store.native_account_active_count("codex", crate::agent::NATIVE_CODEX_ID)?;
-                let native_pi_active =
-                    store.native_account_active_count("pi", NATIVE_PI_ID)?;
-                let native_agy_active =
-                    store.native_account_active_count("agy", NATIVE_AGY_ID)?;
+                let native_pi_active = store.native_account_active_count("pi", NATIVE_PI_ID)?;
+                let native_agy_active = store.native_account_active_count("agy", NATIVE_AGY_ID)?;
                 let sources = sources::ModelSources::open(&data)?;
                 let bindings = ids
                     .iter()
@@ -1076,8 +1088,7 @@ async fn snapshot_with(
     let pi_probe = probe_pi_status(pi_runtime_ok);
     let agy_probe = probe_agy_status(agy_runtime_ok);
     let native_claude_summary = config::read_override_summary(&data, NATIVE_CLAUDE_ID);
-    let native_codex_summary =
-        config::read_override_summary(&data, crate::agent::NATIVE_CODEX_ID);
+    let native_codex_summary = config::read_override_summary(&data, crate::agent::NATIVE_CODEX_ID);
     let now = crate::database::now();
     let mut accounts = vec![
         NativeAccount {

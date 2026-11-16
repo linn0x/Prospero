@@ -37,6 +37,62 @@ const LOG_FLUSH_DELAY_MS = 120;
 export const MAX_API_STATE_SESSIONS = 600;
 export const API_STATE_SOFT_LIMIT_BYTES = 12 * 1024 * 1024;
 export const API_STATE_MAX_BYTES = 16 * 1024 * 1024;
+const API_STATE_ESTIMATE_THRESHOLD_BYTES = Math.floor(API_STATE_SOFT_LIMIT_BYTES * 0.75);
+
+function estimateJsonBytesUpperBound(value: unknown, stopAt = API_STATE_ESTIMATE_THRESHOLD_BYTES): number {
+  let total = 0;
+  const stack: unknown[] = [value];
+  while (stack.length > 0 && total < stopAt) {
+    const current = stack.pop();
+    if (current === null || current === undefined) {
+      total += 4;
+    } else if (typeof current === "boolean") {
+      total += 5;
+    } else if (typeof current === "number") {
+      total += 24;
+    } else if (typeof current === "string") {
+      // Every UTF-16 code unit serializes to at most 6 UTF-8 bytes (\uXXXX) plus quotes.
+      total += current.length * 6 + 2;
+    } else if (Array.isArray(current)) {
+      total += 2 + current.length;
+      for (let index = 0; index < current.length; index++) {
+        stack.push(current[index]);
+      }
+    } else if (typeof current === "object") {
+      const record = current as Record<string, unknown>;
+      const keys = Object.keys(record);
+      total += 2;
+      for (let index = 0; index < keys.length; index++) {
+        const key = keys[index]!;
+        const entry = record[key];
+        if (entry === undefined) continue;
+        total += key.length * 6 + 4;
+        stack.push(entry);
+      }
+    }
+  }
+  return total;
+}
+
+function enforceApiStateBudget(state: ApiState): ApiState {
+  if (estimateJsonBytesUpperBound(state) < API_STATE_ESTIMATE_THRESHOLD_BYTES) {
+    return state;
+  }
+  let effective = state;
+  let byteLength = Buffer.byteLength(JSON.stringify(effective));
+  if (byteLength >= API_STATE_SOFT_LIMIT_BYTES) {
+    effective = compactApiState(effective, "soft");
+    byteLength = Buffer.byteLength(JSON.stringify(effective));
+    if (byteLength > API_STATE_MAX_BYTES) {
+      effective = compactApiState(effective, "aggressive");
+      byteLength = Buffer.byteLength(JSON.stringify(effective));
+    }
+  }
+  if (byteLength > API_STATE_MAX_BYTES) {
+    throw new Error("API projection exceeds page limit");
+  }
+  return effective;
+}
 
 function trimOptionalText(record: JsonObject, key: string, maxLength: number): void {
   const value = record[key];
@@ -224,6 +280,7 @@ function fileSignature(path: string): string {
 }
 
 function reuseEquivalent<T>(previous: T | undefined, next: T): T {
+  if (previous === next) return next;
   return previous !== undefined && isDeepStrictEqual(previous, next) ? previous : next;
 }
 
@@ -377,6 +434,7 @@ export class StateStore extends EventEmitter {
    * user just fetched without trusting an arbitrary renderer-supplied ID.
    */
   private readonly hydratedSessionIds = new Map<string, true>();
+  private readonly projectedSessionsByRaw = new WeakMap<object, { displayTitle: string | undefined; info: SessionInfo }>();
   private apiState: ApiState = { config: {}, status: {}, devices: {}, orchestration: {}, running: false, projects: [] };
 
   constructor(home = process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero"), readonly backend: "files" | "api" = "files", private readonly defaultSettings: Partial<DesktopSettings> = {}) {
@@ -438,17 +496,27 @@ export class StateStore extends EventEmitter {
       && previousInputs.lastError === this.lastError
       && previousInputs.runtimeSwitch === this.runtimeSwitch;
     const daemon = canReuseDaemon ? previous.daemon : (() => {
+      const previousStatus = previousInputs?.status;
+      const previousConfig = previousInputs?.config;
       const port = numberValue(status["port"], numberValue(config["port"], 7423));
       const bind = stringValue(status["bind"], stringValue(config["bind"], "0.0.0.0"));
       const persistence = objectValue(status["persistence"]);
-      const previousSessionsById = new Map(previous?.daemon.sessions.map((session) => [session.id, session]));
-      const sessions = reuseEquivalent(previous?.daemon.sessions, arrayValue(status["sessions"]).map((entry): SessionInfo => {
-        const value = objectValue(entry);
+      const previousSessions = previous?.daemon.sessions;
+      const previousSessionsById = new Map(previousSessions?.map((session) => [session.id, session]));
+      const mappedSessions = arrayValue(status["sessions"]).map((entry): SessionInfo => {
+        const isObjectEntry = entry !== null && typeof entry === "object" && !Array.isArray(entry);
+        const value = isObjectEntry ? (entry as JsonObject) : {};
         const id = stringValue(value["id"]);
         const displayTitle = this.sessionTitles[id];
+        if (isObjectEntry) {
+          const cached = this.projectedSessionsByRaw.get(entry);
+          if (cached && cached.displayTitle === displayTitle) {
+            return cached.info;
+          }
+        }
         const messageQueue = queuedChatMessages(value["messageQueue"]);
         const agentControls = sessionAgentControls(value["agentControls"]);
-        return reuseEquivalent(previousSessionsById.get(id), {
+        const projected = reuseEquivalent(previousSessionsById.get(id), {
           id,
           agent: stringValue(value["agent"], "shell"),
           kind: stringValue(value["kind"], "pty"),
@@ -482,47 +550,76 @@ export class StateStore extends EventEmitter {
             ? (value["subagents"] as NonNullable<SessionInfo["subagents"]>)
             : [],
         });
-      }));
-      this.hydrateSessions(sessions);
-      const summary = reuseEquivalent(previous?.daemon.sessionSummary, sessionSummary(status["sessionSummary"], sessions));
-      const rawCapabilities = arrayValue(status["capabilities"])
-        .filter((value): value is string => typeof value === "string" && value.length > 0 && value.length <= 200)
-        .slice(0, 100);
-      const capabilities = rawCapabilities.length > 0
-        ? reuseEquivalent(previous?.daemon.capabilities, rawCapabilities)
-        : undefined;
-      const persistenceSnapshot = reuseEquivalent(previous?.daemon.persistence, {
-        pty: booleanValue(persistence["pty"]),
-        structured: booleanValue(persistence["structured"]),
+        if (isObjectEntry) {
+          this.projectedSessionsByRaw.set(entry, { displayTitle, info: projected });
+        }
+        return projected;
       });
-      const relay = reuseEquivalent(previous?.daemon.relay, relaySnapshot(status["relay"], config["relay"]));
-      const schedules = reuseEquivalent(previous?.daemon.schedules, records(status["schedules"]));
+      const sessions = previousSessions
+        && previousSessions.length === mappedSessions.length
+        && mappedSessions.every((session, index) => session === previousSessions[index])
+        ? previousSessions
+        : mappedSessions;
+      if (sessions !== previousSessions) {
+        this.hydrateSessions(sessions);
+      }
+      const summary = previous?.daemon.sessionSummary && previousStatus && previousStatus["sessionSummary"] === status["sessionSummary"] && sessions === previousSessions
+        ? previous.daemon.sessionSummary
+        : reuseEquivalent(previous?.daemon.sessionSummary, sessionSummary(status["sessionSummary"], sessions));
+      const capabilities = previous && previousStatus && previousStatus["capabilities"] === status["capabilities"]
+        ? previous.daemon.capabilities
+        : (() => {
+          const rawCapabilities = arrayValue(status["capabilities"])
+            .filter((value): value is string => typeof value === "string" && value.length > 0 && value.length <= 200)
+            .slice(0, 100);
+          return rawCapabilities.length > 0
+            ? reuseEquivalent(previous?.daemon.capabilities, rawCapabilities)
+            : undefined;
+        })();
+      const persistenceSnapshot = previous && previousStatus && previousStatus["persistence"] === status["persistence"]
+        ? previous.daemon.persistence
+        : reuseEquivalent(previous?.daemon.persistence, {
+          pty: booleanValue(persistence["pty"]),
+          structured: booleanValue(persistence["structured"]),
+        });
+      const relay = previous && previousStatus && previousConfig
+        && previousStatus["relay"] === status["relay"]
+        && previousConfig["relay"] === config["relay"]
+        ? previous.daemon.relay
+        : reuseEquivalent(previous?.daemon.relay, relaySnapshot(status["relay"], config["relay"]));
+      const schedules = previous?.daemon.schedules && previousStatus && previousStatus["schedules"] === status["schedules"]
+        ? previous.daemon.schedules
+        : reuseEquivalent(previous?.daemon.schedules, records(status["schedules"]));
       const workspaceCounts = this.backend === "api"
-        ? reuseEquivalent(
-            previous?.daemon.workspaceCounts,
-            Object.fromEntries(Object.entries(objectValue(status["workspaceCounts"])).slice(0, 100).map(([workspace, entry]) => {
-              const counts = objectValue(entry);
-              return [workspace, { revision: nonNegativeInteger(counts["revision"]), total: nonNegativeInteger(counts["total"]), active: nonNegativeInteger(counts["active"]), archived: nonNegativeInteger(counts["archived"]), attention: nonNegativeInteger(counts["attention"]) }];
-            })),
-          )
+        ? (previous && previousStatus && previousStatus["workspaceCounts"] === status["workspaceCounts"]
+          ? previous.daemon.workspaceCounts
+          : reuseEquivalent(
+              previous?.daemon.workspaceCounts,
+              Object.fromEntries(Object.entries(objectValue(status["workspaceCounts"])).slice(0, 100).map(([workspace, entry]) => {
+                const counts = objectValue(entry);
+                return [workspace, { revision: nonNegativeInteger(counts["revision"]), total: nonNegativeInteger(counts["total"]), active: nonNegativeInteger(counts["active"]), archived: nonNegativeInteger(counts["archived"]), attention: nonNegativeInteger(counts["attention"]) }];
+              })),
+            ))
         : undefined;
       const workspaceTabs = this.backend === "api" && status["workspaceTabs"]
-        ? reuseEquivalent(
-            previous?.daemon.workspaceTabs,
-            Object.fromEntries(Object.entries(objectValue(status["workspaceTabs"])).slice(0, 100).map(([workspace, entry]) => {
-              const tabs = objectValue(entry);
-              const openSessionIds = arrayValue(tabs["openSessionIds"]).filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200).slice(0, 64);
-              const activeSessionId = stringValue(tabs["activeSessionId"]);
-              const splitSessionId = stringValue(tabs["splitSessionId"]);
-              return [workspace, {
-                openSessionIds,
-                ...(activeSessionId ? { activeSessionId } : {}),
-                ...(splitSessionId ? { splitSessionId } : {}),
-                updatedAt: nonNegativeInteger(tabs["updatedAt"]),
-                revision: nonNegativeInteger(tabs["revision"]),
-              }];
-            })),
-          )
+        ? (previous && previousStatus && previousStatus["workspaceTabs"] === status["workspaceTabs"]
+          ? previous.daemon.workspaceTabs
+          : reuseEquivalent(
+              previous?.daemon.workspaceTabs,
+              Object.fromEntries(Object.entries(objectValue(status["workspaceTabs"])).slice(0, 100).map(([workspace, entry]) => {
+                const tabs = objectValue(entry);
+                const openSessionIds = arrayValue(tabs["openSessionIds"]).filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200).slice(0, 64);
+                const activeSessionId = stringValue(tabs["activeSessionId"]);
+                const splitSessionId = stringValue(tabs["splitSessionId"]);
+                return [workspace, {
+                  openSessionIds,
+                  ...(activeSessionId ? { activeSessionId } : {}),
+                  ...(splitSessionId ? { splitSessionId } : {}),
+                  updatedAt: nonNegativeInteger(tabs["updatedAt"]),
+                  revision: nonNegativeInteger(tabs["revision"]),
+                }];
+              })),
+            ))
         : undefined;
       const candidate: DaemonSnapshot = {
         running,
@@ -553,7 +650,38 @@ export class StateStore extends EventEmitter {
         ...(running ? { pid: rawPid } : {}),
         ...(this.lastError ? { lastError: this.lastError } : {}),
       };
-      return reuseEquivalent(previous?.daemon, candidate);
+      const prevDaemon = previous?.daemon;
+      if (
+        prevDaemon
+        && prevDaemon.running === candidate.running
+        && prevDaemon.managed === candidate.managed
+        && prevDaemon.fullAccess === candidate.fullAccess
+        && prevDaemon.starting === candidate.starting
+        && prevDaemon.startupProgress === candidate.startupProgress
+        && prevDaemon.startupStage === candidate.startupStage
+        && prevDaemon.port === candidate.port
+        && prevDaemon.bind === candidate.bind
+        && prevDaemon.state === candidate.state
+        && prevDaemon.daemonVersion === candidate.daemonVersion
+        && prevDaemon.buildId === candidate.buildId
+        && prevDaemon.expectedBuildId === candidate.expectedBuildId
+        && prevDaemon.updatePending === candidate.updatePending
+        && prevDaemon.persistence === candidate.persistence
+        && prevDaemon.capabilities === candidate.capabilities
+        && prevDaemon.relay === candidate.relay
+        && prevDaemon.runtime === candidate.runtime
+        && prevDaemon.sessionSummary === candidate.sessionSummary
+        && prevDaemon.sessions === candidate.sessions
+        && prevDaemon.schedules === candidate.schedules
+        && prevDaemon.metadataRevision === candidate.metadataRevision
+        && prevDaemon.workspaceCounts === candidate.workspaceCounts
+        && prevDaemon.workspaceTabs === candidate.workspaceTabs
+        && prevDaemon.pid === candidate.pid
+        && prevDaemon.lastError === candidate.lastError
+      ) {
+        return prevDaemon;
+      }
+      return candidate;
     })();
 
     const deviceRows = arrayValue(devicesRoot["devices"]).length > 0
@@ -682,22 +810,13 @@ export class StateStore extends EventEmitter {
     if (arrayValue(state.status["sessions"]).length > MAX_API_STATE_SESSIONS || state.projects.length > 100) {
       throw new Error("API projection exceeds page limit");
     }
-    let effective = state;
-    let byteLength = Buffer.byteLength(JSON.stringify(effective));
-    if (byteLength >= API_STATE_SOFT_LIMIT_BYTES) {
-      effective = compactApiState(effective, "soft");
-      byteLength = Buffer.byteLength(JSON.stringify(effective));
-      if (byteLength > API_STATE_MAX_BYTES) {
-        effective = compactApiState(effective, "aggressive");
-        byteLength = Buffer.byteLength(JSON.stringify(effective));
-      }
-    }
-    if (byteLength > API_STATE_MAX_BYTES) {
-      throw new Error("API projection exceeds page limit");
-    }
+    const effective = enforceApiStateBudget(state);
+    const sameStatusHeader = this.apiState.status["metadataRevision"] === effective.status["metadataRevision"]
+      && this.apiState.status["pid"] === effective.status["pid"]
+      && this.apiState.status["updatePending"] === effective.status["updatePending"];
     const next: ApiState = {
       config: reuseEquivalent(this.apiState.config, effective.config),
-      status: reuseEquivalent(this.apiState.status, effective.status),
+      status: sameStatusHeader ? reuseEquivalent(this.apiState.status, effective.status) : effective.status,
       devices: reuseEquivalent(this.apiState.devices, effective.devices),
       orchestration: reuseEquivalent(this.apiState.orchestration, effective.orchestration),
       running: effective.running,
@@ -714,6 +833,112 @@ export class StateStore extends EventEmitter {
       return;
     }
     this.apiState = next;
+    this.changed();
+  }
+
+  patchApiSessions(
+    upserts: SessionInfo[],
+    removedIds: string[] = [],
+    runtimePatch?: {
+      metadataRevision?: string;
+      sessionSummary?: JsonObject;
+      workspaceCounts?: JsonObject;
+      workspaceTabs?: JsonObject;
+      updatePending?: boolean;
+    },
+  ): void {
+    if (this.backend !== "api") throw new Error("API data is not enabled");
+    if (!this.apiState.running) return;
+    if (upserts.length === 0 && removedIds.length === 0 && !runtimePatch) return;
+
+    const currentRawSessions = arrayValue(this.apiState.status["sessions"]);
+    const upsertById = new Map<string, SessionInfo>();
+    for (const item of upserts) {
+      if (item && typeof item.id === "string" && item.id) {
+        upsertById.set(item.id, item);
+      }
+    }
+    const removedSet = new Set(removedIds);
+
+    let sessionsChanged = false;
+    const retained: unknown[] = [];
+    for (let index = 0; index < currentRawSessions.length; index++) {
+      const entry = currentRawSessions[index];
+      const entryId = entry !== null && typeof entry === "object" && !Array.isArray(entry)
+        ? stringValue((entry as JsonObject)["id"])
+        : "";
+      if (entryId && removedSet.has(entryId)) {
+        sessionsChanged = true;
+        continue;
+      }
+      const replacement = entryId ? upsertById.get(entryId) : undefined;
+      if (replacement) {
+        upsertById.delete(entryId);
+        if (entry === replacement || isDeepStrictEqual(entry, replacement)) {
+          retained.push(entry);
+        } else {
+          retained.push(replacement);
+          sessionsChanged = true;
+        }
+      } else {
+        retained.push(entry);
+      }
+    }
+
+    if (upsertById.size > 0) {
+      const addedActive: SessionInfo[] = [];
+      const addedArchived: SessionInfo[] = [];
+      for (const item of upsertById.values()) {
+        if (removedSet.has(item.id)) continue;
+        if (item.archived) addedArchived.push(item);
+        else addedActive.push(item);
+      }
+      if (addedActive.length > 0 || addedArchived.length > 0) {
+        sessionsChanged = true;
+        const firstArchivedIndex = retained.findIndex(
+          (entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry) && (entry as JsonObject)["archived"] === true,
+        );
+        if (firstArchivedIndex === -1) {
+          retained.unshift(...addedActive);
+          retained.push(...addedArchived);
+        } else {
+          retained.splice(firstArchivedIndex, 0, ...addedActive);
+          retained.push(...addedArchived);
+        }
+      }
+    }
+
+    const boundedSessions = retained.length > MAX_API_STATE_SESSIONS
+      ? retained.slice(0, MAX_API_STATE_SESSIONS)
+      : retained;
+    if (boundedSessions.length !== retained.length) {
+      sessionsChanged = true;
+    }
+
+    const nextSessions = sessionsChanged ? boundedSessions : currentRawSessions;
+    const nextStatus: JsonObject = {
+      ...this.apiState.status,
+      sessions: nextSessions,
+      ...(runtimePatch?.metadataRevision !== undefined ? { metadataRevision: runtimePatch.metadataRevision } : {}),
+      ...(runtimePatch?.sessionSummary !== undefined ? { sessionSummary: runtimePatch.sessionSummary } : {}),
+      ...(runtimePatch?.workspaceCounts !== undefined ? { workspaceCounts: runtimePatch.workspaceCounts } : {}),
+      ...(runtimePatch?.workspaceTabs !== undefined ? { workspaceTabs: runtimePatch.workspaceTabs } : {}),
+      ...(runtimePatch?.updatePending !== undefined ? { updatePending: runtimePatch.updatePending } : {}),
+    };
+
+    const statusChanged = sessionsChanged
+      || nextStatus["metadataRevision"] !== this.apiState.status["metadataRevision"]
+      || nextStatus["sessionSummary"] !== this.apiState.status["sessionSummary"]
+      || nextStatus["workspaceCounts"] !== this.apiState.status["workspaceCounts"]
+      || nextStatus["workspaceTabs"] !== this.apiState.status["workspaceTabs"]
+      || nextStatus["updatePending"] !== this.apiState.status["updatePending"];
+    if (!statusChanged) return;
+
+    const effective = enforceApiStateBudget({
+      ...this.apiState,
+      status: nextStatus,
+    });
+    this.apiState = effective;
     this.changed();
   }
 

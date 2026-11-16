@@ -57,11 +57,8 @@ impl Store {
     fn session_seq(&self) -> Result<i64> {
         Ok(self
             .connection
-            .query_row(
-                "SELECT last_seq FROM stream_heads WHERE scope='sessions'",
-                [],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT last_seq FROM stream_heads WHERE scope='sessions'")?
+            .query_row([], |row| row.get(0))
             .optional()?
             .unwrap_or(0))
     }
@@ -76,8 +73,10 @@ impl Store {
         }
         let (total, active, attention, revision) = self
             .connection
-            .query_row(
+            .prepare_cached(
                 "SELECT total,active,attention,revision FROM session_counts WHERE scope=?1 AND workspace=?2",
+            )?
+            .query_row(
                 params![i64::from(workspace.is_some()), workspace.unwrap_or("")],
                 |row| {
                     Ok((

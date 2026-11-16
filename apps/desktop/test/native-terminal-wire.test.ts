@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { NativeRelayDecoder, NativeTerminalQueryFilter } from "../src/main/native-terminal-wire";
+import {
+  NativeRelayDecoder,
+  NativeTerminalQueryFilter,
+  isOnlyAutomaticTerminalEvents,
+  stripAutomaticTerminalReplies,
+} from "../src/main/native-terminal-wire";
 
 describe("native Ghostty relay", () => {
   it("decodes fragmented and coalesced input without accepting unknown or oversized messages", () => {
@@ -21,11 +26,24 @@ describe("native Ghostty relay", () => {
     expect(result.every(f => f.payload.equals(payload))).toBe(true);
   });
   it("removes daemon-owned reports at every possible stream boundary and preserves rendering escapes", () => {
-    const source = Buffer.from("中文\x1b[31mred\x1b[0m\x1b[c\x1b[0c\x1b[6n\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]0;title\x07end");
+    const source = Buffer.from(
+      "中文\x1b[31mred\x1b[0m\x1b[c\x1b[0c\x1b[>c\x1b[>0c\x1b[6n\x1b[?6n\x1b[>q\x1b[?u\x1b[?2026$p\x1b[?2027$p\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\x1b]0;title\x07end",
+    );
     const expected = "中文\x1b[31mred\x1b[0m\x1b]0;title\x07end";
     for (let split = 0; split <= source.length; split++) {
       const filter = new NativeTerminalQueryFilter();
       expect(Buffer.concat([filter.push(source.subarray(0, split)), filter.push(source.subarray(split))]).toString()).toBe(expected);
     }
+  });
+  it("strips automatic terminal query replies and detects automatic focus/mouse events", () => {
+    const replyPayload = Buffer.from("\x1b[?6c\x1bP>|ghostty 1.3.1\x1b\\\x1b[?2026;2$y\x1b[?7u\x1b[?24;80R\x1b]12;rgb:c0c0/caca/f5f5\x1b\\hello");
+    expect(stripAutomaticTerminalReplies(replyPayload).toString("utf8")).toBe("hello");
+    expect(stripAutomaticTerminalReplies(Buffer.from("\x1b[1;2R")).toString("utf8")).toBe("\x1b[1;2R");
+    expect(stripAutomaticTerminalReplies(Buffer.from("\x1bP>|ghostty 1.3.1\x1b\\")).byteLength).toBe(0);
+
+    expect(isOnlyAutomaticTerminalEvents(Buffer.from("\x1b[I"))).toBe(true);
+    expect(isOnlyAutomaticTerminalEvents(Buffer.from("\x1b[O\x1b[<0;12;8M"))).toBe(true);
+    expect(isOnlyAutomaticTerminalEvents(Buffer.from("\x1b[Ia"))).toBe(false);
+    expect(isOnlyAutomaticTerminalEvents(Buffer.from("a"))).toBe(false);
   });
 });

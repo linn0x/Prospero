@@ -140,7 +140,7 @@ run("xcrun", ["clang++", "-std=c++17", "-fobjc-arc", "-fblocks", "-mmacosx-versi
 const missing = spawnSync("nm", ["-u", resolve(out, "ghostty.node")], { encoding: "utf8" }).stdout
   .split("\n").map((line) => line.trim()).filter((symbol) => symbol.startsWith("_ghostty_"));
 if (missing.length) throw new Error(`ghostty.node has unresolved Ghostty symbols (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}); libghostty.a is incomplete.`);
-run("xcrun", ["clang++", "-std=c++17", "-O2", "-mmacosx-version-min=14.0", resolve(root, "native/ghostty/relay.cc"), "-o", resolve(out, "prospero-terminal-relay")]);
+run("xcrun", ["clang", "-x", "c", "-std=c11", "-Oz", "-flto", "-mmacosx-version-min=14.0", "-Wl,-dead_strip", resolve(root, "native/ghostty/relay.cc"), "-o", resolve(out, "prospero-terminal-relay")]);
 cpSync(resolve(source, "zig-out/share/ghostty"), resolve(out, "resources"), { recursive: true });
 cpSync(resolve(root, "native/ghostty/config"), resolve(out, "config"));
 cpSync(resolve(source, "LICENSE"), resolve(out, "GHOSTTY-LICENSE"));

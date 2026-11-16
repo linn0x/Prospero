@@ -498,3 +498,35 @@ async fn database_worker_imports_missing_legacy_files_after_marker_exists() {
         Some(42)
     );
 }
+
+#[tokio::test]
+async fn dropping_database_without_shutdown_unparks_writer_immediately() {
+    let directory = TempDir::new().unwrap();
+    let database = Database::open(directory.path().to_path_buf())
+        .await
+        .unwrap();
+    // Let the writer settle into its 500ms idle park.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let started = std::time::Instant::now();
+    drop(database);
+
+    // Re-opening acquires the exclusive owner lock held by the writer thread
+    // and reader pool; if Drop failed to unpark the writer, this would stall
+    // until the 500ms defensive park timeout expired.
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    let reopened = loop {
+        match Database::open(directory.path().to_path_buf()).await {
+            Ok(db) => break db,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => panic!("writer did not release owner lock promptly on drop: {error}"),
+        }
+    };
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "drop wakeup took {:?}, expected immediate unpark",
+        started.elapsed()
+    );
+    reopened.shutdown().await.unwrap();
+}

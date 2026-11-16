@@ -10,6 +10,14 @@ use crate::error::{Error, Result};
 pub struct Token(String);
 
 impl Token {
+    pub fn generate() -> Self {
+        Self(format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
     pub fn load(directory: &Path) -> Result<Self> {
         let path = directory.join("local.token");
         let mut options = OpenOptions::new();
@@ -37,11 +45,7 @@ impl Token {
                 Self::parse(token)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let token = format!(
-                    "{}{}",
-                    uuid::Uuid::new_v4().simple(),
-                    uuid::Uuid::new_v4().simple()
-                );
+                let generated = Self::generate();
                 let mut options = OpenOptions::new();
                 options.create_new(true).write(true);
                 #[cfg(unix)]
@@ -50,9 +54,9 @@ impl Token {
                     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
                 }
                 let mut file = options.open(path)?;
-                file.write_all(token.as_bytes())?;
+                file.write_all(generated.0.as_bytes())?;
                 file.sync_all()?;
-                Ok(Self(token))
+                Ok(generated)
             }
             Err(error) => Err(error.into()),
         }

@@ -123,11 +123,7 @@ impl TurnStreamStateMachine {
         }
     }
 
-    fn emit_thinking_if_changed(
-        &mut self,
-        subagent: Option<String>,
-        out: &mut Vec<AdapterEvent>,
-    ) {
+    fn emit_thinking_if_changed(&mut self, subagent: Option<String>, out: &mut Vec<AdapterEvent>) {
         let combined = self
             .thinking_by_step
             .values()
@@ -425,8 +421,7 @@ impl InFlightTools {
             return;
         }
         self.entries.retain(|entry| {
-            !(entry.call_id == id
-                && (subagent.is_none() || entry.subagent.as_deref() == subagent))
+            !(entry.call_id == id && (subagent.is_none() || entry.subagent.as_deref() == subagent))
         });
     }
 

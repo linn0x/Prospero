@@ -949,7 +949,7 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
         Duration::from_secs(180)
     } else if path == "/v1/accounts" {
         Duration::from_secs(90)
-    } else if path == "/v1/launch/models" {
+    } else if matches!(path, "/v1/launch/models" | "/v1/events") {
         Duration::from_secs(35)
     } else {
         Duration::from_secs(10)
@@ -7237,6 +7237,72 @@ async fn proxy_hosted_terminal_stream(
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::{Message as UpMessage, protocol::WebSocketConfig};
+
+    let (mut client_tx, mut client_rx) = socket.split();
+    macro_rules! forward {
+        ($sink:expr, $message:expr) => {
+            tokio::time::timeout(Duration::from_secs(5), $sink.send($message))
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(|_| Error::Closed)?
+        };
+    }
+
+    let first_binary = loop {
+        let next = match tokio::time::timeout(Duration::from_secs(5), client_rx.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
+                return Err(Error::Timeout);
+            }
+        };
+        match next {
+            Some(Ok(Message::Binary(bytes))) => break bytes,
+            Some(Ok(Message::Ping(bytes))) => {
+                if tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client_tx.send(Message::Pong(bytes)),
+                )
+                .await
+                .is_err()
+                {
+                    return Err(Error::Closed);
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | None => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
+                return Ok(());
+            }
+            Some(Ok(_)) => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
+                return Err(Error::Invalid(
+                    "terminal stream requires binary frames".into(),
+                ));
+            }
+            Some(Err(_)) => return Ok(()),
+        }
+    };
+
+    let attach_info = crate::terminal::stream_session::inspect_client_attach(&first_binary);
+    if attach_info
+        .as_ref()
+        .and_then(|info| info.epoch.as_deref())
+        .is_some_and(|epoch| epoch == host.fallback_epoch())
+    {
+        return crate::terminal::stream_session::serve_hosted_fallback(
+            client_tx,
+            client_rx,
+            host,
+            first_binary,
+        )
+        .await;
+    }
+    let is_cold_attach = attach_info
+        .as_ref()
+        .is_some_and(|info| info.after_seq.is_none() && info.epoch.is_none());
+
     let mut request = host
         .stream_url()
         .into_client_request()
@@ -7247,30 +7313,44 @@ async fn proxy_hosted_terminal_stream(
             .parse()
             .map_err(|_| Error::Closed)?,
     );
-    use tokio_tungstenite::tungstenite::{Message as UpMessage, protocol::WebSocketConfig};
     let mut config = WebSocketConfig::default();
     config.max_message_size =
         Some(crate::terminal::stream::MAX_PAYLOAD + crate::terminal::stream::HEADER);
     config.max_frame_size = config.max_message_size;
     config.max_write_buffer_size =
         2 * (crate::terminal::stream::MAX_PAYLOAD + crate::terminal::stream::HEADER);
-    let (upstream, _) = tokio::time::timeout(
+    let (upstream, _) = match tokio::time::timeout(
         Duration::from_secs(5),
         tokio_tungstenite::connect_async_with_config(request, Some(config), false),
     )
     .await
-    .map_err(|_| Error::Timeout)?
-    .map_err(|_| Error::Closed)?;
-    let (mut client_tx, mut client_rx) = socket.split();
+    {
+        Ok(Ok(pair)) => pair,
+        Err(_) => {
+            let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
+            return Err(Error::Timeout);
+        }
+        Ok(Err(_)) => {
+            let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
+            return Err(Error::Closed);
+        }
+    };
     let (mut host_tx, mut host_rx) = upstream.split();
-    macro_rules! forward {
-        ($sink:expr, $message:expr) => {
-            tokio::time::timeout(Duration::from_secs(5), $sink.send($message))
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|_| Error::Closed)?
-        };
+    if tokio::time::timeout(
+        Duration::from_secs(5),
+        host_tx.send(UpMessage::Binary(first_binary.clone())),
+    )
+    .await
+    .map_err(|_| Error::Timeout)
+    .and_then(|res| res.map_err(|_| Error::Closed))
+    .is_err()
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
+        return Err(Error::Closed);
     }
+
+    let mut upstream_hello_seen = false;
+    let mut proxy_error = None;
     loop {
         tokio::select! {
             client = client_rx.next() => match client {
@@ -7278,26 +7358,76 @@ async fn proxy_hosted_terminal_stream(
                 Some(Ok(Message::Ping(bytes))) => forward!(client_tx, Message::Pong(bytes)),
                 Some(Ok(Message::Pong(_))) => {},
                 Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => return Err(Error::Invalid("terminal stream requires binary frames".into())),
+                Some(Ok(_)) => {
+                    proxy_error = Some(Error::Invalid("terminal stream requires binary frames".into()));
+                    break;
+                }
                 Some(Err(_)) => break,
             },
             remote = host_rx.next() => match remote {
-                Some(Ok(UpMessage::Binary(bytes))) => forward!(client_tx, Message::Binary(bytes)),
+                Some(Ok(UpMessage::Binary(bytes))) => {
+                    if !upstream_hello_seen {
+                        if crate::terminal::stream_session::is_hello_frame(&bytes) {
+                            upstream_hello_seen = true;
+                        } else if is_cold_attach
+                            && crate::terminal::stream_session::is_history_gap_error(&bytes)
+                        {
+                            let _ = tokio::time::timeout(Duration::from_secs(1), host_tx.close()).await;
+                            return crate::terminal::stream_session::serve_hosted_fallback(
+                                client_tx,
+                                client_rx,
+                                host,
+                                first_binary,
+                            )
+                            .await;
+                        }
+                    }
+                    forward!(client_tx, Message::Binary(bytes));
+                }
                 Some(Ok(UpMessage::Ping(bytes))) => forward!(host_tx, UpMessage::Pong(bytes)),
                 Some(Ok(UpMessage::Pong(_))) => {},
                 Some(Ok(UpMessage::Close(_))) | None => break,
-                Some(Ok(_)) => return Err(Error::Invalid("invalid terminal owner stream".into())),
-                Some(Err(_)) => return Err(Error::Closed),
+                Some(Ok(_)) => {
+                    proxy_error = Some(Error::Invalid("invalid terminal owner stream".into()));
+                    break;
+                }
+                Some(Err(_)) => {
+                    proxy_error = Some(Error::Closed);
+                    break;
+                }
             },
         }
     }
     let _ = tokio::time::timeout(Duration::from_secs(1), host_tx.close()).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), client_tx.close()).await;
-    Ok(())
+    match proxy_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
-async fn serve_terminal_stream(api: Api, id: String, socket: WebSocket) -> Result<()> {
-    let terminal = api.terminals.local(&id)?.ok_or(Error::NotFound)?;
+async fn serve_terminal_stream(api: Api, id: String, mut socket: WebSocket) -> Result<()> {
+    use futures_util::SinkExt;
+    let Some(terminal) = api.terminals.local(&id)? else {
+        let payload = serde_json::to_vec(&json!({
+            "code": "closed",
+            "message": "Terminal session is no longer active",
+            "recoverable": false,
+        }))?;
+        if let Ok(encoded) = crate::terminal::stream::encode(&crate::terminal::stream::Frame {
+            kind: crate::terminal::stream::Kind::Error,
+            sequence: 0,
+            payload,
+        }) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                socket.send(Message::Binary(encoded.into())),
+            )
+            .await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
+        return Err(Error::NotFound);
+    };
     crate::terminal::stream_session::serve(socket, terminal).await
 }
 
@@ -7509,17 +7639,64 @@ async fn events(
     query: std::result::Result<Query<EventQuery>, axum::extract::rejection::QueryRejection>,
 ) -> std::result::Result<Json<EventPage>, ApiError> {
     let Query(query) = query.map_err(|_| Error::Invalid("invalid event query".into()))?;
-    Ok(Json(
-        api.database
-            .read("events.page", move |store| {
-                store.events(
-                    &query.scope,
-                    query.after_seq.unwrap_or(0),
-                    query.limit.unwrap_or(100),
-                )
-            })
-            .await?,
-    ))
+    let wait_ms = query.wait_ms.unwrap_or(0).min(25_000);
+    let after_seq = query.after_seq.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100);
+    if wait_ms == 0 {
+        let scope = query.scope;
+        return Ok(Json(
+            api.database
+                .read("events.page", move |store| {
+                    store.events(&scope, after_seq, limit)
+                })
+                .await?,
+        ));
+    }
+
+    // Subscribe and acknowledge current version BEFORE the initial read so no
+    // event published between the read and waiting can be missed.
+    let mut changed = api.changes.subscribe();
+    let mut stopped = api.stopping.subscribe();
+    changed.borrow_and_update();
+
+    let scope = query.scope;
+    let initial_scope = scope.clone();
+    let mut page = api
+        .database
+        .read("events.page", move |store| {
+            store.events(&initial_scope, after_seq, limit)
+        })
+        .await?;
+    if !page.items.is_empty() || page.resync_required || page.has_more || *stopped.borrow() {
+        return Ok(Json(page));
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(wait_ms));
+    loop {
+        let woke_on_change = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                result = changed.changed() => result.is_ok(),
+                _ = stopped.changed() => false,
+            }
+        })
+        .await;
+        match woke_on_change {
+            Ok(true) => {
+                changed.borrow_and_update();
+                let poll_scope = scope.clone();
+                page = api
+                    .database
+                    .read("events.page", move |store| {
+                        store.events(&poll_scope, after_seq, limit)
+                    })
+                    .await?;
+                if !page.items.is_empty() || page.resync_required || page.has_more {
+                    return Ok(Json(page));
+                }
+            }
+            Ok(false) | Err(_) => return Ok(Json(page)),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -9843,6 +10020,154 @@ mod tests {
             remote_orchestration_stamp(&api).await.unwrap(),
             orch_stamp_before
         );
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_long_poll_wakes_immediately_on_matching_scope_and_times_out_when_idle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = Database::open(dir.path().into()).await.unwrap();
+        let raw_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut api = Api::new(database.clone(), Token::parse(raw_token.into()).unwrap());
+        api.schedules = Schedules::with_directory(dir.path().join("schedules"), api.agents.clone());
+
+        let head = database
+            .call(|store| {
+                store.create_session(CreateSession {
+                    agent: AgentKind::Codex,
+                    kind: SessionKind::Structured,
+                    title: "Initial".into(),
+                    workspace: "/synthetic".into(),
+                })
+            })
+            .await
+            .unwrap();
+        api.publish();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = api.router();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        // 1. Immediate return when events already exist after cursor 0.
+        let initial_started = std::time::Instant::now();
+        let initial_page: EventPage = client
+            .get(format!(
+                "http://{addr}/v1/events?scope=sessions&afterSeq=0&waitMs=5000"
+            ))
+            .bearer_auth(raw_token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!initial_page.items.is_empty());
+        assert!(initial_started.elapsed() < Duration::from_millis(500));
+        let cursor = initial_page.latest_seq;
+
+        // 2. Long-poll wakes within milliseconds when a matching scope event arrives
+        //    (and ignores unrelated scope publishes beforehand).
+        let publish_api = api.clone();
+        let publish_db = database.clone();
+        let session_id = head.id.clone();
+        let publisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let timeline_sid = session_id.clone();
+            publish_db
+                .call(move |store| {
+                    store.write_timeline(
+                        &timeline_sid,
+                        TimelineWrite {
+                            id: "unrelated-msg".into(),
+                            turn_id: "turn-1".into(),
+                            expected_revision: 0,
+                            body: TimelineBody::Message {
+                                role: MessageRole::User,
+                                final_answer: false,
+                                attachments: Vec::new(),
+                            },
+                            text: "different scope".into(),
+                            replace: false,
+                            subagent_id: None,
+                        },
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            publish_api.publish();
+
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            publish_db
+                .call(|store| {
+                    store.create_session(CreateSession {
+                        agent: AgentKind::Codex,
+                        kind: SessionKind::Structured,
+                        title: "Second".into(),
+                        workspace: "/synthetic".into(),
+                    })
+                })
+                .await
+                .unwrap();
+            publish_api.publish();
+        });
+
+        let wake_started = std::time::Instant::now();
+        let woken_page: EventPage = client
+            .get(format!(
+                "http://{addr}/v1/events?scope=sessions&afterSeq={cursor}&waitMs=5000"
+            ))
+            .bearer_auth(raw_token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let wake_elapsed = wake_started.elapsed();
+        publisher.await.unwrap();
+        assert_eq!(woken_page.items.len(), 1);
+        assert!(
+            wake_elapsed >= Duration::from_millis(65)
+                && wake_elapsed < Duration::from_millis(1_000),
+            "expected wakeup right after matching event (~80ms), got {wake_elapsed:?}"
+        );
+
+        // 3. Returns empty page cleanly after timeout when idle.
+        let idle_cursor = woken_page.latest_seq;
+        let idle_started = std::time::Instant::now();
+        let idle_page: EventPage = client
+            .get(format!(
+                "http://{addr}/v1/events?scope=sessions&afterSeq={idle_cursor}&waitMs=120"
+            ))
+            .bearer_auth(raw_token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let idle_elapsed = idle_started.elapsed();
+        assert!(idle_page.items.is_empty());
+        assert!(
+            idle_elapsed >= Duration::from_millis(100)
+                && idle_elapsed < Duration::from_millis(1_500),
+            "expected ~120ms idle wait, got {idle_elapsed:?}"
+        );
+
+        let _ = api.stopping.send(true);
+        server.abort();
         database.shutdown().await.unwrap();
     }
 }

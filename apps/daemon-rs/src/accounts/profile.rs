@@ -446,9 +446,7 @@ fn claude_session_environment(
         ),
         (
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(),
-            context_window
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
+            context_window.map(|v| v.to_string()).unwrap_or_default(),
         ),
         (
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS".into(),
@@ -665,13 +663,8 @@ pub(crate) fn known_codex_model(
             &["low", "medium", "high", "max"],
             "Z.ai GLM model",
         )),
-        "claude-opus-4-6"
-        | "claude-opus-4-7"
-        | "claude-opus-4-8"
-        | "openrouter-1"
-        | "openrouter-1o"
-        | "openrouter-2o"
-        | "openrouter-3o" => Some((
+        "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "openrouter-1"
+        | "openrouter-1o" | "openrouter-2o" | "openrouter-3o" => Some((
             if has_1m { 1_000_000 } else { 200_000 },
             &["low", "medium", "high", "xhigh", "max"],
             "Claude Opus",
@@ -723,11 +716,9 @@ pub(crate) fn known_codex_model(
             &["low", "medium", "high"],
             "Seed Coding model",
         )),
-        "gemini-3-flash-preview" | "gemini-3.1-pro-preview" | "gemini-3.8-flash" => Some((
-            1_000_000,
-            &["low", "medium", "high", "max"],
-            "Gemini",
-        )),
+        "gemini-3-flash-preview" | "gemini-3.1-pro-preview" | "gemini-3.8-flash" => {
+            Some((1_000_000, &["low", "medium", "high", "max"], "Gemini"))
+        }
         _ if has_1m => Some((
             1_000_000,
             &["low", "medium", "high"],
@@ -905,7 +896,10 @@ pub(crate) fn codex_model_catalog(profile: &ApiProfile) -> Option<serde_json::Va
 /// `config.toml` at it. Only `model_catalog_json` is touched so settings Codex
 /// persists there (trusted projects, notices) survive every launch; the shared
 /// `~/.codex` of the native account is never involved.
-pub(crate) fn install_codex_model_catalog(root: &std::path::Path, profile: &ApiProfile) -> Result<()> {
+pub(crate) fn install_codex_model_catalog(
+    root: &std::path::Path,
+    profile: &ApiProfile,
+) -> Result<()> {
     let catalog_path = root.join(CODEX_MODEL_CATALOG);
     let config_path = root.join("config.toml");
     let mut config = match std::fs::read_to_string(&config_path) {
@@ -916,16 +910,28 @@ pub(crate) fn install_codex_model_catalog(root: &std::path::Path, profile: &ApiP
     };
     let Some(catalog) = codex_model_catalog(profile) else {
         if config.remove("model_catalog_json").is_some() {
-            std::fs::write(&config_path, toml::to_string(&config).map_err(|_| Error::Invalid("Codex 账号 config.toml 无效".into()))?)?;
+            std::fs::write(
+                &config_path,
+                toml::to_string(&config)
+                    .map_err(|_| Error::Invalid("Codex 账号 config.toml 无效".into()))?,
+            )?;
         }
         let _ = std::fs::remove_file(&catalog_path);
         return Ok(());
     };
     std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog)?)?;
     let path = catalog_path.to_string_lossy().into_owned();
-    if config.get("model_catalog_json").and_then(toml::Value::as_str) != Some(path.as_str()) {
+    if config
+        .get("model_catalog_json")
+        .and_then(toml::Value::as_str)
+        != Some(path.as_str())
+    {
         config.insert("model_catalog_json".into(), toml::Value::String(path));
-        std::fs::write(&config_path, toml::to_string(&config).map_err(|_| Error::Invalid("Codex 账号 config.toml 无效".into()))?)?;
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config)
+                .map_err(|_| Error::Invalid("Codex 账号 config.toml 无效".into()))?,
+        )?;
     }
     Ok(())
 }
@@ -1065,7 +1071,10 @@ mod tests {
         let catalog = codex_model_catalog(&codex_profile("glm-5.3", Some(caps))).unwrap();
         assert_eq!(catalog["models"][0]["context_window"], 64_000);
         assert_eq!(catalog["models"][0]["default_reasoning_level"], "medium");
-        assert_eq!(catalog["models"][0]["input_modalities"], serde_json::json!(["text", "image"]));
+        assert_eq!(
+            catalog["models"][0]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
         assert!(codex_model_catalog(&codex_profile("vendor-mystery", None)).is_none());
     }
 
@@ -1079,10 +1088,14 @@ mod tests {
         .unwrap();
         install_codex_model_catalog(root.path(), &codex_profile("glm-5-turbo", None)).unwrap();
         let config: toml::Table =
-            toml::from_str(&std::fs::read_to_string(root.path().join("config.toml")).unwrap()).unwrap();
+            toml::from_str(&std::fs::read_to_string(root.path().join("config.toml")).unwrap())
+                .unwrap();
         let catalog_path = root.path().join(CODEX_MODEL_CATALOG);
         assert_eq!(config["model_catalog_json"].as_str(), catalog_path.to_str());
-        assert_eq!(config["projects"]["/work"]["trust_level"].as_str(), Some("trusted"));
+        assert_eq!(
+            config["projects"]["/work"]["trust_level"].as_str(),
+            Some("trusted")
+        );
         let catalog: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
         assert_eq!(catalog["models"][0]["context_window"], 204_800);
@@ -1090,7 +1103,8 @@ mod tests {
         // A route switched to an unknown model drops the stale catalog again.
         install_codex_model_catalog(root.path(), &codex_profile("vendor-mystery", None)).unwrap();
         let config: toml::Table =
-            toml::from_str(&std::fs::read_to_string(root.path().join("config.toml")).unwrap()).unwrap();
+            toml::from_str(&std::fs::read_to_string(root.path().join("config.toml")).unwrap())
+                .unwrap();
         assert!(config.get("model_catalog_json").is_none());
         assert!(config.get("projects").is_some());
         assert!(!catalog_path.exists());
@@ -1187,10 +1201,7 @@ mod tests {
             },
             "test-secret-1234567890abcdef1234567890",
         );
-        assert!(env.contains(&(
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(),
-            "128000".into()
-        )));
+        assert!(env.contains(&("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), "128000".into())));
         assert!(env.contains(&(
             "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT".into(),
             "1".into()

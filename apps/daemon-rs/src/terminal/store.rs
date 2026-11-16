@@ -103,11 +103,8 @@ impl Store {
 
     pub(crate) fn terminal_checkpoint_seq(&self, id: &str) -> Result<i64> {
         self.connection
-            .query_row(
-                "SELECT latest_seq FROM terminal_runs WHERE session_id=? AND active=1",
-                [id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT latest_seq FROM terminal_runs WHERE session_id=? AND active=1")?
+            .query_row([id], |row| row.get(0))
             .optional()?
             .ok_or(Error::Conflict)
     }
@@ -115,7 +112,7 @@ impl Store {
     pub fn active_terminal_ids(&mut self) -> Result<Vec<String>> {
         let mut ids: Vec<String> = self
             .connection
-            .prepare(
+            .prepare_cached(
                 "SELECT t.session_id \
                  FROM terminal_runs t \
                  LEFT JOIN session_heads h ON h.id = t.session_id \
@@ -145,7 +142,7 @@ impl Store {
         before: i64,
         limit: usize,
     ) -> Result<Vec<String>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT h.id FROM session_heads h \
              JOIN terminal_runs t ON t.session_id=h.id \
              WHERE h.lifecycle='active' AND t.active=1 \
@@ -211,7 +208,12 @@ impl Store {
         if query.wait_ms.unwrap_or(0) > 5000 {
             return Err(Error::Invalid("terminal wait exceeds limit".into()));
         }
-        let (cols, rows, active, floor, latest, code): (u16, u16, bool, i64, i64, Option<u32>) = self.connection.query_row("SELECT cols,rows,active,floor_seq,latest_seq,exit_code FROM terminal_runs WHERE session_id=?", [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))).optional()?.ok_or(Error::NotFound)?;
+        let (cols, rows, active, floor, latest, code): (u16, u16, bool, i64, i64, Option<u32>) = self
+            .connection
+            .prepare_cached("SELECT cols,rows,active,floor_seq,latest_seq,exit_code FROM terminal_runs WHERE session_id=?")?
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+            .optional()?
+            .ok_or(Error::NotFound)?;
         if active {
             return Err(Error::Busy);
         }
@@ -221,7 +223,7 @@ impl Store {
         }
         let mut events = Vec::new();
         if after >= floor && after <= latest {
-            let mut statement = self.connection.prepare("SELECT payload FROM terminal_output WHERE session_id=?1 AND seq>?2 ORDER BY seq LIMIT 64")?;
+            let mut statement = self.connection.prepare_cached("SELECT payload FROM terminal_output WHERE session_id=?1 AND seq>?2 ORDER BY seq LIMIT 64")?;
             let mut records = statement.query(params![id, after])?;
             let mut bytes = 0;
             while let Some(record) = records.next()? {
@@ -256,11 +258,8 @@ impl Store {
         validate_id(id)?;
         let value: Option<String> = self
             .connection
-            .query_row(
-                "SELECT snapshot FROM terminal_runs WHERE session_id=?",
-                [id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT snapshot FROM terminal_runs WHERE session_id=?")?
+            .query_row([id], |row| row.get(0))
             .optional()?
             .ok_or(Error::NotFound)?;
         Ok(value
@@ -278,7 +277,7 @@ impl Store {
             [],
         )?;
         let bloated: Vec<(String, bool, i64, i64)> = {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "SELECT session_id, active, floor_seq, latest_seq \
                  FROM terminal_runs \
                  WHERE latest_seq - floor_seq > ?1",
@@ -314,11 +313,10 @@ impl Store {
 
 fn persist(tx: &Transaction<'_>, id: &str, archive: Archive, active: bool) -> Result<()> {
     let (previous, previous_floor, previous_snapshot): (i64, i64, Option<String>) = tx
-        .query_row(
+        .prepare_cached(
             "SELECT latest_seq,floor_seq,snapshot FROM terminal_runs WHERE session_id=? AND active=1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+        )?
+        .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .optional()?
         .ok_or(Error::Conflict)?;
     if archive.seq < previous
@@ -361,23 +359,21 @@ fn persist(tx: &Transaction<'_>, id: &str, archive: Archive, active: bool) -> Re
     }
     .max(previous_floor);
     let snapshot = candidate_snapshot.filter(|s| s.seq >= effective_floor && s.seq <= archive.seq);
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE terminal_runs SET active=?1,floor_seq=?2,latest_seq=?3,exit_code=?4,snapshot=?5 WHERE session_id=?6",
-        params![
-            active,
-            effective_floor,
-            archive.seq,
-            archive.exit_code,
-            snapshot
-                .map(|snapshot| serde_json::to_string(&snapshot))
-                .transpose()?,
-            id
-        ],
-    )?;
-    tx.execute(
-        "DELETE FROM terminal_output WHERE session_id=?1 AND seq<=?2",
-        params![id, effective_floor],
-    )?;
+    )?
+    .execute(params![
+        active,
+        effective_floor,
+        archive.seq,
+        archive.exit_code,
+        snapshot
+            .map(|snapshot| serde_json::to_string(&snapshot))
+            .transpose()?,
+        id
+    ])?;
+    tx.prepare_cached("DELETE FROM terminal_output WHERE session_id=?1 AND seq<=?2")?
+        .execute(params![id, effective_floor])?;
     let mut insert =
         tx.prepare_cached("INSERT INTO terminal_output(session_id,seq,payload) VALUES(?1,?2,?3)")?;
     for (offset, event) in archive.events.iter().enumerate() {

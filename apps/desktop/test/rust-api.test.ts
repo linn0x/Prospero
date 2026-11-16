@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RustClient } from "../src/main/rust-client";
 import { applySessionChanges, previousCursors, visibleRows } from "../src/renderer/src/rust/session-page";
-import type { ChangeEvent, SessionHead } from "@prospero/protocol/rust-daemon";
+import type { ChangeEvent, ResyncRequired, SessionHead } from "@prospero/protocol/rust-daemon";
 
 const token = "a".repeat(64);
 const head: SessionHead = { id: "fixture", agent: "codex", kind: "structured", title: "Example", workspace: "/synthetic", lifecycle: "archived", status: "completed", createdAt: 1, updatedAt: 1, revision: 1 };
@@ -139,6 +139,81 @@ describe("Rust desktop API boundary", () => {
     await expect(client.health()).rejects.toThrow("page limit");
     fetcher.mockResolvedValue(new Response("hello", { headers: { "x-next-offset": "999" } }));
     await expect(client.content("fixture", "history", 0)).rejects.toThrow("Invalid content cursor");
+  });
+
+  it("forwards waitMs for long-polled events and extends the RPC deadline accordingly", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ items: [], nextSeq: 5, latestSeq: 5, floorSeq: 0, hasMore: false, resyncRequired: false })),
+    );
+    try {
+      const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+      await client.events({ scope: "timeline:fixture", afterSeq: 5, limit: 100, waitMs: 15_000 });
+      const url = new URL(String(fetcher.mock.calls[0]![0]));
+      expect(url.pathname).toBe("/v1/events");
+      expect(url.searchParams.get("scope")).toBe("timeline:fixture");
+      expect(url.searchParams.get("afterSeq")).toBe("5");
+      expect(url.searchParams.get("waitMs")).toBe("15000");
+      expect(timeout).toHaveBeenCalledWith(20_000);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("parses chunk-split SSE change, keepalive, and resync frames over /v1/events/stream", async () => {
+    const encoder = new TextEncoder();
+    const changeEvent: ChangeEvent = {
+      scope: "sessions",
+      seq: 7,
+      kind: "session.updated",
+      entityId: "fixture",
+      data: head,
+    };
+    const resyncPayload: ResyncRequired = {
+      scope: "sessions",
+      requestedAfterSeq: 2,
+      floorSeq: 6,
+      latestSeq: 7,
+    };
+    const rawFrames = [
+      ": connected\r\n\r\n",
+      "event: chan",
+      `ge\nid: 7\ndata: ${JSON.stringify(changeEvent).slice(0, 24)}`,
+      `${JSON.stringify(changeEvent).slice(24)}\n\n: keepalive\n\n`,
+      `event: resync\ndata: ${JSON.stringify(resyncPayload)}\n\n`,
+    ];
+    const stream = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        for (const part of rawFrames) streamController.enqueue(encoder.encode(part));
+        streamController.close();
+      },
+    });
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const changesSeen: ChangeEvent[] = [];
+    const resyncsSeen: ResyncRequired[] = [];
+    const abortController = new AbortController();
+    try {
+      const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+      await client.subscribeEvents(
+        { scope: "sessions", afterSeq: 6 },
+        {
+          onChange: (item) => changesSeen.push(item),
+          onResync: (item) => resyncsSeen.push(item),
+        },
+        abortController.signal,
+      );
+      expect(timeout).not.toHaveBeenCalled();
+      const [url, init] = fetcher.mock.calls[0]!;
+      expect(String(url)).toBe("http://127.0.0.1:12345/v1/events/stream?scope=sessions&afterSeq=6");
+      expect(init?.headers).toMatchObject({ authorization: `Bearer ${token}`, accept: "text/event-stream" });
+      expect(changesSeen).toEqual([changeEvent]);
+      expect(resyncsSeen).toEqual([resyncPayload]);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 });
 

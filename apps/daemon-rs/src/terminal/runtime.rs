@@ -387,6 +387,9 @@ impl Terminals {
         let _ = runtime.sync_native_binding(&head.id).await;
         let finalized = runtime.finish_handle(&head.id, &terminal).await;
         if finalized.is_ok() {
+            if let Ok(mut entries) = runtime.0.entries.lock() {
+                entries.remove(&head.id);
+            }
             let _ = runtime.sync_native_binding(&head.id).await;
             let _ = terminal.release().await;
         }
@@ -1138,7 +1141,24 @@ impl Terminals {
 
     pub async fn read(&self, id: String, query: TerminalQuery) -> Result<TerminalPage> {
         match self.terminal(&id) {
-            Ok(terminal) => terminal.read(query).await,
+            Ok(terminal) => match terminal.read(query.clone()).await {
+                Ok(page) => Ok(page),
+                Err(error @ (Error::NotFound | Error::Closed)) => {
+                    self.0
+                        .database
+                        .call(move |store| {
+                            if matches!(error, Error::Closed)
+                                && store.session(&id)?.lifecycle
+                                    != crate::protocol::SessionLifecycle::Archived
+                            {
+                                return Err(Error::Closed);
+                            }
+                            store.terminal_output(&id, query)
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            },
             Err(Error::NotFound) => {
                 self.0
                     .database
@@ -1151,7 +1171,24 @@ impl Terminals {
 
     pub async fn snapshot(&self, id: String) -> Result<Option<TerminalSnapshot>> {
         match self.terminal(&id) {
-            Ok(terminal) => terminal.snapshot().await,
+            Ok(terminal) => match terminal.snapshot().await {
+                Ok(snapshot) => Ok(snapshot),
+                Err(error @ (Error::NotFound | Error::Closed)) => {
+                    self.0
+                        .database
+                        .call(move |store| {
+                            if matches!(error, Error::Closed)
+                                && store.session(&id)?.lifecycle
+                                    != crate::protocol::SessionLifecycle::Archived
+                            {
+                                return Err(Error::Closed);
+                            }
+                            store.terminal_snapshot(&id)
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            },
             Err(Error::NotFound) => {
                 self.0
                     .database

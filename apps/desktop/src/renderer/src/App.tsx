@@ -1,16 +1,11 @@
-import { NativeSessionBindingDialog, needsNativeBinding } from "./NativeSessionBindingDialog";
-import { isSessionEndedStatus } from "../../shared/session-state";
-import { ArchivedChatsDialog } from "./ArchivedChatsDialog";
+import { isSessionEndedStatus, needsNativeBinding } from "../../shared/session-state";
 import { chatBranchDisabledReason } from "./workspace/chat-branch";
 import { scheduleDeferredRequest } from "./deferred-request";
-import { OverviewAttention } from "./attention/OverviewAttention";
-import { AttentionGroup, AttentionFilters, AttentionDetails } from "./attention/AttentionGroups";
 import { attentionSummary, pendingRequests, type AttentionFilter } from "./attention/attention-state";
 import { WindowsTitlebar } from "./app-shell/WindowsTitlebar";
 import { notify } from "./notifications/notifications";
 import { useNavigationHistory } from "./app-shell/use-navigation-history";
 import { ProjectToolsProvider } from "./project-tools/ProjectToolsHost";
-import { WorkspaceHistory } from "./WorkspaceHistory";
 import {
   Fragment,
   lazy,
@@ -225,13 +220,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import "./styles.css";
 import "./workspace/workspace.css";
-import { WorkspacePane } from "./workspace/WorkspacePane";
-import { WorkspaceTabs } from "./app-shell/WorkspaceTabs";
 import { rememberedLaunchAgent, rememberedLaunchKind, rememberLaunch } from "./workspace/session-launch-preferences";
-import { WorkspacePicker } from "./remote-workspaces/AddWorkspaceDialog";
 import { RemoteWorkspaceList } from "./remote-workspaces/RemoteWorkspaceList";
 import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
-import { SourceSelector } from "./model-sources/SourceSelector";
 import { useModelSources, runModelSourceAction } from "./model-sources/use-model-sources";
 import { defaultSourceSelection, rememberSourceSelection, rememberedSourceSelection, selectedSourceRoute, type SourceRuntimeAgent, type SourceSelection } from "./model-sources/source-state";
 import { sessionLabel, sidebarSessionLabel, SessionAgentIcon, StatusMark, PROSPERO_BOT_SESSION_STORAGE_KEY, PROSPERO_BOT_TITLE, isProsperoBotSession } from "./workspace/session-presentation";
@@ -268,6 +259,61 @@ function readSidebarOpenPreference(): boolean | undefined {
   }
 }
 
+const WorkspacePane = lazy(() =>
+  import("./workspace/WorkspacePane").then((module) => ({
+    default: module.WorkspacePane,
+  })),
+);
+const WorkspaceTabs = lazy(() =>
+  import("./app-shell/WorkspaceTabs").then((module) => ({
+    default: module.WorkspaceTabs,
+  })),
+);
+const NativeSessionBindingDialog = lazy(() =>
+  import("./NativeSessionBindingDialog").then((module) => ({
+    default: module.NativeSessionBindingDialog,
+  })),
+);
+const ArchivedChatsDialog = lazy(() =>
+  import("./ArchivedChatsDialog").then((module) => ({
+    default: module.ArchivedChatsDialog,
+  })),
+);
+const WorkspaceHistory = lazy(() =>
+  import("./WorkspaceHistory").then((module) => ({
+    default: module.WorkspaceHistory,
+  })),
+);
+const OverviewAttention = lazy(() =>
+  import("./attention/OverviewAttention").then((module) => ({
+    default: module.OverviewAttention,
+  })),
+);
+const AttentionGroup = lazy(() =>
+  import("./attention/AttentionGroups").then((module) => ({
+    default: module.AttentionGroup,
+  })),
+);
+const AttentionFilters = lazy(() =>
+  import("./attention/AttentionGroups").then((module) => ({
+    default: module.AttentionFilters,
+  })),
+);
+const AttentionDetails = lazy(() =>
+  import("./attention/AttentionGroups").then((module) => ({
+    default: module.AttentionDetails,
+  })),
+);
+const WorkspacePicker = lazy(() =>
+  import("./remote-workspaces/AddWorkspaceDialog").then((module) => ({
+    default: module.WorkspacePicker,
+  })),
+);
+const SourceSelector = lazy(() =>
+  import("./model-sources/SourceSelector").then((module) => ({
+    default: module.SourceSelector,
+  })),
+);
 const OrchestrationPane = lazy(() =>
   import("./OrchestrationPane").then((module) => ({
     default: module.OrchestrationPane,
@@ -1424,10 +1470,10 @@ function ShellSidebar({
           </ContextMenu>
           <CollapsibleContent>
             <SidebarMenuSub>
-              {workspacePaging ? <WorkspaceHistory workspace={project} name={name} enabled={projectOpen && workspaceOpen && snapshot.daemon.running}
+              {workspacePaging ? <Suspense fallback={null}><WorkspaceHistory workspace={project} name={name} enabled={projectOpen && workspaceOpen && snapshot.daemon.running}
                 revision={snapshot.daemon.workspaceCounts?.[project] ? `${snapshot.daemon.pid}:${snapshot.daemon.workspaceCounts[project].revision}` : snapshot.daemon.metadataRevision} preview={matchingSessions} activeId={activeId} pinned={snapshot.pinnedSessionIds}
                 unread={snapshot.unreadSessionIds} archived={snapshot.archivedSessionIds} query={normalizedSessionQuery} onTotal={updateWorkspaceTotal} renderRow={renderSession}
-              /> : <>
+              /></Suspense> : <>
               {visibleSessions.map(renderSession)}
               {matchingSessions.length >
                 SIDEBAR_SESSION_PREVIEW_LIMIT && (
@@ -1891,7 +1937,7 @@ function ShellSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
-      {archiveOpen && <ArchivedChatsDialog ids={snapshot.archivedSessionIds} onClose={() => setArchiveOpen(false)} onOpen={selectSession} />}
+      {archiveOpen && <Suspense fallback={null}><ArchivedChatsDialog ids={snapshot.archivedSessionIds} onClose={() => setArchiveOpen(false)} onOpen={selectSession} /></Suspense>}
       <SidebarRail
         aria-label={t("调整侧栏宽度", "Resize sidebar")}
         title={t("拖动调整宽度 · 双击恢复默认", "Drag to resize · Double-click to reset")}
@@ -3172,7 +3218,9 @@ function NewSessionDialog({
                 </div>
               )}
               {useSource ? (
-                <SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} effort={input.effort} onEffortChange={effort => setInput({ ...input, effort: effort as SessionCreateInput["effort"] })} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} />
+                <Suspense fallback={null}>
+                  <SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} agent={sourceRuntimeAgent} effort={input.effort} onEffortChange={effort => setInput({ ...input, effort: effort as SessionCreateInput["effort"] })} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} />
+                </Suspense>
               ) : (
                 <>
                   {(input.agent === "codex" || input.agent === "claude" || input.agent === "agy" || input.agent === "opencode" || input.agent === "pi") && (
@@ -3348,7 +3396,9 @@ function NewSessionDialog({
         </DialogFooter>
           </TabsContent>
           <TabsContent value="workspace" className="create-dialog-panel">
-            <WorkspacePicker onBusyChange={setChoosingWorkspace} onClose={() => onOpenChange(false)} onLocalAdded={(cwd) => { setRemoteId(undefined); setInput((current) => ({ ...current, cwd })); setTab("session"); }} onRemoteAdded={(workspace) => { onRemoteWorkspace(workspace); setRemoteId(workspace.id); setTab("session"); }} onManageHosts={() => { onOpenChange(false); onManageHosts(); }} />
+            <Suspense fallback={null}>
+              <WorkspacePicker onBusyChange={setChoosingWorkspace} onClose={() => onOpenChange(false)} onLocalAdded={(cwd) => { setRemoteId(undefined); setInput((current) => ({ ...current, cwd })); setTab("session"); }} onRemoteAdded={(workspace) => { onRemoteWorkspace(workspace); setRemoteId(workspace.id); setTab("session"); }} onManageHosts={() => { onOpenChange(false); onManageHosts(); }} />
+            </Suspense>
           </TabsContent>
         </Tabs>
       </DialogContent>
@@ -4435,10 +4485,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               /></div></Suspense>}
         </div>
       </SidebarInset>
-      {archiveBinding && <NativeSessionBindingDialog session={archiveBinding.session} archived={archiveBinding.archived} onClose={() => setArchiveBinding(undefined)} onDone={() => {
+      {archiveBinding && <Suspense fallback={null}><NativeSessionBindingDialog session={archiveBinding.session} archived={archiveBinding.archived} onClose={() => setArchiveBinding(undefined)} onDone={() => {
         if (archiveBinding.archived) { setOpenIds(current => current.filter(id => id !== archiveBinding.session.id)); setActiveId(current => current === archiveBinding.session.id ? undefined : current); }
         setArchiveBinding(undefined);
-      }} />}
+      }} /></Suspense>}
       {newSessionOpen && (
         <NewSessionDialog
           snapshot={sessionSnapshot}

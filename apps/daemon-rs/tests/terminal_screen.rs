@@ -100,3 +100,70 @@ fn protected_cells_and_selective_erase_refuse_snapshot() {
     selective.process(b"text\x1b[?2K");
     assert!(selective.snapshot(9).is_err());
 }
+
+#[test]
+fn grapheme_clustering_and_kitty_keyboard_modes_preserve_checkpoint() {
+    let size = TerminalSize { cols: 80, rows: 24 };
+    let mut screen = Screen::new(size);
+    screen.process(b"\x1b[?2027h\x1b[>5uprimary\r\n\x1b[?1049h\x1b[>7ualternate");
+    assert_eq!(screen.kitty_keyboard_flags(), 7);
+    assert!(screen.mode_enabled(2027));
+    assert!(screen.mode_enabled(1049));
+
+    let snapshot = screen.snapshot(10).unwrap();
+    let bytes = STANDARD.decode(snapshot.data_b64).unwrap();
+    let ansi = String::from_utf8_lossy(&bytes);
+    assert!(ansi.contains("\x1b[?2027h"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[>7u"), "{ansi:?}");
+
+    let mut restored = Screen::new(size);
+    restored.process(&bytes);
+    assert_eq!(restored.kitty_keyboard_flags(), 7);
+    assert!(restored.mode_enabled(2027));
+    assert!(restored.mode_enabled(1049));
+    assert_eq!(restored.visible_tail_text(24), screen.visible_tail_text(24));
+
+    // Popping alt-screen Kitty keyboard and leaving alt-screen restores primary Kitty flags (5).
+    restored.process(b"\x1b[<u\x1b[?1049l");
+    assert_eq!(restored.kitty_keyboard_flags(), 5);
+}
+
+#[test]
+fn agent_tui_notifications_progress_pointer_and_large_clipboard_preserve_checkpoints() {
+    for terminator in ["\x07", "\x1b\\"] {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let mut screen = Screen::new(size);
+        screen.process(b"agent prompt\r\n");
+        for osc in [
+            "9;4;3",
+            "9;4;1;50",
+            "9;4;0",
+            "9;Turn finished",
+            "22;pointer",
+            "22;default",
+            "99;i=1:d=0;Done",
+            "777;notify;Codex;Completed",
+            "12;?",
+            "4;1;?",
+            "110",
+            "111",
+            "112",
+        ] {
+            screen.process(format!("\x1b]{osc}{terminator}").as_bytes());
+        }
+        // Oversized OSC 52 clipboard copy (> 8 KiB) refuses checkpoint mid-sequence,
+        // then recovers once terminated.
+        screen.process(b"\x1b]52;c;");
+        screen.process(&vec![b'A'; 24_000]);
+        assert!(screen.snapshot(11).is_err());
+        screen.process(terminator.as_bytes());
+        screen.process(b"after copy");
+
+        let snapshot = screen.snapshot(12).expect("checkpoint remains compatible");
+        let bytes = STANDARD.decode(snapshot.data_b64).unwrap();
+        let mut restored = Screen::new(size);
+        restored.process(&bytes);
+        assert_eq!(restored.visible_tail_text(24), screen.visible_tail_text(24));
+        assert_eq!(restored.cursor_position(), screen.cursor_position());
+    }
+}

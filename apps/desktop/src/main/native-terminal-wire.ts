@@ -48,11 +48,34 @@ export class NativeTerminalQueryFilter {
         this.pending = Buffer.from(input.subarray(escape)); i = escape; break;
       }
       const sequence = input.subarray(escape, i).toString("latin1");
-      if (/^\x1b\[(?:0?c|6n)$/.test(sequence) || /^\x1b\](?:10|11);\?(?:\x07|\x1b\\)$/.test(sequence)) {
+      if (
+        /^\x1b\[(?:0*c|>0*c|0*6n|\?0*6n|>0*q|\?u|\?\d+\$p)$/.test(sequence) ||
+        /^\x1b\]0*(?:10|11|12);\?(?:\x07|\x1b\\)$/.test(sequence)
+      ) {
         parts.push(input.subarray(start, escape)); start = i;
       }
     }
     parts.push(input.subarray(start, i));
     return Buffer.concat(parts);
   }
+}
+
+const AUTOMATIC_TERMINAL_REPLY_RE =
+  /\x1bP>\|[\s\S]*?\x1b\\|\x1b\[(?:[?>][\d;]*c|\?\d+;\d+\$y|\?\d+u|\?\d+;\d+R)|\x1b\](?:10|11|12);rgb:[^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+const AUTOMATIC_FOCUS_OR_MOUSE_RE =
+  /^(?:\x1b\[(?:I|O|<\d+;\d+;\d+[Mm]|M[\s\S]{3}))+$/;
+
+/** Strips terminal-emulator query replies so Ghostty never echoes duplicate answers into the daemon PTY. */
+export function stripAutomaticTerminalReplies(payload: Buffer): Buffer {
+  if (!payload.includes(0x1b)) return payload;
+  const raw = payload.toString("latin1");
+  const stripped = raw.replace(AUTOMATIC_TERMINAL_REPLY_RE, "");
+  return stripped.length === raw.length ? payload : Buffer.from(stripped, "latin1");
+}
+
+/** Returns true when a relay input frame contains only focus or mouse reports rather than keyboard input. */
+export function isOnlyAutomaticTerminalEvents(payload: Buffer): boolean {
+  if (payload.byteLength === 0 || payload[0] !== 0x1b) return false;
+  return AUTOMATIC_FOCUS_OR_MOUSE_RE.test(payload.toString("latin1"));
 }

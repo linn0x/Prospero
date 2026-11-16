@@ -893,10 +893,7 @@ async fn subscription_account_proxy_and_env_overrides() {
         .await;
     assert_eq!(status, StatusCode::OK, "{saved}");
     assert_eq!(saved["ok"], true, "{saved}");
-    assert_eq!(
-        saved["config"]["defaultModel"],
-        "gpt-daybreak-blue-latest"
-    );
+    assert_eq!(saved["config"]["defaultModel"], "gpt-daybreak-blue-latest");
     assert_eq!(saved["config"]["defaultEffort"], "ultra");
     assert_eq!(saved["config"]["proxyUrl"], "http://127.0.0.1:7890");
     assert_eq!(saved["config"]["noProxy"], "localhost,127.0.0.1");
@@ -934,7 +931,10 @@ async fn subscription_account_proxy_and_env_overrides() {
         .await;
     assert_eq!(status, StatusCode::OK, "{native_saved}");
     assert_eq!(native_saved["ok"], true);
-    assert_eq!(native_saved["config"]["proxyUrl"], "socks5://127.0.0.1:1080");
+    assert_eq!(
+        native_saved["config"]["proxyUrl"],
+        "socks5://127.0.0.1:1080"
+    );
 
     let (_, listed) = harness
         .post(control("agent.accounts.list", serde_json::Map::new()))

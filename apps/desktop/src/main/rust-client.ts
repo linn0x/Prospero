@@ -1,4 +1,4 @@
-import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery, WorkspaceTabsEntry, WorkspaceTabsList, WorkspaceTabsUpdate } from "@prospero/protocol/rust-daemon";
+import type { ChangeEvent, ContentPage, EventPage, EventQuery, Health, RenameSession, ResyncRequired, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery, WorkspaceTabsEntry, WorkspaceTabsList, WorkspaceTabsUpdate } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
 import WebSocket from "ws";
 import { setTimeout as delay } from "node:timers/promises";
@@ -368,7 +368,115 @@ export class RustClient {
     const params = new URLSearchParams({ scope: query.scope });
     if (query.afterSeq != null) params.set("afterSeq", String(query.afterSeq));
     if (query.limit != null) params.set("limit", String(query.limit));
-    return this.json(`/v1/events?${params}`, { signal });
+    if (query.waitMs != null) params.set("waitMs", String(query.waitMs));
+    const timeoutMs = query.waitMs != null && query.waitMs > 0
+      ? Math.max(7000, Math.min(25_000, query.waitMs) + 5000)
+      : 7000;
+    return this.json(`/v1/events?${params}`, { signal, timeoutMs });
+  }
+  async subscribeEvents(
+    query: { scope: string; afterSeq: number },
+    handlers: { onChange: (event: ChangeEvent) => void; onResync: (resync: ResyncRequired) => void },
+    signal: AbortSignal,
+  ): Promise<void> {
+    const params = new URLSearchParams({ scope: query.scope, afterSeq: String(query.afterSeq) });
+    const response = await this.response(`/v1/events/stream?${params}`, {
+      signal,
+      timeoutMs: null,
+      headers: { accept: "text/event-stream" },
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`Rust 服务请求失败（${response.status}）`);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("Empty daemon response");
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let eventType = "message";
+    let dataLines: string[] = [];
+    let dataBytes = 0;
+    const abortListener = (): void => {
+      void reader.cancel().catch(() => {});
+    };
+    signal.addEventListener("abort", abortListener, { once: true });
+    const dispatchFrame = (): void => {
+      const currentType = eventType;
+      const lines = dataLines;
+      eventType = "message";
+      dataLines = [];
+      dataBytes = 0;
+      if (lines.length === 0) return;
+      const payload = lines.join("\n");
+      if (currentType === "failure") {
+        throw new Error("事件流读取失败");
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        throw new Error("Invalid daemon event stream frame");
+      }
+      if (currentType === "change") {
+        handlers.onChange(parsed as ChangeEvent);
+      } else if (currentType === "resync") {
+        handlers.onResync(parsed as ResyncRequired);
+      }
+    };
+    const processLine = (rawLine: string): void => {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (line === "") {
+        dispatchFrame();
+        return;
+      }
+      if (line.startsWith(":")) return;
+      if (line.startsWith("event:")) {
+        const value = line.slice(6);
+        eventType = value.startsWith(" ") ? value.slice(1) : value;
+        return;
+      }
+      if (line.startsWith("data:")) {
+        const value = line.slice(5);
+        const content = value.startsWith(" ") ? value.slice(1) : value;
+        dataBytes += content.length;
+        if (dataBytes > MAX_BYTES) throw new Error("Daemon event frame exceeded limit");
+        dataLines.push(content);
+      }
+    };
+    try {
+      for (;;) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch {
+          if (signal.aborted) throw new DOMException("Request cancelled", "AbortError");
+          throw new Error("无法连接本机 Rust 服务");
+        }
+        if (signal.aborted) throw new DOMException("Request cancelled", "AbortError");
+        if (chunk.done) {
+          buffer += decoder.decode();
+          if (buffer.length > 0) {
+            processLine(buffer);
+            buffer = "";
+          }
+          dispatchFrame();
+          break;
+        }
+        buffer += decoder.decode(chunk.value, { stream: true });
+        if (buffer.length > MAX_BYTES) throw new Error("Daemon event stream buffer exceeded limit");
+        let newline = buffer.indexOf("\n");
+        while (newline !== -1) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          processLine(line);
+          newline = buffer.indexOf("\n");
+        }
+      }
+    } finally {
+      signal.removeEventListener("abort", abortListener);
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
   }
   contents(value: string, cursor?: string): Promise<ContentPage> {
     const params = new URLSearchParams({ limit: "20" });

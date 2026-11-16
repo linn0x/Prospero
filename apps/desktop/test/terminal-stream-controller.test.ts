@@ -200,4 +200,44 @@ describe("TerminalStreamController", () => {
     expect(consumed).toEqual([1]);
     expect(states.at(-1)).toMatchObject({ connected: false, syncing: false, exited: true, readOnly: true });
   });
+
+  it("flushes same-tick Error and history_gap frames before handling port close", async () => {
+    const gapPort = new Port();
+    const gaps: string[] = [];
+    const gapErrors: string[] = [];
+    const gapController = new TerminalStreamController({
+      sessionId: "term-same-tick-gap",
+      cursor: () => 5,
+      epoch: () => "e1",
+      wantControl: true,
+      consume: async () => undefined,
+      onState: () => undefined,
+      onError: message => gapErrors.push(message),
+      onHistoryGap: message => gaps.push(message),
+    });
+    gapController.attach(gapPort as unknown as MessagePort);
+    gapPort.receive(frame(TerminalStreamKind.Error, 0, json({ code: "history_gap", message: "The retained output cannot reconstruct this terminal", recoverable: false })));
+    gapPort.emitClose();
+    await tick();
+    expect(gaps).toEqual(["The retained output cannot reconstruct this terminal"]);
+    expect(gapErrors).toEqual([]);
+
+    const errPort = new Port();
+    const fatalErrors: string[] = [];
+    const errController = new TerminalStreamController({
+      sessionId: "term-same-tick-error",
+      cursor: () => undefined,
+      epoch: () => undefined,
+      wantControl: true,
+      consume: async () => undefined,
+      onState: () => undefined,
+      onError: message => fatalErrors.push(message),
+      onHistoryGap: () => undefined,
+    });
+    errController.attach(errPort as unknown as MessagePort);
+    errPort.receive(frame(TerminalStreamKind.Error, 0, json({ code: "busy", message: "Too many terminal viewers", recoverable: false })));
+    errPort.emitClose();
+    await tick();
+    expect(fatalErrors).toEqual(["Too many terminal viewers"]);
+  });
 });
