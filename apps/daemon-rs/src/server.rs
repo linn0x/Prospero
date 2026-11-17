@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::Path as FsPath;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -1152,8 +1152,10 @@ async fn handle_remote_ws(
         ..RemoteWsState::default()
     };
     let mut changes = api.changes.subscribe();
-    let mut output_tick = tokio::time::interval(Duration::from_millis(25));
+    let mut output_tick = tokio::time::interval(Duration::from_millis(12));
     output_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut metadata_tick = tokio::time::interval(REMOTE_METADATA_MIN_INTERVAL);
+    metadata_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut revoke_check = tokio::time::interval(Duration::from_millis(500));
     revoke_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1222,6 +1224,9 @@ async fn handle_remote_ws(
             _ = output_tick.tick(), if state.pty_attachments.values().any(|attachment| attachment.pending) => {
                 if flush_remote_terminal_events(&api, &mut socket, &mut channel, &mut state).await.is_err() { return; }
             }
+            _ = metadata_tick.tick(), if state.metadata_dirty => {
+                if flush_remote_ws_metadata(&api, &mut socket, &mut channel, &mut state).await.is_err() { return; }
+            }
             _ = revoke_check.tick() => {
                 if remote_device_revoked(&home, &device.token) {
                     close_ws(&mut socket, CLOSE_REVOKED, "revoked").await;
@@ -1232,6 +1237,10 @@ async fn handle_remote_ws(
     }
 }
 
+const REMOTE_PTY_ACK_WINDOW: i64 = 2048;
+const REMOTE_PTY_DRAIN_PAGES_PER_TICK: usize = 4;
+const REMOTE_METADATA_MIN_INTERVAL: Duration = Duration::from_millis(120);
+
 #[derive(Debug, Default)]
 struct RemoteWsState {
     pty_attachments: HashMap<String, RemotePtyAttachment>,
@@ -1241,6 +1250,8 @@ struct RemoteWsState {
     fork_requests: HashSet<String>,
     orchestration_snapshot: Option<String>,
     orchestration_stamp: Option<(i64, u64)>,
+    last_metadata_flush: Option<Instant>,
+    metadata_dirty: bool,
 }
 
 #[derive(Debug)]
@@ -1249,6 +1260,7 @@ struct RemotePtyAttachment {
     last_ack_seq: i64,
     pending: bool,
     replay_until: i64,
+    compact: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3419,6 +3431,10 @@ async fn remote_session_attach(
         .get("tailEvents")
         .and_then(JsonValue::as_u64)
         .map(|value| value.clamp(1, 512) as i64);
+    let compact = message
+        .get("compact")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
     let source = sid.clone();
     let head = api.call(move |store| store.session(&source)).await?;
     send_remote_json(
@@ -3427,12 +3443,24 @@ async fn remote_session_attach(
         &json!({"type":"session.state","session":remote_session_info(head)}),
     )
     .await?;
-    if remote_try_pty_attach(api, socket, channel, state, &sid, last_seq, tail_events).await? {
+    if remote_try_pty_attach(
+        api,
+        socket,
+        channel,
+        state,
+        &sid,
+        last_seq,
+        tail_events,
+        compact,
+    )
+    .await?
+    {
         return Ok(());
     }
     remote_chat_attach(api, socket, channel, state, message).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn remote_try_pty_attach(
     api: &Api,
     socket: &mut WebSocket,
@@ -3441,6 +3469,7 @@ async fn remote_try_pty_attach(
     sid: &str,
     last_seq: Option<i64>,
     tail_events: Option<i64>,
+    compact: bool,
 ) -> Result<bool> {
     let page = match api
         .terminals
@@ -3460,7 +3489,17 @@ async fn remote_try_pty_attach(
     if last_seq.is_none()
         && let Some(tail_events) = tail_events
     {
-        send_terminal_tail(api, socket, channel, state, sid, &page, tail_events).await?;
+        send_terminal_tail(
+            api,
+            socket,
+            channel,
+            state,
+            sid,
+            &page,
+            tail_events,
+            compact,
+        )
+        .await?;
         return Ok(true);
     }
     state.pty_attachments.insert(
@@ -3470,6 +3509,7 @@ async fn remote_try_pty_attach(
             last_ack_seq: last_seq.unwrap_or(0),
             pending: false,
             replay_until: page.latest_seq,
+            compact,
         },
     );
     if last_seq.is_some() && !page.resync_required {
@@ -3482,6 +3522,7 @@ async fn remote_try_pty_attach(
                 .pty_attachments
                 .get(sid)
                 .is_some_and(|att| page.base_seq < att.replay_until),
+            compact,
         )
         .await?;
         if let Some(att) = state.pty_attachments.get_mut(sid) {
@@ -3494,6 +3535,7 @@ async fn remote_try_pty_attach(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_terminal_tail(
     api: &Api,
     socket: &mut WebSocket,
@@ -3502,6 +3544,7 @@ async fn send_terminal_tail(
     sid: &str,
     bounds: &TerminalPage,
     tail_events: i64,
+    compact: bool,
 ) -> Result<()> {
     let latest = bounds.latest_seq;
     let mut base = latest.saturating_sub(tail_events).max(bounds.floor_seq);
@@ -3541,6 +3584,7 @@ async fn send_terminal_tail(
             last_ack_seq: base,
             pending: false,
             replay_until: page.latest_seq,
+            compact,
         },
     );
     send_remote_json(
@@ -3549,7 +3593,7 @@ async fn send_terminal_tail(
         &json!({"type":"term.snapshot","sid":sid,"ansi":"","dataB64":"","seq":base,"cols":size.cols,"rows":size.rows}),
     )
     .await?;
-    send_terminal_page(socket, channel, sid, &page, true).await?;
+    send_terminal_page(socket, channel, sid, &page, true, compact).await?;
     if let Some(att) = state.pty_attachments.get_mut(sid) {
         att.last_sent_seq = page.next_seq;
         att.pending = page.next_seq < page.latest_seq;
@@ -3564,14 +3608,28 @@ async fn send_terminal_snapshot(
     state: &mut RemoteWsState,
     sid: &str,
 ) -> Result<()> {
+    let compact = state
+        .pty_attachments
+        .get(sid)
+        .is_some_and(|att| att.compact);
     if let Some(snapshot) = api.terminals.snapshot(sid.to_owned()).await? {
+        let ansi = if compact {
+            String::new()
+        } else {
+            String::from_utf8_lossy(
+                &BASE64_STANDARD
+                    .decode(&snapshot.data_b64)
+                    .map_err(|_| Error::Invalid("invalid terminal snapshot".into()))?,
+            )
+            .into_owned()
+        };
         send_remote_json(
             socket,
             channel,
             &json!({
                 "type":"term.snapshot",
                 "sid":sid,
-                "ansi": String::from_utf8_lossy(&BASE64_STANDARD.decode(&snapshot.data_b64).map_err(|_| Error::Invalid("invalid terminal snapshot".into()))?).into_owned(),
+                "ansi": ansi,
                 "dataB64": snapshot.data_b64,
                 "seq":snapshot.seq,
                 "cols":snapshot.size.cols,
@@ -3624,6 +3682,7 @@ async fn send_terminal_snapshot(
                     .pty_attachments
                     .get(sid)
                     .is_some_and(|att| page.base_seq < att.replay_until),
+                compact,
             )
             .await?;
             if let Some(att) = state.pty_attachments.get_mut(sid) {
@@ -3660,16 +3719,41 @@ async fn send_terminal_page(
     sid: &str,
     page: &TerminalPage,
     replay: bool,
+    compact: bool,
 ) -> Result<()> {
-    let data_b64 = terminal_page_output_b64(page)?;
-    if !page.events.is_empty() {
-        send_remote_json(
-            socket,
-            channel,
-            &json!({"type":"term.output","sid":sid,"dataB64":data_b64,"events":page.events,"seq":page.next_seq,"replay":replay}),
-        )
-        .await?;
+    if page.events.is_empty() {
+        return Ok(());
     }
+    if compact {
+        let has_resize = page
+            .events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::Resize { .. }));
+        if !replay && !has_resize {
+            let data_b64 = terminal_page_output_b64(page)?;
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"term.output","sid":sid,"dataB64":data_b64,"seq":page.next_seq}),
+            )
+            .await?;
+        } else {
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"term.output","sid":sid,"dataB64":"","events":page.events,"seq":page.next_seq,"replay":replay}),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    let data_b64 = terminal_page_output_b64(page)?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"term.output","sid":sid,"dataB64":data_b64,"events":page.events,"seq":page.next_seq,"replay":replay}),
+    )
+    .await?;
     Ok(())
 }
 
@@ -3993,10 +4077,29 @@ async fn flush_remote_ws_changes(
     channel: &mut SecureChannel,
     state: &mut RemoteWsState,
 ) -> Result<()> {
-    flush_remote_session_states(api, socket, channel, state).await?;
-    flush_remote_orchestration_snapshot(api, socket, channel, state).await?;
+    flush_remote_terminal_events(api, socket, channel, state).await?;
     flush_remote_chat_events(api, socket, channel, state).await?;
-    flush_remote_terminal_events(api, socket, channel, state).await
+    if state
+        .last_metadata_flush
+        .is_none_or(|last| last.elapsed() >= REMOTE_METADATA_MIN_INTERVAL)
+    {
+        flush_remote_ws_metadata(api, socket, channel, state).await?;
+    } else {
+        state.metadata_dirty = true;
+    }
+    Ok(())
+}
+
+async fn flush_remote_ws_metadata(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+) -> Result<()> {
+    state.metadata_dirty = false;
+    state.last_metadata_flush = Some(Instant::now());
+    flush_remote_session_states(api, socket, channel, state).await?;
+    flush_remote_orchestration_snapshot(api, socket, channel, state).await
 }
 
 async fn flush_remote_session_states(
@@ -4144,56 +4247,58 @@ async fn flush_remote_terminal_events(
     channel: &mut SecureChannel,
     state: &mut RemoteWsState,
 ) -> Result<()> {
-    let attached: Vec<(String, i64)> = state
-        .pty_attachments
-        .iter()
-        .map(|(sid, att)| (sid.clone(), att.last_sent_seq))
-        .collect();
-    for (sid, last_seq) in attached {
-        if state
-            .pty_attachments
-            .get(&sid)
-            .is_some_and(|att| att.last_sent_seq.saturating_sub(att.last_ack_seq) >= 256)
-        {
-            continue;
-        }
+    let sids: Vec<String> = state.pty_attachments.keys().cloned().collect();
+    for sid in sids {
+        for _ in 0..REMOTE_PTY_DRAIN_PAGES_PER_TICK {
+            let Some((last_seq, compact)) = state.pty_attachments.get(&sid).and_then(|att| {
+                (att.last_sent_seq.saturating_sub(att.last_ack_seq) < REMOTE_PTY_ACK_WINDOW)
+                    .then_some((att.last_sent_seq, att.compact))
+            }) else {
+                break;
+            };
 
-        let page = match api
-            .terminals
-            .read(
-                sid.clone(),
-                TerminalQuery {
-                    after_seq: Some(last_seq),
-                    wait_ms: None,
-                },
-            )
-            .await
-        {
-            Ok(page) => page,
-            Err(Error::NotFound) => {
-                state.pty_attachments.remove(&sid);
-                continue;
+            let page = match api
+                .terminals
+                .read(
+                    sid.clone(),
+                    TerminalQuery {
+                        after_seq: Some(last_seq),
+                        wait_ms: None,
+                    },
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(Error::NotFound) => {
+                    state.pty_attachments.remove(&sid);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if page.resync_required {
+                send_terminal_snapshot(api, socket, channel, state, &sid).await?;
+                break;
             }
-            Err(error) => return Err(error),
-        };
-        if page.resync_required {
-            send_terminal_snapshot(api, socket, channel, state, &sid).await?;
-            continue;
-        }
-        send_terminal_page(
-            socket,
-            channel,
-            &sid,
-            &page,
-            state
+            if page.events.is_empty() {
+                if let Some(att) = state.pty_attachments.get_mut(&sid) {
+                    att.last_sent_seq = page.next_seq;
+                    att.pending = false;
+                }
+                break;
+            }
+            let replay = state
                 .pty_attachments
                 .get(&sid)
-                .is_some_and(|att| page.base_seq < att.replay_until),
-        )
-        .await?;
-        if let Some(att) = state.pty_attachments.get_mut(&sid) {
-            att.last_sent_seq = page.next_seq;
-            att.pending = page.next_seq < page.latest_seq;
+                .is_some_and(|att| page.base_seq < att.replay_until);
+            send_terminal_page(socket, channel, &sid, &page, replay, compact).await?;
+            let has_more = page.next_seq < page.latest_seq;
+            if let Some(att) = state.pty_attachments.get_mut(&sid) {
+                att.last_sent_seq = page.next_seq;
+                att.pending = has_more;
+            }
+            if !has_more {
+                break;
+            }
         }
     }
     Ok(())

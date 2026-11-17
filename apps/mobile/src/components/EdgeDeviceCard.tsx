@@ -45,7 +45,7 @@ function DeviceChip({ host, runtime, index, columns, selected, choosingOrchestra
       accessibilityRole={choosingOrchestration ? "button" : "checkbox"}
       accessibilityState={choosingOrchestration ? { disabled } : { checked: selected }}
       accessibilityLabel={`${host.name}，${selected ? edgeDeviceConnectionLabel(runtime) : "未选择"}`}
-      accessibilityHint={choosingOrchestration ? "打开此设备的 Agent 编排" : "点击选择或取消选择，长按查看设备详情"}
+      accessibilityHint={choosingOrchestration ? "打开此电脑的任务编排" : "点击选择或取消选择，长按查看电脑详情"}
       disabled={disabled}
       onPress={choosingOrchestration ? onOpenOrchestration : onToggle}
       onLongPress={choosingOrchestration ? undefined : onOpenHost}
@@ -81,7 +81,7 @@ export function EdgeDeviceCard({ hosts, selectedHosts, runtimes, choosingOrchest
   return <View testID="edge-device-card" style={styles.card}>
     <View style={styles.heading}>
       <Text accessibilityLiveRegion="polite" style={styles.caption} numberOfLines={1}>
-        {choosingOrchestration ? "点选设备，打开 Agent 编排" : `设备 ${selectedHosts.length}/${hosts.length} · ${connected} 在线`}
+        {choosingOrchestration ? "点选设备，打开任务编排" : `电脑 ${selectedHosts.length}/${hosts.length} · ${connected} 在线`}
       </Text>
       <Pressable accessibilityRole="button"
         accessibilityLabel={choosingOrchestration ? "取消选择编排设备" : allSelected ? "取消选择全部 Edge 设备" : "选择全部 Edge 设备"}

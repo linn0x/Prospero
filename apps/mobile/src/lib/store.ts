@@ -35,10 +35,38 @@ export function flushSessionUpdates(): void {
   if (pendingSessionUpdates.size === 0) return;
   const updates = [...pendingSessionUpdates.entries()];
   pendingSessionUpdates.clear();
-  const app = useApp.getState();
-  for (const [key, session] of updates) {
-    app.upsertSession(key.slice(0, key.indexOf("\u0000")), session);
-  }
+  useApp.setState((state) => {
+    let nextRuntimes: Record<string, HostRuntime> | null = null;
+    for (const [key, session] of updates) {
+      const sep = key.indexOf("\u0000");
+      const hostId = key.slice(0, sep);
+      const baseRuntimes = nextRuntimes ?? state.runtimes;
+      const runtime = baseRuntimes[hostId];
+      const previous = runtime?.sessions[session.id];
+      if (
+        previous?.revision !== undefined &&
+        session.revision !== undefined &&
+        previous.revision > session.revision
+      ) {
+        continue;
+      }
+      if (
+        !session.archived &&
+        runtime?.status === "connected" &&
+        sessionActivityChanged(previous, session)
+      ) {
+        recentSessions.activity(hostId, session.id, session.preview);
+      }
+      if (nextRuntimes === null) {
+        nextRuntimes = { ...state.runtimes };
+      }
+      const rt = nextRuntimes[hostId] ?? emptyRuntime;
+      const sessions = rt === state.runtimes[hostId] ? { ...rt.sessions } : rt.sessions;
+      sessions[session.id] = session;
+      nextRuntimes[hostId] = rt === state.runtimes[hostId] ? { ...rt, sessions } : rt;
+    }
+    return nextRuntimes === null ? state : { runtimes: nextRuntimes };
+  });
 }
 
 export const emptyRuntime: HostRuntime = {

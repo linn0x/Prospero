@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import * as RN from "react-native";
 import { useFocusEffect } from "expo-router";
 import type { OrchestrationSnapshot } from "@prospero/protocol";
 import type { HostConnection } from "@/lib/connection";
@@ -26,8 +27,9 @@ export function useOrchestrationSnapshot(
       }
 
       let active = true;
-      setReceived(null);
-      const refresh = (): void => conn.orchestrationSnapshot();
+      const refresh = (): void => {
+        if (active) conn.orchestrationSnapshot();
+      };
       const offSnapshot = conn.events.on("orchestrationSnapshot", (message) => {
         if (active) setReceived({ conn, snapshot: message.snapshot });
       });
@@ -36,11 +38,15 @@ export function useOrchestrationSnapshot(
           if (active) onServerError(message.message);
         })
         : undefined;
-      refresh();
+      // Defer initial RPC until native navigation push/pop finishes so 120Hz transitions stay hitch-free.
+      const interactionTask = "InteractionManager" in RN && typeof RN.InteractionManager?.runAfterInteractions === "function"
+        ? RN.InteractionManager.runAfterInteractions(refresh)
+        : (refresh(), null);
       const timer = setInterval(refresh, refreshEveryMs);
       const cleanup = (): void => {
         if (!active) return;
         active = false;
+        interactionTask?.cancel();
         offSnapshot();
         offError?.();
         clearInterval(timer);

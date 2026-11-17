@@ -830,3 +830,45 @@ it("loads all desktop account profiles and sends the selected API and terminal m
     await expect(task.completion).resolves.toMatchObject({ accountId: "api-47", kind: "pty" });
   } finally { connection.stop(); }
 });
+
+it("coalesces concurrent workspaceList calls on the same root and isolates distinct workspace roots", async () => {
+  const { connection, socket, internals } = endedTerminalConnection();
+  try {
+    const firstHome = connection.workspaceList("", "home");
+    const secondHome = connection.workspaceList("", "home");
+    const computer = connection.workspaceList("", "computer");
+    expect(socket.sent).toHaveLength(2);
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "workspace.list", path: "", root: "home" });
+    expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: "workspace.list", path: "", root: "computer" });
+
+    internals.onMessage(
+      JSON.stringify({
+        type: "workspace.listing",
+        root: "home",
+        path: "",
+        cwd: "/Users/bytedance",
+        entries: [{ name: "Prospero", kind: "dir", size: 0, mtime: 1 }],
+      }),
+    );
+    internals.onMessage(
+      JSON.stringify({
+        type: "workspace.listing",
+        root: "computer",
+        path: "",
+        cwd: "",
+        entries: [{ name: "C:", kind: "dir", size: 0, mtime: 1 }],
+      }),
+    );
+
+    const [resolvedFirst, resolvedSecond, resolvedComputer] = await Promise.all([
+      firstHome,
+      secondHome,
+      computer,
+    ]);
+    expect(resolvedFirst.cwd).toBe("/Users/bytedance");
+    expect(resolvedSecond.cwd).toBe("/Users/bytedance");
+    expect(resolvedComputer.entries[0]?.name).toBe("C:");
+  } finally {
+    connection.stop();
+  }
+});

@@ -867,6 +867,8 @@ export const C2SSessionAttachSchema = z.object({
   /** 客户端已收到的最后 seq;省略表示要全量快照 */
   lastSeq: seq.optional(),
   tailEvents: z.number().int().min(1).max(512).optional(),
+  /** 启用紧凑下行编码（去除 snapshot/output 中重复的 ansi 与 dataB64 双份字段）。 */
+  compact: z.boolean().optional(),
 });
 
 export const C2STermInputSchema = z.object({

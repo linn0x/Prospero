@@ -11,8 +11,8 @@ const homeScreen = read("app", "index.tsx");
 const quickPanel = read("components", "SessionQuickPanel.tsx");
 
 describe("首页动线", () => {
-  it("标题栏可直达当前设备的 Agent 编排", () => {
-    expect(homeScreen).toContain('accessibilityLabel="Agent 编排"');
+  it("标题栏可直达当前电脑的任务编排", () => {
+    expect(homeScreen).toContain('accessibilityLabel="任务编排"');
     expect(homeScreen).toContain("`/host/${effectiveSelectedHostId}/orchestration`");
   });
 });
@@ -58,8 +58,8 @@ describe("主机页动线", () => {
   it("账号与编排收进标题栏菜单", () => {
     expect(hostScreen).toContain('accessibilityLabel="更多主机功能"');
     expect(hostScreen).toContain("setToolsOpen(true)");
-    expect(hostScreen).toContain('label="Agent 账号"');
-    expect(hostScreen).toContain('label="Agent 编排"');
+    expect(hostScreen).toContain('label="账号与模型源"');
+    expect(hostScreen).toContain('label="任务编排"');
   });
 
   it("列表上方不再有这两个入口占位", () => {

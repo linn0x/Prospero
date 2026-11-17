@@ -21,8 +21,9 @@ import { fromB64, toB64, type FsEntry } from "@prospero/protocol";
 import { FileContentView } from "@/components/FileContentView";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
+import { SplitPaneDivider } from "@/components/SplitPaneDivider";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
-import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
+import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getEditorExitPlan, resolveEditorExitConfirmation } from "@/lib/editor-exit";
 import { downloadFileChunks, uploadFileChunks } from "@/lib/file-transfer";
 import { validateFileName } from "@/lib/file-names";
@@ -54,7 +55,10 @@ export default function FilesScreen(): React.ReactElement {
   const { conn, runtime } = useHostConnection(hostId);
   const insets = useSafeAreaInsets();
   const adaptiveLayout = useAdaptiveLayout();
-  const contentPaneWidth = primaryPaneWidth(adaptiveLayout.width, adaptiveLayout.verticalPanes);
+  const splitLayout = Boolean(adaptiveLayout.splitPanes);
+  const browserPaneWidth = adaptiveLayout.splitPanes?.start ?? adaptiveLayout.width;
+  const detailPaneWidth = adaptiveLayout.splitPanes?.end ?? adaptiveLayout.width;
+  const splitGap = adaptiveLayout.splitPanes?.gap ?? StyleSheet.hairlineWidth;
 
   const [dir, setDir] = useState("");
   const [entries, setEntries] = useState<FsEntry[]>([]);
@@ -140,12 +144,7 @@ export default function FilesScreen(): React.ReactElement {
     });
   }, [editing, leaveEditor, navigation]);
 
-  const openEntry = async (entry: FsEntry): Promise<void> => {
-    const next = dir === "" ? entry.name : `${dir}/${entry.name}`;
-    if (entry.kind === "dir") {
-      void load(next);
-      return;
-    }
+  const readAndOpenFile = async (entry: FsEntry, next: string): Promise<void> => {
     if (!conn) return;
     setBusy(entry.name);
     try {
@@ -162,6 +161,23 @@ export default function FilesScreen(): React.ReactElement {
     } finally {
       setBusy(null);
     }
+  };
+
+  const openEntry = async (entry: FsEntry): Promise<void> => {
+    const next = dir === "" ? entry.name : `${dir}/${entry.name}`;
+    if (entry.kind === "dir") {
+      void load(next);
+      return;
+    }
+    if (editing && editing.path === next) return;
+    if (editing && editing.text !== editing.original) {
+      Alert.alert("放弃修改?", "切换文件前未保存的改动会丢失。", [
+        { text: "继续编辑", style: "cancel" },
+        { text: "放弃并打开", style: "destructive", onPress: () => { void readAndOpenFile(entry, next); } },
+      ]);
+      return;
+    }
+    await readAndOpenFile(entry, next);
   };
 
   const save = async (): Promise<void> => {
@@ -296,9 +312,9 @@ export default function FilesScreen(): React.ReactElement {
     void load(parent);
   };
 
-  // ---------------------------------------------------------------- 编辑视图
+  // ---------------------------------------------------------------- 编辑视图（窄屏单栏）
 
-  if (editing) {
+  if (editing && !splitLayout) {
     const dirty = editing.text !== editing.original;
     return (
       <KeyboardAvoidingView
@@ -327,12 +343,7 @@ export default function FilesScreen(): React.ReactElement {
             ),
           }}
         />
-        <View
-          style={[
-            styles.contentPane,
-            adaptiveLayout.verticalPanes && { alignSelf: "flex-start", width: contentPaneWidth },
-          ]}
-        >
+        <View style={styles.contentPane}>
           {editing.truncated && (
             <Text style={styles.warnBar}>文件超过 1MB,只显示前 1MB —— 只读,保存已禁用</Text>
           )}
@@ -347,17 +358,20 @@ export default function FilesScreen(): React.ReactElement {
     );
   }
 
-  // ---------------------------------------------------------------- 浏览视图
+  // ---------------------------------------------------------------- 浏览视图（折叠屏/宽屏双栏左目录右编辑）
+
+  const dirty = editing !== null && editing.text !== editing.original;
 
   return (
-    <View style={styles.screen}>
+    <KeyboardAvoidingView
+      style={styles.screen}
+      behavior="padding"
+      keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
+    >
       <Stack.Screen
         options={{
           title: "文件",
           headerBackTitle: "",
-          // 必须显式给回 headerLeft:导航选项是合并而非重置的,
-          // 编辑态设过的那个会残留下来,点了只调用 setEditing(null) —— 看起来就是"返回失效"。
-          // 顺便让它在子目录里表现为"上一级",这也更符合层级浏览的直觉。
           headerLeft:
             dir === ""
               ? undefined
@@ -372,7 +386,6 @@ export default function FilesScreen(): React.ReactElement {
                 <Text style={styles.headerAction}>新建夹</Text>
               </Pressable>
               <Pressable onPress={() => void upload()} hitSlop={8}>
-                {/* ＋ 会被读成"新建文件";这里只做上传,就直说 */}
                 <Text style={styles.headerAction}>上传</Text>
               </Pressable>
             </View>
@@ -380,10 +393,11 @@ export default function FilesScreen(): React.ReactElement {
         }}
       />
 
+      <View style={[styles.workspace, splitLayout && styles.workspaceSplit]}>
       <View
         style={[
           styles.contentPane,
-          adaptiveLayout.verticalPanes && { alignSelf: "flex-start", width: contentPaneWidth },
+          splitLayout && { flex: 0, width: browserPaneWidth },
         ]}
       >
         <View style={styles.pathBar}>
@@ -408,7 +422,8 @@ export default function FilesScreen(): React.ReactElement {
             loading ? null : <Text style={styles.empty}>这个目录是空的</Text>
           }
           renderItem={({ item }) => {
-          // 目录没什么可下载的,只有文件给左滑操作
+          const entryPath = dir === "" ? item.name : `${dir}/${item.name}`;
+          const selected = editing?.path === entryPath;
           const actions: SwipeAction[] = [];
           if (item.kind === "file") {
             actions.push({
@@ -446,7 +461,11 @@ export default function FilesScreen(): React.ReactElement {
           });
           const row = (
             <Pressable
-              style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+              style={({ pressed }) => [
+                styles.row,
+                selected && styles.rowSelected,
+                pressed && styles.rowPressed,
+              ]}
               onPress={() => void openEntry(item)}
             >
               <Icon
@@ -468,7 +487,71 @@ export default function FilesScreen(): React.ReactElement {
             return actions.length > 0 ? <SwipeRow actions={actions}>{row}</SwipeRow> : row;
           }}
         />
-      <Text style={styles.hint}>左滑可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
+      </View>
+      {splitLayout && (
+        <>
+          <SplitPaneDivider
+            label="拖动调整文件目录栏宽度"
+            value={browserPaneWidth}
+            min={adaptiveLayout.splitBounds?.minStart ?? 204}
+            max={adaptiveLayout.splitBounds?.maxStart ?? 440}
+            gap={splitGap}
+            disabled={adaptiveLayout.splitResizable === false}
+            onChange={adaptiveLayout.setSplitStart}
+            onCommit={adaptiveLayout.commitSplitStart}
+            onReset={adaptiveLayout.resetSplitStart}
+          />
+          <View style={[styles.detailPane, { width: detailPaneWidth }]}>
+            {editing ? (
+              <>
+                <View style={styles.detailHeader}>
+                  <Text style={styles.detailTitle} numberOfLines={1} ellipsizeMode="middle">
+                    {editing.path}
+                  </Text>
+                  <View style={styles.detailActions}>
+                    <Pressable
+                      onPress={() => void save()}
+                      disabled={!dirty || saving || editing.truncated}
+                      hitSlop={8}
+                    >
+                      {saving ? (
+                        <ActivityIndicator size="small" color={color.accent} />
+                      ) : (
+                        <Text style={[styles.detailSave, !dirty && styles.headerActionOff]}>
+                          保存
+                        </Text>
+                      )}
+                    </Pressable>
+                    <Pressable onPress={leaveEditor} hitSlop={8} accessibilityLabel="关闭文件预览">
+                      <Icon name="xmark" size={16} color={color.textDim} />
+                    </Pressable>
+                  </View>
+                </View>
+                {editing.truncated && (
+                  <Text style={styles.warnBar}>文件超过 1MB,只显示前 1MB —— 只读,保存已禁用</Text>
+                )}
+                <FileContentView
+                  key={editing.path}
+                  filePath={editing.path}
+                  text={editing.text}
+                  onChangeText={(text) => setEditing({ ...editing, text })}
+                  editable={!editing.truncated && !saving}
+                  bottomInset={insets.bottom}
+                  conn={conn}
+                  hostId={hostId}
+                  sid={sid}
+                  projectRoot={runtime.sessions[sid]?.cwd}
+                />
+              </>
+            ) : (
+              <View style={styles.detailPlaceholder}>
+                <Icon name="doc.on.doc" size={28} color={color.textFaint} />
+                <Text style={styles.empty}>从左侧选择文件以预览或编辑</Text>
+              </View>
+            )}
+          </View>
+        </>
+      )}
       </View>
       <PromptDialog
         visible={namePrompt !== null}
@@ -494,7 +577,7 @@ export default function FilesScreen(): React.ReactElement {
           })
         }
       />
-    </View>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -508,7 +591,31 @@ function encodeUtf8(text: string): string {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: color.bg },
+  workspace: { flex: 1, minHeight: 0 },
+  workspaceSplit: { flexDirection: "row" },
   contentPane: { flex: 1, minWidth: 0, overflow: "hidden" },
+  foldGutter: {
+    flexShrink: 0,
+    backgroundColor: color.bg,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
+  detailPane: { flexShrink: 0, minWidth: 0, overflow: "hidden", backgroundColor: color.bg },
+  detailHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  detailTitle: { flex: 1, color: color.text, fontSize: 13, fontWeight: "600" },
+  detailActions: { flexDirection: "row", alignItems: "center", gap: 14 },
+  detailSave: { color: color.accent, fontSize: 14, fontWeight: "600" },
+  detailPlaceholder: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
   pathBar: {
     flexDirection: "row",
     alignItems: "center",
@@ -531,16 +638,11 @@ const styles = StyleSheet.create({
     borderBottomColor: color.border,
   },
   rowPressed: { backgroundColor: color.pressed },
+  rowSelected: { backgroundColor: color.accentBg },
   name: { color: color.text, fontSize: 15, flex: 1 },
   size: { color: color.textFaint, fontSize: 12 },
-  empty: { color: color.textDim, textAlign: "center", marginTop: 40 },
+  empty: { color: color.textDim, textAlign: "center", marginTop: 12 },
   error: { color: color.danger, paddingHorizontal: 16, paddingVertical: 10, fontSize: 13 },
-  hint: {
-    color: color.textFaint,
-    fontSize: 11,
-    textAlign: "center",
-    paddingVertical: 8,
-  },
   warnBar: {
     backgroundColor: color.warnBg,
     color: color.warn,

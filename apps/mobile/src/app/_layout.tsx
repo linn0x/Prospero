@@ -1,7 +1,7 @@
 import "@/lib/polyfills";
 
 import { useEffect, useMemo } from "react";
-import { useColorScheme } from "react-native";
+import { Platform, useColorScheme } from "react-native";
 import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from "expo-router";
 import { NavigationBar } from "expo-navigation-bar";
 import { StatusBar } from "expo-status-bar";
@@ -25,7 +25,7 @@ export const unstable_settings = {
 };
 
 export default function RootLayout() {
-  const { verticalPanes } = useAdaptiveLayout();
+  const { splitPanes, verticalPanes } = useAdaptiveLayout();
   const systemScheme = useColorScheme();
   const themeMode = useApp((state) =>
     normalizeHomeSettings(state.homeSettings ?? DEFAULT_HOME_SETTINGS).themeMode,
@@ -68,12 +68,13 @@ export default function RootLayout() {
             <NavigationBar style={activeScheme} />
             <Stack
               screenOptions={{
-                headerStyle: { backgroundColor: palette.surface },
+                animation: Platform.OS === "ios" ? "default" : "ios_from_right",
+                headerStyle: { backgroundColor: palette.bg },
                 headerTintColor: palette.text,
                 headerTitleStyle: { fontSize: 17, fontWeight: "600" },
                 // A centered native-stack title otherwise lands directly under
-                // the hinge on book-style foldables.
-                headerTitleAlign: verticalPanes ? "left" : undefined,
+                // the hinge or awkwardly far from dual-pane navigation on foldables.
+                headerTitleAlign: verticalPanes || splitPanes ? "left" : undefined,
                 headerShadowVisible: false,
                 headerBackButtonDisplayMode: "minimal",
                 contentStyle: { backgroundColor: palette.bg },

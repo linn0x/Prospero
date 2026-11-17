@@ -51,7 +51,7 @@ describe("inline Edge device controls", () => {
   it("opens orchestration only for included devices, without altering the saved selection", () => {
     const callbacks = { ...props(), choosingOrchestration: true };
     const html = renderToStaticMarkup(createElement(EdgeDeviceCard, callbacks));
-    expect(html).toContain("点选设备，打开 Agent 编排");
+    expect(html).toContain("点选设备，打开任务编排");
     expect(controls.get("linux，未选择")!.disabled).toBe(true);
     controls.get("pc，离线")!.onPress();
     expect(callbacks.onOpenOrchestration).toHaveBeenCalledWith("pc");

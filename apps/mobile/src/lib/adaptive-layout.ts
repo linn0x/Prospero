@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Platform, useWindowDimensions } from "react-native";
 
 import ProsperoWindowLayoutModule from "../../modules/prospero-window-layout/src/ProsperoWindowLayoutModule";
@@ -7,15 +7,21 @@ import type {
 } from "../../modules/prospero-window-layout/src/ProsperoWindowLayout.types";
 import {
   devicePosture,
+  splitPaneBounds,
+  splitPaneLayout,
   verticalPaneLayout,
   windowWidthClass,
 } from "@/lib/adaptive-layout-math";
+import { useSplitPanePreferences } from "@/lib/split-pane-preferences";
 
 export {
   devicePosture,
   primaryPaneWidth,
+  splitPaneBounds,
+  splitPaneLayout,
   type DevicePosture,
   type FoldPosture,
+  type SplitPaneOptions,
   type WindowOrientation,
   verticalPaneLayout,
   windowWidthClass,
@@ -52,6 +58,15 @@ export function setSensorRotation(enabled: boolean): void {
 export function useAdaptiveLayout() {
   const { width, height } = useWindowDimensions();
   const [layout, setLayout] = useState<WindowLayoutInfo>(readCurrentLayout);
+  const customRatio = useSplitPanePreferences((state) => state.customRatio);
+  const hydrateSplit = useSplitPanePreferences((state) => state.hydrate);
+  const setCustomRatio = useSplitPanePreferences((state) => state.setCustomRatio);
+  const commitCustomRatio = useSplitPanePreferences((state) => state.commitCustomRatio);
+  const resetCustomRatio = useSplitPanePreferences((state) => state.resetCustomRatio);
+
+  useEffect(() => {
+    void hydrateSplit();
+  }, [hydrateSplit]);
 
   useEffect(() => {
     if (Platform.OS !== "android" || !ProsperoWindowLayoutModule) return;
@@ -82,8 +97,31 @@ export function useAdaptiveLayout() {
     return () => cancelAnimationFrame(frame);
   }, [height, width]);
 
+  const setSplitStart = useCallback(
+    (nextStart: number) => {
+      if (!Number.isFinite(width) || width <= 0) return;
+      setCustomRatio(nextStart / width);
+    },
+    [setCustomRatio, width],
+  );
+
+  const commitSplitStart = useCallback(
+    (nextStart: number) => {
+      if (!Number.isFinite(width) || width <= 0) return;
+      commitCustomRatio(nextStart / width);
+    },
+    [commitCustomRatio, width],
+  );
+
   return useMemo(() => {
     const widthClass = windowWidthClass(width);
+    const splitPanes = splitPaneLayout(
+      width,
+      height,
+      layout.foldingFeature,
+      customRatio !== null ? { customRatio } : undefined,
+    );
+    const splitBounds = splitPaneBounds(width, splitPanes?.gap ?? 1);
     return {
       width,
       height,
@@ -92,8 +130,23 @@ export function useAdaptiveLayout() {
       isExpanded: widthClass === "expanded",
       foldingFeature: layout.foldingFeature,
       verticalPanes: verticalPaneLayout(width, layout.foldingFeature, height),
+      splitPanes,
+      splitBounds,
+      splitResizable: Boolean(splitPanes && layout.foldingFeature?.occlusionType !== "full"),
+      setSplitStart,
+      commitSplitStart,
+      resetSplitStart: resetCustomRatio,
       // 窗口尺寸和 WindowManager 事件到达顺序不定，两者任一变化都重新判定。
       posture: devicePosture(width, height, layout.foldingFeature, layout.device),
     };
-  }, [height, layout.device, layout.foldingFeature, width]);
+  }, [
+    commitSplitStart,
+    customRatio,
+    height,
+    layout.device,
+    layout.foldingFeature,
+    resetCustomRatio,
+    setSplitStart,
+    width,
+  ]);
 }

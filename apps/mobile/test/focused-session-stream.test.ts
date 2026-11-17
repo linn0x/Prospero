@@ -132,4 +132,42 @@ describe("focused session stream lifecycle", () => {
     expect(output).toHaveBeenCalledOnce();
     stop();
   });
+
+  it("pipelines terminal ACKs immediately across window steps and coalesces tail ACKs in 24ms", () => {
+    const conn = makeConnection();
+    const cursor = { current: 100 };
+    const stop = subscribeFocusedTerminal({
+      conn,
+      sid: "pty-fast",
+      cursor,
+      snapshot: vi.fn(),
+      output: vi.fn(),
+      flush: vi.fn(),
+      attach: vi.fn(),
+    });
+
+    // Window step >= 64 triggers immediate 0ms pipelined ACK (no 500ms stall)
+    conn.events.emit("output", { type: "term.output", sid: "pty-fast", seq: 164, dataB64: "QQ==" });
+    expect(conn.ack).toHaveBeenCalledWith("pty-fast", 164);
+
+    // Small tail delta coalesces within 24ms instead of waiting 500ms
+    conn.ack.mockClear();
+    conn.events.emit("output", { type: "term.output", sid: "pty-fast", seq: 170, dataB64: "Qg==" });
+    expect(conn.ack).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(24);
+    expect(conn.ack).toHaveBeenCalledWith("pty-fast", 170);
+
+    // Replay frames also ACK immediately
+    conn.ack.mockClear();
+    conn.events.emit("output", {
+      type: "term.output",
+      sid: "pty-fast",
+      seq: 175,
+      dataB64: "",
+      events: [{ type: "output", dataB64: "Qw==" }],
+      replay: true,
+    });
+    expect(conn.ack).toHaveBeenCalledWith("pty-fast", 175);
+    stop();
+  });
 });

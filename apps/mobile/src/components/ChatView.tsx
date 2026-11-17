@@ -447,7 +447,7 @@ const ChatViewContent = memo(function ChatViewContent({
           </View>
           <Text style={styles.emptyTitle}>{search ? "没有找到消息" : "准备好了"}</Text>
           <Text style={styles.emptyText}>
-            {search ? "换个关键词试试" : "描述目标，或从下方快捷回复开始"}
+            {search ? "换个关键词试试" : "直接描述需求，或点击左下角 ＋ 使用快捷指令"}
           </Text>
         </View>
       ),
@@ -480,11 +480,15 @@ const ChatViewContent = memo(function ChatViewContent({
     [listHeader, visiblePendingOutgoing, styles],
   );
 
+  const atZeroOffsetRef = useRef(true);
   const handleContentSizeChange = useCallback(() => {
     if (!scrollFollow.current.following) return;
     // Inversion makes the latest edge exact even while older Markdown rows are unmeasured.
     scrollFollow.current.followLatest();
-    listRef.current?.scrollToOffset({ offset: 0, animated: false });
+    if (!atZeroOffsetRef.current) {
+      atZeroOffsetRef.current = true;
+      listRef.current?.scrollToOffset({ offset: 0, animated: false });
+    }
   }, []);
 
   // hasUnread 走 ref:直接读 state 会让 onScroll 在每次未读标记变化时换引用。
@@ -495,6 +499,7 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const handleScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      atZeroOffsetRef.current = e.nativeEvent.contentOffset.y <= 1;
       const bottom = isScrollAtBottom(e.nativeEvent);
       scrollFollow.current.scrolled(bottom);
       if (bottom && hasUnreadRef.current) setHasUnread(false);
@@ -529,13 +534,13 @@ const ChatViewContent = memo(function ChatViewContent({
         onScrollEndDrag={handleScrollEndDrag}
         onMomentumScrollBegin={handleMomentumScrollBegin}
         onMomentumScrollEnd={handleMomentumScrollEnd}
-        scrollEventThrottle={16}
+        scrollEventThrottle={32}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
         removeClippedSubviews={Platform.OS === "android"}
         initialNumToRender={12}
         maxToRenderPerBatch={10}
-        updateCellsBatchingPeriod={16}
+        updateCellsBatchingPeriod={8}
         // iOS 上 removeClippedSubviews 不可靠,只能靠窗口本身收窄挂载量。气泡里
         // 有 Markdown、diff 和图片,十一屏的量在长会话里就是白挂着的原生视图。
         windowSize={7}
@@ -1625,39 +1630,39 @@ const ActivityGroup = memo(function ActivityGroup({
 
 const useStyles = createThemedStyles((color) => StyleSheet.create({
   turnCapsule: { alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 7,
-    minHeight: 40, paddingHorizontal: 13, paddingVertical: 8, borderRadius: 22,
-    borderWidth: StyleSheet.hairlineWidth, borderColor: color.border, backgroundColor: color.surfaceRaised },
+    minHeight: 34, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999,
+    backgroundColor: color.surfaceRaised },
   turnCapsuleText: { color: color.textDim, fontSize: 12, fontWeight: "600" },
   turnCapsuleHint: { color: color.textFaint, fontSize: 11 },
   resultFiles: { gap: 6, marginTop: 10 },
-  resultFile: { flexDirection: "row", alignItems: "center", gap: 8, minHeight: 42,
-    borderRadius: radius.md, borderWidth: StyleSheet.hairlineWidth, borderColor: color.border,
-    backgroundColor: color.surfaceRaised, paddingHorizontal: 11 },
+  resultFile: { flexDirection: "row", alignItems: "center", gap: 8, minHeight: 40,
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised, paddingHorizontal: 12 },
   resultFileText: { flex: 1, color: color.accent, fontSize: 12 },
   root: { flex: 1 },
   list: { flex: 1, backgroundColor: color.bg },
   content: {
     flexGrow: 1,
     width: "100%",
-    maxWidth: 920,
+    maxWidth: 880,
     alignSelf: "center",
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     // Inverted content: logical top is the visual bottom next to the composer.
-    paddingTop: 28,
-    paddingBottom: 14,
-    gap: 14,
+    paddingTop: 20,
+    paddingBottom: 16,
+    gap: 16,
   },
-  empty: { minHeight: 280, alignItems: "center", justifyContent: "center", gap: 7 },
+  empty: { minHeight: 260, alignItems: "center", justifyContent: "center", gap: 8 },
   emptyIcon: {
-    width: 50,
-    height: 50,
+    width: 48,
+    height: 48,
     borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: color.surface,
     marginBottom: 4,
   },
-  emptyTitle: { color: color.text, fontSize: 15, fontWeight: "600" },
+  emptyTitle: { color: color.text, fontSize: 16, fontWeight: "600", letterSpacing: -0.2 },
   emptyText: { color: color.textDim, fontSize: 13, textAlign: "center" },
 
   agentWorking: {
@@ -1701,42 +1706,41 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   userRow: { alignItems: "flex-end" },
   pendingOutgoingBubble: {
     alignSelf: "flex-end",
-    maxWidth: "88%",
-    marginBottom: 4,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-    borderRadius: 15,
-    backgroundColor: color.accentDim,
-    opacity: 0.82,
-  },
-  pendingOutgoingText: { color: color.text, fontSize: 14, lineHeight: 20 },
-  pendingOutgoingStatus: { marginTop: 3, color: color.textDim, fontSize: 10 },
-  userBubble: {
-    backgroundColor: color.accent,
-    borderRadius: 18,
-    borderBottomRightRadius: 5,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
     maxWidth: "86%",
+    marginBottom: 4,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    borderRadius: 20,
+    backgroundColor: color.surfaceRaised,
+    opacity: 0.78,
+  },
+  pendingOutgoingText: { color: color.text, fontSize: 15, lineHeight: 22 },
+  pendingOutgoingStatus: { marginTop: 3, color: color.textDim, fontSize: 10.5 },
+  userBubble: {
+    backgroundColor: color.surfaceRaised,
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    maxWidth: "85%",
     gap: 8,
   },
-  userText: { color: color.onAccent, fontSize: 15, lineHeight: 22 },
+  userText: { color: color.text, fontSize: 15.5, lineHeight: 23 },
   userAttachments: { flexDirection: "row", flexWrap: "wrap", gap: 7 },
   userAttachmentImage: {
     width: 168,
     height: 126,
-    borderRadius: 8,
-    backgroundColor: color.accentDim,
+    borderRadius: 12,
+    backgroundColor: color.surface,
   },
   userAttachmentPlaceholder: {
     width: 168,
     height: 92,
-    borderRadius: 8,
+    borderRadius: 12,
     paddingHorizontal: 10,
     alignItems: "center",
     justifyContent: "center",
     gap: 6,
-    backgroundColor: color.accentDim,
+    backgroundColor: color.surface,
   },
   userAttachmentRetry: { borderWidth: 1, borderColor: color.text },
   userAttachmentLabel: { color: color.text, fontSize: 10.5, lineHeight: 14, textAlign: "center" },
@@ -1817,11 +1821,12 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
 
   toolCard: {
     backgroundColor: color.surface,
-    borderRadius: radius.md,
-    padding: 11,
-    gap: 7,
+    borderRadius: 15,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
+    paddingHorizontal: 13,
+    paddingVertical: 11,
+    gap: 6,
   },
   toolHeader: { flexDirection: "row", alignItems: "center", gap: 8 },
   toolDot: { width: 7, height: 7, borderRadius: 4 },
@@ -1899,15 +1904,15 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
 
   activityGroup: {
     backgroundColor: color.surface,
-    borderRadius: radius.md,
+    borderRadius: 15,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
     overflow: "hidden",
   },
   activityHeader: {
-    minHeight: 54,
-    paddingHorizontal: 11,
-    paddingVertical: 9,
+    minHeight: 46,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     flexDirection: "row",
     alignItems: "center",
     gap: 9,

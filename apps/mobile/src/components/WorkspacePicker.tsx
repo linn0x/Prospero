@@ -58,6 +58,8 @@ export function WorkspacePicker({
   conn,
   initialPath,
   initialCwd = "",
+  title = "选择工作区",
+  confirmLabel = "选择当前文件夹",
   onClose,
   onManualInput,
   onSelect,
@@ -66,6 +68,8 @@ export function WorkspacePicker({
   conn: HostConnection;
   initialPath: string;
   initialCwd?: string;
+  title?: string;
+  confirmLabel?: string;
   onClose: () => void;
   onManualInput?: () => void;
   onSelect: (selection: Selection) => void;
@@ -176,7 +180,7 @@ export function WorkspacePicker({
           <Pressable onPress={close} hitSlop={10} style={styles.headerSide}>
             <Text style={styles.headerAction}>取消</Text>
           </Pressable>
-          <Text style={styles.title}>选择工作目录</Text>
+          <Text style={styles.title}>{title}</Text>
           <View style={[styles.headerSide, styles.headerRight]}>
             {conn.supportsWorkspaceRoots && root !== "computer" && cwd !== "" && (
               <Pressable
@@ -316,7 +320,7 @@ export function WorkspacePicker({
               pressed && styles.choosePressed,
             ]}
           >
-            <Text style={styles.chooseText}>选择当前文件夹</Text>
+            <Text style={styles.chooseText}>{confirmLabel}</Text>
           </Pressable>
         </View>
         <PromptDialog

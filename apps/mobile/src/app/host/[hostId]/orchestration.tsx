@@ -14,20 +14,24 @@ import {
 import { randomUUID } from "expo-crypto";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import Svg, { Path } from "react-native-svg";
-import { executionPending, latestExecution, latestOperation, runtimeStatus } from "@prospero/protocol";
+import { executionPending, getAgentAccountEngine, latestExecution, latestOperation, runtimeStatus } from "@prospero/protocol";
 import type {
   AgentAccount,
   AgentKind,
   ApprovalPolicy,
+  CodeAgentKind,
+  ModelSource,
   OrchestrationRun,
   OrchestrationTask,
   OrchestrationWorktreeAsset,
 } from "@prospero/protocol";
+import { availableSourceRoutes, sourceRouteLabel } from "@/lib/session-model-sources";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
+import { SplitPaneDivider } from "@/components/SplitPaneDivider";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
-import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
+import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import {
   createOrchestrationTemplatePayload,
   instantiateOrchestrationTemplate,
@@ -205,12 +209,18 @@ export default function OrchestrationScreen() {
   const [policy, setPolicy] = useState<ApprovalPolicy>("standard");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>([]);
+  const [modelSources, setModelSources] = useState<ModelSource[]>([]);
+  const [authSourceMode, setAuthSourceMode] = useState<"subscription" | "source">("subscription");
+  const [bindingRouteId, setBindingRouteId] = useState<string | null>(null);
   const [templates, setTemplates] = useState<OrchestrationTemplate[]>([]);
   const [templatesLoading, setTemplatesLoading] = useState(true);
   const [templateNameDialogOpen, setTemplateNameDialogOpen] = useState(false);
   const [templateName, setTemplateName] = useState("");
   const adaptiveLayout = useAdaptiveLayout();
-  const contentPaneWidth = primaryPaneWidth(adaptiveLayout.width, adaptiveLayout.verticalPanes);
+  const splitLayout = Boolean(adaptiveLayout.splitPanes);
+  const navPaneWidth = adaptiveLayout.splitPanes?.start ?? adaptiveLayout.width;
+  const detailPaneWidth = adaptiveLayout.splitPanes?.end ?? adaptiveLayout.width;
+  const splitGap = adaptiveLayout.splitPanes?.gap ?? StyleSheet.hairlineWidth;
   const snapshot = useOrchestrationSnapshot(conn, runtime.status, 5_000, setBanner);
   const supportsDeepseekHarness =
     runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
@@ -223,11 +233,18 @@ export default function OrchestrationScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      if (!conn || runtime.status !== "connected" || !conn.supportsAgentAccounts) return undefined;
+      if (!conn || runtime.status !== "connected") return undefined;
       let cancelled = false;
-      void conn.agentAccounts().then((accounts) => {
-        if (!cancelled) setAgentAccounts(accounts);
-      }).catch(() => {});
+      if (conn.supportsAgentAccounts) {
+        void conn.agentAccounts().then((accounts) => {
+          if (!cancelled) setAgentAccounts(accounts);
+        }).catch(() => {});
+      }
+      if (conn.supportsModelSources) {
+        void conn.modelSourceAction({ kind: "list" }).then((res) => {
+          if (!cancelled) setModelSources(res.sources ?? []);
+        }).catch(() => {});
+      }
       return () => {
         cancelled = true;
       };
@@ -267,11 +284,45 @@ export default function OrchestrationScreen() {
   );
   const orphanWorktreeAssets = worktreeAssetGroups.orphaned;
   const accountsFor = (agent: AgentKind): AgentAccount[] =>
-    agent === "claude" || agent === "codex" || agent === "pi"
-      ? agentAccounts.filter((account) => account.agent === agent)
+    agent === "claude" || agent === "codex" || agent === "agy" || agent === "opencode" || agent === "pi"
+      ? agentAccounts.filter((account) => !account.modelSource && getAgentAccountEngine(account) === agent)
       : [];
   const defaultAccountId = (agent: AgentKind): string | undefined =>
     accountsFor(agent).find((account) => account.isDefault)?.id ?? accountsFor(agent)[0]?.id;
+
+  const sourceRoutesFor = (agent: AgentKind) => {
+    if (agent !== "claude" && agent !== "codex" && agent !== "opencode" && agent !== "pi") return [];
+    const codeAgent = agent as CodeAgentKind;
+    return modelSources.flatMap((source) =>
+      availableSourceRoutes(source, codeAgent).map((route) => ({ source, route })),
+    );
+  };
+
+  const bindOrchestrationSourceRoute = async (
+    agent: CodeAgentKind,
+    source: ModelSource,
+    routeId: string,
+    onBound: (accountId: string) => void,
+  ): Promise<void> => {
+    if (!conn || bindingRouteId) return;
+    setBindingRouteId(`${source.id}:${routeId}`);
+    try {
+      const result = await conn.modelSourceAction({
+        kind: "bind",
+        sourceId: source.id,
+        revision: source.revision,
+        routeId,
+        agent,
+      });
+      if (result.accounts) setAgentAccounts(result.accounts);
+      if (result.sources) setModelSources(result.sources);
+      if (result.accountId) onBound(result.accountId);
+    } catch (error) {
+      setBanner(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBindingRouteId(null);
+    }
+  };
 
   const requestedRunId = selectedRouteRunId(runId, runs);
   const selectedRunCandidate = selectedRunId
@@ -902,355 +953,76 @@ export default function OrchestrationScreen() {
     if (dispatch) router.push(`/host/${hostId}/session/${dispatch.sessionId}`);
   };
 
-  return (
-    <KeyboardAvoidingView
-      style={styles.screen}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      <Stack.Screen
-        options={{
-          title: "Agent 编排",
-          headerRight: () => canMutate ? (
-            <Pressable
-              onPress={openRunEditor}
-              hitSlop={10}
-              accessibilityLabel={canCreateGraph ? "可视化新建编排" : "新建手工 Run"}
-            >
-              <Icon name="plus" size={19} color={color.accent} weight="semibold" />
-            </Pressable>
-          ) : null,
-        }}
-      />
-
-      <View
-        style={[
-          styles.contentPane,
-          adaptiveLayout.verticalPanes && { alignSelf: "flex-start", width: contentPaneWidth },
-        ]}
-      >
-        {banner !== null && (
-          <Pressable style={styles.banner} onPress={() => setBanner(null)}>
-            <Text style={styles.bannerText}>{banner}（点击关闭）</Text>
-          </Pressable>
-        )}
-
-        <ScrollView
-          contentContainerStyle={styles.content}
-          keyboardShouldPersistTaps="handled"
+  const navSections = (
+    <>
+      {connectionNotice !== null ? (
+        <View
+          style={[
+            styles.notice,
+            connectionNotice.tone === "danger" && styles.noticeDanger,
+            connectionNotice.tone === "quiet" && styles.noticeQuiet,
+          ]}
+          accessibilityLiveRegion={connectionNotice.tone === "danger" ? "assertive" : "polite"}
         >
-        <View style={styles.hero}>
-          <View style={styles.heroIcon}>
-            <Icon name="point.3.connected.trianglepath.dotted" size={24} color={color.accent} />
-          </View>
-          <View style={styles.heroCopy}>
-            <Text style={styles.heroTitle}>画出依赖，再指定 Agent 执行</Text>
-            <Text style={styles.heroDetail}>
-              可视化任务图会原子保存在电脑端；worker 只有显式交付才会完成任务。
-            </Text>
-          </View>
-        </View>
-
-        {editor?.kind !== "graph" && (
-          <View style={styles.templateSection}>
-            <View style={styles.templateHeader}>
-              <View style={styles.templateHeaderIcon}>
-                <Icon name="square.stack.3d.up" size={16} color={color.accent} />
-              </View>
-              <View style={styles.templateHeaderCopy}>
-                <Text style={styles.templateTitle}>编排模板</Text>
-                <Text style={styles.templateSubtitle}>保存在本机，可为不同电脑复用任务图</Text>
-              </View>
-              {templates.length > 0 && (
-                <Text style={styles.templateCount}>{templates.length}</Text>
-              )}
-            </View>
-            {templatesLoading ? (
-              <Text style={styles.templateEmpty}>正在读取本机模板…</Text>
-            ) : templates.length === 0 ? (
-              <Text style={styles.templateEmpty}>在任务图编辑器中完成编排后，可存为模板。</Text>
-            ) : (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={styles.templateStrip}
-              >
-                {templates.map((template) => (
-                  <View key={template.id} style={styles.templateCard}>
-                    <Text style={styles.templateCardName} numberOfLines={1}>{template.name}</Text>
-                    <Text style={styles.templateCardObjective} numberOfLines={2}>
-                      {template.payload.objective}
-                    </Text>
-                    <Text style={styles.templateCardMeta}>
-                      {template.payload.nodes.length} 个任务 · 本机模板
-                    </Text>
-                    <View style={styles.templateCardActions}>
-                      <Pressable
-                        accessibilityRole="button"
-                        accessibilityLabel={`使用编排模板 ${template.name}`}
-                        disabled={!canCreateGraph}
-                        style={({ pressed }) => [
-                          styles.templateUseButton,
-                          !canCreateGraph && styles.disabled,
-                          pressed && styles.primaryPressed,
-                        ]}
-                        onPress={() => openTemplate(template)}
-                      >
-                        <Text style={styles.templateUseText}>使用模板</Text>
-                      </Pressable>
-                      <Pressable
-                        accessibilityRole="button"
-                        accessibilityLabel={`删除编排模板 ${template.name}`}
-                        hitSlop={8}
-                        style={({ pressed }) => [
-                          styles.templateDeleteButton,
-                          pressed && styles.primaryPressed,
-                        ]}
-                        onPress={() => confirmDeleteTemplate(template)}
-                      >
-                        <Icon name="trash" size={14} color={color.textFaint} />
-                      </Pressable>
-                    </View>
-                  </View>
-                ))}
-              </ScrollView>
-            )}
-          </View>
-        )}
-
-        {connectionNotice !== null ? (
-          <View
+          <Text
             style={[
-              styles.notice,
-              connectionNotice.tone === "danger" && styles.noticeDanger,
-              connectionNotice.tone === "quiet" && styles.noticeQuiet,
+              styles.noticeText,
+              connectionNotice.tone === "danger" && styles.noticeDangerText,
+              connectionNotice.tone === "quiet" && styles.noticeQuietText,
             ]}
-            accessibilityLiveRegion={connectionNotice.tone === "danger" ? "assertive" : "polite"}
           >
-            <Text
-              style={[
-                styles.noticeText,
-                connectionNotice.tone === "danger" && styles.noticeDangerText,
-                connectionNotice.tone === "quiet" && styles.noticeQuietText,
-              ]}
-            >
-              {connectionNotice.text}
-            </Text>
-            {connectionNotice.canRetry && (
-              <Pressable
-                style={styles.noticeRetry}
-                onPress={() => conn?.kick()}
-                accessibilityRole="button"
-                accessibilityLabel={`重试连接 ${host?.name ?? "电脑"}`}
-                accessibilityHint="重新连接后刷新编排状态"
-              >
-                <Text style={styles.noticeRetryText}>重试连接</Text>
-              </Pressable>
-            )}
-          </View>
-        ) : !conn?.supportsOrchestrationSnapshot ? (
-          <View style={styles.notice}>
-            <Text style={styles.noticeText}>电脑端 daemon 版本过旧，升级后现有配对会自动保留。</Text>
-          </View>
-        ) : null}
-
-        {conn?.supportsOrchestrationSnapshot && !conn.supportsManualOrchestration && (
-          <View style={styles.notice}>
-            <Text style={styles.noticeText}>
-              当前只能查看编排和处理 Gate。请升级 daemon，或为该设备开启人工编排权限。
-            </Text>
-          </View>
-        )}
-
-        {editor?.kind === "graph" && (
-          <EditorCard
-            title={graphIsEditing ? "编辑任务图" : "可视化新建编排"}
-            onCancel={() => setEditor(null)}
-          >
-            <TextInput
-              value={objective}
-              onChangeText={(value) => {
-                recordGraphChange();
-                setObjective(value);
-              }}
-              style={[styles.multilineInput, graphIsEditing && styles.readOnlyInput]}
-              placeholder="最终目标，例如：完成协议兼容并发布移动端与桌面端"
-              placeholderTextColor={color.textFaint}
-              selectionColor={color.accent}
-              multiline
-              editable={!graphIsEditing}
-              autoFocus={!graphIsEditing}
-            />
-            {graphIsEditing && (
-              <Text style={styles.graphHint}>
-                基于 r{graphBaseRevision} 编辑 · {graphLockedIds.length} 个运行中或已结束节点只读
-              </Text>
-            )}
-
-            <View style={styles.graphEditorToolbar}>
-              <View style={styles.graphEditorCopy}>
-                <Text style={styles.fieldLabel}>任务依赖图</Text>
-                <Text style={styles.graphHint}>连线从前置任务指向后续任务</Text>
-              </View>
-              <View style={styles.graphToolbarActions}>
-                <Pressable
-                  disabled={undoStack.length === 0}
-                  style={[styles.historyAction, undoStack.length === 0 && styles.disabled]}
-                  onPress={undoGraph}
-                >
-                  <Text style={styles.historyActionText}>撤销</Text>
-                </Pressable>
-                <Pressable
-                  disabled={redoStack.length === 0}
-                  style={[styles.historyAction, redoStack.length === 0 && styles.disabled]}
-                  onPress={redoGraph}
-                >
-                  <Text style={styles.historyActionText}>重做</Text>
-                </Pressable>
-                <Pressable style={styles.smallAction} onPress={addDraftNode}>
-                  <Icon name="plus" size={13} color={color.accent} />
-                  <Text style={styles.smallActionText}>任务</Text>
-                </Pressable>
-              </View>
-            </View>
-
-            <TaskTopology
-              nodes={draftNodes.map((node) => ({
-                ...node,
-                incomplete: node.title.trim().length === 0 || node.spec.trim().length === 0,
-                locked: lockedDraftIds.has(node.id),
-              }))}
-              selectedId={selectedDraftId}
-              onSelect={setSelectedDraftId}
-            />
-
-            {selectedDraft && (
-              <View style={styles.draftInspector}>
-                <View style={styles.editorHeader}>
-                  <View style={styles.inspectorTitleRow}>
-                    <Text style={styles.editorTitle}>任务设置</Text>
-                    {lockedDraftIds.has(selectedDraft.id) && (
-                      <Text style={styles.lockedBadge}>只读</Text>
-                    )}
-                  </View>
-                  <Pressable
-                    disabled={lockedDraftIds.has(selectedDraft.id)
-                      || (!graphIsEditing && draftNodes.length <= 1)}
-                    onPress={() => removeDraftNode(selectedDraft.id)}
-                    style={(lockedDraftIds.has(selectedDraft.id)
-                      || (!graphIsEditing && draftNodes.length <= 1)) && styles.disabled}
-                    accessibilityLabel="删除任务"
-                  >
-                    <Icon name="trash" size={16} color={color.danger} />
-                  </Pressable>
-                </View>
-                <TextInput
-                  value={selectedDraft.title}
-                  onChangeText={(value) => updateDraft(selectedDraft.id, { title: value })}
-                  style={styles.input}
-                  placeholder="任务标题"
-                  placeholderTextColor={color.textFaint}
-                  selectionColor={color.accent}
-                  editable={!lockedDraftIds.has(selectedDraft.id)}
-                />
-                <TextInput
-                  value={selectedDraft.spec}
-                  onChangeText={(value) => updateDraft(selectedDraft.id, { spec: value })}
-                  style={styles.multilineInput}
-                  placeholder="交付说明与验收条件"
-                  placeholderTextColor={color.textFaint}
-                  selectionColor={color.accent}
-                  multiline
-                  editable={!lockedDraftIds.has(selectedDraft.id)}
-                />
-                {draftNodes.length > 1 && (
-                  <View style={styles.fieldGroup}>
-                    <Text style={styles.fieldLabel}>前置依赖（可多选）</Text>
-                    <View style={styles.wrapRow}>
-                      {draftNodes.filter((node) => node.id !== selectedDraft.id).map((candidate) => {
-                        const selected = selectedDraft.deps.includes(candidate.id);
-                        const wouldCycle = !selected && transitivelyDepends(
-                          draftNodes,
-                          candidate.id,
-                          selectedDraft.id,
-                        );
-                        return (
-                          <Pressable
-                            key={candidate.id}
-                            disabled={lockedDraftIds.has(selectedDraft.id) || wouldCycle}
-                            style={[
-                              styles.choice,
-                              selected && styles.choiceActive,
-                              (lockedDraftIds.has(selectedDraft.id) || wouldCycle) && styles.disabled,
-                            ]}
-                            onPress={() => updateDraft(selectedDraft.id, {
-                              deps: selected
-                                ? selectedDraft.deps.filter((id) => id !== candidate.id)
-                                : [...selectedDraft.deps, candidate.id],
-                            })}
-                          >
-                            <Text style={[styles.choiceText, selected && styles.choiceTextActive]}>
-                              {candidate.title.trim() || "未命名任务"}
-                            </Text>
-                          </Pressable>
-                        );
-                      })}
-                    </View>
-                  </View>
-                )}
-              </View>
-            )}
-
-            <Text style={[styles.graphValidation, graphIssue === null && styles.graphValidationReady]}>
-              {graphIssue ?? (graphIsEditing
-                ? `将原子更新 ${editableDraftNodes.length} 个待派发任务，删除 ${deletedPersistedIds.length} 个`
-                : `将一次性创建 ${draftNodes.length} 个任务`)}
-            </Text>
+            {connectionNotice.text}
+          </Text>
+          {connectionNotice.canRetry && (
             <Pressable
+              style={styles.noticeRetry}
+              onPress={() => conn?.kick()}
               accessibilityRole="button"
-              accessibilityLabel="将当前任务图存为编排模板"
-              disabled={templateIssue !== null}
-              style={({ pressed }) => [
-                styles.templateSaveButton,
-                templateIssue !== null && styles.disabled,
-                pressed && styles.primaryPressed,
-              ]}
-              onPress={() => {
-                setTemplateName(objective.trim().slice(0, 48));
-                setTemplateNameDialogOpen(true);
-              }}
+              accessibilityLabel={`重试连接 ${host?.name ?? "电脑"}`}
+              accessibilityHint="重新连接后刷新编排状态"
             >
-              <Icon name="square.stack.3d.up" size={16} color={color.accent} />
-              <Text style={styles.templateSaveText}>存为本机模板</Text>
+              <Text style={styles.noticeRetryText}>重试连接</Text>
             </Pressable>
-            <PrimaryButton
-              label={graphIsEditing ? "保存任务图" : "发布任务图"}
-              disabled={graphIssue !== null || !canCreateGraph}
-              onPress={publishGraph}
-            />
-          </EditorCard>
-        )}
+          )}
+        </View>
+      ) : !conn?.supportsOrchestrationSnapshot ? (
+        <View style={styles.notice}>
+          <Text style={styles.noticeText}>电脑端 daemon 版本过旧，升级后现有配对会自动保留。</Text>
+        </View>
+      ) : null}
 
-        {editor?.kind === "run" && (
-          <EditorCard title="新建手工 Run" onCancel={() => setEditor(null)}>
-            <TextInput
-              value={objective}
-              onChangeText={setObjective}
-              style={styles.multilineInput}
-              placeholder="写下最终目标，例如：完成协议兼容并发布 iOS"
-              placeholderTextColor={color.textFaint}
-              selectionColor={color.accent}
-              multiline
-              autoFocus
-            />
-            <PrimaryButton
-              label="创建 Run"
-              disabled={objective.trim().length === 0 || !canMutate}
-              onPress={createRun}
-            />
-          </EditorCard>
-        )}
+      {conn?.supportsOrchestrationSnapshot && !conn.supportsManualOrchestration && (
+        <View style={styles.notice}>
+          <Text style={styles.noticeText}>
+            当前只能查看编排和处理 Gate。请升级 daemon，或为该设备开启人工编排权限。
+          </Text>
+        </View>
+      )}
 
-        {runGroups.active.length > 0 && (
+      {runGroups.active.length > 0 && (
+        splitLayout ? (
+          <View style={styles.runStack}>
+            {runGroups.active.map((run) => (
+              <Pressable
+                key={run.id}
+                onPress={() => {
+                  setSelectedRunId(run.id);
+                  setSelectedTopologyTaskId(null);
+                  setEditor(null);
+                }}
+                style={[styles.runChip, styles.runChipStacked, activeRunId === run.id && styles.runChipActive]}
+              >
+                <Text
+                  style={[styles.runChipTitle, activeRunId === run.id && styles.runChipTitleActive]}
+                  numberOfLines={2}
+                >
+                  {run.objective}
+                </Text>
+                <Text style={styles.runChipMeta}>{runLabel(run)} · {run.status}</Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : (
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
@@ -1276,37 +1048,66 @@ export default function OrchestrationScreen() {
               </Pressable>
             ))}
           </ScrollView>
-        )}
+        )
+      )}
 
-        {runGroups.history.length > 0 && (
-          <View style={styles.runHistory}>
-            <Pressable
-              style={({ pressed }) => [
-                styles.runHistoryToggle,
-                pressed && styles.runHistoryTogglePressed,
-              ]}
-              onPress={() => {
-                const next = !historyOpen;
-                setHistoryOpen(next);
-                if (!next && selectedRun?.status !== "active") {
-                  setSelectedRunId(runGroups.active[0]?.id ?? null);
-                  setSelectedTopologyTaskId(null);
-                  setEditor(null);
-                }
-              }}
-              accessibilityRole="button"
-              accessibilityState={{ expanded: historyOpen }}
-              accessibilityLabel={`${historyOpen ? "折叠" : "展开"}已结束的 Goal 编排`}
-            >
-              <Icon
-                name={historyOpen ? "chevron.down" : "chevron.right"}
-                size={13}
-                color={color.textDim}
-              />
-              <Text style={styles.runHistoryTitle}>已结束的 Goal 编排</Text>
-              <Text style={styles.runHistoryCount}>{String(runGroups.history.length)}</Text>
-            </Pressable>
-            {historyOpen && (
+      {runGroups.history.length > 0 && (
+        <View style={styles.runHistory}>
+          <Pressable
+            style={({ pressed }) => [
+              styles.runHistoryToggle,
+              pressed && styles.runHistoryTogglePressed,
+            ]}
+            onPress={() => {
+              const next = !historyOpen;
+              setHistoryOpen(next);
+              if (!next && selectedRun?.status !== "active") {
+                setSelectedRunId(runGroups.active[0]?.id ?? null);
+                setSelectedTopologyTaskId(null);
+                setEditor(null);
+              }
+            }}
+            accessibilityRole="button"
+            accessibilityState={{ expanded: historyOpen }}
+            accessibilityLabel={`${historyOpen ? "折叠" : "展开"}已结束的 Goal 编排`}
+          >
+            <Icon
+              name={historyOpen ? "chevron.down" : "chevron.right"}
+              size={13}
+              color={color.textDim}
+            />
+            <Text style={styles.runHistoryTitle}>已结束的 Goal 编排</Text>
+            <Text style={styles.runHistoryCount}>{String(runGroups.history.length)}</Text>
+          </Pressable>
+          {historyOpen && (
+            splitLayout ? (
+              <View style={styles.runHistoryStack}>
+                {runGroups.history.map((run) => (
+                  <Pressable
+                    key={run.id}
+                    onPress={() => {
+                      setSelectedRunId(run.id);
+                      setSelectedTopologyTaskId(null);
+                      setEditor(null);
+                    }}
+                    style={[styles.runChip, styles.runChipStacked, activeRunId === run.id && styles.runChipActive]}
+                  >
+                    <Text
+                      style={[
+                        styles.runChipTitle,
+                        activeRunId === run.id && styles.runChipTitleActive,
+                      ]}
+                      numberOfLines={2}
+                    >
+                      {run.objective}
+                    </Text>
+                    <Text style={styles.runChipMeta}>
+                      {runLabel(run)} · {runStatusLabel[run.status]}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : (
               <ScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
@@ -1337,23 +1138,282 @@ export default function OrchestrationScreen() {
                   </Pressable>
                 ))}
               </ScrollView>
-            )}
-          </View>
-        )}
+            )
+          )}
+        </View>
+      )}
 
-        {runs.length === 0 && editor?.kind !== "run" && conn?.supportsOrchestrationSnapshot && (
-          <View style={styles.empty}>
-            <Icon name="square.stack.3d.up" size={30} color={color.textFaint} />
-            <Text style={styles.emptyTitle}>还没有编排 Run</Text>
-            <Text style={styles.emptyDetail}>在画布上添加任务和依赖，再一次性发布整张图。</Text>
-            {canMutate && (
-              <PrimaryButton
-                label={canCreateGraph ? "可视化新建" : "新建手工 Run"}
-                onPress={openRunEditor}
-              />
+      {editor?.kind !== "graph" && (templatesLoading || templates.length > 0) && (
+        <View style={styles.templateSection}>
+          <View style={styles.templateHeader}>
+            <View style={styles.templateHeaderIcon}>
+              <Icon name="square.stack.3d.up" size={16} color={color.accent} />
+            </View>
+            <View style={styles.templateHeaderCopy}>
+              <Text style={styles.templateTitle}>编排模板</Text>
+              <Text style={styles.templateSubtitle}>本机保存，可跨设备复用</Text>
+            </View>
+            {templates.length > 0 && (
+              <Text style={styles.templateCount}>{templates.length}</Text>
             )}
           </View>
-        )}
+          {templatesLoading ? (
+            <Text style={styles.templateEmpty}>正在读取本机模板…</Text>
+          ) : (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.templateStrip}
+            >
+              {templates.map((template) => (
+                <View key={template.id} style={styles.templateCard}>
+                  <Text style={styles.templateCardName} numberOfLines={1}>{template.name}</Text>
+                  <Text style={styles.templateCardObjective} numberOfLines={2}>
+                    {template.payload.objective}
+                  </Text>
+                  <Text style={styles.templateCardMeta}>
+                    {template.payload.nodes.length} 个任务 · 本机模板
+                  </Text>
+                  <View style={styles.templateCardActions}>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`使用编排模板 ${template.name}`}
+                      disabled={!canCreateGraph}
+                      style={({ pressed }) => [
+                        styles.templateUseButton,
+                        !canCreateGraph && styles.disabled,
+                        pressed && styles.primaryPressed,
+                      ]}
+                      onPress={() => openTemplate(template)}
+                    >
+                      <Text style={styles.templateUseText}>使用模板</Text>
+                    </Pressable>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`删除编排模板 ${template.name}`}
+                      hitSlop={8}
+                      style={({ pressed }) => [
+                        styles.templateDeleteButton,
+                        pressed && styles.primaryPressed,
+                      ]}
+                      onPress={() => confirmDeleteTemplate(template)}
+                    >
+                      <Icon name="trash" size={14} color={color.textFaint} />
+                    </Pressable>
+                  </View>
+                </View>
+              ))}
+            </ScrollView>
+          )}
+        </View>
+      )}
+    </>
+  );
+
+  const detailSections = (
+    <>
+      {editor?.kind === "graph" && (
+        <EditorCard
+          title={graphIsEditing ? "编辑任务图" : "可视化新建编排"}
+          onCancel={() => setEditor(null)}
+        >
+          <TextInput
+            value={objective}
+            onChangeText={(value) => {
+              recordGraphChange();
+              setObjective(value);
+            }}
+            style={[styles.multilineInput, graphIsEditing && styles.readOnlyInput]}
+            placeholder="最终目标，例如：完成协议兼容并发布移动端与桌面端"
+            placeholderTextColor={color.textFaint}
+            selectionColor={color.accent}
+            multiline
+            editable={!graphIsEditing}
+            autoFocus={!graphIsEditing}
+          />
+          {graphIsEditing && (
+            <Text style={styles.graphHint}>
+              基于 r{graphBaseRevision} 编辑 · {graphLockedIds.length} 个运行中或已结束节点只读
+            </Text>
+          )}
+
+          <View style={styles.graphEditorToolbar}>
+            <View style={styles.graphEditorCopy}>
+              <Text style={styles.fieldLabel}>任务依赖图</Text>
+              <Text style={styles.graphHint}>连线从前置任务指向后续任务</Text>
+            </View>
+            <View style={styles.graphToolbarActions}>
+              <Pressable
+                disabled={undoStack.length === 0}
+                style={[styles.historyAction, undoStack.length === 0 && styles.disabled]}
+                onPress={undoGraph}
+              >
+                <Text style={styles.historyActionText}>撤销</Text>
+              </Pressable>
+              <Pressable
+                disabled={redoStack.length === 0}
+                style={[styles.historyAction, redoStack.length === 0 && styles.disabled]}
+                onPress={redoGraph}
+              >
+                <Text style={styles.historyActionText}>重做</Text>
+              </Pressable>
+              <Pressable style={styles.smallAction} onPress={addDraftNode}>
+                <Icon name="plus" size={13} color={color.accent} />
+                <Text style={styles.smallActionText}>任务</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <TaskTopology
+            nodes={draftNodes.map((node) => ({
+              ...node,
+              incomplete: node.title.trim().length === 0 || node.spec.trim().length === 0,
+              locked: lockedDraftIds.has(node.id),
+            }))}
+            selectedId={selectedDraftId}
+            onSelect={setSelectedDraftId}
+          />
+
+          {selectedDraft && (
+            <View style={styles.draftInspector}>
+              <View style={styles.editorHeader}>
+                <View style={styles.inspectorTitleRow}>
+                  <Text style={styles.editorTitle}>任务设置</Text>
+                  {lockedDraftIds.has(selectedDraft.id) && (
+                    <Text style={styles.lockedBadge}>只读</Text>
+                  )}
+                </View>
+                <Pressable
+                  disabled={lockedDraftIds.has(selectedDraft.id)
+                    || (!graphIsEditing && draftNodes.length <= 1)}
+                  onPress={() => removeDraftNode(selectedDraft.id)}
+                  style={(lockedDraftIds.has(selectedDraft.id)
+                    || (!graphIsEditing && draftNodes.length <= 1)) && styles.disabled}
+                  accessibilityLabel="删除任务"
+                >
+                  <Icon name="trash" size={16} color={color.danger} />
+                </Pressable>
+              </View>
+              <TextInput
+                value={selectedDraft.title}
+                onChangeText={(value) => updateDraft(selectedDraft.id, { title: value })}
+                style={styles.input}
+                placeholder="任务标题"
+                placeholderTextColor={color.textFaint}
+                selectionColor={color.accent}
+                editable={!lockedDraftIds.has(selectedDraft.id)}
+              />
+              <TextInput
+                value={selectedDraft.spec}
+                onChangeText={(value) => updateDraft(selectedDraft.id, { spec: value })}
+                style={styles.multilineInput}
+                placeholder="交付说明与验收条件"
+                placeholderTextColor={color.textFaint}
+                selectionColor={color.accent}
+                multiline
+                editable={!lockedDraftIds.has(selectedDraft.id)}
+              />
+              {draftNodes.length > 1 && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.fieldLabel}>前置依赖（可多选）</Text>
+                  <View style={styles.wrapRow}>
+                    {draftNodes.filter((node) => node.id !== selectedDraft.id).map((candidate) => {
+                      const selected = selectedDraft.deps.includes(candidate.id);
+                      const wouldCycle = !selected && transitivelyDepends(
+                        draftNodes,
+                        candidate.id,
+                        selectedDraft.id,
+                      );
+                      return (
+                        <Pressable
+                          key={candidate.id}
+                          disabled={lockedDraftIds.has(selectedDraft.id) || wouldCycle}
+                          style={[
+                            styles.choice,
+                            selected && styles.choiceActive,
+                            (lockedDraftIds.has(selectedDraft.id) || wouldCycle) && styles.disabled,
+                          ]}
+                          onPress={() => updateDraft(selectedDraft.id, {
+                            deps: selected
+                              ? selectedDraft.deps.filter((id) => id !== candidate.id)
+                              : [...selectedDraft.deps, candidate.id],
+                          })}
+                        >
+                          <Text style={[styles.choiceText, selected && styles.choiceTextActive]}>
+                            {candidate.title.trim() || "未命名任务"}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </View>
+              )}
+            </View>
+          )}
+
+          <Text style={[styles.graphValidation, graphIssue === null && styles.graphValidationReady]}>
+            {graphIssue ?? (graphIsEditing
+              ? `将原子更新 ${editableDraftNodes.length} 个待派发任务，删除 ${deletedPersistedIds.length} 个`
+              : `将一次性创建 ${draftNodes.length} 个任务`)}
+          </Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="将当前任务图存为编排模板"
+            disabled={templateIssue !== null}
+            style={({ pressed }) => [
+              styles.templateSaveButton,
+              templateIssue !== null && styles.disabled,
+              pressed && styles.primaryPressed,
+            ]}
+            onPress={() => {
+              setTemplateName(objective.trim().slice(0, 48));
+              setTemplateNameDialogOpen(true);
+            }}
+          >
+            <Icon name="square.stack.3d.up" size={16} color={color.accent} />
+            <Text style={styles.templateSaveText}>存为本机模板</Text>
+          </Pressable>
+          <PrimaryButton
+            label={graphIsEditing ? "保存任务图" : "发布任务图"}
+            disabled={graphIssue !== null || !canCreateGraph}
+            onPress={publishGraph}
+          />
+        </EditorCard>
+      )}
+
+      {editor?.kind === "run" && (
+        <EditorCard title="新建手工 Run" onCancel={() => setEditor(null)}>
+          <TextInput
+            value={objective}
+            onChangeText={setObjective}
+            style={styles.multilineInput}
+            placeholder="写下最终目标，例如：完成协议兼容并发布 iOS"
+            placeholderTextColor={color.textFaint}
+            selectionColor={color.accent}
+            multiline
+            autoFocus
+          />
+          <PrimaryButton
+            label="创建 Run"
+            disabled={objective.trim().length === 0 || !canMutate}
+            onPress={createRun}
+          />
+        </EditorCard>
+      )}
+
+      {runs.length === 0 && editor?.kind !== "run" && editor?.kind !== "graph" && conn?.supportsOrchestrationSnapshot && (
+        <View style={styles.empty}>
+          <Icon name="square.stack.3d.up" size={30} color={color.textFaint} />
+          <Text style={styles.emptyTitle}>还没有编排 Run</Text>
+          <Text style={styles.emptyDetail}>添加任务与依赖，一次性发布任务图。</Text>
+          {canMutate && (
+            <PrimaryButton
+              label={canCreateGraph ? "可视化新建" : "新建手工 Run"}
+              onPress={openRunEditor}
+            />
+          )}
+        </View>
+      )}
 
         {selectedRun && (
           <View style={styles.runSection}>
@@ -1724,20 +1784,70 @@ export default function OrchestrationScreen() {
                     ))}
                   </View>
                 </View>
-                {accountsFor(automationAgent).length > 0 && (
+                {(accountsFor(automationAgent).length > 0 || sourceRoutesFor(automationAgent).length > 0) && (
                   <View style={styles.fieldGroup}>
-                    <Text style={styles.fieldLabel}>账号环境</Text>
-                    <View style={styles.wrapRow}>
-                      {accountsFor(automationAgent).map((account) => (
+                    <Text style={styles.fieldLabel}>模型与认证来源</Text>
+                    {conn?.supportsModelSources && sourceRoutesFor(automationAgent).length > 0 && (
+                      <View style={styles.wrapRow}>
                         <Choice
-                          key={account.id}
-                          active={automationAccountId === account.id}
-                          label={account.name}
-                          onPress={() => setAutomationAccountId(account.id)}
+                          active={authSourceMode === "subscription"}
+                          label={`订阅登录态 (${String(accountsFor(automationAgent).length)})`}
+                          onPress={() => {
+                            setAuthSourceMode("subscription");
+                            setAutomationAccountId(defaultAccountId(automationAgent));
+                          }}
                         />
-                      ))}
-                    </View>
-                    <Text style={styles.graphHint}>账号环境独立；整张图仍在下方选择的同一个项目工作区中运行。</Text>
+                        <Choice
+                          active={authSourceMode === "source"}
+                          label={`API 模型源 (${String(sourceRoutesFor(automationAgent).length)})`}
+                          onPress={() => setAuthSourceMode("source")}
+                        />
+                      </View>
+                    )}
+                    {authSourceMode === "source" && sourceRoutesFor(automationAgent).length > 0 ? (
+                      <View style={styles.wrapRow}>
+                        {sourceRoutesFor(automationAgent).map(({ source, route }) => {
+                          const selectedAcc = agentAccounts.find((a) => a.id === automationAccountId);
+                          const active =
+                            selectedAcc?.modelSource?.sourceId === source.id &&
+                            selectedAcc.modelSource.routeId === route.id;
+                          return (
+                            <Choice
+                              key={`${source.id}:${route.id}`}
+                              active={active}
+                              label={`${source.name} / ${sourceRouteLabel(route)}`}
+                              onPress={() => {
+                                if (
+                                  automationAgent === "claude" ||
+                                  automationAgent === "codex" ||
+                                  automationAgent === "opencode" ||
+                                  automationAgent === "pi"
+                                ) {
+                                  void bindOrchestrationSourceRoute(
+                                    automationAgent,
+                                    source,
+                                    route.id,
+                                    setAutomationAccountId,
+                                  );
+                                }
+                              }}
+                            />
+                          );
+                        })}
+                      </View>
+                    ) : (
+                      <View style={styles.wrapRow}>
+                        {accountsFor(automationAgent).map((account) => (
+                          <Choice
+                            key={account.id}
+                            active={automationAccountId === account.id}
+                            label={account.name}
+                            onPress={() => setAutomationAccountId(account.id)}
+                          />
+                        ))}
+                      </View>
+                    )}
+                    <Text style={styles.graphHint}>认证来源独立；整张任务图仍在下方选择的同一个工作区中运行。</Text>
                   </View>
                 )}
                 <View style={styles.cwdRow}>
@@ -1822,19 +1932,69 @@ export default function OrchestrationScreen() {
                     ))}
                   </View>
                 </View>
-                {accountsFor(workerAgent).length > 0 && (
+                {(accountsFor(workerAgent).length > 0 || sourceRoutesFor(workerAgent).length > 0) && (
                   <View style={styles.fieldGroup}>
-                    <Text style={styles.fieldLabel}>账号环境</Text>
-                    <View style={styles.wrapRow}>
-                      {accountsFor(workerAgent).map((account) => (
+                    <Text style={styles.fieldLabel}>模型与认证来源</Text>
+                    {conn?.supportsModelSources && sourceRoutesFor(workerAgent).length > 0 && (
+                      <View style={styles.wrapRow}>
                         <Choice
-                          key={account.id}
-                          active={workerAccountId === account.id}
-                          label={account.name}
-                          onPress={() => setWorkerAccountId(account.id)}
+                          active={authSourceMode === "subscription"}
+                          label={`订阅登录态 (${String(accountsFor(workerAgent).length)})`}
+                          onPress={() => {
+                            setAuthSourceMode("subscription");
+                            setWorkerAccountId(defaultAccountId(workerAgent));
+                          }}
                         />
-                      ))}
-                    </View>
+                        <Choice
+                          active={authSourceMode === "source"}
+                          label={`API 模型源 (${String(sourceRoutesFor(workerAgent).length)})`}
+                          onPress={() => setAuthSourceMode("source")}
+                        />
+                      </View>
+                    )}
+                    {authSourceMode === "source" && sourceRoutesFor(workerAgent).length > 0 ? (
+                      <View style={styles.wrapRow}>
+                        {sourceRoutesFor(workerAgent).map(({ source, route }) => {
+                          const selectedAcc = agentAccounts.find((a) => a.id === workerAccountId);
+                          const active =
+                            selectedAcc?.modelSource?.sourceId === source.id &&
+                            selectedAcc.modelSource.routeId === route.id;
+                          return (
+                            <Choice
+                              key={`${source.id}:${route.id}`}
+                              active={active}
+                              label={`${source.name} / ${sourceRouteLabel(route)}`}
+                              onPress={() => {
+                                if (
+                                  workerAgent === "claude" ||
+                                  workerAgent === "codex" ||
+                                  workerAgent === "opencode" ||
+                                  workerAgent === "pi"
+                                ) {
+                                  void bindOrchestrationSourceRoute(
+                                    workerAgent,
+                                    source,
+                                    route.id,
+                                    setWorkerAccountId,
+                                  );
+                                }
+                              }}
+                            />
+                          );
+                        })}
+                      </View>
+                    ) : (
+                      <View style={styles.wrapRow}>
+                        {accountsFor(workerAgent).map((account) => (
+                          <Choice
+                            key={account.id}
+                            active={workerAccountId === account.id}
+                            label={account.name}
+                            onPress={() => setWorkerAccountId(account.id)}
+                          />
+                        ))}
+                      </View>
+                    )}
                   </View>
                 )}
                 <View style={styles.cwdRow}>
@@ -2025,8 +2185,74 @@ export default function OrchestrationScreen() {
             )}
           </View>
         )}
-        </ScrollView>
-      </View>
+    </>
+  );
+
+  return (
+    <KeyboardAvoidingView
+      style={styles.screen}
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
+    >
+      <Stack.Screen
+        options={{
+          title: "任务编排",
+          headerRight: () => canMutate ? (
+            <Pressable
+              onPress={openRunEditor}
+              hitSlop={10}
+              accessibilityLabel={canCreateGraph ? "可视化新建编排" : "新建手工 Run"}
+            >
+              <Icon name="plus" size={19} color={color.accent} weight="semibold" />
+            </Pressable>
+          ) : null,
+        }}
+      />
+
+      {banner !== null && (
+        <Pressable style={styles.banner} onPress={() => setBanner(null)}>
+          <Text style={styles.bannerText}>{banner}（点击关闭）</Text>
+        </Pressable>
+      )}
+
+      {splitLayout ? (
+        <View style={styles.splitWorkspace}>
+          <ScrollView
+            style={[styles.splitPane, { width: navPaneWidth }]}
+            contentContainerStyle={styles.content}
+            keyboardShouldPersistTaps="handled"
+          >
+            {navSections}
+          </ScrollView>
+          <SplitPaneDivider
+            label="拖动调整编排导航栏宽度"
+            value={navPaneWidth}
+            min={adaptiveLayout.splitBounds?.minStart ?? 204}
+            max={adaptiveLayout.splitBounds?.maxStart ?? 440}
+            gap={splitGap}
+            disabled={adaptiveLayout.splitResizable === false}
+            onChange={adaptiveLayout.setSplitStart}
+            onCommit={adaptiveLayout.commitSplitStart}
+            onReset={adaptiveLayout.resetSplitStart}
+          />
+          <ScrollView
+            style={[styles.splitPane, { width: detailPaneWidth }]}
+            contentContainerStyle={styles.content}
+            keyboardShouldPersistTaps="handled"
+          >
+            {detailSections}
+          </ScrollView>
+        </View>
+      ) : (
+        <View style={styles.contentPane}>
+          <ScrollView
+            contentContainerStyle={styles.content}
+            keyboardShouldPersistTaps="handled"
+          >
+            {navSections}
+            {detailSections}
+          </ScrollView>
+        </View>
+      )}
 
       {conn && (
         <WorkspacePicker
@@ -2368,27 +2594,21 @@ function Choice({ active, label, onPress }: { active: boolean; label: string; on
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: color.bg },
   contentPane: { flex: 1, minWidth: 0, overflow: "hidden" },
-  content: { padding: space.lg, paddingBottom: 48, gap: space.lg },
+  splitWorkspace: { flex: 1, flexDirection: "row", minHeight: 0 },
+  splitPane: { flexGrow: 0, flexShrink: 0, minWidth: 0 },
+  foldGutter: {
+    flexShrink: 0,
+    backgroundColor: color.bg,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
+  content: { padding: space.lg, paddingBottom: 48, gap: space.md },
   banner: { backgroundColor: color.warnBg, paddingHorizontal: space.lg, paddingVertical: space.sm },
   bannerText: { color: color.warn, fontSize: 12, lineHeight: 17 },
-  hero: {
-    flexDirection: "row",
-    gap: space.md,
-    padding: space.lg,
-    borderRadius: radius.lg,
-    backgroundColor: color.surface,
-  },
-  heroIcon: {
-    width: 48,
-    height: 48,
-    borderRadius: radius.md,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: color.accentBg,
-  },
-  heroCopy: { flex: 1, gap: 5 },
-  heroTitle: { ...font.body, fontWeight: "700" },
-  heroDetail: { ...font.sub, lineHeight: 19 },
+  runStack: { gap: space.sm },
+  runHistoryStack: { gap: space.sm, padding: space.sm },
+  runChipStacked: { width: "100%" },
   templateSection: {
     gap: space.md,
     padding: space.md,

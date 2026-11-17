@@ -16,16 +16,16 @@ import { radius, createThemedStyles, useMobileTheme } from "@/lib/theme";
  * 会亮得跳出来,六个并排更是一片吵。识别靠色相,不靠饱和度。
  */
 const AGENTS: Record<AgentKind, { dark: string; light: string; symbol?: IconName }> = {
-  claude: { dark: "#D97757", light: "#A94F31" },
-  codex: { dark: "#8AB4F8", light: "#315EA8" },
+  claude: { dark: "#E07A5F", light: "#C45A3B" },
+  codex: { dark: "#7EA7FF", light: "#2454CC" },
   deepseek: { dark: "#829BFF", light: "#3D57C8" },
-  opencode: { dark: "#5BC98C", light: "#1E7049" },
+  opencode: { dark: "#52D18E", light: "#147247" },
   pi: { dark: "#34D399", light: "#0D9488" },
   agy: { dark: "#A78BFA", light: "#6D28D9", symbol: "terminal.fill" },
-  grok: { dark: "#C9C9D4", light: "#404957" },
+  grok: { dark: "#D4D4DF", light: "#27272A" },
   trae: { dark: "#3ED592", light: "#147A50" },
-  shell: { dark: "#C1C7D0", light: "#404957", symbol: "terminal.fill" },
-  custom: { dark: "#C1C7D0", light: "#404957", symbol: "command" },
+  shell: { dark: "#B8C0CC", light: "#475262", symbol: "terminal.fill" },
+  custom: { dark: "#B8C0CC", light: "#475262", symbol: "command" },
 };
 
 export function agentTint(

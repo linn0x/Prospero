@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { AccessibilityInfo, Animated, Pressable, StyleSheet, Text, useAnimatedValue } from "react-native";
+import { AccessibilityInfo, Animated, Pressable, StyleSheet, Text, useAnimatedValue, View } from "react-native";
 import { useMobileTheme } from "@/lib/theme";
 
 export function HomeModeTitle({ edge, onToggle }: { edge: boolean; onToggle: () => void }) {
@@ -30,8 +30,12 @@ export function HomeModeTitle({ edge, onToggle }: { edge: boolean; onToggle: () 
       style={styles.touch}
     >
       <Animated.View style={[styles.wordmark, { transform: [{ scale }] }]}>
-        <Text style={[styles.title, { color: edge ? palette.accent : palette.text }, edge && styles.edge]}>Prospero</Text>
-        {edge && <Text style={[styles.plus, { color: palette.accent }]}>+</Text>}
+        <Text style={[styles.title, { color: palette.text }]}>Prospero</Text>
+        {edge && (
+          <View style={[styles.edgeBadge, { backgroundColor: palette.text }]}>
+            <Text style={[styles.edgeBadgeText, { color: palette.bg }]}>EDGE</Text>
+          </View>
+        )}
       </Animated.View>
     </Pressable>
   );
@@ -39,8 +43,12 @@ export function HomeModeTitle({ edge, onToggle }: { edge: boolean; onToggle: () 
 
 const styles = StyleSheet.create({
   touch: { minHeight: 44, justifyContent: "center", paddingRight: 8 },
-  wordmark: { flexDirection: "row", alignItems: "center" },
-  title: { fontSize: 20, fontWeight: "600" },
-  edge: { fontStyle: "italic" },
-  plus: { fontSize: 19, fontWeight: "700", marginLeft: 2, alignSelf: "flex-start" },
+  wordmark: { flexDirection: "row", alignItems: "center", gap: 7 },
+  title: { fontSize: 21, fontWeight: "700", letterSpacing: -0.6 },
+  edgeBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  edgeBadgeText: { fontSize: 9.5, fontWeight: "800", letterSpacing: 0.6 },
 });

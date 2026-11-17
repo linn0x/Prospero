@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import type { AgentKind, HostInfo, S2CMessage, UsageAccount } from "@prospero/protocol";
+import type { HostInfo, S2CMessage, UsageAccount } from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import type { HostConnection } from "@/lib/connection";
 import { bytes, duration, untilLabel } from "@/lib/format";
 import { homeUsageAccounts } from "@/lib/home-usage";
+import { Icon } from "@/components/Icon";
 import { Row, Sheet } from "@/components/Sheet";
-import { color, font, quotaRemainingColor, quotaRemainingPct, radius, space, utilizationColor } from "@/lib/theme";
+import { createThemedStyles, fontForPalette, quotaRemainingColor, quotaRemainingPct, radius, space, useMobileTheme } from "@/lib/theme";
 
 type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
@@ -49,6 +50,9 @@ export function HostSummary({
   sessionCount: number;
   runningCount: number;
 }) {
+  const { palette: color } = useMobileTheme();
+  const font = fontForPalette(color);
+  const styles = useStyles();
   const [usage, setUsage] = useState<UsageResult | null>(
     () => usageCache.get(hostId)?.value ?? null,
   );
@@ -103,24 +107,16 @@ export function HostSummary({
     conn?.supportsDeepseekHarness === true &&
     !accounts.some((account) => account.agent === "deepseek");
   const hasCodeAgents = accounts.length > 0 || showDeepseekHarness;
-
-  const specs = [
-    info.platform !== undefined
-      ? `${info.platform}${info.osVersion !== undefined ? ` ${info.osVersion}` : ""}`
-      : null,
-    info.arch,
-    info.cpus !== undefined ? `${String(info.cpus)} 核` : null,
-  ].filter((x): x is string => typeof x === "string" && x.length > 0);
   const pathLabel = conn?.activePath === "relay" ? "中继" : conn?.activePath === "direct" ? "直连" : null;
 
   return (
     <>
       <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="查看机器状态与订阅额度详情"
         style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
         onPress={() => { setOpen(true); setNow(Date.now()); }}
       >
-        {/* 连接状态并进卡片 —— 它以前是卡片上方孤零零一行灰字,和机器信息
-            明明说的是同一件事,却分成两块各占一份高度 */}
         <View style={styles.head}>
           <View style={[styles.dot, connected ? styles.dotOn : styles.dotOff]} />
           <Text style={styles.headText} numberOfLines={1}>
@@ -128,63 +124,44 @@ export function HostSummary({
             {connected && rttMs !== null ? ` · ${String(rttMs)}ms` : ""}
             {connected && pathLabel ? ` · ${pathLabel}` : ""}
           </Text>
-          <Text style={font.meta}>
-            {runningCount > 0 ? `${String(runningCount)} 个运行中 · ` : ""}
-            {`${String(sessionCount)} 个会话`}
-          </Text>
-          <Text style={styles.chev}>›</Text>
+          {memUsed !== null && (
+            <Text style={styles.inlineMeta} numberOfLines={1}>
+              {`${bytes(info.memFree ?? 0)} 可用`}
+            </Text>
+          )}
+          <Icon name="chevron.right" size={14} color={color.textFaint} />
         </View>
 
-        {/* 机器名不放这儿 —— 导航栏标题已经是它了,重复一遍只是占地方 */}
-        {specs.length > 0 && (
-          <Text style={font.meta} numberOfLines={1}>
-            {specs.join(" · ")}
-          </Text>
-        )}
-
-        {memUsed !== null && (
-          <Gauge
-            label="内存"
-            /* 报"还剩多少"而不是"用了多少":决定要不要腾地方的是余量 */
-            value={`${bytes(info.memFree ?? 0)} 可用`}
-            pct={memUsed}
-            tint={utilizationColor(memUsed)}
-          />
-        )}
-
-        {hasCodeAgents && <View style={styles.rule} />}
-
-        {accounts.map((a) => {
-          const w = topWindow(a);
-          return (
-            <Gauge
-              key={a.accountId ?? `${a.agent}:${a.source ?? "unknown"}`}
-              label={a.agent}
-              agent={a.agent}
-              badge={accountSourceLabel(a)}
-              value={
-                w
-                  ? `${w.label} 剩 ${String(quotaRemainingPct(w.utilization))}%`
-                  : a.available
-                    ? "无限流"
-                    : "暂无数据"
-              }
-              pct={w ? quotaRemainingPct(w.utilization) : 0}
-              tint={w ? quotaRemainingColor(quotaRemainingPct(w.utilization)) : color.border}
-            />
-          );
-        })}
-
-        {showDeepseekHarness && (
-          <Gauge
-            label="deepseek"
-            agent="deepseek"
-            badge="Harness"
-            value="已接入 · 模型服务商计费"
-            pct={0}
-            tint={color.border}
-            showBar={false}
-          />
+        {(accounts.length > 0 || showDeepseekHarness) && (
+          <View style={styles.pillsRow}>
+            {accounts.slice(0, 3).map((a) => {
+              const w = topWindow(a);
+              const rem = w ? quotaRemainingPct(w.utilization) : null;
+              return (
+                <View
+                  key={a.accountId ?? `${a.agent}:${a.source ?? "unknown"}`}
+                  style={styles.quotaPill}
+                >
+                  <AgentIcon agent={a.agent} size={12} />
+                  <Text style={styles.quotaAgent}>{a.agent}</Text>
+                  <Text
+                    style={[
+                      styles.quotaVal,
+                      rem !== null && { color: quotaRemainingColor(rem, color) },
+                    ]}
+                  >
+                    {rem !== null ? `${String(rem)}%` : a.available ? "无限流" : "—"}
+                  </Text>
+                </View>
+              );
+            })}
+            {showDeepseekHarness && (
+              <View style={styles.quotaPill}>
+                <AgentIcon agent="deepseek" size={12} />
+                <Text style={styles.quotaAgent}>deepseek</Text>
+              </View>
+            )}
+          </View>
         )}
       </Pressable>
 
@@ -254,7 +231,7 @@ export function HostSummary({
                         style={[
                           styles.gaugeValue,
                           styles.gaugeValueRight,
-                          { color: quotaRemainingColor(quotaRemainingPct(w.utilization)) },
+                          { color: quotaRemainingColor(quotaRemainingPct(w.utilization), color) },
                         ]}
                       >
                         {`已用 ${String(Math.round(w.utilization))}% · 剩 ${String(quotaRemainingPct(w.utilization))}%`}
@@ -262,7 +239,8 @@ export function HostSummary({
                     </View>
                     <Bar
                       pct={quotaRemainingPct(w.utilization)}
-                      tint={quotaRemainingColor(quotaRemainingPct(w.utilization))}
+                      tint={quotaRemainingColor(quotaRemainingPct(w.utilization), color)}
+                      styles={styles}
                     />
                     {w.resetsAt !== undefined && (
                       <Text style={font.meta}>{untilLabel(w.resetsAt, now)}</Text>
@@ -300,39 +278,8 @@ export function HostSummary({
   );
 }
 
-/** 一行指标:左边名字、右边数、底下一条细进度 */
-function Gauge({
-  label,
-  value,
-  pct,
-  tint,
-  agent,
-  badge,
-  showBar = true,
-}: {
-  label: string;
-  value: string;
-  pct: number;
-  tint: string;
-  agent?: AgentKind;
-  badge?: string;
-  showBar?: boolean;
-}) {
-  return (
-    <View style={styles.gauge}>
-      <View style={styles.gaugeHead}>
-        {agent !== undefined && <AgentIcon agent={agent} size={13} />}
-        <Text style={font.meta}>{label}</Text>
-        {badge !== undefined && <Text style={styles.badge}>{badge}</Text>}
-        <Text style={[styles.gaugeValue, styles.gaugeValueRight]}>{value}</Text>
-      </View>
-      {showBar && <Bar pct={pct} tint={tint} />}
-    </View>
-  );
-}
-
-/** 细进度条。卡片上要并排放好几根,粗了就成了噪音 */
-function Bar({ pct, tint }: { pct: number; tint: string }) {
+/** 细进度条。弹层里按需展示各窗口余量 */
+function Bar({ pct, tint, styles }: { pct: number; tint: string; styles: ReturnType<typeof useStyles> }) {
   const v = Math.max(0, Math.min(100, pct));
   return (
     <View style={styles.track}>
@@ -364,45 +311,56 @@ function noWindowReason(a: UsageAccount): string {
   return "Codex 暂未提供套餐限流窗口。开始一次 Codex 对话后再刷新。";
 }
 
-const styles = StyleSheet.create({
-  card: {
-    backgroundColor: color.surface,
-    borderRadius: radius.lg,
-    paddingHorizontal: space.lg,
-    paddingVertical: space.lg,
-    gap: space.md,
-  },
-  cardPressed: { backgroundColor: color.pressed },
-  head: { flexDirection: "row", alignItems: "center", gap: 6 },
-  headText: { ...font.body, flex: 1 },
-  dotOn: { backgroundColor: color.success },
-  dotOff: { backgroundColor: color.textFaint },
-  chev: { color: color.textFaint, fontSize: 20, marginLeft: 2 },
-  rule: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: color.border,
-    marginVertical: space.xs,
-  },
-  gauge: { gap: 6 },
-  gaugeHead: { flexDirection: "row", alignItems: "center", gap: 6 },
-  gaugeValue: { ...font.meta, color: color.textDim, fontVariant: ["tabular-nums"] },
-  gaugeValueRight: { marginLeft: "auto" },
-  dot: { width: 7, height: 7, borderRadius: 4 },
-  badge: {
-    ...font.meta,
-    color: color.textDim,
-    backgroundColor: color.surfaceRaised,
-    borderRadius: radius.sm,
-    paddingHorizontal: 6,
-    paddingVertical: 1,
-    overflow: "hidden",
-    textTransform: "uppercase",
-  },
-  track: { height: 4, borderRadius: 2, backgroundColor: color.surfaceRaised, overflow: "hidden" },
-  fill: { height: "100%", borderRadius: 2 },
-  account: { gap: space.sm, paddingVertical: space.md },
-  accountHead: { flexDirection: "row", alignItems: "center", gap: space.sm },
-  window: { gap: 4 },
-  section: { ...font.sub, color: color.textFaint, marginTop: space.xl, marginBottom: space.xs },
-  note: { ...font.sub, paddingVertical: space.sm, lineHeight: 19 },
+const useStyles = createThemedStyles((color) => {
+  const font = fontForPalette(color);
+  return StyleSheet.create({
+    card: {
+      backgroundColor: color.surface,
+      borderRadius: 16,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: color.border,
+      paddingHorizontal: space.md,
+      paddingVertical: 11,
+      gap: 8,
+    },
+    cardPressed: { backgroundColor: color.pressed },
+    head: { flexDirection: "row", alignItems: "center", gap: 7 },
+    headText: { color: color.text, fontSize: 13.5, fontWeight: "600", flex: 1 },
+    inlineMeta: { color: color.textFaint, fontSize: 11.5, fontVariant: ["tabular-nums"] },
+    dotOn: { backgroundColor: color.success },
+    dotOff: { backgroundColor: color.textFaint },
+    pillsRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+    quotaPill: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 5,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      borderRadius: radius.pill,
+      backgroundColor: color.surfaceRaised,
+    },
+    quotaAgent: { color: color.textDim, fontSize: 11, fontWeight: "600" },
+    quotaVal: { color: color.textFaint, fontSize: 11, fontWeight: "600", fontVariant: ["tabular-nums"] },
+    gaugeHead: { flexDirection: "row", alignItems: "center", gap: 6 },
+    gaugeValue: { ...font.meta, color: color.textDim, fontVariant: ["tabular-nums"] },
+    gaugeValueRight: { marginLeft: "auto" },
+    dot: { width: 7, height: 7, borderRadius: 3.5 },
+    badge: {
+      ...font.meta,
+      color: color.textDim,
+      backgroundColor: color.surfaceRaised,
+      borderRadius: radius.sm,
+      paddingHorizontal: 6,
+      paddingVertical: 1,
+      overflow: "hidden",
+      textTransform: "uppercase",
+    },
+    track: { height: 4, borderRadius: 2, backgroundColor: color.surfaceRaised, overflow: "hidden" },
+    fill: { height: "100%", borderRadius: 2 },
+    account: { gap: space.sm, paddingVertical: space.md },
+    accountHead: { flexDirection: "row", alignItems: "center", gap: space.sm },
+    window: { gap: 4 },
+    section: { ...font.sub, color: color.textFaint, marginTop: space.xl, marginBottom: space.xs },
+    note: { ...font.sub, paddingVertical: space.sm, lineHeight: 19 },
+  });
 });

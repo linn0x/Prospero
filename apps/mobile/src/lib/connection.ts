@@ -335,6 +335,7 @@ export class HostConnection {
     this.stopped = true;
     this.sessionCreates.disconnect();
     this.terminalCloses.disconnect();
+    this.workspaceListInFlight.clear();
     this.clearTimers();
     this.abortRacingAttempts();
     this.ws?.close();
@@ -961,6 +962,10 @@ export class HostConnection {
     string,
     { resolve: (m: S2CMessage) => void; reject: (e: Error) => void }
   >();
+  private readonly workspaceListInFlight = new Map<
+    string,
+    Promise<Extract<S2CMessage, { type: "workspace.listing" }>>
+  >();
 
   private fsKey(sid: string, path: string): string {
     return `${sid}\u0000${path}`;
@@ -980,7 +985,9 @@ export class HostConnection {
               ? "#model-sources"
           : (msg.sid ?? "#account");
     const responsePath =
-      msg.type === "session.history.result"
+      msg.type === "workspace.listing"
+        ? `${msg.root ?? "home"}:${msg.path}`
+        : msg.type === "session.history.result"
         ? `#session.history:${msg.requestId}`
         : msg.type === "session.lifecycle.result"
         ? `#session.lifecycle:${msg.requestId}`
@@ -1076,18 +1083,36 @@ export class HostConnection {
     root?: string,
     mkdir?: string,
   ): Promise<Extract<S2CMessage, { type: "workspace.listing" }>> {
-    const result = await this.fsRequest<Extract<S2CMessage, { type: "workspace.listing" }>>(
-      "#workspace",
-      path,
-      {
-        type: "workspace.list",
-        path,
-        ...(root ? { root } : {}),
-        ...(mkdir ? { mkdir } : {}),
-      },
-    );
-    if (result.error) throw new Error(result.error);
-    return result;
+    const requestKey = `${root ?? "home"}:${path}`;
+    if (!mkdir) {
+      const existing = this.workspaceListInFlight.get(requestKey);
+      if (existing) return existing;
+    }
+    const run = (async () => {
+      const result = await this.fsRequest<Extract<S2CMessage, { type: "workspace.listing" }>>(
+        "#workspace",
+        requestKey,
+        {
+          type: "workspace.list",
+          path,
+          ...(root ? { root } : {}),
+          ...(mkdir ? { mkdir } : {}),
+        },
+      );
+      if (result.error) throw new Error(result.error);
+      return result;
+    })();
+    if (!mkdir) {
+      this.workspaceListInFlight.set(requestKey, run);
+      void run
+        .finally(() => {
+          if (this.workspaceListInFlight.get(requestKey) === run) {
+            this.workspaceListInFlight.delete(requestKey);
+          }
+        })
+        .catch(() => undefined);
+    }
+    return run;
   }
 
   workspaceMkdir(
@@ -1403,6 +1428,7 @@ export class HostConnection {
     // 断线时挂起的文件请求永远等不到应答了,立刻失败好过等超时
     for (const [, waiter] of this.fsWaiters) waiter.reject(new Error("连接已断开"));
     this.fsWaiters.clear();
+    this.workspaceListInFlight.clear();
     this.clearTimers();
     this.ws = null;
     this.channel = null;
@@ -1522,10 +1548,17 @@ export class HostConnection {
   private foregroundAt: number | null = null;
   private attachStartedAt = new Map<string, number>();
 
-  attach(sid: string, lastSeq?: number, options?: { tailEvents?: number }): void {
+  attach(
+    sid: string,
+    lastSeq?: number,
+    options?: { tailEvents?: number; compact?: boolean; force?: boolean },
+  ): void {
     const requested = lastSeq ?? null;
     const previous = this.attachedChatSessions.get(sid);
-    if (previous === null || (previous !== undefined && requested !== null && requested <= previous)) {
+    if (
+      !options?.force &&
+      (previous === null || (previous !== undefined && requested !== null && requested <= previous))
+    ) {
       return;
     }
     this.attachedChatSessions.set(sid, requested);
@@ -1533,6 +1566,7 @@ export class HostConnection {
     this.send({
       type: "session.attach",
       sid,
+      compact: options?.compact ?? true,
       ...(lastSeq !== undefined ? { lastSeq } : {}),
       ...(options?.tailEvents !== undefined ? { tailEvents: options.tailEvents } : {}),
     });

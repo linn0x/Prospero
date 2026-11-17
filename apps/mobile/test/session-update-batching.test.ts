@@ -42,10 +42,16 @@ describe("session update batching", () => {
 
   it("keeps different hosts and sessions in the same frame", () => {
     vi.useFakeTimers();
+    let commits = 0;
+    const unsubscribe = useApp.subscribe(() => {
+      commits += 1;
+    });
     useApp.getState().queueSessionUpdate("mac", session("s1", "mac"));
     useApp.getState().queueSessionUpdate("pc", session("s2", "pc"));
     vi.advanceTimersByTime(16);
+    unsubscribe();
 
+    expect(commits).toBe(1);
     expect(useApp.getState().runtimes.mac.sessions.s1?.preview).toBe("mac");
     expect(useApp.getState().runtimes.pc.sessions.s2?.preview).toBe("pc");
   });

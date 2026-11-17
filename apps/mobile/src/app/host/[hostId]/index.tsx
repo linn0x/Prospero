@@ -2,7 +2,14 @@ import { SessionAccountSelect } from "@/components/SessionAccountSelect";
 import { SessionModelSourceSelect } from "@/components/SessionModelSourceSelect";
 import { ResizeHandle } from "../../../components/ResizeHandle";
 import { selectLaunchAccount } from "@/lib/session-launch-selection";
-import { agentForSourceRoute, catalogRouteInput, sourceCatalogTarget, type SourceModelChoice } from "@/lib/session-model-sources";
+import {
+  agentForSourceRoute,
+  catalogRouteInput,
+  defaultModelSourceRoute,
+  sourceCatalogTarget,
+  type SourceModelChoice,
+} from "@/lib/session-model-sources";
+import { useWorkspaceConcepts } from "../../../lib/workspace-concepts";
 import { SessionLifecycleSheet } from "@/components/SessionLifecycleSheet";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -73,10 +80,10 @@ import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
 const AGENTS: AgentKind[] = [
-  "claude", "codex", "pi", "deepseek", "opencode", "grok", "trae", "shell",
+  "claude", "codex", "agy", "pi", "deepseek", "opencode", "grok", "trae", "shell",
 ];
 /** 有结构化适配器的 agent(会话会以对话形态呈现) */
-const STRUCTURED: AgentKind[] = ["claude", "codex", "pi", "opencode", "deepseek"];
+const STRUCTURED: AgentKind[] = ["claude", "codex", "agy", "pi", "opencode", "deepseek"];
 const RESUMABLE: AgentKind[] = ["claude", "codex", "pi", "deepseek"];
 const PLAN_CAPABLE: AgentKind[] = ["claude", "codex"];
 const APPROVAL_POLICIES: readonly {
@@ -143,12 +150,22 @@ function projectNameFor(path: string): string {
 }
 
 export default function HostScreen() {
-  const { hostId, create, cmd, quickCreate, cwd: quickCreateCwd } = useLocalSearchParams<{
+  const {
+    hostId,
+    create,
+    cmd,
+    quickCreate,
+    cwd: quickCreateCwd,
+    authMode: requestedAuthMode,
+    accountId: requestedAccountId,
+  } = useLocalSearchParams<{
     hostId: string;
     create?: string;
     cmd?: string;
     quickCreate?: string;
     cwd?: string;
+    authMode?: string;
+    accountId?: string;
   }>();
   const { host, conn, runtime } = useHostConnection(hostId);
   const supportsTerminal = supportsRemoteTerminal(runtime.hostInfo);
@@ -156,10 +173,6 @@ export default function HostScreen() {
   const isFocused = useIsFocused();
   const supportsDeepseekHarness =
     runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
-  const availableAgents = useMemo(
-    () => AGENTS.filter((candidate) => (candidate !== "deepseek" || supportsDeepseekHarness) && (candidate !== "shell" || supportsTerminal)),
-    [supportsDeepseekHarness, supportsTerminal],
-  );
   const [agent, setAgent] = useState<AgentKind>("claude");
   const [sessionKind, setSessionKind] = useState<SessionKind>("structured");
   const [launchMode, setLaunchMode] = useState<"default" | "plan">("default");
@@ -182,6 +195,20 @@ export default function HostScreen() {
   const [resumeLoaded, setResumeLoaded] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>([]);
+  const hasAgyAccounts = useMemo(
+    () => agentAccounts.some((account) => getAgentAccountEngine(account) === "agy"),
+    [agentAccounts],
+  );
+  const availableAgents = useMemo(
+    () =>
+      AGENTS.filter(
+        (candidate) =>
+          (candidate !== "deepseek" || supportsDeepseekHarness) &&
+          (candidate !== "shell" || supportsTerminal) &&
+          (candidate !== "agy" || hasAgyAccounts),
+      ),
+    [hasAgyAccounts, supportsDeepseekHarness, supportsTerminal],
+  );
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [accountsError, setAccountsError] = useState<string | null>(null);
   const [accountsReload, setAccountsReload] = useState(0);
@@ -191,9 +218,14 @@ export default function HostScreen() {
   const [modelSourcesReload, setModelSourcesReload] = useState(0);
   const [sourceBinding, setSourceBinding] = useState(false);
   const sourceBindingEpoch = useRef(0);
+  const [authSourceMode, setAuthSourceMode] = useState<"subscription" | "source">("subscription");
   const [selectedAccountIds, setSelectedAccountIds] = useState<
     Partial<Record<CodeAgentKind, string>>
   >({});
+  const [selectedSourceAccountIds, setSelectedSourceAccountIds] = useState<
+    Partial<Record<CodeAgentKind, string>>
+  >({});
+  const [selectedSourceEffort, setSelectedSourceEffort] = useState<string | null>(null);
   const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
   const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
   const [launchModelsError, setLaunchModelsError] = useState<string | null>(null);
@@ -224,6 +256,7 @@ export default function HostScreen() {
   const [createDelivery, setCreateDelivery] = useState<"sent" | "queued" | null>(null);
   const [createStartedAt, setCreateStartedAt] = useState<number | null>(null);
   const [manualCwdOpen, setManualCwdOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
   const [goalRunExpansionOverrides, setGoalRunExpansionOverrides] = useState<
     Record<string, boolean>
@@ -241,16 +274,16 @@ export default function HostScreen() {
     setCreateStartedAt(null);
   }, [pendingCreate]);
   const insets = useSafeAreaInsets();
-  const { width, height, verticalPanes } = useAdaptiveLayout();
+  const { width, height, verticalPanes, splitPanes } = useAdaptiveLayout();
   const orchestration = useOrchestrationSnapshot(composing ? null : conn, runtime.status, 8_000);
   const coordinatorRuns = useMemo(
     () => coordinatorRunsBySession(orchestration?.runs ?? []),
     [orchestration],
   );
   const goalGroups = useMemo(() => goalSessionGroups(orchestration), [orchestration]);
-  // 横屏手机、iPad、Android 平板用并列双栏；其余手机严格上下各占一半。
+  // Z Fold 平展内屏(splitPanes)、铰链双栏、横屏手机与平板用并列双栏；紧凑窄屏走精简纵向流。
   const wideComposer =
-    verticalPanes !== null || width >= 720 || (width >= 600 && width > height);
+    Boolean(splitPanes) || Boolean(verticalPanes) || width >= 720 || (width >= 600 && width > height);
   const balancedPaneWidth = width / 2;
   const [composerFraction, setComposerFraction] = useState(0.5);
   const composerMinWidth = Math.min(240, balancedPaneWidth);
@@ -260,27 +293,78 @@ export default function HostScreen() {
     end: width - composerStart,
   };
 
-  const codeAgent = agent === "claude" || agent === "codex" || agent === "opencode" || agent === "pi" ? agent : null;
-  const launchCatalogAgent = codeAgent ?? (agent === "deepseek" ? "deepseek" : null);
-  const matchingAccounts = codeAgent
-    ? agentAccounts.filter((account) => getAgentAccountEngine(account) === codeAgent)
-    : [];
+  const codeAgent =
+    agent === "claude" || agent === "codex" || agent === "agy" || agent === "opencode" || agent === "pi"
+      ? agent
+      : null;
+  const launchCatalogAgent =
+    codeAgent && codeAgent !== "agy"
+      ? codeAgent
+      : agent === "deepseek"
+        ? "deepseek"
+        : null;
+  const subscriptionPool = useMemo(
+    () => agentAccounts.filter((account) => !account.modelSource),
+    [agentAccounts],
+  );
+  const matchingSubscriptions = useMemo(
+    () =>
+      codeAgent
+        ? subscriptionPool.filter((account) => getAgentAccountEngine(account) === codeAgent)
+        : [],
+    [codeAgent, subscriptionPool],
+  );
+  const matchingSourceAccounts = useMemo(
+    () =>
+      codeAgent
+        ? agentAccounts.filter(
+            (account) => Boolean(account.modelSource) && getAgentAccountEngine(account) === codeAgent,
+          )
+        : [],
+    [agentAccounts, codeAgent],
+  );
+  const sourceSupported = Boolean(codeAgent && codeAgent !== "agy" && conn?.supportsModelSources);
+  const effectiveAuthMode: "subscription" | "source" =
+    sourceSupported && authSourceMode === "source" ? "source" : "subscription";
   const selectedAccount = codeAgent
-    ? matchingAccounts.find((account) => account.id === selectedAccountIds[codeAgent]) ??
-      matchingAccounts.find((account) => account.isDefault) ??
-      matchingAccounts[0]
+    ? effectiveAuthMode === "source"
+      ? matchingSourceAccounts.find((account) => account.id === selectedSourceAccountIds[codeAgent]) ??
+        matchingSourceAccounts[0]
+      : matchingSubscriptions.find((account) => account.id === selectedAccountIds[codeAgent]) ??
+        matchingSubscriptions.find((account) => account.isDefault) ??
+        matchingSubscriptions[0]
     : undefined;
-  const accountReady = !codeAgent || !supportsAccounts || selectedAccount !== undefined;
+  const defaultSourcePair = useMemo(
+    () => (codeAgent && effectiveAuthMode === "source" ? defaultModelSourceRoute(modelSources, codeAgent) : null),
+    [codeAgent, effectiveAuthMode, modelSources],
+  );
+  const accountReady =
+    effectiveAuthMode === "source"
+      ? selectedAccount !== undefined || defaultSourcePair !== null
+      : !codeAgent || !supportsAccounts || selectedAccount !== undefined;
   const selectedAccountCapabilities = selectedAccount ? getAgentAccountCapabilities(selectedAccount) : undefined;
-  const accountRequiresStructured = selectedAccountCapabilities?.sessionKinds.length === 1 && selectedAccountCapabilities.sessionKinds[0] === "structured";
+  const sourceRequiresStructured =
+    effectiveAuthMode === "source" &&
+    !selectedAccount &&
+    defaultSourcePair?.route.protocol === "openai_chat_completions" &&
+    codeAgent !== "pi";
+  const accountRequiresStructured =
+    sourceRequiresStructured ||
+    (selectedAccountCapabilities?.sessionKinds.length === 1 &&
+      selectedAccountCapabilities.sessionKinds[0] === "structured");
   const effectiveSessionKind: SessionKind = accountRequiresStructured ? "structured" : sessionKind;
   const managedAgentTerminal = effectiveSessionKind === "pty" && (agent === "claude" || agent === "codex" || agent === "pi");
   const displayedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : approvalPolicy;
   const accountCanPlan = selectedAccountCapabilities?.plan ?? true;
-  const accountCanResume = selectedAccountCapabilities?.resume ?? true;
-  const accountCanSelectModel = selectedAccountCapabilities?.modelSelection ?? true;
-  const accountCanSelectEffort = selectedAccountCapabilities?.reasoningEffort ?? true;
-  const accountCanLaunch = selectedAccountCapabilities?.sessionKinds.includes(effectiveSessionKind) ?? agent !== "opencode";
+  const accountCanResume = effectiveAuthMode === "subscription" && (selectedAccountCapabilities?.resume ?? true);
+  const accountCanSelectModel =
+    effectiveAuthMode === "subscription" && (selectedAccountCapabilities?.modelSelection ?? true);
+  const accountCanSelectEffort =
+    effectiveAuthMode === "subscription" && (selectedAccountCapabilities?.reasoningEffort ?? true);
+  const accountCanLaunch =
+    effectiveAuthMode === "source"
+      ? selectedAccountCapabilities?.sessionKinds.includes(effectiveSessionKind) ?? true
+      : selectedAccountCapabilities?.sessionKinds.includes(effectiveSessionKind) ?? agent !== "opencode";
   const canSearchResume =
     composing &&
     launchIntent === "conversation" &&
@@ -292,6 +376,20 @@ export default function HostScreen() {
   const selectedLaunchModelInfo = launchModels.find(
     (model) => model.id === selectedLaunchModel,
   );
+  const effectiveAdvancedOpen =
+    advancedOpen ||
+    !accountCanLaunch ||
+    launchIntent === "goal" ||
+    selectedResume !== null;
+  const advancedSummary = [
+    STRUCTURED.includes(agent) && agent !== "deepseek"
+      ? (effectiveSessionKind === "pty" ? "终端" : "对话")
+      : null,
+    (effectiveSessionKind === "structured" || managedAgentTerminal)
+      ? (APPROVAL_POLICIES.find((item) => item.value === displayedApprovalPolicy)?.label ?? null)
+      : null,
+    effectiveSessionKind === "structured" && launchMode === "plan" ? "Plan" : null,
+  ].filter((part): part is string => Boolean(part)).join(" · ");
 
   // A slow bind may complete after changing hosts, agents, or dismissing the form.
   // It must never replace the current selection in that case.
@@ -319,7 +417,7 @@ export default function HostScreen() {
     return result.models ?? [];
   }, [conn, codeAgent]);
 
-  const selectModelSource = async (source: ModelSource, choice: SourceModelChoice): Promise<void> => {
+  const selectModelSource = async (source: ModelSource, choice: SourceModelChoice): Promise<AgentAccount> => {
     if (!conn || !codeAgent || runtime.status !== "connected" || sourceBinding) throw new Error("设备未连接或正在选择模型。");
     const epoch = ++sourceBindingEpoch.current;
     setSourceBinding(true);
@@ -357,12 +455,14 @@ export default function HostScreen() {
       if (next.agent !== targetAgent) throw new Error("模型源返回了不匹配的 Agent，请刷新后重试。");
       setAgentAccounts(accounts);
       if (result.sources) setModelSources(result.sources);
+      setAuthSourceMode("source");
       setAgent(next.agent);
       setSessionKind(next.kind);
-      setSelectedAccountIds((current) => ({ ...current, [next.agent]: account.id }));
+      setSelectedSourceAccountIds((current) => ({ ...current, [next.agent]: account.id }));
       setSelectedResume(null); setResumeResults([]); setResumeLoaded(false);
       if (!getAgentAccountCapabilities(account).plan) setLaunchMode("default");
       if (next.kind === "pty") setLaunchIntent("conversation");
+      return account;
     } finally { setSourceBinding(false); }
   };
 
@@ -390,8 +490,22 @@ export default function HostScreen() {
           setAgentAccounts(next);
           setSelectedAccountIds((current) => {
             const updated = { ...current };
+            for (const kind of ["claude", "codex", "agy", "opencode", "pi"] as const) {
+              const available = next.filter(
+                (account) => !account.modelSource && getAgentAccountEngine(account) === kind,
+              );
+              if (!available.some((account) => account.id === updated[kind])) {
+                updated[kind] = available.find((account) => account.isDefault)?.id ?? available[0]?.id;
+              }
+            }
+            return updated;
+          });
+          setSelectedSourceAccountIds((current) => {
+            const updated = { ...current };
             for (const kind of ["claude", "codex", "opencode", "pi"] as const) {
-              const available = next.filter((account) => getAgentAccountEngine(account) === kind);
+              const available = next.filter(
+                (account) => Boolean(account.modelSource) && getAgentAccountEngine(account) === kind,
+              );
               if (!available.some((account) => account.id === updated[kind])) {
                 updated[kind] = available.find((account) => account.isDefault)?.id ?? available[0]?.id;
               }
@@ -561,7 +675,7 @@ export default function HostScreen() {
     if (!isFocused || !conn || runtime.status !== "connected") return;
     if (quickCreate !== "conversation" && quickCreate !== "directory") return;
     const requestedCwd = typeof quickCreateCwd === "string" ? quickCreateCwd.trim() : "";
-    const fireKey = `${quickCreate}:${requestedCwd}`;
+    const fireKey = `${quickCreate}:${requestedCwd}:${requestedAuthMode ?? ""}:${requestedAccountId ?? ""}`;
     if (homeQuickCreateRef.current === fireKey) return;
     homeQuickCreateRef.current = fireKey;
     const timer = setTimeout(() => {
@@ -574,11 +688,39 @@ export default function HostScreen() {
       setWorkspacePath("");
       setManualCwdOpen(false);
       if (requestedCwd) setCwd(requestedCwd);
+      if (requestedAuthMode === "source") {
+        setAuthSourceMode("source");
+      } else if (requestedAuthMode === "subscription") {
+        setAuthSourceMode("subscription");
+      }
+      if (requestedAccountId) {
+        const matched = agentAccounts.find((item) => item.id === requestedAccountId);
+        if (matched) {
+          const engine = getAgentAccountEngine(matched);
+          setAgent(engine);
+          if (matched.modelSource) {
+            setAuthSourceMode("source");
+            setSelectedSourceAccountIds((current) => ({ ...current, [engine]: matched.id }));
+          } else {
+            setAuthSourceMode("subscription");
+            setSelectedAccountIds((current) => ({ ...current, [engine]: matched.id }));
+          }
+        }
+      }
       setComposing(true);
       setPickerOpen(quickCreate === "directory");
     }, 0);
     return () => clearTimeout(timer);
-  }, [conn, isFocused, quickCreate, quickCreateCwd, runtime.status]);
+  }, [
+    agentAccounts,
+    conn,
+    isFocused,
+    quickCreate,
+    quickCreateCwd,
+    requestedAccountId,
+    requestedAuthMode,
+    runtime.status,
+  ]);
 
   // Create completion belongs to a request, not whichever snapshot happened to arrive first.
   const trackCreate = useCallback((
@@ -783,11 +925,9 @@ export default function HostScreen() {
   const submitCreate = (): void => {
     if (!conn || runtime.status !== "connected" || pendingCreate.pending || sourceBinding) return;
     if (agent === "shell" && !supportsTerminal) { setBanner(REMOTE_TERMINAL_UNAVAILABLE); return; }
-    if (codeAgent && supportsAccounts && !selectedAccount) { setAccountsError("请先读取并选择电脑上的账号或 API。"); return; }
-    if (!accountCanLaunch) { setBanner(selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"); return; }
     const projectPath = cwd.trim();
     if (projectPath.length === 0) {
-      setBanner("请先选择项目目录，再新建会话。");
+      setBanner("请先选择工作区，再新建会话。");
       setPickerOpen(true);
       return;
     }
@@ -796,70 +936,115 @@ export default function HostScreen() {
       setBanner("请先写下 Goal，协调者才知道要完成什么。");
       return;
     }
-    const accountOption = selectedAccount ? { accountId: selectedAccount.id } : {};
-    const modelOption =
-      effectiveSessionKind === "structured" &&
-      launchCatalogAgent !== null &&
-      accountCanSelectModel && selectedLaunchModelInfo !== undefined
-        ? {
-            model: selectedLaunchModelInfo.id,
-            ...(accountCanSelectEffort && selectedLaunchEffort ? { effort: selectedLaunchEffort } : {}),
+
+    const launchWithAccount = (launchAccount: AgentAccount | undefined, fallbackAgent: AgentKind): void => {
+      const agent = launchAccount ? getAgentAccountEngine(launchAccount) : fallbackAgent;
+      const resolvedCaps = launchAccount ? getAgentAccountCapabilities(launchAccount) : undefined;
+      const resolvedKind: SessionKind =
+        resolvedCaps?.sessionKinds.length === 1 && resolvedCaps.sessionKinds[0] === "structured"
+          ? "structured"
+          : effectiveSessionKind;
+      const canLaunch = resolvedCaps?.sessionKinds.includes(resolvedKind) ?? agent !== "opencode";
+      if (!canLaunch) {
+        setBanner(launchAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。");
+        return;
+      }
+      if (hostId) useWorkspaceConcepts.getState().addWorkspace(hostId, projectPath);
+      const accountOption = launchAccount ? { accountId: launchAccount.id } : {};
+      const modelOption =
+        effectiveAuthMode === "source"
+          ? resolvedKind === "structured" && selectedSourceEffort
+            ? { effort: selectedSourceEffort }
+            : {}
+          : resolvedKind === "structured" &&
+              launchCatalogAgent !== null &&
+              accountCanSelectModel && selectedLaunchModelInfo !== undefined
+            ? {
+                model: selectedLaunchModelInfo.id,
+                ...(accountCanSelectEffort && selectedLaunchEffort ? { effort: selectedLaunchEffort } : {}),
+              }
+            : {};
+      const managedTerminal =
+        resolvedKind === "pty" &&
+        (agent === "claude" || agent === "codex" || agent === "pi");
+      const sessionOptions:
+        | {
+            mode?: "default" | "plan";
+            resume?: { id: string; title?: string };
+            goal?: string;
+            accountId?: string;
+            approvalPolicy?: ApprovalPolicy;
+            model?: string;
+            effort?: string;
+            agentPreset?: string;
           }
-        : {};
-    const sessionOptions:
-      | {
-          mode?: "default" | "plan";
-          resume?: { id: string; title?: string };
-          goal?: string;
-          accountId?: string;
-          approvalPolicy?: ApprovalPolicy;
-          model?: string;
-          effort?: string;
-          agentPreset?: string;
-        }
-      | undefined =
-      launchIntent === "goal"
+        | undefined =
+        launchIntent === "goal"
           ? {
               ...accountOption,
               ...modelOption,
               ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
               approvalPolicy,
               goal: objective,
-            ...(PLAN_CAPABLE.includes(agent) && accountCanPlan ? { mode: "plan" as const } : {}),
-          }
-        : effectiveSessionKind === "structured" && RESUMABLE.includes(agent)
+              ...(PLAN_CAPABLE.includes(agent) && accountCanPlan ? { mode: "plan" as const } : {}),
+            }
+          : resolvedKind === "structured" && RESUMABLE.includes(agent)
             ? {
                 ...accountOption,
                 ...modelOption,
                 ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
                 approvalPolicy,
                 ...(PLAN_CAPABLE.includes(agent) && accountCanPlan ? { mode: launchMode } : {}),
-              ...(accountCanResume && selectedResume
-                ? { resume: { id: selectedResume.id, title: selectedResume.title } }
-                : {}),
-            }
-          : effectiveSessionKind === "structured"
-            ? {
-                ...accountOption,
-                ...modelOption,
-                ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
-                approvalPolicy,
+                ...(accountCanResume && selectedResume
+                  ? { resume: { id: selectedResume.id, title: selectedResume.title } }
+                  : {}),
               }
-            : { ...accountOption, approvalPolicy: managedAgentTerminal ? terminalApprovalPolicy : approvalPolicy };
-    const createKind = launchIntent === "goal"
-      ? "structured"
-      : STRUCTURED.includes(agent)
-        ? effectiveSessionKind
-        : "pty";
-    const sendCreate = (options: typeof sessionOptions): void => {
-      const task = conn.createSessionTracked(agent, projectPath, undefined, createKind, 80, 24, options);
+            : resolvedKind === "structured"
+              ? {
+                  ...accountOption,
+                  ...modelOption,
+                  ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
+                  approvalPolicy,
+                }
+              : { ...accountOption, approvalPolicy: managedTerminal ? terminalApprovalPolicy : approvalPolicy };
+      const createKind = launchIntent === "goal"
+        ? "structured"
+        : STRUCTURED.includes(agent)
+          ? resolvedKind
+          : "pty";
+      pendingResumeTitleRef.current =
+        agent === "codex" && sessionOptions?.resume
+          ? sessionOptions.resume.title ?? "这条 Codex 对话"
+          : null;
+      const task = conn.createSessionTracked(agent, projectPath, undefined, createKind, 80, 24, sessionOptions);
       trackCreate(task, pendingResumeTitleRef.current);
     };
-    pendingResumeTitleRef.current =
-      agent === "codex" && sessionOptions?.resume
-        ? sessionOptions.resume.title ?? "这条 Codex 对话"
-        : null;
-    sendCreate(sessionOptions);
+
+    if (effectiveAuthMode === "source") {
+      if (selectedAccount) {
+        launchWithAccount(selectedAccount, agent);
+        return;
+      }
+      if (!defaultSourcePair) {
+        setModelSourcesError("请先在「API 模型源」中选择或启用模型。");
+        return;
+      }
+      void selectModelSource(defaultSourcePair.source, {
+        kind: "route",
+        route: defaultSourcePair.route,
+      })
+        .then((boundAccount) => launchWithAccount(boundAccount, agent))
+        .catch((failure: unknown) => {
+          setModelSourcesError(failure instanceof Error ? failure.message : String(failure));
+        });
+      return;
+    }
+
+    if (codeAgent && supportsAccounts && !selectedAccount) {
+      setAccountsError("请先选择订阅账号，或切换到上方「API 模型源」。");
+      return;
+    }
+    launchWithAccount(selectedAccount, agent);
   };
 
   const leaveHost = (): void => {
@@ -1077,11 +1262,11 @@ export default function HostScreen() {
               ]}
             >
               <View style={styles.paneHeader}>
-                <Text style={styles.paneTitle}>项目</Text>
+                <Text style={styles.paneTitle}>工作区</Text>
                 <Text style={styles.paneMeta}>
                   {selectedProjectSessions.length > 0
                     ? `${String(selectedProjectSessions.length)} 个已有会话`
-                    : "选择本次工作的目录"}
+                    : "选择本次会话所在工作区"}
                 </Text>
               </View>
               <Pressable
@@ -1089,17 +1274,17 @@ export default function HostScreen() {
                 onPress={() => setPickerOpen(true)}
                 disabled={runtime.status !== "connected" || createDelivery !== null}
                 accessibilityRole="button"
-                accessibilityLabel={cwd.trim() ? "更换项目目录" : "选择项目目录"}
+                accessibilityLabel={cwd.trim() ? "更换工作区" : "选择工作区"}
               >
                 <View style={styles.selectedProjectIcon}>
                   <Icon name="folder.fill" size={20} color={color.accent} />
                 </View>
                 <View style={styles.selectedProjectCopy}>
                   <Text style={styles.selectedProjectName} numberOfLines={1}>
-                    {cwd.trim() ? projectNameFor(cwd.trim()) : "未选择项目"}
+                    {cwd.trim() ? projectNameFor(cwd.trim()) : "未选择工作区"}
                   </Text>
                   <Text style={styles.selectedProjectPath} numberOfLines={2}>
-                    {cwd.trim() || (wideComposer ? "输入完整路径，或从电脑浏览选择" : "从电脑浏览选择目录")}
+                    {cwd.trim() || (wideComposer ? "输入完整路径，或从电脑浏览选择工作区" : "从电脑浏览选择工作区")}
                   </Text>
                   {!wideComposer && <Text style={styles.selectedProjectChange}>点按更换</Text>}
                 </View>
@@ -1119,7 +1304,7 @@ export default function HostScreen() {
                   <Icon name="folder.fill" size={16} color={color.textDim} />
                   <TextInput
                     style={styles.cwdInput}
-                    placeholder="项目目录"
+                    placeholder="工作区目录路径"
                     placeholderTextColor={color.textFaint}
                     selectionColor={color.accent}
                     value={cwd}
@@ -1132,7 +1317,7 @@ export default function HostScreen() {
                     spellCheck={false}
                     clearButtonMode="while-editing"
                     keyboardAppearance="default"
-                    accessibilityLabel="工作目录"
+                    accessibilityLabel="工作区目录"
                   />
                 </View>
                 <Pressable
@@ -1187,7 +1372,7 @@ export default function HostScreen() {
               keyboardShouldPersistTaps="handled"
               nestedScrollEnabled
             >
-          <Text style={styles.formLabel}>运行方式</Text>
+          <Text style={styles.formLabel}>Agent</Text>
           <View style={styles.chips}>
             {availableAgents.map((a) => (
               <Pressable
@@ -1197,6 +1382,15 @@ export default function HostScreen() {
                   setAgent(a);
                   setSessionKind(STRUCTURED.includes(a) ? "structured" : "pty");
                   if (!STRUCTURED.includes(a)) setApprovalPolicy("strict");
+                  if (a === "agy" || !["claude", "codex", "opencode", "pi"].includes(a)) {
+                    setAuthSourceMode("subscription");
+                  } else if (
+                    a === "pi" &&
+                    subscriptionPool.filter((acc) => getAgentAccountEngine(acc) === "pi").length === 0 &&
+                    conn?.supportsModelSources
+                  ) {
+                    setAuthSourceMode("source");
+                  }
                   setLaunchMode("default");
                   setLaunchIntent("conversation");
                   setGoal("");
@@ -1209,487 +1403,621 @@ export default function HostScreen() {
               >
                 <AgentIcon agent={a} size={14} />
                 <Text style={[styles.chipText, agent === a && styles.chipTextActive]}>{a}</Text>
-                {/* 对话/终端决定进去看到的是消息流还是一块终端屏,建之前就该知道。
-                    原来这里挂个 💬 emoji —— 和满屏 SF Symbols 摆在一起像块补丁 */}
-                {STRUCTURED.includes(a) && (
-                  <Icon
-                    name="bubble.left.and.text.bubble.right"
-                    size={11}
-                    /* 选中时底色变蓝,弱灰会糊在上面看不见 */
-                    color={agent === a ? color.textDim : color.textFaint}
-                  />
-                )}
               </Pressable>
             ))}
           </View>
           {STRUCTURED.includes(agent) && (
             <>
-              {agent !== "deepseek" && (
-                <>
-                  <Text style={[styles.formLabel, styles.kindLabel]}>会话模式</Text>
-                  <View style={styles.kindSwitch} accessibilityRole="tablist">
-                <Pressable
-                  style={[styles.kindOption, effectiveSessionKind === "structured" && styles.kindOptionActive]}
-                  onPress={() => { sourceBindingEpoch.current++; setSessionKind("structured"); }}
-                  disabled={selectedAccountCapabilities?.sessionKinds.includes("structured") === false}
-                  accessibilityRole="tab"
-                  accessibilityState={{ selected: effectiveSessionKind === "structured" }}
-                  accessibilityLabel="创建对话会话"
-                >
-                  <Icon
-                    name="bubble.left.and.text.bubble.right"
-                    size={14}
-                    color={effectiveSessionKind === "structured" ? color.text : color.textDim}
-                  />
-                  <Text
-                    style={[
-                      styles.kindOptionText,
-                      effectiveSessionKind === "structured" && styles.kindOptionTextActive,
-                    ]}
-                  >
-                    对话
-                  </Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.kindOption, effectiveSessionKind === "pty" && styles.kindOptionActive]}
-                  onPress={() => {
-                    sourceBindingEpoch.current++;
-                    setSessionKind("pty");
-                    setApprovalPolicy("strict");
-                    setLaunchIntent("conversation");
-                    setSelectedResume(null);
-                  }}
-                  disabled={selectedAccountCapabilities?.sessionKinds.includes("pty") === false}
-                  accessibilityRole="tab"
-                  accessibilityState={{ selected: effectiveSessionKind === "pty", disabled: selectedAccountCapabilities?.sessionKinds.includes("pty") === false }}
-                  accessibilityLabel="创建终端会话"
-                >
-                  <Icon
-                    name="terminal"
-                    size={14}
-                    color={effectiveSessionKind === "pty" ? color.text : color.textDim}
-                  />
-                  <Text
-                    style={[
-                      styles.kindOptionText,
-                      effectiveSessionKind === "pty" && styles.kindOptionTextActive,
-                    ]}
-                  >
-                    终端
-                  </Text>
-                </Pressable>
-                  </View>
-                  <Text style={styles.kindHelp}>
-                    {accountRequiresStructured
-                      ? "当前账号只支持对话；使用终端请选择 Claude 或 Codex 账号 / API"
-                      : effectiveSessionKind === "structured"
-                        ? "消息、工具调用和审批以卡片展示"
-                      : `启动 ${agent} TUI，可直接操作完整终端`}
-                  </Text>
-                </>
-              )}
-              {codeAgent && <SessionAccountSelect accounts={conn?.supportsModelSources && !modelSourcesLoading && !modelSourcesError
-                  ? agentAccounts.filter((account) => !account.modelSource || !modelSources.some((source) => source.enabled && source.id === account.modelSource?.sourceId && source.routes.some((route) => route.enabled && route.modelCapabilities?.tools !== false && route.id === account.modelSource?.routeId)))
-                  : agentAccounts} selected={selectedAccount} loading={accountsLoading} error={accountsError}
-                supported={supportsAccounts} disabled={runtime.status !== "connected" || createDelivery !== null || sourceBinding}
-                onRetry={() => setAccountsReload(value => value + 1)}
-                onManage={() => { resetPendingCreate(); router.push(`/host/${hostId}/accounts`); }}
-                onSelect={account => {
-                  sourceBindingEpoch.current++;
-                  const next = selectLaunchAccount(account, effectiveSessionKind);
-                  setAgent(next.agent);
-                  setSessionKind(next.kind);
-                  setSelectedAccountIds(current => ({ ...current, [next.agent]: account.id }));
-                  setSelectedResume(null); setResumeResults([]); setResumeLoaded(false);
-                  if (!getAgentAccountCapabilities(account).plan) setLaunchMode("default");
-                  if (next.kind === "pty") setLaunchIntent("conversation");
-                }} />}
-              {codeAgent && conn?.supportsModelSources && <SessionModelSourceSelect agent={codeAgent} sources={modelSources}
-                loading={modelSourcesLoading} error={modelSourcesError} disabled={runtime.status !== "connected" || createDelivery !== null || sourceBinding}
-                onRetry={() => setModelSourcesReload((value) => value + 1)} onLoadModels={loadSourceModels} onSelect={selectModelSource} />}
-              {!accountCanLaunch && <Text style={styles.resumeError}>{selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"}</Text>}
-              {effectiveSessionKind === "structured" && launchCatalogAgent && accountCanSelectModel && conn?.supportsSessionCreateModel && (
-                <>
-                  <View style={[styles.accountLabelRow, styles.kindLabel]}>
-                    <Text style={styles.formLabel}>模型</Text>
+              <View style={styles.authSourceCard}>
+                <View style={styles.authSourceCardHead}>
+                  <Text style={styles.authSourceCardTitle}>模型与认证来源</Text>
+                  {supportsAccounts && (
                     <Pressable
-                      onPress={() => setLaunchModelsReload((value) => value + 1)}
-                      disabled={launchModelsLoading}
+                      onPress={() => {
+                        resetPendingCreate();
+                        router.push(`/host/${hostId}/accounts`);
+                      }}
+                      disabled={createDelivery !== null || sourceBinding}
                       hitSlop={8}
-                      accessibilityLabel="刷新可选模型"
+                      accessibilityRole="button"
+                      accessibilityLabel="管理订阅与模型源"
                     >
-                      <Text style={styles.accountManage}>
-                        {launchModelsLoading ? "读取中" : "刷新"}
+                      <Text style={styles.accountManage}>管理订阅与模型源</Text>
+                    </Pressable>
+                  )}
+                </View>
+
+                {codeAgent && codeAgent !== "agy" && (
+                  <View
+                    style={styles.kindSwitch}
+                    accessibilityRole="tablist"
+                    accessibilityLabel="模型连接方式"
+                  >
+                    <Pressable
+                      style={[
+                        styles.kindOption,
+                        styles.authModeOption,
+                        effectiveAuthMode === "subscription" && styles.kindOptionActive,
+                      ]}
+                      onPress={() => {
+                        sourceBindingEpoch.current++;
+                        setAuthSourceMode("subscription");
+                      }}
+                      disabled={createDelivery !== null || sourceBinding}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected: effectiveAuthMode === "subscription" }}
+                      accessibilityLabel="切换到订阅登录态"
+                    >
+                      <Text
+                        style={[
+                          styles.kindOptionText,
+                          effectiveAuthMode === "subscription" && styles.kindOptionTextActive,
+                        ]}
+                      >
+                        订阅登录态
+                        {matchingSubscriptions.length > 0
+                          ? ` (${String(matchingSubscriptions.length)})`
+                          : ""}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.kindOption,
+                        styles.authModeOption,
+                        effectiveAuthMode === "source" && styles.kindOptionActive,
+                      ]}
+                      onPress={() => {
+                        sourceBindingEpoch.current++;
+                        setAuthSourceMode("source");
+                        setSelectedResume(null);
+                      }}
+                      disabled={!sourceSupported || createDelivery !== null || sourceBinding}
+                      accessibilityRole="tab"
+                      accessibilityState={{
+                        selected: effectiveAuthMode === "source",
+                        disabled: !sourceSupported,
+                      }}
+                      accessibilityLabel="切换到 API 模型源"
+                    >
+                      <Text
+                        style={[
+                          styles.kindOptionText,
+                          effectiveAuthMode === "source" && styles.kindOptionTextActive,
+                        ]}
+                      >
+                        API 模型源
                       </Text>
                     </Pressable>
                   </View>
-                  {launchModelsLoading && launchModels.length === 0 ? (
-                    <View style={styles.modelLoading}>
-                      <ActivityIndicator size="small" color={color.accent} />
-                      <Text style={styles.kindHelp}>从 {agent} 读取实时模型目录…</Text>
-                    </View>
-                  ) : (
-                    <>
-                      {launchModelsError && (
-                        <Text style={styles.resumeError}>{launchModelsError}</Text>
-                      )}
-                      {launchModels.length > 0 && (
-                        <View style={styles.chips} accessibilityRole="radiogroup">
-                          {launchModels.map((model) => {
-                            const active = selectedLaunchModel === model.id;
-                            return (
-                              <Pressable
-                                key={model.id}
-                                style={[styles.chip, active && styles.chipActive]}
-                                onPress={() => {
-                                  setSelectedLaunchModel(model.id);
-                                  setSelectedLaunchEffort(
-                                    model.defaultEffort ?? model.supportedEfforts[0] ?? null,
-                                  );
-                                }}
-                                accessibilityRole="radio"
-                                accessibilityState={{ checked: active }}
-                                accessibilityLabel={`模型 ${model.label}`}
-                              >
-                                <Text
-                                  style={[styles.chipText, active && styles.chipTextActive]}
-                                  numberOfLines={1}
-                                >
-                                  {model.label}
+                )}
+
+                {effectiveAuthMode === "source" && codeAgent ? (
+                  <SessionModelSourceSelect
+                    agent={codeAgent}
+                    sources={modelSources}
+                    selectedAccount={selectedAccount}
+                    effort={selectedSourceEffort}
+                    onEffortChange={setSelectedSourceEffort}
+                    loading={modelSourcesLoading}
+                    error={modelSourcesError}
+                    disabled={runtime.status !== "connected" || createDelivery !== null || sourceBinding}
+                    onRetry={() => setModelSourcesReload((value) => value + 1)}
+                    onLoadModels={loadSourceModels}
+                    onSelect={async (source, choice) => {
+                      await selectModelSource(source, choice);
+                    }}
+                  />
+                ) : (
+                  <>
+                    {codeAgent && (
+                      <SessionAccountSelect
+                        label="订阅账号"
+                        emptyHint="没有可用订阅账号（可切换到上方 API 模型源）"
+                        accounts={subscriptionPool}
+                        selected={selectedAccount}
+                        loading={accountsLoading}
+                        error={accountsError}
+                        supported={supportsAccounts}
+                        disabled={runtime.status !== "connected" || createDelivery !== null || sourceBinding}
+                        onRetry={() => setAccountsReload((value) => value + 1)}
+                        onSelect={(account) => {
+                          sourceBindingEpoch.current++;
+                          const next = selectLaunchAccount(account, effectiveSessionKind);
+                          setAuthSourceMode("subscription");
+                          setAgent(next.agent);
+                          setSessionKind(next.kind);
+                          setSelectedAccountIds((current) => ({
+                            ...current,
+                            [next.agent]: account.id,
+                          }));
+                          setSelectedResume(null);
+                          setResumeResults([]);
+                          setResumeLoaded(false);
+                          if (!getAgentAccountCapabilities(account).plan) setLaunchMode("default");
+                          if (next.kind === "pty") setLaunchIntent("conversation");
+                        }}
+                      />
+                    )}
+                    {!accountCanLaunch && (
+                      <Text style={styles.resumeError}>
+                        {selectedAccount?.apiProfileError ??
+                          "当前账号不支持此会话，请检查配置和模型工具能力。"}
+                      </Text>
+                    )}
+                    {effectiveSessionKind === "structured" &&
+                      launchCatalogAgent &&
+                      accountCanSelectModel &&
+                      conn?.supportsSessionCreateModel && (
+                        <>
+                          <View style={[styles.accountLabelRow, styles.kindLabel]}>
+                            <Text style={styles.formLabel}>模型</Text>
+                            <Pressable
+                              onPress={() => setLaunchModelsReload((value) => value + 1)}
+                              disabled={launchModelsLoading}
+                              hitSlop={8}
+                              accessibilityLabel="刷新可选模型"
+                            >
+                              <Text style={styles.accountManage}>
+                                {launchModelsLoading ? "读取中" : "刷新"}
+                              </Text>
+                            </Pressable>
+                          </View>
+                          {launchModelsLoading && launchModels.length === 0 ? (
+                            <View style={styles.modelLoading}>
+                              <ActivityIndicator size="small" color={color.accent} />
+                              <Text style={styles.kindHelp}>从 {agent} 读取实时模型目录…</Text>
+                            </View>
+                          ) : (
+                            <>
+                              {launchModelsError && (
+                                <Text style={styles.resumeError}>{launchModelsError}</Text>
+                              )}
+                              {launchModels.length > 0 && (
+                                <View style={styles.chips} accessibilityRole="radiogroup">
+                                  {launchModels.map((model) => {
+                                    const active = selectedLaunchModel === model.id;
+                                    return (
+                                      <Pressable
+                                        key={model.id}
+                                        style={[styles.chip, active && styles.chipActive]}
+                                        onPress={() => {
+                                          setSelectedLaunchModel(model.id);
+                                          setSelectedLaunchEffort(
+                                            model.defaultEffort ?? model.supportedEfforts[0] ?? null,
+                                          );
+                                        }}
+                                        accessibilityRole="radio"
+                                        accessibilityState={{ checked: active }}
+                                        accessibilityLabel={`模型 ${model.label}`}
+                                      >
+                                        <Text
+                                          style={[styles.chipText, active && styles.chipTextActive]}
+                                          numberOfLines={1}
+                                        >
+                                          {model.label}
+                                        </Text>
+                                      </Pressable>
+                                    );
+                                  })}
+                                </View>
+                              )}
+                              {selectedLaunchModelInfo?.description && (
+                                <Text style={styles.kindHelp} numberOfLines={2}>
+                                  {selectedLaunchModelInfo.description}
                                 </Text>
-                              </Pressable>
-                            );
-                          })}
-                        </View>
-                      )}
-                      {selectedLaunchModelInfo?.description && (
-                        <Text style={styles.kindHelp} numberOfLines={2}>
-                          {selectedLaunchModelInfo.description}
-                        </Text>
-                      )}
-                      {accountCanSelectEffort && (selectedLaunchModelInfo?.supportedEfforts.length ?? 0) > 0 && (
-                        <>
-                          <Text style={[styles.formLabel, styles.modelEffortLabel]}>推理强度</Text>
-                          <View style={styles.chips} accessibilityRole="radiogroup">
-                            {selectedLaunchModelInfo?.supportedEfforts.map((effort) => {
-                              const active = selectedLaunchEffort === effort;
-                              return (
-                                <Pressable
-                                  key={effort}
-                                  style={[styles.chip, active && styles.chipActive]}
-                                  onPress={() => setSelectedLaunchEffort(effort)}
-                                  accessibilityRole="radio"
-                                  accessibilityState={{ checked: active }}
-                                >
-                                  <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                                    {effort}
-                                  </Text>
-                                </Pressable>
-                              );
-                            })}
-                          </View>
-                        </>
-                      )}
-                      {agent === "deepseek" && launchPresets.length > 0 && (
-                        <>
-                          <Text style={[styles.formLabel, styles.modelEffortLabel]}>Agent 预设</Text>
-                          <View style={styles.chips} accessibilityRole="radiogroup">
-                            {launchPresets.map((preset) => {
-                              const active = selectedLaunchPreset === preset.id;
-                              return (
-                                <Pressable
-                                  key={preset.id}
-                                  style={[styles.chip, active && styles.chipActive]}
-                                  onPress={() => setSelectedLaunchPreset(preset.id)}
-                                  accessibilityRole="radio"
-                                  accessibilityState={{ checked: active }}
-                                  accessibilityLabel={`Agent 预设 ${preset.name}`}
-                                >
-                                  <Text style={[styles.chipText, active && styles.chipTextActive]} numberOfLines={1}>
-                                    {preset.name}{preset.custom ? " · 自定义" : ""}
-                                  </Text>
-                                </Pressable>
-                              );
-                            })}
-                          </View>
-                          {launchPresets.find((preset) => preset.id === selectedLaunchPreset)?.description && (
-                            <Text style={styles.kindHelp} numberOfLines={2}>
-                              {launchPresets.find((preset) => preset.id === selectedLaunchPreset)?.description}
-                            </Text>
+                              )}
+                              {accountCanSelectEffort &&
+                                (selectedLaunchModelInfo?.supportedEfforts.length ?? 0) > 0 && (
+                                  <>
+                                    <Text style={[styles.formLabel, styles.modelEffortLabel]}>
+                                      推理强度
+                                    </Text>
+                                    <View style={styles.chips} accessibilityRole="radiogroup">
+                                      {selectedLaunchModelInfo?.supportedEfforts.map((effort) => {
+                                        const active = selectedLaunchEffort === effort;
+                                        return (
+                                          <Pressable
+                                            key={effort}
+                                            style={[styles.chip, active && styles.chipActive]}
+                                            onPress={() => setSelectedLaunchEffort(effort)}
+                                            accessibilityRole="radio"
+                                            accessibilityState={{ checked: active }}
+                                          >
+                                            <Text
+                                              style={[
+                                                styles.chipText,
+                                                active && styles.chipTextActive,
+                                              ]}
+                                            >
+                                              {effort}
+                                            </Text>
+                                          </Pressable>
+                                        );
+                                      })}
+                                    </View>
+                                  </>
+                                )}
+                            </>
                           )}
                         </>
                       )}
-                    </>
-                  )}
-                </>
-              )}
-              {effectiveSessionKind === "structured" &&
-                launchCatalogAgent &&
-                conn &&
-                !conn.supportsSessionCreateModel && (
-                  <>
-                    <Text style={[styles.formLabel, styles.kindLabel]}>模型与推理强度</Text>
-                    <Text style={styles.kindHelp}>
-                      电脑端仍在运行旧版 daemon；重启电脑上的 Prospero 后即可选择。
-                    </Text>
                   </>
                 )}
-              {effectiveSessionKind === "structured" && (
-                <>
-                  <Text style={[styles.formLabel, styles.kindLabel]}>发起方式</Text>
-                  <View style={styles.kindSwitch} accessibilityRole="tablist">
-                    <Pressable
-                      style={[styles.kindOption, launchIntent === "conversation" && styles.kindOptionActive]}
-                      onPress={() => setLaunchIntent("conversation")}
-                      accessibilityRole="tab"
-                      accessibilityState={{ selected: launchIntent === "conversation" }}
-                    >
-                      <Icon
-                        name="bubble.left.and.text.bubble.right"
-                        size={14}
-                        color={launchIntent === "conversation" ? color.text : color.textDim}
-                      />
-                      <Text style={[styles.kindOptionText, launchIntent === "conversation" && styles.kindOptionTextActive]}>
-                        对话
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={[styles.kindOption, launchIntent === "goal" && styles.kindOptionActive]}
-                      onPress={() => {
-                        setLaunchIntent("goal");
-                        setSelectedResume(null);
-                      }}
-                      accessibilityRole="tab"
-                      accessibilityState={{ selected: launchIntent === "goal" }}
-                      accessibilityLabel="创建 Goal 协调者会话"
-                    >
-                      <Icon
-                        name="command"
-                        size={14}
-                        color={launchIntent === "goal" ? color.text : color.textDim}
-                      />
-                      <Text style={[styles.kindOptionText, launchIntent === "goal" && styles.kindOptionTextActive]}>
-                        Goal
-                      </Text>
-                    </Pressable>
-                  </View>
-                  <Text style={styles.kindHelp}>
-                    {launchIntent === "goal"
-                      ? "创建协调者与 Run；它会拆分任务、派发 worker，并在需要时向你请求决策"
-                      : "普通对话只启动一个 Agent 会话"}
-                  </Text>
-                </>
-              )}
-              {(effectiveSessionKind === "structured" || managedAgentTerminal) && (
-                <>
-                  <Text style={[styles.formLabel, styles.kindLabel]}>审批策略</Text>
-                  <View style={styles.kindSwitch} accessibilityRole="radiogroup">
-                    {APPROVAL_POLICIES.map((option) => {
-                      const active = displayedApprovalPolicy === option.value;
-                      const danger = option.value === "yolo";
-                      return (
+              </View>
+
+              <Pressable
+                style={({ pressed }) => [styles.advancedToggle, pressed && styles.cardPressed]}
+                onPress={() => setAdvancedOpen((open) => !open)}
+                accessibilityRole="button"
+                accessibilityLabel="高级设置"
+                accessibilityState={{ expanded: effectiveAdvancedOpen }}
+              >
+                <View style={styles.advancedToggleCopy}>
+                  <Text style={styles.advancedToggleTitle}>高级设置</Text>
+                  {advancedSummary.length > 0 && (
+                    <Text style={styles.advancedToggleSummary} numberOfLines={1}>
+                      {advancedSummary}
+                    </Text>
+                  )}
+                </View>
+                <Icon
+                  name={effectiveAdvancedOpen ? "chevron.down" : "chevron.right"}
+                  size={13}
+                  color={color.textFaint}
+                />
+              </Pressable>
+
+              {effectiveAdvancedOpen && (
+                <View style={styles.advancedBody}>
+                  {agent !== "deepseek" && (
+                    <>
+                      <Text style={[styles.formLabel, styles.kindLabel]}>会话类型</Text>
+                      <View style={styles.kindSwitch} accessibilityRole="tablist">
                         <Pressable
-                          key={option.value}
-                          style={[
-                            styles.kindOption,
-                            active && styles.kindOptionActive,
-                            active && danger && styles.policyOptionDangerActive,
-                          ]}
-                          disabled={createDelivery !== null}
-                          onPress={() => {
-                            if (managedAgentTerminal) setTerminalApprovalPolicy(option.value);
-                            else if (danger) setCreateYoloConfirmOpen(true);
-                            else setApprovalPolicy(option.value);
-                          }}
-                          accessibilityRole="radio"
-                          accessibilityState={{ checked: active }}
-                          accessibilityLabel={`审批策略：${option.label}`}
-                          accessibilityHint={approvalPolicyHelp[option.value]}
+                          style={[styles.kindOption, effectiveSessionKind === "structured" && styles.kindOptionActive]}
+                          onPress={() => { sourceBindingEpoch.current++; setSessionKind("structured"); }}
+                          disabled={selectedAccountCapabilities?.sessionKinds.includes("structured") === false}
+                          accessibilityRole="tab"
+                          accessibilityState={{ selected: effectiveSessionKind === "structured" }}
+                          accessibilityLabel="创建对话会话"
                         >
                           <Icon
-                            name={option.symbol}
+                            name="bubble.left.and.text.bubble.right"
                             size={14}
-                            color={active && danger ? color.danger : active ? color.text : color.textDim}
+                            color={effectiveSessionKind === "structured" ? color.text : color.textDim}
                           />
                           <Text
                             style={[
                               styles.kindOptionText,
-                              active && styles.kindOptionTextActive,
-                              active && danger && styles.policyOptionDangerText,
+                              effectiveSessionKind === "structured" && styles.kindOptionTextActive,
                             ]}
                           >
-                            {option.label}
+                            对话
                           </Text>
                         </Pressable>
-                      );
-                    })}
-                  </View>
-                  <Text
-                    style={[
-                      styles.kindHelp,
-                      displayedApprovalPolicy === "yolo" && styles.policyDangerHelp,
-                    ]}
-                  >
-                    {managedAgentTerminal && displayedApprovalPolicy === "yolo" ? "终端默认免审批；Codex 同时关闭沙箱。" : approvalPolicyHelp[displayedApprovalPolicy]}
-                  </Text>
-                </>
-              )}
-              {effectiveSessionKind === "structured" && (accountCanPlan || accountCanResume) && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
-                <>
-                  {PLAN_CAPABLE.includes(agent) && accountCanPlan && (
-                    <>
-                      <Text style={[styles.formLabel, styles.kindLabel]}>启动模式</Text>
-                      <View style={styles.kindSwitch} accessibilityRole="tablist">
-                    <Pressable
-                      style={[styles.kindOption, launchMode === "default" && styles.kindOptionActive]}
-                      onPress={() => setLaunchMode("default")}
-                      accessibilityRole="tab"
-                      accessibilityState={{ selected: launchMode === "default" }}
-                    >
-                      <Icon
-                        name="bubble.left.and.text.bubble.right"
-                        size={14}
-                        color={launchMode === "default" ? color.text : color.textDim}
-                      />
-                      <Text
-                        style={[
-                          styles.kindOptionText,
-                          launchMode === "default" && styles.kindOptionTextActive,
-                        ]}
-                      >
-                        执行
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={[styles.kindOption, launchMode === "plan" && styles.kindOptionActive]}
-                      onPress={() => setLaunchMode("plan")}
-                      accessibilityRole="tab"
-                      accessibilityState={{ selected: launchMode === "plan" }}
-                    >
-                      <Icon
-                        name="doc.on.doc"
-                        size={14}
-                        color={launchMode === "plan" ? color.text : color.textDim}
-                      />
-                      <Text
-                        style={[
-                          styles.kindOptionText,
-                          launchMode === "plan" && styles.kindOptionTextActive,
-                        ]}
-                      >
-                        Plan
-                      </Text>
-                    </Pressable>
+                        <Pressable
+                          style={[styles.kindOption, effectiveSessionKind === "pty" && styles.kindOptionActive]}
+                          onPress={() => {
+                            sourceBindingEpoch.current++;
+                            setSessionKind("pty");
+                            setApprovalPolicy("strict");
+                            setLaunchIntent("conversation");
+                            setSelectedResume(null);
+                          }}
+                          disabled={accountRequiresStructured || selectedAccountCapabilities?.sessionKinds.includes("pty") === false}
+                          accessibilityRole="tab"
+                          accessibilityState={{ selected: effectiveSessionKind === "pty", disabled: accountRequiresStructured || selectedAccountCapabilities?.sessionKinds.includes("pty") === false }}
+                          accessibilityLabel="创建终端会话"
+                        >
+                          <Icon
+                            name="terminal"
+                            size={14}
+                            color={effectiveSessionKind === "pty" ? color.text : color.textDim}
+                          />
+                          <Text
+                            style={[
+                              styles.kindOptionText,
+                              effectiveSessionKind === "pty" && styles.kindOptionTextActive,
+                            ]}
+                          >
+                            终端 (Agent TUI)
+                          </Text>
+                        </Pressable>
                       </View>
                       <Text style={styles.kindHelp}>
-                        {launchMode === "plan" ? "先调查、提问并形成计划" : "直接执行任务并允许工具操作"}
+                        {accountRequiresStructured
+                          ? "当前模型或账号仅支持对话会话；使用终端请选择 Claude 或 Codex 订阅 / Responses 模型源"
+                          : effectiveSessionKind === "structured"
+                            ? "消息、工具调用和审批以卡片展示"
+                            : `启动 ${agent} TUI，可直接操作完整终端`}
                       </Text>
                     </>
                   )}
+                  {effectiveSessionKind === "structured" && agent === "deepseek" && launchPresets.length > 0 && (
+                    <>
+                      <Text style={[styles.formLabel, styles.modelEffortLabel]}>Agent 预设</Text>
+                      <View style={styles.chips} accessibilityRole="radiogroup">
+                        {launchPresets.map((preset) => {
+                          const active = selectedLaunchPreset === preset.id;
+                          return (
+                            <Pressable
+                              key={preset.id}
+                              style={[styles.chip, active && styles.chipActive]}
+                              onPress={() => setSelectedLaunchPreset(preset.id)}
+                              accessibilityRole="radio"
+                              accessibilityState={{ checked: active }}
+                              accessibilityLabel={`Agent 预设 ${preset.name}`}
+                            >
+                              <Text style={[styles.chipText, active && styles.chipTextActive]} numberOfLines={1}>
+                                {preset.name}{preset.custom ? " · 自定义" : ""}
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                      {launchPresets.find((preset) => preset.id === selectedLaunchPreset)?.description && (
+                        <Text style={styles.kindHelp} numberOfLines={2}>
+                          {launchPresets.find((preset) => preset.id === selectedLaunchPreset)?.description}
+                        </Text>
+                      )}
+                    </>
+                  )}
+                  {effectiveSessionKind === "structured" &&
+                    launchCatalogAgent &&
+                    conn &&
+                    !conn.supportsSessionCreateModel && (
+                      <>
+                        <Text style={[styles.formLabel, styles.kindLabel]}>模型与推理强度</Text>
+                        <Text style={styles.kindHelp}>
+                          电脑端仍在运行旧版 daemon；重启电脑上的 Prospero 后即可选择。
+                        </Text>
+                      </>
+                    )}
+                  {effectiveSessionKind === "structured" && (
+                    <>
+                      <Text style={[styles.formLabel, styles.kindLabel]}>发起方式</Text>
+                      <View style={styles.kindSwitch} accessibilityRole="tablist">
+                        <Pressable
+                          style={[styles.kindOption, launchIntent === "conversation" && styles.kindOptionActive]}
+                          onPress={() => setLaunchIntent("conversation")}
+                          accessibilityRole="tab"
+                          accessibilityState={{ selected: launchIntent === "conversation" }}
+                        >
+                          <Icon
+                            name="bubble.left.and.text.bubble.right"
+                            size={14}
+                            color={launchIntent === "conversation" ? color.text : color.textDim}
+                          />
+                          <Text style={[styles.kindOptionText, launchIntent === "conversation" && styles.kindOptionTextActive]}>
+                            对话
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={[styles.kindOption, launchIntent === "goal" && styles.kindOptionActive]}
+                          onPress={() => {
+                            setLaunchIntent("goal");
+                            setSelectedResume(null);
+                          }}
+                          accessibilityRole="tab"
+                          accessibilityState={{ selected: launchIntent === "goal" }}
+                          accessibilityLabel="创建 Goal 协调者会话"
+                        >
+                          <Icon
+                            name="command"
+                            size={14}
+                            color={launchIntent === "goal" ? color.text : color.textDim}
+                          />
+                          <Text style={[styles.kindOptionText, launchIntent === "goal" && styles.kindOptionTextActive]}>
+                            Goal
+                          </Text>
+                        </Pressable>
+                      </View>
+                    </>
+                  )}
+                  {(effectiveSessionKind === "structured" || managedAgentTerminal) && (
+                    <>
+                      <Text style={[styles.formLabel, styles.kindLabel]}>审批策略</Text>
+                      <View style={styles.kindSwitch} accessibilityRole="radiogroup">
+                        {APPROVAL_POLICIES.map((option) => {
+                          const active = displayedApprovalPolicy === option.value;
+                          const danger = option.value === "yolo";
+                          return (
+                            <Pressable
+                              key={option.value}
+                              style={[
+                                styles.kindOption,
+                                active && styles.kindOptionActive,
+                                active && danger && styles.policyOptionDangerActive,
+                              ]}
+                              disabled={createDelivery !== null}
+                              onPress={() => {
+                                if (managedAgentTerminal) setTerminalApprovalPolicy(option.value);
+                                else if (danger) setCreateYoloConfirmOpen(true);
+                                else setApprovalPolicy(option.value);
+                              }}
+                              accessibilityRole="radio"
+                              accessibilityState={{ checked: active }}
+                              accessibilityLabel={`审批策略：${option.label}`}
+                              accessibilityHint={approvalPolicyHelp[option.value]}
+                            >
+                              <Icon
+                                name={option.symbol}
+                                size={14}
+                                color={active && danger ? color.danger : active ? color.text : color.textDim}
+                              />
+                              <Text
+                                style={[
+                                  styles.kindOptionText,
+                                  active && styles.kindOptionTextActive,
+                                  active && danger && styles.policyOptionDangerText,
+                                ]}
+                              >
+                                {option.label}
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                      <Text
+                        style={[
+                          styles.kindHelp,
+                          displayedApprovalPolicy === "yolo" && styles.policyDangerHelp,
+                        ]}
+                      >
+                        {managedAgentTerminal && displayedApprovalPolicy === "yolo" ? "终端默认免审批；Codex 同时关闭沙箱。" : approvalPolicyHelp[displayedApprovalPolicy]}
+                      </Text>
+                    </>
+                  )}
+                  {effectiveSessionKind === "structured" && (accountCanPlan || accountCanResume) && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
+                    <>
+                      {PLAN_CAPABLE.includes(agent) && accountCanPlan && (
+                        <>
+                          <Text style={[styles.formLabel, styles.kindLabel]}>启动模式</Text>
+                          <View style={styles.kindSwitch} accessibilityRole="tablist">
+                            <Pressable
+                              style={[styles.kindOption, launchMode === "default" && styles.kindOptionActive]}
+                              onPress={() => setLaunchMode("default")}
+                              accessibilityRole="tab"
+                              accessibilityState={{ selected: launchMode === "default" }}
+                            >
+                              <Icon
+                                name="bubble.left.and.text.bubble.right"
+                                size={14}
+                                color={launchMode === "default" ? color.text : color.textDim}
+                              />
+                              <Text
+                                style={[
+                                  styles.kindOptionText,
+                                  launchMode === "default" && styles.kindOptionTextActive,
+                                ]}
+                              >
+                                执行
+                              </Text>
+                            </Pressable>
+                            <Pressable
+                              style={[styles.kindOption, launchMode === "plan" && styles.kindOptionActive]}
+                              onPress={() => setLaunchMode("plan")}
+                              accessibilityRole="tab"
+                              accessibilityState={{ selected: launchMode === "plan" }}
+                            >
+                              <Icon
+                                name="doc.on.doc"
+                                size={14}
+                                color={launchMode === "plan" ? color.text : color.textDim}
+                              />
+                              <Text
+                                style={[
+                                  styles.kindOptionText,
+                                  launchMode === "plan" && styles.kindOptionTextActive,
+                                ]}
+                              >
+                                Plan
+                              </Text>
+                            </Pressable>
+                          </View>
+                        </>
+                      )}
 
-                  {accountCanResume && <>
-                  <Text style={[styles.formLabel, styles.kindLabel]}>接回本机对话</Text>
-                  <View style={styles.resumeSearch}>
-                    <Icon name="magnifyingglass" size={14} color={color.textDim} />
-                    <TextInput
-                      value={resumeQuery}
-                      onChangeText={(value) => {
-                        setResumeQuery(value);
-                        setSelectedResume(null);
-                        setResumeLoaded(false);
-                      }}
-                      style={styles.resumeInput}
-                      placeholder="搜索标题、提示词或目录"
-                      placeholderTextColor={color.textFaint}
-                      selectionColor={color.accent}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                      clearButtonMode="while-editing"
-                      keyboardAppearance="default"
-                      accessibilityLabel="搜索本机可恢复对话"
-                    />
-                    {resumeLoading && <ActivityIndicator size="small" color={color.accent} />}
-                  </View>
-                  {resumeError && <Text style={styles.resumeError}>{resumeError}</Text>}
-                  {resumeLoaded && !resumeLoading && !resumeError && resumeResults.length === 0 && (
-                    <Text style={styles.resumeEmpty}>
-                      {resumeQuery.trim() ? "没有匹配的本机对话" : "没有找到可恢复的本机对话"}
-                    </Text>
-                  )}
-                  {resumeResults.length > 0 && (
-                    <ScrollView
-                      style={styles.resumeList}
-                      contentContainerStyle={styles.resumeListContent}
-                      nestedScrollEnabled
-                      keyboardShouldPersistTaps="handled"
-                    >
-                      {resumeResults.map((conversation) => {
-                        const selected = selectedResume?.id === conversation.id;
-                        return (
-                          <Pressable
-                            key={conversation.id}
-                            style={({ pressed }) => [
-                              styles.resumeRow,
-                              selected && styles.resumeRowSelected,
-                              pressed && styles.cardPressed,
-                            ]}
-                            onPress={() => {
-                              setSelectedResume(selected ? null : conversation);
-                              if (!selected) {
-                                setCwd(conversation.cwd);
-                                setWorkspacePath("");
-                              }
+                      {accountCanResume && <>
+                        <Text style={[styles.formLabel, styles.kindLabel]}>接回本机对话</Text>
+                        <View style={styles.resumeSearch}>
+                          <Icon name="magnifyingglass" size={14} color={color.textDim} />
+                          <TextInput
+                            value={resumeQuery}
+                            onChangeText={(value) => {
+                              setResumeQuery(value);
+                              setSelectedResume(null);
+                              setResumeLoaded(false);
                             }}
-                            accessibilityRole="button"
-                            accessibilityState={{ selected }}
-                            accessibilityLabel={`恢复对话 ${conversation.title}`}
+                            style={styles.resumeInput}
+                            placeholder="搜索标题、提示词或目录"
+                            placeholderTextColor={color.textFaint}
+                            selectionColor={color.accent}
+                            autoCapitalize="none"
+                            autoCorrect={false}
+                            clearButtonMode="while-editing"
+                            keyboardAppearance="default"
+                            accessibilityLabel="搜索本机可恢复对话"
+                          />
+                          {resumeLoading && <ActivityIndicator size="small" color={color.accent} />}
+                        </View>
+                        {resumeError && <Text style={styles.resumeError}>{resumeError}</Text>}
+                        {resumeLoaded && !resumeLoading && !resumeError && resumeResults.length === 0 && (
+                          <Text style={styles.resumeEmpty}>
+                            {resumeQuery.trim() ? "没有匹配的本机对话" : "没有找到可恢复的本机对话"}
+                          </Text>
+                        )}
+                        {resumeResults.length > 0 && (
+                          <ScrollView
+                            style={styles.resumeList}
+                            contentContainerStyle={styles.resumeListContent}
+                            nestedScrollEnabled
+                            keyboardShouldPersistTaps="handled"
                           >
-                            <View style={styles.resumeCopy}>
-                              <Text style={styles.resumeTitle} numberOfLines={1}>
-                                {conversation.title}
-                              </Text>
-                              {conversation.preview && (
-                                <Text style={styles.resumePreview} numberOfLines={1}>
-                                  {conversation.preview}
-                                </Text>
-                              )}
-                              <Text style={styles.resumeMeta} numberOfLines={1}>
-                                {formatConversationDate(conversation.updatedAt)} · {conversation.cwd}
-                              </Text>
-                            </View>
-                            {selected && (
-                              <Icon name="checkmark.circle.fill" size={17} color={color.accent} />
-                            )}
-                          </Pressable>
-                        );
-                      })}
-                    </ScrollView>
+                            {resumeResults.map((conversation) => {
+                              const selected = selectedResume?.id === conversation.id;
+                              return (
+                                <Pressable
+                                  key={conversation.id}
+                                  style={({ pressed }) => [
+                                    styles.resumeRow,
+                                    selected && styles.resumeRowSelected,
+                                    pressed && styles.cardPressed,
+                                  ]}
+                                  onPress={() => {
+                                    setSelectedResume(selected ? null : conversation);
+                                    if (!selected) {
+                                      setCwd(conversation.cwd);
+                                      setWorkspacePath("");
+                                    }
+                                  }}
+                                  accessibilityRole="button"
+                                  accessibilityState={{ selected }}
+                                  accessibilityLabel={`恢复对话 ${conversation.title}`}
+                                >
+                                  <View style={styles.resumeCopy}>
+                                    <Text style={styles.resumeTitle} numberOfLines={1}>
+                                      {conversation.title}
+                                    </Text>
+                                    {conversation.preview && (
+                                      <Text style={styles.resumePreview} numberOfLines={1}>
+                                        {conversation.preview}
+                                      </Text>
+                                    )}
+                                    <Text style={styles.resumeMeta} numberOfLines={1}>
+                                      {formatConversationDate(conversation.updatedAt)} · {conversation.cwd}
+                                    </Text>
+                                  </View>
+                                  {selected && (
+                                    <Icon name="checkmark.circle.fill" size={17} color={color.accent} />
+                                  )}
+                                </Pressable>
+                              );
+                            })}
+                          </ScrollView>
+                        )}
+                      </>}
+                    </>
                   )}
-                  </>}
-                </>
-              )}
-              {effectiveSessionKind === "structured" && launchIntent === "goal" && (
-                <>
-                  <Text style={[styles.formLabel, styles.kindLabel]}>Goal</Text>
-                  <TextInput
-                    value={goal}
-                    onChangeText={setGoal}
-                    style={styles.goalInput}
-                    placeholder="例如：完成移动端 iOS/Android 适配并验收"
-                    placeholderTextColor={color.textFaint}
-                    selectionColor={color.accent}
-                    multiline
-                    textAlignVertical="top"
-                    autoCorrect
-                    keyboardAppearance="default"
-                    accessibilityLabel="Goal 目标"
-                  />
-                  <Text style={styles.kindHelp}>
-                    {accountRequiresStructured
-                      ? "Goal 会创建新的 OpenCode 协调者会话，不能接回已有原生对话。"
-                      : "Goal 会创建新的协调者会话，不能接回已有原生对话；Claude 和 Codex 会从 Plan 开始。"}
-                  </Text>
-                </>
+                  {effectiveSessionKind === "structured" && launchIntent === "goal" && (
+                    <>
+                      <Text style={[styles.formLabel, styles.kindLabel]}>Goal</Text>
+                      <TextInput
+                        value={goal}
+                        onChangeText={setGoal}
+                        style={styles.goalInput}
+                        placeholder="例如：完成移动端 iOS/Android 适配并验收"
+                        placeholderTextColor={color.textFaint}
+                        selectionColor={color.accent}
+                        multiline
+                        textAlignVertical="top"
+                        autoCorrect
+                        keyboardAppearance="default"
+                        accessibilityLabel="Goal 目标"
+                      />
+                    </>
+                  )}
+                </View>
               )}
             </>
           )}
@@ -1704,7 +2032,7 @@ export default function HostScreen() {
             accessibilityState={{ disabled: runtime.status !== "connected" || createDelivery !== null || sourceBinding, busy: createDelivery !== null || sourceBinding }}
           >
             <View style={styles.createBtnContent}>
-              {createDelivery !== null && <ActivityIndicator size="small" color={color.onAccent} />}
+              {createDelivery !== null && <ActivityIndicator size="small" color={color.bg} />}
               <Text style={styles.createBtnText}>{createButtonLabel}</Text>
             </View>
           </Pressable>
@@ -1800,7 +2128,6 @@ export default function HostScreen() {
           </Text>
         }
         ListFooterComponent={<View>
-          {projects.length > 0 && <Text style={styles.swipeHint}>左滑：项目可新建 · 会话可{showArchived ? "继续或查看历史" : "停止并归档"}</Text>}
           {showArchived && (historyCursor || historyLoading) && <Pressable accessibilityRole="button" disabled={historyLoading} onPress={() => {
             if (!conn || !historyCursor) return;
             setHistoryLoading(true);
@@ -1915,6 +2242,9 @@ export default function HostScreen() {
           onSelect={(selection) => {
             setWorkspacePath(selection.path);
             setCwd(selection.cwd);
+            if (hostId && selection.cwd.trim()) {
+              useWorkspaceConcepts.getState().addWorkspace(hostId, selection.cwd);
+            }
             setManualCwdOpen(false);
             setPickerOpen(false);
           }}
@@ -1934,7 +2264,7 @@ export default function HostScreen() {
           }} />}
         {conn?.supportsAgentAccounts && (
           <SheetAction
-            label="Agent 账号"
+            label="账号与模型源"
             detail="Codex 与 Claude Code 独立登录环境，可共享同一项目目录"
             symbol="square.stack.3d.up"
             onPress={() => {
@@ -1946,7 +2276,7 @@ export default function HostScreen() {
         )}
         {conn?.supportsOrchestrationSnapshot && (
           <SheetAction
-            label="Agent 编排"
+            label="任务编排"
             detail={
               conn.supportsManualOrchestration
                 ? "手工创建 Run、任务依赖并指定 worker"
@@ -2102,7 +2432,6 @@ const SessionRow = memo(function SessionRow({
               : [
                   session.agent,
                   session.accountName,
-                  session.kind === "structured" ? "ChatUI" : "终端",
                 ].filter(Boolean).join(" · ")}
           </Text>
         </Pressable>
@@ -2510,10 +2839,48 @@ const styles = StyleSheet.create({
   },
   newBoxScroll: { flexGrow: 0, maxHeight: "72%" },
   formLabel: { ...font.meta, color: color.textDim, fontWeight: "600" },
+  authSourceCard: {
+    marginTop: space.xs,
+    padding: space.md,
+    gap: 10,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
+  authSourceCardHead: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: space.sm,
+  },
+  authSourceCardTitle: { color: color.text, fontSize: 13.5, fontWeight: "700" },
+  authModeOption: { minHeight: 40 },
   accountLabelRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   accountManage: { color: color.accent, fontSize: 12, fontWeight: "600" },
   accountDot: { width: 7, height: 7, borderRadius: 4 },
   kindLabel: { marginTop: space.xs },
+  advancedToggle: {
+    minHeight: 48,
+    marginTop: space.xs,
+    paddingHorizontal: space.md,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: space.sm,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+  },
+  advancedToggleCopy: { flex: 1, minWidth: 0, gap: 2 },
+  advancedToggleTitle: { color: color.text, fontSize: 13.5, fontWeight: "600" },
+  advancedToggleSummary: { color: color.textDim, fontSize: 11.5 },
+  advancedBody: {
+    gap: space.sm,
+    padding: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+  },
   modelLoading: { flexDirection: "row", alignItems: "center", gap: space.sm, minHeight: 34 },
   modelEffortLabel: { marginTop: 2 },
   kindSwitch: {
@@ -2587,7 +2954,7 @@ const styles = StyleSheet.create({
   resumePreview: { color: color.textDim, fontSize: 11.5 },
   resumeMeta: { color: color.textFaint, fontSize: 10 },
   cwdLabel: { marginTop: space.xs },
-  createBtnText: { color: color.onAccent, fontSize: 15, fontWeight: "700" },
+  createBtnText: { color: color.bg, fontSize: 15, fontWeight: "700" },
   btnDisabled: { opacity: 0.45 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   dim: font.sub,
@@ -2727,12 +3094,12 @@ const styles = StyleSheet.create({
   },
   projectHeaderPressed: { backgroundColor: color.pressed },
   projectIcon: {
-    width: 34,
-    height: 34,
-    borderRadius: 10,
+    width: 30,
+    height: 30,
+    borderRadius: 9,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: color.accentDim,
+    backgroundColor: color.surfaceRaised,
   },
   projectCopy: { flex: 1, gap: 2 },
   projectName: { color: color.text, fontSize: 15, fontWeight: "700" },
@@ -2860,10 +3227,10 @@ const styles = StyleSheet.create({
   manualCwdToggleText: { color: color.accent, fontSize: 12, fontWeight: "600" },
   cwdHelp: { ...font.meta, marginLeft: 2 },
   createBtn: {
-    minHeight: 48,
+    minHeight: 50,
     marginTop: space.xs,
-    backgroundColor: color.accent,
-    borderRadius: radius.md,
+    backgroundColor: color.text,
+    borderRadius: radius.pill,
     alignItems: "center",
     justifyContent: "center",
   },

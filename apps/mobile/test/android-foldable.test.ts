@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 import {
   devicePosture,
   primaryPaneWidth,
+  splitPaneBounds,
+  splitPaneLayout,
   verticalPaneLayout,
   windowWidthClass,
 } from "../src/lib/adaptive-layout-math";
@@ -114,6 +116,100 @@ describe("Android 折叠屏适配", () => {
     });
     expect(primaryPaneWidth(860, panes)).toBe(420);
     expect(primaryPaneWidth(860, null)).toBe(860);
+  });
+
+  it("Z Fold 平展内屏（isSeparating=false）与分离铰链统一启用双栏，窄外屏保持单栏", () => {
+    // Z Fold 平展竖屏 (~704x840) 与横屏 (~880x704): Jetpack WindowManager 报告 isSeparating=false
+    const flatPortrait = splitPaneLayout(704, 840, {
+      bounds: { x: 352, y: 0, width: 0, height: 840 },
+      orientation: "vertical",
+      state: "flat",
+      occlusionType: "none",
+      isSeparating: false,
+    });
+    expect(flatPortrait).toEqual({ start: 268, gap: 1, endStart: 269, end: 435 });
+
+    const flatLandscape = splitPaneLayout(880, 704, {
+      bounds: { x: 0, y: 352, width: 880, height: 0 },
+      orientation: "horizontal",
+      state: "flat",
+      occlusionType: "none",
+      isSeparating: false,
+    });
+    expect(flatLandscape).toEqual({ start: 334, gap: 1, endStart: 335, end: 545 });
+
+    // 半折分离铰链优先遵循物理折痕边界
+    const halfOpened = splitPaneLayout(860, 720, {
+      bounds: { x: 420, y: 0, width: 20, height: 720 },
+      orientation: "vertical",
+      state: "half-opened",
+      occlusionType: "full",
+      isSeparating: true,
+    });
+    expect(halfOpened).toEqual({ start: 420, gap: 20, endStart: 440, end: 420 });
+
+    // Z Fold 外屏竖屏与横屏 (<600dp 宽 或 <420dp 高) 严格保持单栏
+    expect(splitPaneLayout(374, 832, null)).toBeNull();
+    expect(splitPaneLayout(832, 374, null)).toBeNull();
+
+    // 首页、会话、文件、Git、编排页均接入 splitPanes 与可拖动 SplitPaneDivider
+    for (const file of [
+      "src/components/HomeDashboard.tsx",
+      "src/app/host/[hostId]/session/[sid].tsx",
+      "src/app/host/[hostId]/files/[sid].tsx",
+      "src/app/host/[hostId]/git/[sid].tsx",
+      "src/app/host/[hostId]/orchestration.tsx",
+    ]) {
+      const source = readFileSync(join(import.meta.dirname, "..", file), "utf8");
+      expect(source, file).toContain("splitPanes");
+      expect(source, file).toContain("SplitPaneDivider");
+    }
+
+    // 展开状态支持自由拖动边栏比例并自动夹紧两侧可用宽度
+    const bounds = splitPaneBounds(704, 1);
+    expect(bounds).toEqual({ minStart: 220, maxStart: 447 });
+    expect(splitPaneLayout(704, 840, null, { customRatio: 0.31 })).toEqual({
+      start: 220,
+      gap: 1,
+      endStart: 221,
+      end: 483,
+    });
+    expect(splitPaneLayout(704, 840, null, { customRatio: 0.9 })).toEqual({
+      start: 447,
+      gap: 1,
+      endStart: 448,
+      end: 256,
+    });
+    // Z Fold 连续柔性屏（occlusionType="none"）即使 isSeparating=true 也允许用户拖动覆盖折痕位置
+    expect(
+      splitPaneLayout(
+        860,
+        720,
+        {
+          bounds: { x: 420, y: 0, width: 0, height: 720 },
+          orientation: "vertical",
+          state: "half-opened",
+          occlusionType: "none",
+          isSeparating: true,
+        },
+        { customRatio: 0.32 },
+      ),
+    ).toEqual({ start: 275, gap: 8, endStart: 283, end: 577 });
+    // 双物理屏遮挡铰链（occlusionType="full"）仍保持硬件隔离边界
+    expect(
+      splitPaneLayout(
+        860,
+        720,
+        {
+          bounds: { x: 420, y: 0, width: 20, height: 720 },
+          orientation: "vertical",
+          state: "half-opened",
+          occlusionType: "full",
+          isSeparating: true,
+        },
+        { customRatio: 0.32 },
+      ),
+    ).toEqual({ start: 420, gap: 20, endStart: 440, end: 420 });
   });
 
   it("新建页宽屏双栏首帧使用显式等宽约束", () => {

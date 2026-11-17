@@ -1,6 +1,7 @@
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import type { ComponentProps } from "react";
 import { Platform, Text, type StyleProp, type TextStyle } from "react-native";
+import Svg, { Path } from "react-native-svg";
 import { SymbolView, type SymbolViewProps } from "expo-symbols";
 import { useMobileTheme } from "@/lib/theme";
 
@@ -53,7 +54,12 @@ export type IconName =
   | "speedometer"
   | "arrow.triangle.branch"
   | "arrow.up.left.and.arrow.down.right"
-  | "arrow.down.right.and.arrow.up.left";
+  | "arrow.down.right.and.arrow.up.left"
+  | "pin"
+  | "pin.fill"
+  | "folder.badge.plus"
+  | "tray.fill"
+  | "arrow.up.arrow.down";
 
 const FALLBACK: Record<IconName, string> = {
   magnifyingglass: "🔍",
@@ -69,7 +75,7 @@ const FALLBACK: Record<IconName, string> = {
   xmark: "×",
   "stop.circle": "■",
   trash: "🗑",
-  terminal: "TTY",
+  terminal: ">_",
   "bubble.left.and.text.bubble.right": "💬",
   "ellipsis.circle": "⋯",
   "doc.on.doc": "复制",
@@ -88,7 +94,7 @@ const FALLBACK: Record<IconName, string> = {
   "checkmark.circle.fill": "✓",
   "xmark.circle.fill": "✕",
   "exclamationmark.triangle.fill": "⚠︎",
-  "terminal.fill": "TTY",
+  "terminal.fill": ">_",
   command: "⌘",
   "point.3.connected.trianglepath.dotted": "⌘",
   "square.stack.3d.up": "▱",
@@ -97,6 +103,11 @@ const FALLBACK: Record<IconName, string> = {
   "arrow.triangle.branch": "⑂",
   "arrow.up.left.and.arrow.down.right": "⤢",
   "arrow.down.right.and.arrow.up.left": "⤡",
+  pin: "📌",
+  "pin.fill": "📌",
+  "folder.badge.plus": "＋",
+  "tray.fill": "📥",
+  "arrow.up.arrow.down": "⇅",
 };
 
 type MaterialIconName = ComponentProps<typeof MaterialIcons>["name"];
@@ -143,6 +154,11 @@ const ANDROID_ICON: Record<IconName, MaterialIconName> = {
   "arrow.triangle.branch": "call-split",
   "arrow.up.left.and.arrow.down.right": "open-in-full",
   "arrow.down.right.and.arrow.up.left": "close-fullscreen",
+  pin: "push-pin",
+  "pin.fill": "push-pin",
+  "folder.badge.plus": "create-new-folder",
+  "tray.fill": "inbox",
+  "arrow.up.arrow.down": "swap-vert",
 };
 
 export function Icon({
@@ -174,6 +190,25 @@ export function Icon({
   }
 
   if (Platform.OS === "android") {
+    if (name === "terminal" || name === "terminal.fill") {
+      const strokeWidth = name === "terminal.fill" ? 2.05 : 1.85;
+      return (
+        <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+          <Path
+            d="M3.75 6.25A2.25 2.25 0 0 1 6 4h12a2.25 2.25 0 0 1 2.25 2.25v11.5A2.25 2.25 0 0 1 18 20H6a2.25 2.25 0 0 1-2.25-2.25V6.25Z"
+            stroke={color}
+            strokeWidth={strokeWidth}
+          />
+          <Path
+            d="M7.75 9.5L10.75 12L7.75 14.5M12.5 14.75H16"
+            stroke={color}
+            strokeWidth={strokeWidth + 0.1}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </Svg>
+      );
+    }
     return (
       <MaterialIcons
         name={ANDROID_ICON[name]}

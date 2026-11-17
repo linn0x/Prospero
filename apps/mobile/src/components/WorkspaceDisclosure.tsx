@@ -1,20 +1,43 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { AccessibilityInfo, Animated, Easing, StyleSheet, View, useAnimatedValue } from "react-native";
+import * as RN from "react-native";
+import { AccessibilityInfo, Animated, StyleSheet, View, useAnimatedValue } from "react-native";
 import { Icon } from "./Icon";
 import Svg, { Path } from "react-native-svg";
 
-/** Measure intrinsic content while animating its clip height, so following rows move with it. */
+function animateNextLayout(): void {
+  const layoutAnim = "LayoutAnimation" in RN ? RN.LayoutAnimation : undefined;
+  if (typeof layoutAnim?.configureNext !== "function") return;
+  layoutAnim.configureNext({
+    duration: 210,
+    create: {
+      type: layoutAnim.Types.easeInEaseOut,
+      property: layoutAnim.Properties.opacity,
+    },
+    update: {
+      type: layoutAnim.Types.spring,
+      springDamping: 0.86,
+    },
+    delete: {
+      duration: 150,
+      type: layoutAnim.Types.easeInEaseOut,
+      property: layoutAnim.Properties.opacity,
+    },
+  });
+}
+
+/**
+ * Native 120fps disclosure: chevron + opacity run on RenderThread/CoreAnimation
+ * (`useNativeDriver: true`), while Fabric's native LayoutAnimation moves sibling rows
+ * without JS-thread height thrashing or absolute double-layout passes.
+ */
 export function WorkspaceDisclosure({ expanded, header, children }: {
   expanded: boolean;
   header: (progress: Animated.Value) => ReactNode;
   children: ReactNode;
 }) {
   const progress = useAnimatedValue(expanded ? 1 : 0);
-  const height = useAnimatedValue(0);
-  const [contentHeight, setContentHeight] = useState(0);
-  const [retained, setRetained] = useState(expanded);
   const [reduceMotion, setReduceMotion] = useState(false);
-  const expandedRef = useRef(expanded);
+  const prevExpanded = useRef(expanded);
 
   useEffect(() => {
     let active = true;
@@ -24,30 +47,47 @@ export function WorkspaceDisclosure({ expanded, header, children }: {
   }, []);
 
   useLayoutEffect(() => {
-    expandedRef.current = expanded;
-    let active = true;
-    const options = { duration: reduceMotion ? 0 : 200, easing: Easing.out(Easing.cubic), useNativeDriver: false };
-    const animation = Animated.parallel([
-      Animated.timing(progress, { ...options, toValue: expanded ? 1 : 0 }),
-      Animated.timing(height, { ...options, toValue: expanded ? contentHeight : 0 }),
-    ]);
-    animation.start(({ finished }) => {
-      if (active && finished && !expandedRef.current) setRetained(false);
+    const toggled = prevExpanded.current !== expanded;
+    prevExpanded.current = expanded;
+    if (toggled && !reduceMotion) {
+      animateNextLayout();
+    }
+    if (reduceMotion) {
+      progress.setValue(expanded ? 1 : 0);
+      return;
+    }
+    const animation = Animated.spring(progress, {
+      toValue: expanded ? 1 : 0,
+      damping: 26,
+      stiffness: 340,
+      mass: 0.75,
+      useNativeDriver: true,
     });
-    return () => { active = false; animation.stop(); };
-  }, [contentHeight, expanded, height, progress, reduceMotion]);
+    animation.start();
+    return () => animation.stop();
+  }, [expanded, progress, reduceMotion]);
 
   return <>
     {header(progress)}
-    <Animated.View testID="workspace-disclosure" style={[styles.clip, { height, opacity: progress }]}
-      pointerEvents={expanded ? "auto" : "none"} accessibilityElementsHidden={!expanded}
-      importantForAccessibility={expanded ? "auto" : "no-hide-descendants"}>
-      {(expanded || retained) && <View style={styles.content}
-        onLayout={({ nativeEvent }) => {
-          setContentHeight(nativeEvent.layout.height);
-          if (expandedRef.current) setRetained(true);
-        }}>{children}</View>}
-    </Animated.View>
+    {expanded ? (
+      <Animated.View
+        testID="workspace-disclosure"
+        style={[
+          styles.clip,
+          {
+            opacity: progress,
+            transform: [{
+              translateY: progress.interpolate({
+                inputRange: [0, 1],
+                outputRange: [-6, 0],
+              }),
+            }],
+          },
+        ]}
+      >
+        {children}
+      </Animated.View>
+    ) : null}
   </>;
 }
 
@@ -74,5 +114,4 @@ export function WorkspaceChevron({ progress, size, color }: { progress: Animated
 
 const styles = StyleSheet.create({
   clip: { overflow: "hidden" },
-  content: { position: "absolute", top: 0, left: 0, right: 0 },
 });

@@ -10,7 +10,12 @@ import { toast } from "@/components/Toast";
 import { Icon } from "@/components/Icon";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { DismissedModalAction } from "@/lib/host-screen-flow";
-import { supportsRemoteTerminal, REMOTE_TERMINAL_UNAVAILABLE } from "@/lib/terminal-session";
+import {
+  isShellTerminal,
+  isTerminalEnded,
+  supportsRemoteTerminal,
+  REMOTE_TERMINAL_UNAVAILABLE,
+} from "@/lib/terminal-session";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { dropConnection, getConnection, peekConnection, wireAppStateReconnect } from "@/lib/connection";
 import { selectedEdgeHosts, useEdgePreferences } from "@/lib/edge-preferences";
@@ -91,6 +96,18 @@ export default function HostsScreen() {
     const candidates = mode === "edge" ? edgeHosts : hosts.filter((host) => host.id === effectiveSelectedHostId);
     return candidates.filter((host) => supportsRemoteTerminal(runtimes[host.id]?.hostInfo));
   }, [mode, edgeHosts, hosts, effectiveSelectedHostId, runtimes]);
+  const activeTerminalCount = useMemo(
+    () =>
+      terminalHosts.reduce(
+        (count, host) =>
+          count +
+          Object.values(runtimes[host.id]?.sessions ?? {}).filter(
+            (session) => isShellTerminal(session) && !isTerminalEnded(session),
+          ).length,
+        0,
+      ),
+    [runtimes, terminalHosts],
+  );
   const selectedConnection = mode === "normal" && effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
   const orchestration = useOrchestrationSnapshot(
     selectedConnection,
@@ -209,24 +226,35 @@ export default function HostsScreen() {
           headerTitle: () => <HomeModeTitle edge={mode === "edge"} onToggle={toggleMode} />,
           headerRight: () => (
             <View style={styles.headerActions}>
-              {terminalHosts.length > 0 && <Pressable accessibilityRole="button" accessibilityLabel="远程终端"
-                accessibilityHint="打开设备的 Shell 终端，可新建或返回已有终端"
-                onPress={openTerminal} style={styles.headerButton}>
-                <Icon name="terminal" size={21} color={palette.accent} />
-              </Pressable>}
+              {terminalHosts.length > 0 && (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="远程终端"
+                  accessibilityHint={
+                    activeTerminalCount > 0
+                      ? `当前有 ${String(activeTerminalCount)} 个运行中的终端，点击打开或新建`
+                      : "打开设备的 Shell 终端，可新建或返回已有终端"
+                  }
+                  onPress={openTerminal}
+                  style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
+                >
+                  <Icon name="terminal" size={17} color={palette.text} />
+                  {activeTerminalCount > 0 && <View style={styles.headerLiveDot} />}
+                </Pressable>
+              )}
               {effectiveSelectedHostId !== null && (
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel="Agent 编排"
-                  accessibilityHint={mode === "edge" ? "打开所选设备的 Agent 编排，多台设备时在设备卡片中选择" : "打开当前设备的 Agent 编排页面"}
+                  accessibilityLabel="任务编排"
+                  accessibilityHint={mode === "edge" ? "打开所选电脑的任务编排，多台电脑时在卡片中选择" : "打开当前电脑的任务编排页面"}
                   accessibilityState={{ expanded: mode === "edge" && choosingEdgeOrchestration }}
                   onPress={openOrchestration}
-                  style={styles.headerButton}
+                  style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
                 >
                   <Icon
                     name="point.3.connected.trianglepath.dotted"
-                    size={21}
-                    color={palette.accent}
+                    size={17}
+                    color={palette.text}
                   />
                 </Pressable>
               )}
@@ -235,9 +263,9 @@ export default function HostsScreen() {
                 accessibilityLabel="设置"
                 accessibilityHint="打开应用、首页和设备连接设置"
                 onPress={() => router.push("/settings")}
-                style={styles.headerButton}
+                style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
               >
-                <Icon name="gearshape.fill" size={20} color={palette.accent} />
+                <Icon name="gearshape.fill" size={17} color={palette.text} />
               </Pressable>
             </View>
           ),
@@ -303,11 +331,13 @@ export default function HostsScreen() {
           hosts={hosts}
           runtimes={runtimes}
           selectedHostId={effectiveSelectedHostId}
+          connection={selectedConnection}
           devicePickerOpen={devicePickerOpen}
           bottomInset={insets.bottom}
           onToggleDevicePicker={onToggleDevicePicker}
           onCloseDevicePicker={closeDevicePicker}
           managedWorkspacePaths={managedWorkspacePaths}
+          worktreeAssets={orchestration?.worktreeAssets}
           onSelectHost={onSelectHost}
           onOpenHost={(hostId) => router.push(`/host/${hostId}`)}
           onOpenSession={(hostId, sessionId) =>
@@ -333,11 +363,17 @@ export default function HostsScreen() {
               params: { hostId, quickCreate: "directory" },
             })
           }
+          onOpenTerminals={(hostId, cwd) =>
+            router.push({
+              pathname: "/host/[hostId]/terminals",
+              params: { hostId, ...(cwd ? { cwd } : {}) },
+            })
+          }
           homeSettings={homeSettings}
           onChangeHomeSettings={onChangeHomeSettings}
         />
       )}
-      <Sheet visible={terminalPickerOpen} title="选择终端设备"
+      <Sheet visible={terminalPickerOpen} title="选择终端电脑"
         onClose={() => { terminalNavigation.cancel(); setTerminalPickerOpen(false); }}
         onDismiss={() => terminalNavigation.dismiss()}>
         {terminalHosts.map((host) => <SheetAction key={host.id} label={host.name} symbol="terminal"
@@ -356,8 +392,29 @@ function createStyles(palette: ThemePalette) {
   };
   return StyleSheet.create({
   container: { flex: 1, backgroundColor: palette.bg },
-  headerActions: { flexDirection: "row", alignItems: "center", gap: 2 },
-  headerButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: 6 },
+  headerButton: {
+    width: 36,
+    height: 36,
+    borderRadius: radius.pill,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: palette.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.border,
+  },
+  headerLiveDot: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: palette.success,
+    borderWidth: 1.5,
+    borderColor: palette.surface,
+  },
+  headerButtonPressed: { backgroundColor: palette.pressed },
   emptyScroll: { flex: 1 },
   emptyWrap: { alignItems: "center", gap: space.md },
   emptyTitle: { ...themedFont.title, textAlign: "center" },
@@ -378,10 +435,10 @@ function createStyles(palette: ThemePalette) {
     marginTop: space.sm,
     paddingHorizontal: space.xl,
     paddingVertical: space.md,
-    borderRadius: radius.md,
-    backgroundColor: palette.accentDim,
+    borderRadius: radius.pill,
+    backgroundColor: palette.text,
   },
-  ctaPressed: { backgroundColor: palette.pressed },
-  ctaText: { color: palette.text, fontSize: 15, fontWeight: "600", textAlign: "center" },
+  ctaPressed: { opacity: 0.84 },
+  ctaText: { color: palette.bg, fontSize: 15, fontWeight: "700", textAlign: "center" },
   });
 }

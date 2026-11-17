@@ -18,6 +18,7 @@ import type { GitFile } from "@prospero/protocol";
 import { DismissKey } from "@/components/DismissKey";
 import { DiffView } from "@/components/DiffView";
 import { Icon } from "@/components/Icon";
+import { SplitPaneDivider } from "@/components/SplitPaneDivider";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { toast } from "@/components/Toast";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
@@ -158,17 +159,13 @@ export default function GitScreen(): React.ReactElement {
 
   const staged = files.filter((f) => f.index !== " " && f.index !== "?");
   const unstaged = files.filter((f) => f.index === " " || f.index === "?");
-  const splitLayout =
-    adaptiveLayout.verticalPanes !== null ||
-    (adaptiveLayout.width >= 840 && adaptiveLayout.height >= 480);
+  const splitLayout = Boolean(adaptiveLayout.splitPanes);
   const filePaneWidth =
-    adaptiveLayout.verticalPanes?.start ??
-    Math.min(380, Math.max(300, adaptiveLayout.width * 0.38));
+    adaptiveLayout.splitPanes?.start ?? adaptiveLayout.width;
   const detailPaneWidth =
-    adaptiveLayout.verticalPanes?.end ??
-    adaptiveLayout.width - filePaneWidth - StyleSheet.hairlineWidth;
+    adaptiveLayout.splitPanes?.end ?? adaptiveLayout.width;
   const splitGap =
-    adaptiveLayout.verticalPanes?.gap ?? StyleSheet.hairlineWidth;
+    adaptiveLayout.splitPanes?.gap ?? StyleSheet.hairlineWidth;
   const commitBarPadding = getGitCommitBarPadding(insets);
 
   return (
@@ -260,7 +257,11 @@ export default function GitScreen(): React.ReactElement {
               return (
                 <SwipeRow actions={actions}>
                   <Pressable
-                    style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+                    style={({ pressed }) => [
+                      styles.row,
+                      openPath === item.path && styles.rowSelected,
+                      pressed && styles.rowPressed,
+                    ]}
                     onPress={() => void openDiff(item)}
                   >
                     <Text style={[styles.badge, isStaged ? styles.badgeStaged : styles.badgeDirty]}>
@@ -276,9 +277,16 @@ export default function GitScreen(): React.ReactElement {
           />
         </View>
         {splitLayout && (
-          <View
-            style={[styles.gitFoldGutter, { width: splitGap }]}
-            pointerEvents="none"
+          <SplitPaneDivider
+            label="拖动调整变更文件栏宽度"
+            value={filePaneWidth}
+            min={adaptiveLayout.splitBounds?.minStart ?? 204}
+            max={adaptiveLayout.splitBounds?.maxStart ?? 440}
+            gap={splitGap}
+            disabled={adaptiveLayout.splitResizable === false}
+            onChange={adaptiveLayout.setSplitStart}
+            onCommit={adaptiveLayout.commitSplitStart}
+            onReset={adaptiveLayout.resetSplitStart}
           />
         )}
         <View
@@ -381,6 +389,7 @@ const styles = StyleSheet.create({
     borderBottomColor: color.border,
   },
   rowPressed: { backgroundColor: color.pressed },
+  rowSelected: { backgroundColor: color.accentBg },
   badge: {
     width: 22,
     textAlign: "center",

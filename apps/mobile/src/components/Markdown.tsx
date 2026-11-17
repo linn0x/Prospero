@@ -360,21 +360,21 @@ function Spans({
 }
 
 const useStyles = createThemedStyles((color) => StyleSheet.create({
-  root: { gap: 6 },
-  body: { color: color.text, fontSize: 15, lineHeight: 22 },
+  root: { gap: 8 },
+  body: { color: color.text, fontSize: 15.5, lineHeight: 24 },
   bold: { fontWeight: "700" },
   italic: { fontStyle: "italic" },
-  heading: { color: color.text, fontSize: 17, fontWeight: "700", lineHeight: 24, marginTop: 2 },
-  headingSmall: { fontSize: 15 },
-  mathHeading: { marginTop: 2 },
+  heading: { color: color.text, fontSize: 17.5, fontWeight: "700", letterSpacing: -0.3, lineHeight: 25, marginTop: 4 },
+  headingSmall: { fontSize: 15.5 },
+  mathHeading: { marginTop: 4 },
   bulletRow: { flexDirection: "row", gap: 8, paddingLeft: 2 },
-  bulletMark: { color: color.accent, fontSize: 15, lineHeight: 22, minWidth: 14 },
+  bulletMark: { color: color.textFaint, fontSize: 15.5, lineHeight: 24, minWidth: 14 },
   mathBulletBody: { flex: 1 },
   inlineCode: {
     fontFamily: MONOSPACE_FONT,
     fontSize: 13,
-    color: color.success,
-    backgroundColor: color.successBg,
+    color: color.text,
+    backgroundColor: color.surfaceRaised,
   },
   fileReference: {
     color: color.accent,

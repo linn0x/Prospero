@@ -16,44 +16,44 @@ export const MONOSPACE_FONT = Platform.OS === "ios" ? "Menlo" : "monospace";
  */
 export const darkColor = {
   bg: "#0B0D12",
-  surface: "#151820",
-  surfaceRaised: "#20242D",
-  pressed: "#2A303B",
-  border: "#343A46",
+  surface: "#14171F",
+  surfaceRaised: "#1D212B",
+  pressed: "#262B38",
+  border: "#232834",
   text: "#F5F7FA",
-  textDim: "#C1C7D0",
-  textFaint: "#929BA8",
+  textDim: "#B8C0CC",
+  textFaint: "#8E97A6",
   accent: "#7EA7FF",
-  accentDim: "#294A82",
+  accentDim: "#26457A",
   onAccent: "#071224",
-  success: "#5BC98C",
-  warn: "#E5A341",
-  danger: "#EF5F5F",
-  successBg: "#16301F",
-  warnBg: "#33270F",
-  dangerBg: "#3A1A1A",
-  accentBg: "#17203A",
+  success: "#52D18E",
+  warn: "#F2AC42",
+  danger: "#F56B6B",
+  successBg: "#122B1D",
+  warnBg: "#2E220D",
+  dangerBg: "#351719",
+  accentBg: "#162038",
 } as const;
 
 export const lightColor: { [Key in keyof typeof darkColor]: string } = {
   bg: "#F2F4F7",
   surface: "#FFFFFF",
-  surfaceRaised: "#E8ECF2",
-  pressed: "#DCE2EA",
-  border: "#C4CBD5",
-  text: "#11151B",
-  textDim: "#404957",
-  textFaint: "#667180",
-  accent: "#315EA8",
-  accentDim: "#D7E3F8",
+  surfaceRaised: "#EEF0F5",
+  pressed: "#E4E7EE",
+  border: "#E2E5EC",
+  text: "#0F141C",
+  textDim: "#475262",
+  textFaint: "#5E6978",
+  accent: "#2454CC",
+  accentDim: "#DAE5FF",
   onAccent: "#FFFFFF",
-  success: "#1E7049",
-  warn: "#87530A",
-  danger: "#AD3030",
-  successBg: "#DDF1E7",
-  warnBg: "#F7E8CC",
-  dangerBg: "#F8DEDE",
-  accentBg: "#E4ECFB",
+  success: "#147247",
+  warn: "#945200",
+  danger: "#B42323",
+  successBg: "#E3F6EC",
+  warnBg: "#FEF2DE",
+  dangerBg: "#FDECEC",
+  accentBg: "#EDF2FF",
 };
 
 export type ThemePalette = { [Key in keyof typeof darkColor]: string };
@@ -165,16 +165,17 @@ export const space = {
 } as const;
 
 export const radius = {
-  sm: 8,
-  md: 12,
-  lg: 18,
+  sm: 10,
+  md: 14,
+  lg: 22,
+  pill: 999,
 } as const;
 
 export const font = {
-  title: { fontSize: 20, fontWeight: "700" as const, color: color.text },
+  title: { fontSize: 19, fontWeight: "700" as const, letterSpacing: -0.3, color: color.text },
   body: { fontSize: 15, fontWeight: "500" as const, color: color.text },
-  sub: { fontSize: 13, color: color.textDim },
-  meta: { fontSize: 11, color: color.textFaint },
+  sub: { fontSize: 13, lineHeight: 18, color: color.textDim },
+  meta: { fontSize: 11.5, color: color.textFaint },
   mono: { fontFamily: MONOSPACE_FONT, fontSize: 12, color: color.text },
 } as const;
 
@@ -191,11 +192,11 @@ export function fontForPalette(palette: ThemePalette) {
 /** 会话/连接状态到颜色 —— 全 App 一套。 */
 export function statusColors(palette: ThemePalette): Record<string, string> {
   return {
-    running: palette.warn,
-    starting: palette.warn,
+    running: palette.success,
+    starting: palette.success,
     waiting_approval: palette.warn,
     waiting_input: palette.accent,
-    idle: palette.accent,
+    idle: palette.textFaint,
     completed: palette.success,
     done: palette.textFaint,
     died: palette.danger,

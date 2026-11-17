@@ -12,7 +12,32 @@ export interface VerticalPaneLayout {
   end: number;
 }
 
+export interface SplitPaneOptions {
+  minWidth?: number;
+  minHeight?: number;
+  startRatio?: number;
+  /** User-dragged ratio; overrides default clamping and non-occluded creases. */
+  customRatio?: number;
+  minStart?: number;
+  maxStart?: number;
+}
+
 const MIN_USABLE_PANE = 240;
+const MIN_DRAGGABLE_START = 220;
+const MIN_DRAGGABLE_END = 256;
+
+export function splitPaneBounds(
+  width: number,
+  gap = 1,
+): { minStart: number; maxStart: number } {
+  if (!Number.isFinite(width) || width <= 0) {
+    return { minStart: MIN_DRAGGABLE_START, maxStart: MIN_DRAGGABLE_START };
+  }
+  const available = Math.max(0, width - Math.max(1, gap));
+  const minStart = Math.min(MIN_DRAGGABLE_START, Math.floor(available * 0.45));
+  const maxStart = Math.max(minStart, available - MIN_DRAGGABLE_END);
+  return { minStart, maxStart };
+}
 
 export function windowWidthClass(width: number): WindowWidthClass {
   if (width < 600) return "compact";
@@ -57,6 +82,59 @@ export function verticalPaneLayout(
   const gap = Math.max(8, physicalGap);
   const endStart = Math.min(width, start + gap);
   const end = Math.max(0, width - endStart);
+  if (start < MIN_USABLE_PANE || end < MIN_USABLE_PANE) return null;
+  return { start, gap, endStart, end };
+}
+
+/**
+ * Unified dual-pane geometry for foldables (both flat unfolded Z Fold where
+ * `isSeparating === false` and half-opened separating hinges) and tablets.
+ * Compact phones and narrow foldable cover screens (<600dp or <420dp tall) return `null`.
+ */
+export function splitPaneLayout(
+  width: number,
+  height: number,
+  feature: FoldingFeatureInfo | null,
+  options?: SplitPaneOptions,
+): VerticalPaneLayout | null {
+  const customRatio = options?.customRatio;
+  const hasCustomRatio = customRatio !== undefined && Number.isFinite(customRatio);
+  const physical = verticalPaneLayout(width, feature, height);
+  // Only a physically occluded dual-screen hinge forces fixed hardware columns;
+  // continuous flexible OLED panels (Galaxy Z Fold) stay freely resizable.
+  if (physical !== null && (!hasCustomRatio || feature?.occlusionType === "full")) {
+    return physical;
+  }
+
+  const minWidth = options?.minWidth ?? 600;
+  const minHeight = options?.minHeight ?? 420;
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width < minWidth ||
+    height < minHeight
+  ) {
+    return null;
+  }
+
+  const gap = physical ? physical.gap : 1;
+  if (hasCustomRatio) {
+    const bounds = splitPaneBounds(width, gap);
+    const start = Math.round(
+      Math.min(bounds.maxStart, Math.max(bounds.minStart, width * customRatio)),
+    );
+    const endStart = start + gap;
+    const end = Math.max(0, width - endStart);
+    if (start < MIN_DRAGGABLE_START || end < MIN_USABLE_PANE) return null;
+    return { start, gap, endStart, end };
+  }
+
+  const ratio = options?.startRatio ?? 0.38;
+  const minStart = options?.minStart ?? 256;
+  const maxStart = options?.maxStart ?? 380;
+  const start = Math.round(Math.min(maxStart, Math.max(minStart, width * ratio)));
+  const endStart = start + gap;
+  const end = width - endStart;
   if (start < MIN_USABLE_PANE || end < MIN_USABLE_PANE) return null;
   return { start, gap, endStart, end };
 }

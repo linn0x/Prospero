@@ -4,6 +4,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  InteractionManager,
   Keyboard,
   Platform,
   Pressable,
@@ -14,6 +15,7 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
+import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import * as Linking from "expo-linking";
 import { StatusBar } from "expo-status-bar";
@@ -37,6 +39,7 @@ import type {
   ChatDelivery,
   ChatSuggestion,
   ChatSuggestionKind,
+  OrchestrationWorktreeAsset,
   S2CMessage,
   SessionInfo,
   SubagentInfo,
@@ -56,11 +59,12 @@ import { isShellTerminal, isTerminalEnded, supportsRemoteTerminal, REMOTE_TERMIN
 import { DismissKey } from "@/components/DismissKey";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
-import { KeyBar } from "@/components/KeyBar";
+import { KeyBar, type KeyBarHandle } from "@/components/KeyBar";
 import { PerfHud } from "@/components/PerfHud";
 import { QuickReplies } from "@/components/QuickReplies";
 import { SessionQuickPanel } from "@/components/SessionQuickPanel";
-import { Terminal, type TerminalHandle } from "@/components/Terminal";
+import { SplitPaneDivider } from "@/components/SplitPaneDivider";
+import { Terminal, type TerminalExtractedText, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
 import { setSensorRotation, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import {
@@ -80,7 +84,17 @@ import {
   setPerfHudEnabled,
   type TerminalPerf,
 } from "@/lib/perf-hud";
-import { sortSessions } from "@/lib/store";
+import { sortSessions, useApp } from "@/lib/store";
+import { DEFAULT_HOME_SETTINGS, workspaceAliasKey } from "@/lib/home-preferences";
+import { groupSessionsByProject } from "@/lib/session-projects";
+import { WorkspaceFolderIcon } from "@/components/WorkspaceDisclosure";
+import {
+  buildAlignedWorkspaceTree,
+  desktopSidebarSessionLabel,
+  sortWorkspaceSessions,
+  useHydratedWorkspaceConcepts,
+  workspacePathKey,
+} from "@/lib/workspace-concepts";
 import { recentSessions } from "@/lib/recent-sessions";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { coordinatorRunsBySession, orchestrationRoute } from "@/lib/orchestration-overview";
@@ -222,7 +236,6 @@ function SessionHeaderTitle({
   const elapsed = useElapsed(
     busy || session?.status === "waiting_approval" ? session?.busySince : undefined,
   );
-  const totals = session?.totals;
   const parts = session
     ? subagent
       ? [session.agent, "子 Agent", subagentStatusText[subagent.status], pending > 0 ? `${String(pending)} 项待处理` : ""]
@@ -232,18 +245,14 @@ function SessionHeaderTitle({
         session.accountName ?? "",
         `${shellTerminal && !isTerminalEnded(session) ? "终端已打开" : statusText[session.status]}${elapsed ? ` ${elapsed}` : ""}`,
         pending > 0 ? `${String(pending)} 项待处理` : "",
-        session.messageQueue?.length
-          ? `${String(session.messageQueue.length)} 条排队`
-          : "",
-        totals && totals.costUsd > 0 ? `$${totals.costUsd.toFixed(3)}` : "",
-        tightest ? `${tightest.label} ${String(Math.round(tightest.utilization))}%` : "",
+        tightest && tightest.utilization >= 80 ? `${tightest.label} ${String(Math.round(tightest.utilization))}%` : "",
         ].filter(Boolean)
     : [];
 
   const Container = onSwitch ? Pressable : View;
   return (
     <Container
-      style={[styles.headerTitle, { maxWidth: Math.max(60, Math.min(width >= 600 ? 380 : 238, width - 244)) }]}
+      style={[styles.headerTitle, { maxWidth: Math.max(100, Math.min(width >= 600 ? 440 : 290, width - 160)) }]}
       {...(onSwitch
         ? {
             onPress: onSwitch,
@@ -367,73 +376,234 @@ function SessionSwitcherSheet({
   );
 }
 
+let cachedTerminalFontPreference: TerminalFontPreference | null = null;
+
+const NO_RAIL_WORKTREE_ASSETS: readonly OrchestrationWorktreeAsset[] = [];
+
 function FoldableSessionRail({
   sessions,
   currentId,
   hostId,
   width,
+  isSubagent = false,
+  worktreeAssets = NO_RAIL_WORKTREE_ASSETS,
 }: {
   sessions: readonly SessionInfo[];
   currentId: string;
   hostId: string;
   width: number;
+  isSubagent?: boolean;
+  worktreeAssets?: readonly OrchestrationWorktreeAsset[];
 }) {
   const styles = useStyles();
   const { palette: color } = useMobileTheme();
   const statusColor = statusColors(color);
+  const workspaceAliases = useApp(
+    (state) => state.homeSettings?.workspaceAliases ?? DEFAULT_HOME_SETTINGS.workspaceAliases,
+  );
+  const {
+    savedWorkspaces,
+    pinnedWorkspaces,
+    pinnedSessions,
+    workspaceSort,
+  } = useHydratedWorkspaceConcepts();
+
+  const visibleSessions = useMemo(
+    () => sessions.filter((item) => item.archived !== true || item.id === currentId),
+    [currentId, sessions],
+  );
+  const currentSession = useMemo(
+    () => visibleSessions.find((item) => item.id === currentId),
+    [currentId, visibleSessions],
+  );
+  const pinnedSet = useMemo(
+    () => new Set(pinnedSessions[hostId] ?? []),
+    [hostId, pinnedSessions],
+  );
+  const pinnedList = useMemo(
+    () => sortWorkspaceSessions(visibleSessions.filter((s) => pinnedSet.has(s.id)), pinnedSet),
+    [pinnedSet, visibleSessions],
+  );
+  const displayNameFor = useCallback(
+    (path: string, fallback: string) =>
+      workspaceAliases[workspaceAliasKey(hostId, path)] ?? fallback,
+    [hostId, workspaceAliases],
+  );
+  const { workspaces, childTaskWorkspacesByKey, orphanTaskWorkspaces } = useMemo(
+    () =>
+      buildAlignedWorkspaceTree({
+        projects: groupSessionsByProject(visibleSessions),
+        savedPaths: savedWorkspaces[hostId] ?? [],
+        pinnedPaths: pinnedWorkspaces[hostId] ?? [],
+        worktreeAssets,
+        sortMode: workspaceSort,
+        displayNameFor,
+      }),
+    [displayNameFor, hostId, pinnedWorkspaces, savedWorkspaces, visibleSessions, workspaceSort, worktreeAssets],
+  );
+
+  const [collapsedKeys, setCollapsedKeys] = useState<Set<string>>(() => new Set());
+  const currentWorkspaceKey = currentSession ? workspacePathKey(currentSession.cwd) : "";
+
+  const selectSession = (targetId: string): void => {
+    if (isSubagent) {
+      router.replace({
+        pathname: "/host/[hostId]/session/[sid]",
+        params: { hostId, sid: targetId },
+      });
+      return;
+    }
+    router.setParams({ sid: targetId });
+  };
+
+  const renderRailSession = (item: SessionInfo, showFolder = false) => {
+    const selected = !isSubagent && item.id === currentId;
+    const label = desktopSidebarSessionLabel(item);
+    const folder = item.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? item.cwd;
+    return (
+      <Pressable
+        key={item.id}
+        style={({ pressed }) => [
+          styles.sessionRailItem,
+          selected && styles.sessionRailItemSelected,
+          pressed && styles.controlPressed,
+        ]}
+        disabled={selected}
+        onPress={() => selectSession(item.id)}
+        accessibilityRole="button"
+        accessibilityState={{ selected }}
+        accessibilityLabel={`打开会话 ${item.title}`}
+      >
+        <View style={styles.sessionRailItemTop}>
+          <AgentIcon agent={item.agent} size={14} badge badgeOutline={false} />
+          <Text style={styles.sessionRailItemTitle} numberOfLines={1}>
+            {label}
+          </Text>
+          <View
+            style={[
+              styles.sessionRailStatus,
+              { backgroundColor: statusColor[item.status] ?? color.textFaint },
+            ]}
+          />
+        </View>
+        <Text style={styles.sessionRailPath} numberOfLines={1}>
+          {showFolder ? `${folder} · ${statusText[item.status]}` : statusText[item.status]}
+        </Text>
+      </Pressable>
+    );
+  };
+
+  const allRailWorkspaces = [...workspaces, ...orphanTaskWorkspaces];
+
   return (
     <View style={[styles.sessionRail, { width }]}>
       <View style={styles.sessionRailHeader}>
-        <Text style={styles.sessionRailTitle}>会话</Text>
-        <Text style={styles.sessionRailCount}>{String(sessions.length)}</Text>
+        <View style={styles.sessionRailHeaderLeft}>
+          <Text style={styles.sessionRailTitle}>工作区</Text>
+          <Text style={styles.sessionRailCount}>{String(allRailWorkspaces.length)}</Text>
+        </View>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="新建会话"
+          hitSlop={6}
+          onPress={() =>
+            router.navigate({
+              pathname: "/host/[hostId]",
+              params: {
+                hostId,
+                quickCreate: "conversation",
+                ...(currentSession?.cwd ? { cwd: currentSession.cwd } : {}),
+              },
+            })
+          }
+          style={({ pressed }) => [styles.sessionRailAddBtn, pressed && styles.controlPressed]}
+        >
+          <Icon name="plus" size={13} color={color.textDim} weight="semibold" />
+        </Pressable>
       </View>
       <ScrollView
         contentContainerStyle={styles.sessionRailList}
         showsVerticalScrollIndicator={false}
       >
-        {sessions.map((item) => {
-          const selected = item.id === currentId;
+        {pinnedList.length > 0 && (
+          <View style={styles.sessionRailSection}>
+            <View style={styles.sessionRailSubHeader}>
+              <Icon name="pin.fill" size={10} color={color.textFaint} />
+              <Text style={styles.sessionRailSubTitle}>置顶</Text>
+            </View>
+            {pinnedList.map((item) => renderRailSession(item, true))}
+          </View>
+        )}
+
+        {allRailWorkspaces.map((project) => {
+          const pKey = workspacePathKey(project.path);
+          const childTasks = childTaskWorkspacesByKey.get(pKey) ?? [];
+          const ownsCurrent =
+            pKey === currentWorkspaceKey ||
+            childTasks.some((child) => workspacePathKey(child.path) === currentWorkspaceKey);
+          const expanded =
+            (ownsCurrent && !collapsedKeys.has(`manual:${pKey}`)) ||
+            (!ownsCurrent && !collapsedKeys.has(pKey) && (allRailWorkspaces.length === 1 || project.runningCount > 0));
+          const displayName = displayNameFor(project.path, project.name);
+          const sorted = sortWorkspaceSessions(project.sessions, pinnedSet);
+
           return (
-            <Pressable
-              key={item.id}
-              style={({ pressed }) => [
-                styles.sessionRailItem,
-                selected && styles.sessionRailItemSelected,
-                pressed && styles.controlPressed,
-              ]}
-              disabled={selected}
-              onPress={() =>
-                router.replace({
-                  pathname: "/host/[hostId]/session/[sid]",
-                  params: { hostId, sid: item.id },
-                })
-              }
-              accessibilityRole="button"
-              accessibilityState={{ selected }}
-              accessibilityLabel={`打开会话 ${item.title}`}
-            >
-              <View style={styles.sessionRailItemTop}>
-                <AgentIcon agent={item.agent} size={15} badge badgeOutline={false} />
-                <View
-                  style={[
-                    styles.sessionRailStatus,
-                    { backgroundColor: statusColor[item.status] ?? color.textFaint },
-                  ]}
-                />
-                <Text style={styles.sessionRailItemTitle} numberOfLines={1}>
-                  {item.title}
-                </Text>
-                <Text style={styles.sessionRailAgent}>{item.agent}</Text>
+            <View key={project.path} style={styles.sessionRailWorkspaceGroup}>
+              <View style={styles.sessionRailWorkspaceHeader}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityState={{ expanded }}
+                  onPress={() =>
+                    setCollapsedKeys((prev) => {
+                      const next = new Set(prev);
+                      const targetMarker = ownsCurrent ? `manual:${pKey}` : pKey;
+                      if (expanded) next.add(targetMarker);
+                      else next.delete(targetMarker);
+                      return next;
+                    })
+                  }
+                  style={({ pressed }) => [styles.sessionRailWorkspaceToggle, pressed && styles.controlPressed]}
+                >
+                  <WorkspaceFolderIcon expanded={expanded} size={13} color={color.textDim} />
+                  <Text style={styles.sessionRailWorkspaceName} numberOfLines={1}>
+                    {displayName}
+                  </Text>
+                  <Text style={styles.sessionRailWorkspaceCount}>
+                    {String(project.sessions.length)}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`在 ${displayName} 中新建会话`}
+                  hitSlop={6}
+                  onPress={() =>
+                    router.navigate({
+                      pathname: "/host/[hostId]",
+                      params: { hostId, quickCreate: "conversation", cwd: project.path },
+                    })
+                  }
+                  style={({ pressed }) => [styles.sessionRailInlineAdd, pressed && styles.controlPressed]}
+                >
+                  <Icon name="plus" size={12} color={color.textFaint} weight="semibold" />
+                </Pressable>
               </View>
-              <Text style={styles.sessionRailPath} numberOfLines={1} ellipsizeMode="middle">
-                {item.cwd}
-              </Text>
-              {item.preview ? (
-                <Text style={styles.sessionRailPreview} numberOfLines={2}>
-                  {item.preview}
-                </Text>
-              ) : null}
-            </Pressable>
+
+              {expanded && (
+                <View style={styles.sessionRailTreeChildren}>
+                  {sorted.map((item) => renderRailSession(item))}
+                  {childTasks.map((taskWs) => (
+                    <View key={taskWs.path} style={styles.sessionRailTaskSubgroup}>
+                      <Text style={styles.sessionRailTaskSubTitle} numberOfLines={1}>
+                        ⑂ {displayNameFor(taskWs.path, taskWs.name)}
+                      </Text>
+                      {sortWorkspaceSessions(taskWs.sessions, pinnedSet).map((item) =>
+                        renderRailSession(item),
+                      )}
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
           );
         })}
       </ScrollView>
@@ -474,8 +644,10 @@ export default function SessionScreen() {
   }, []);
   const [focused, setFocused] = useState(false);
   const [screenFocused, setScreenFocused] = useState(false);
-  const [terminalFullscreen, setTerminalFullscreen] = useState(true);
+  const [terminalFullscreen, setTerminalFullscreen] = useState(false);
   const [terminalToolsVisible, setTerminalToolsVisible] = useState(false);
+  const [terminalWideCols, setTerminalWideCols] = useState<number | null>(null);
+  const [terminalExtract, setTerminalExtract] = useState<TerminalExtractedText | null>(null);
   const [terminalKeyboardVisible, setTerminalKeyboardVisible] = useState(Keyboard.isVisible());
   useFocusEffect(useCallback(() => {
     setScreenFocused(true);
@@ -519,6 +691,8 @@ export default function SessionScreen() {
   const supportsDeepseekTrajectory = conn?.supportsDeepseekTrajectory ?? false;
   const effectiveDeepseekView = supportsDeepseekTrajectory ? deepseekView : "chat";
   const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
+  const { pinnedSessions, togglePinSession } = useHydratedWorkspaceConcepts();
+  const isPinnedSession = Boolean(hostId && sid && (pinnedSessions[hostId] ?? []).includes(sid));
   const coordinatorRun = useMemo(
     () => coordinatorRunsBySession(orchestration?.runs ?? []).get(sid) ?? null,
     [orchestration, sid],
@@ -528,12 +702,10 @@ export default function SessionScreen() {
     [runtime.sessions],
   );
   const immersiveTerminal = session?.kind === "pty" && terminalFullscreen;
-  const showSessionRail = !immersiveTerminal && (
-    adaptiveLayout.verticalPanes !== null ||
-    (adaptiveLayout.width >= 960 && adaptiveLayout.height >= 560));
-  const sessionRailWidth =
-    adaptiveLayout.verticalPanes?.start ??
-    Math.min(360, Math.max(288, adaptiveLayout.width * 0.32));
+  const showSessionRail = !immersiveTerminal && Boolean(adaptiveLayout.splitPanes);
+  const sessionRailWidth = adaptiveLayout.splitPanes?.start ?? 300;
+  const sessionDetailWidth = adaptiveLayout.splitPanes?.end;
+  const sessionSplitGap = adaptiveLayout.splitPanes?.gap ?? StyleSheet.hairlineWidth;
   const agentControls = session?.agentControls;
   const subagent = subagentId
     ? session?.subagents?.find((candidate) => candidate.id === subagentId)
@@ -594,12 +766,17 @@ export default function SessionScreen() {
     }
   };
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [composerToolsOpen, setComposerToolsOpen] = useState(false);
+  const [composerToolsNavigation] = useState(() => new DismissedModalAction());
   const [policyOpen, setPolicyOpen] = useState(false);
   const [yoloConfirmOpen, setYoloConfirmOpen] = useState(false);
   const [killConfirmOpen, setKillConfirmOpen] = useState(false);
   const [deleteTerminalOpen, setDeleteTerminalOpen] = useState(false);
   const [terminalDeletion] = useState(() => new DismissedModalAction());
-  useFocusEffect(useCallback(() => () => terminalDeletion.cancel(), [terminalDeletion]));
+  useFocusEffect(useCallback(() => () => {
+    terminalDeletion.cancel();
+    composerToolsNavigation.cancel();
+  }, [composerToolsNavigation, terminalDeletion]));
   const [controlsLoading, setControlsLoading] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [models, setModels] = useState<AgentModel[]>([]);
@@ -613,16 +790,38 @@ export default function SessionScreen() {
   const [images, setImages] = useState<PickedImage[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const termRef = useRef<TerminalHandle>(null);
+  const keyBarRef = useRef<KeyBarHandle>(null);
   const quickPanelRef = useRef<DrawerLayoutMethods>(null);
   const [quickPanelActive, setQuickPanelActive] = useState(false);
   const [terminalFontPreference, setTerminalFontPreference] = useState<TerminalFontPreference>(
-    SYSTEM_TERMINAL_FONT_PREFERENCE,
+    () => cachedTerminalFontPreference ?? SYSTEM_TERMINAL_FONT_PREFERENCE,
   );
-  const [terminalFontPreferenceHydrated, setTerminalFontPreferenceHydrated] = useState(false);
+  const [terminalFontPreferenceHydrated, setTerminalFontPreferenceHydrated] = useState(
+    () => cachedTerminalFontPreference !== null,
+  );
   const terminalFontPreferenceChanged = useRef(false);
   const [perfHud, setPerfHud] = useState(false);
   const [terminalPerf, setTerminalPerf] = useState<TerminalPerf | null>(null);
-  const fontSize = terminalFontSizeForPreference(terminalFontPreference, fontScale);
+  const terminalViewportWidth = showSessionRail
+    ? (sessionDetailWidth ?? Math.max(240, adaptiveLayout.width - sessionRailWidth))
+    : adaptiveLayout.width;
+  const fontSize = terminalFontSizeForPreference(
+    terminalFontPreference,
+    fontScale,
+    terminalViewportWidth,
+  );
+  const existingWorkspaceShell = useMemo(() => {
+    if (!session || shellTerminal) return null;
+    const targetKey = workspacePathKey(session.cwd);
+    return (
+      orderedSessions.find(
+        (candidate) =>
+          isShellTerminal(candidate) &&
+          !isTerminalEnded(candidate) &&
+          workspacePathKey(candidate.cwd) === targetKey,
+      ) ?? null
+    );
+  }, [orderedSessions, session, shellTerminal]);
   const composerToken = useMemo(
     () => activeComposerToken(draft, selection.start),
     [draft, selection.start],
@@ -715,14 +914,19 @@ export default function SessionScreen() {
     let alive = true;
     void AsyncStorage.getItem(TERMINAL_FONT_PREFERENCE_STORAGE_KEY)
       .then((raw) => {
+        const parsed = parseTerminalFontPreference(raw);
+        if (!terminalFontPreferenceChanged.current) {
+          cachedTerminalFontPreference = parsed;
+        }
         if (!alive) return;
         if (!terminalFontPreferenceChanged.current) {
-          setTerminalFontPreference(parseTerminalFontPreference(raw));
+          setTerminalFontPreference(parsed);
         }
         setTerminalFontPreferenceHydrated(true);
       })
       .catch(() => {
         // 偏好读取失败时不阻塞终端；默认的 system 模式仍然可用。
+        cachedTerminalFontPreference ??= SYSTEM_TERMINAL_FONT_PREFERENCE;
         if (alive) setTerminalFontPreferenceHydrated(true);
       });
     return () => {
@@ -736,6 +940,7 @@ export default function SessionScreen() {
       mode: "custom",
       size: clampTerminalFontSize(size),
     };
+    cachedTerminalFontPreference = preference;
     setTerminalFontPreference(preference);
     const serialized = serializeTerminalFontPreference(preference);
     if (serialized) void AsyncStorage.setItem(TERMINAL_FONT_PREFERENCE_STORAGE_KEY, serialized);
@@ -743,7 +948,9 @@ export default function SessionScreen() {
 
   const followSystemTerminalFontSize = useCallback((): void => {
     terminalFontPreferenceChanged.current = true;
-    setTerminalFontPreference(resetTerminalFontPreference());
+    const reset = resetTerminalFontPreference();
+    cachedTerminalFontPreference = reset;
+    setTerminalFontPreference(reset);
     void AsyncStorage.removeItem(TERMINAL_FONT_PREFERENCE_STORAGE_KEY);
   }, []);
 
@@ -1130,20 +1337,39 @@ export default function SessionScreen() {
     ],
   );
 
+  const lastSidRef = useRef(sid);
+  useEffect(() => {
+    if (lastSidRef.current === sid) return;
+    lastSidRef.current = sid;
+    setSearch(null);
+    setPendingOutgoing(null);
+    setDeliveryError(null);
+    setCurrentModel(undefined);
+    setCurrentEffort(undefined);
+    setCurrentMode(undefined);
+    setModels([]);
+    setModes([]);
+    setUsage(null);
+    setUsageError(null);
+  }, [sid]);
+
   // 会话打开时取一次;不轮询 —— 限流窗口是小时级的,盯着刷没意义
   useEffect(() => {
     if (!conn || !sid || !isStructured) return;
     let alive = true;
-    void conn
-      .usageGet(sid)
-      .then((r) => {
-        if (alive) setUsage(r);
-      })
-      .catch(() => {
-        // 取不到就是没有,不打扰用户
-      });
+    const task = InteractionManager.runAfterInteractions(() => {
+      void conn
+        .usageGet(sid)
+        .then((r) => {
+          if (alive) setUsage(r);
+        })
+        .catch(() => {
+          // 取不到就是没有,不打扰用户
+        });
+    });
     return () => {
       alive = false;
+      task.cancel();
     };
   }, [conn, sid, isStructured]);
 
@@ -1385,8 +1611,8 @@ export default function SessionScreen() {
     >
       <Icon
         name="arrow.up"
-        size={17}
-        color={canSend ? color.onAccent : color.textFaint}
+        size={16}
+        color={canSend ? color.bg : color.textFaint}
         weight="semibold"
       />
     </Pressable>
@@ -1416,6 +1642,24 @@ export default function SessionScreen() {
           session={session}
           pending={pending}
           coordinatorAvailable={coordinatorRun !== null && !isSubagent}
+          {...(!shellTerminal && supportsRemoteTerminal(runtime.hostInfo)
+            ? {
+                terminalAction: {
+                  active: existingWorkspaceShell !== null,
+                  onPress: () =>
+                    leaveQuickPanel(() => {
+                      if (existingWorkspaceShell) {
+                        router.push(`/host/${hostId}/session/${existingWorkspaceShell.id}`);
+                        return;
+                      }
+                      router.push({
+                        pathname: "/host/[hostId]/terminals",
+                        params: { hostId, cwd: session.cwd },
+                      });
+                    }),
+                },
+              }
+            : {})}
           onClose={closeQuickPanel}
           onOpenGit={() => leaveQuickPanel(() => router.push(`/host/${hostId}/git/${sid}`))}
           onOpenFiles={() => leaveQuickPanel(() => router.push(`/host/${hostId}/files/${sid}`))}
@@ -1434,30 +1678,32 @@ export default function SessionScreen() {
           currentId={sid}
           hostId={hostId}
           width={sessionRailWidth}
+          isSubagent={isSubagent}
+          worktreeAssets={orchestration?.worktreeAssets}
         />
       )}
-      {!immersiveTerminal && adaptiveLayout.verticalPanes && (
-        <View
-          style={[
-            styles.sessionFoldGutter,
-            { width: adaptiveLayout.verticalPanes.gap },
-          ]}
-          pointerEvents="none"
+      {showSessionRail && (
+        <SplitPaneDivider
+          label="拖动调整会话侧栏宽度"
+          value={sessionRailWidth}
+          min={adaptiveLayout.splitBounds?.minStart ?? 204}
+          max={adaptiveLayout.splitBounds?.maxStart ?? 440}
+          gap={sessionSplitGap}
+          disabled={adaptiveLayout.splitResizable === false}
+          onChange={adaptiveLayout.setSplitStart}
+          onCommit={adaptiveLayout.commitSplitStart}
+          onReset={adaptiveLayout.resetSplitStart}
         />
       )}
       <KeyboardAvoidingView
         style={[
           styles.container,
           showSessionRail && styles.sessionDetail,
-          !immersiveTerminal && adaptiveLayout.verticalPanes && {
+          showSessionRail && sessionDetailWidth !== undefined && {
             flex: 0,
-            width: adaptiveLayout.verticalPanes.end,
+            width: sessionDetailWidth,
           },
         ]}
-        // 显式使用 native-stack 已知的头部高度，首轮布局就能同步算出 IME 重叠量。
-        // automaticOffset 需要异步测量窗口坐标，快速首次点按时可能晚于键盘动画。
-        // Android 也用 padding:height 模式只在键盘判定为收起时才刷新记住的布局高度,
-        // 折叠屏展开/旋转后会把旧屏高度当显式 height 套回来，下方露出一截页面底色。
         behavior="padding"
         keyboardVerticalOffset={immersiveTerminal ? 0 : headerHeight}
       >
@@ -1469,13 +1715,13 @@ export default function SessionScreen() {
           headerBackVisible: false,
           headerLeft: () => (
             <Pressable
-              style={styles.headerBack}
+              style={({ pressed }) => [styles.headerBack, pressed && styles.composerBtnPressed]}
               onPress={returnToHost}
               hitSlop={10}
               accessibilityRole="button"
               accessibilityLabel="返回项目会话列表"
             >
-              <Icon name="chevron.left" size={20} color={color.accent} weight="semibold" />
+              <Icon name="chevron.left" size={17} color={color.text} weight="semibold" />
             </Pressable>
           ),
           headerTitle: () => (
@@ -1489,60 +1735,46 @@ export default function SessionScreen() {
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
-              {/* "停止"分秒必争；文件、改动和分支统一放进右侧快捷面板。 */}
-              <View style={styles.headerAction}>
-              {shellTerminal && !terminalEnded ? (
-                <Pressable onPress={confirmKill} disabled={terminalClose.closing} hitSlop={8}
-                  accessibilityRole="button" accessibilityLabel="关闭终端">
-                  {terminalClose.closing ? <ActivityIndicator color={color.danger} /> : <Icon name="xmark" size={20} color={color.danger} />}
-                </Pressable>
-              ) : busy && !isSubagent && (
+              {shellTerminal && !terminalEnded && (
                 <Pressable
-                  onPress={() => conn.interrupt(sid)}
+                  style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
+                  onPress={confirmKill}
+                  disabled={terminalClose.closing}
                   hitSlop={8}
                   accessibilityRole="button"
-                  accessibilityLabel="停止当前任务"
+                  accessibilityLabel="关闭终端"
                 >
-                  <Icon name="stop.circle" size={21} color={color.warn} />
+                  {terminalClose.closing ? <ActivityIndicator color={color.danger} /> : <Icon name="xmark" size={17} color={color.danger} />}
                 </Pressable>
               )}
-              </View>
-              {isChat && <Pressable
-                style={styles.headerAction}
-                onPress={() => {
-                  if (!settings.sessionActionsHidden) setSearch(null);
-                  void updateSettings({ sessionActionsHidden: !settings.sessionActionsHidden });
-                }}
-                accessibilityRole="button"
-                accessibilityLabel={settings.sessionActionsHidden ? "显示会话快捷操作" : "隐藏会话快捷操作"}
-                accessibilityHint="同时展开或收起标题下方工具栏和底部快捷指令栏"
-                accessibilityState={{ expanded: !settings.sessionActionsHidden }}
-              >
-                <Icon name={settings.sessionActionsHidden ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"}
-                  size={19} color={color.accent} />
-              </Pressable>}
-              {!isChat && <Pressable style={styles.headerAction} onPress={() => setTerminalFullscreen(true)}
-                accessibilityRole="button" accessibilityLabel="终端全屏">
-                <Icon name="arrow.up.left.and.arrow.down.right" size={19} color={color.accent} />
-              </Pressable>}
+              {!isChat && (
+                <Pressable
+                  style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
+                  onPress={() => setTerminalFullscreen(true)}
+                  accessibilityRole="button"
+                  accessibilityLabel="终端全屏"
+                >
+                  <Icon name="arrow.up.left.and.arrow.down.right" size={16} color={color.text} />
+                </Pressable>
+              )}
               <Pressable
-                style={styles.headerAction}
+                style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
                 onPress={openQuickPanel}
                 hitSlop={8}
                 accessibilityRole="button"
                 accessibilityLabel="打开会话工具"
                 accessibilityHint="查看文件改动、Git 分支和项目文件"
               >
-                <Icon name="square.stack.3d.up" size={20} color={color.accent} />
+                <Icon name="square.stack.3d.up" size={16} color={color.text} />
               </Pressable>
               <Pressable
-                style={styles.headerAction}
+                style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
                 onPress={openMenu}
                 hitSlop={8}
                 accessibilityRole="button"
                 accessibilityLabel="更多会话操作"
               >
-                <Icon name="ellipsis.circle" size={21} color={color.accent} />
+                <Icon name="ellipsis.circle" size={17} color={color.text} />
               </Pressable>
             </View>
           ),
@@ -1560,97 +1792,6 @@ export default function SessionScreen() {
           </View>
           <Pressable onPress={() => conn.kick()} hitSlop={8} accessibilityRole="button">
             <Text style={styles.reconnAction}>重试</Text>
-          </Pressable>
-        </View>
-      )}
-
-      {isStructured && !settings.sessionActionsHidden && (
-        <View style={styles.modeBar}>
-          {coordinatorRun && !isSubagent ? (
-            <Pressable
-              style={({ pressed }) => [styles.chatModeLabel, styles.coordinatorModeLink, pressed && styles.controlPressed]}
-              onPress={() => router.push(orchestrationRoute(hostId, coordinatorRun.id))}
-              accessibilityRole="button"
-              accessibilityLabel="打开 Goal 任务图"
-            >
-              <Icon name="point.3.connected.trianglepath.dotted" size={14} color={color.accent} />
-              <Text style={[styles.modeText, styles.coordinatorModeText]}>Goal 编排者</Text>
-              <Icon name="chevron.right" size={12} color={color.accent} />
-            </Pressable>
-          ) : (
-            <View style={styles.chatModeLabel}>
-              {isSubagent ? (
-                <View style={styles.subagentModeIdentity}>
-                  <View
-                    style={[
-                      styles.subagentModeDot,
-                      {
-                        backgroundColor:
-                          subagent?.status === "running" || subagent?.status === "starting"
-                            ? color.accent
-                            : color.textFaint,
-                      },
-                    ]}
-                  />
-                  <Text style={styles.subagentModeName} numberOfLines={1}>
-                    {subagent?.name ?? "子 Agent"}
-                  </Text>
-                </View>
-              ) : session.agent === "deepseek" && supportsDeepseekTrajectory ? (
-                <View style={styles.deepseekViewToggle}>
-                  {(["chat", "trajectory"] as const).map((mode) => (
-                    <Pressable
-                      key={mode}
-                      style={[styles.deepseekViewOption, deepseekView === mode && styles.deepseekViewOptionActive]}
-                      onPress={() => setDeepseekView(mode)}
-                      accessibilityRole="button"
-                      accessibilityState={{ selected: deepseekView === mode }}
-                    >
-                      <Text style={[styles.deepseekViewText, deepseekView === mode && styles.deepseekViewTextActive]}>
-                        {mode === "chat" ? "对话" : "轨迹"}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
-              ) : (
-                <>
-                  <Icon name="bubble.left.and.text.bubble.right" size={14} color={color.text} />
-                  <Text style={styles.modeText}>对话</Text>
-                </>
-              )}
-            </View>
-          )}
-          {!isSubagent && agentControls && (
-            <Pressable
-              style={[styles.controlChip, displayedMode === "plan" && styles.controlChipPlan]}
-              onPress={openControls}
-              accessibilityRole="button"
-              accessibilityLabel={session.agent === "deepseek" ? "模型与推理强度" : "模型与 Plan 模式"}
-            >
-              <Text style={[styles.controlChipText, displayedMode === "plan" && styles.controlChipTextPlan]}>
-                {displayedMode === "plan" ? "Plan" : displayedModel?.split("/").at(-1) ?? "模型"}
-              </Text>
-            </Pressable>
-          )}
-          {!isSubagent && (
-            <Pressable
-              style={[styles.policyChip, policy === "yolo" && styles.policyChipYolo]}
-              onPress={choosePolicy}
-              accessibilityRole="button"
-              accessibilityLabel={`审批策略：${policyLabel[policy]}`}
-            >
-              <Text style={[styles.policyChipText, policy === "yolo" && styles.policyChipTextYolo]}>
-                {policyLabel[policy]}
-              </Text>
-            </Pressable>
-          )}
-          <Pressable
-            style={[styles.modeAction, search !== null && styles.modeActionActive]}
-            onPress={() => setSearch((value) => (value === null ? "" : null))}
-            accessibilityRole="button"
-            accessibilityLabel={search === null ? "搜索消息" : "关闭搜索"}
-          >
-            <Icon name="magnifyingglass" size={16} color={color.textDim} />
           </Pressable>
         </View>
       )}
@@ -1734,6 +1875,7 @@ export default function SessionScreen() {
       {isChat ? (
         <ConversationFontScale value={settings.conversationFontSize / DEFAULT_CONVERSATION_FONT_SIZE}>
         <ChatView
+          key={`${sid}:${subagentId ?? ""}`}
           conn={conn}
           sid={sid}
           pendingOutgoing={pendingOutgoing}
@@ -1759,13 +1901,17 @@ export default function SessionScreen() {
                 conn={conn}
                 sid={sid}
                 fontSize={fontSize}
+                wideCols={terminalWideCols}
                 onFontSize={setCustomTerminalFontSize}
-                layoutKey={`${adaptiveLayout.posture.fold}:${adaptiveLayout.posture.orientation}`}
+                layoutKey={`${adaptiveLayout.posture.fold}:${adaptiveLayout.posture.orientation}:${immersiveTerminal ? "full" : "dock"}:${String(Math.round(terminalViewportWidth))}`}
                 inputEnabled={terminalInputEnabled}
                 sessionEnded={terminalEnded}
                 endedActions={<>
                   {shellTerminal && terminalActions.error && <Text accessibilityRole="alert" style={styles.terminalActionError}>{terminalActions.error}</Text>}
                   <View style={styles.terminalEndedActions}>
+                    <Pressable accessibilityRole="button" accessibilityLabel="提取终端文字与链接" onPress={() => { void termRef.current?.extractText().then((res) => setTerminalExtract(res)); }} style={styles.terminalEndedButton}>
+                      <Text style={styles.terminalEndedButtonText}>选词/链接</Text>
+                    </Pressable>
                     <Pressable accessibilityRole="button" accessibilityLabel="复制终端全部内容" onPress={() => termRef.current?.copyAll()} style={styles.terminalEndedButton}>
                       <Text style={styles.terminalEndedButtonText}>复制全部</Text>
                     </Pressable>
@@ -1789,6 +1935,17 @@ export default function SessionScreen() {
                 </>}
                 onInputB64={terminalKeyboard.inputB64}
                 onPasteB64={terminalKeyboard.pasteB64}
+                onCanvasTap={(info) => {
+                  if (keyBarRef.current?.isComposerOpen()) {
+                    if (!info.mouseActive || info.yRatio >= 0.72) {
+                      keyBarRef.current.focusComposer();
+                    }
+                    return;
+                  }
+                  if (!info.mouseActive) {
+                    termRef.current?.focus();
+                  }
+                }}
                 disconnectedMessage={terminalEnded ? "终端已结束。" : terminalClose.closing ? "正在关闭终端…" : "主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"}
                 onRetryConnection={terminalEnded || terminalClose.closing ? undefined : retryTerminalConnection}
                 {...(perfHud ? { onPerf: setTerminalPerf } : {})}
@@ -1804,23 +1961,55 @@ export default function SessionScreen() {
                 </Pressable>
               </View>}
             </View>
-            {!terminalEnded && (!immersiveTerminal || terminalKeyboardVisible || terminalToolsVisible) && <View style={{ paddingBottom: terminalKeyboardVisible || immersiveTerminal ? 0 : insets.bottom, backgroundColor: "#16171a" }}><KeyBar
+            {!terminalEnded && (!immersiveTerminal || !terminalToolsVisible) && <View style={{ paddingBottom: terminalKeyboardVisible || immersiveTerminal ? 0 : insets.bottom, backgroundColor: "#14161B" }}><KeyBar
+              ref={keyBarRef}
               onKey={terminalKeyboard.sendKey}
               onShortcut={terminalKeyboard.paste}
               onPaste={(text) => termRef.current?.paste(text) ?? Promise.resolve({ accepted: false, reason: "offline" })}
+              onSendText={async (text, submit) => {
+                const pasted = await (termRef.current?.paste(text) ?? Promise.resolve({ accepted: false as const, reason: "offline" as const }));
+                if (!pasted.accepted || !submit) return pasted;
+                await new Promise<void>((resolve) => setTimeout(resolve, 50));
+                return terminalKeyboard.paste("\r");
+              }}
+              composerPlaceholder={
+                session.agent === "shell"
+                  ? "输入 Shell 命令（支持中文与语音）…"
+                  : `发消息给 ${session.agent}（支持中文、多行与语音）…`
+              }
+              onExtractText={() => {
+                void termRef.current?.extractText().then((res) => setTerminalExtract(res));
+              }}
+              wideColsActive={terminalWideCols !== null}
+              onToggleWideCols={() => setTerminalWideCols((prev) => (prev === null ? 88 : null))}
               modifiers={terminalKeyboard.modifiers}
               onToggleModifier={terminalKeyboard.toggleModifier}
               enabled={terminalInputEnabled}
               disabledMessage={terminalEnded ? "终端已结束" : terminalClose.closing ? "正在关闭终端…" : "主机未连接；快捷键和粘贴已冻结，不会自动重放。"}
               onRetry={terminalEnded || terminalClose.closing ? undefined : () => conn.kick()}
-              onFontSize={(delta) => setCustomTerminalFontSize(adjustTerminalFontSize(fontSize, delta))}
-              onResetFontSize={followSystemTerminalFontSize}
+              onFontSize={(delta) => {
+                setTerminalWideCols(null);
+                setCustomTerminalFontSize(adjustTerminalFontSize(fontSize, delta));
+              }}
+              onResetFontSize={() => {
+                setTerminalWideCols(null);
+                followSystemTerminalFontSize();
+              }}
               fontSizeMode={terminalFontPreference.mode}
               onScrollBottom={() => termRef.current?.scrollToBottom()}
               onCopyAll={() => termRef.current?.copyAll()}
               onSearch={() => setSearch("")}
-              newlineSequence={session.agent === "codex" ? "\x1b[13;2u" : ["claude", "shell"].includes(session.agent) ? "\x1b\r" : undefined}
-              onDismissKeyboard={Platform.OS === "android" ? undefined : () => termRef.current?.blur()}
+              newlineSequence={
+                ["codex", "agy", "pi", "opencode", "grok", "trae", "deepseek"].includes(session.agent)
+                  ? "\x1b[13;2u"
+                  : ["claude", "shell"].includes(session.agent)
+                    ? "\x1b\r"
+                    : undefined
+              }
+              onDismissKeyboard={Platform.OS === "android" ? undefined : () => {
+                Keyboard.dismiss();
+                termRef.current?.blur();
+              }}
             /></View>}
           </>
         ) : (
@@ -1884,10 +2073,6 @@ export default function SessionScreen() {
         </View>
       )}
 
-      {isChat && !settings.sessionActionsHidden && commandHints.length === 0 && completionKind === null && (
-        <QuickReplies busy={busy} replies={settings.quickReplies} onPick={send} />
-      )}
-
       {isChat && !isSubagent && (session.messageQueue?.length ?? 0) > 0 && (
         <View style={styles.queuePanel}>
           <View style={styles.queueHeader}>
@@ -1938,42 +2123,6 @@ export default function SessionScreen() {
         </View>
       )}
 
-      {isChat && !isSubagent && busy && (
-        <View style={styles.deliveryBar}>
-          <Text style={styles.deliveryLabel}>发送方式</Text>
-          <Pressable
-            style={[styles.deliveryOption, busyDelivery === "queue" && styles.deliveryOptionActive]}
-            onPress={() => setBusyDelivery("queue")}
-            accessibilityRole="button"
-            accessibilityState={{ selected: busyDelivery === "queue" }}
-          >
-            <Text
-              style={[
-                styles.deliveryOptionText,
-                busyDelivery === "queue" && styles.deliveryOptionTextActive,
-              ]}
-            >
-              排到队尾
-            </Text>
-          </Pressable>
-          <Pressable
-            style={[styles.deliveryOption, busyDelivery === "steer" && styles.deliveryOptionActive]}
-            onPress={() => setBusyDelivery("steer")}
-            accessibilityRole="button"
-            accessibilityState={{ selected: busyDelivery === "steer" }}
-          >
-            <Text
-              style={[
-                styles.deliveryOptionText,
-                busyDelivery === "steer" && styles.deliveryOptionTextActive,
-              ]}
-            >
-              引导当前任务
-            </Text>
-          </Pressable>
-        </View>
-      )}
-
       {isChat && !isSubagent && images.length > 0 && (
         <ScrollView horizontal style={styles.thumbs} contentContainerStyle={styles.thumbsRow}>
           {images.map((img, i) => (
@@ -2012,6 +2161,26 @@ export default function SessionScreen() {
       {lifecycleTarget !== null && conn && <SessionLifecycleSheet conn={conn} session={session} archived={lifecycleTarget}
         onClose={() => setLifecycleTarget(null)} onDone={() => { const archived = lifecycleTarget; setLifecycleTarget(null); if (archived) returnToHost(); }} />}
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
+        {!isSubagent && (
+          <SheetAction
+            label={isPinnedSession ? "取消置顶会话" : "置顶会话"}
+            detail="固定在首页与工作区侧栏顶部，方便快速切回"
+            symbol={isPinnedSession ? "pin.fill" : "pin"}
+            onPress={() => {
+              togglePinSession(hostId, sid);
+              setMenuOpen(false);
+            }}
+          />
+        )}
+        <SheetAction
+          label={search === null ? "搜索会话内容" : "关闭搜索"}
+          detail={isChat ? "在当前对话历史中查找关键词" : "在终端缓冲区中查找内容"}
+          symbol="magnifyingglass"
+          onPress={() => {
+            setMenuOpen(false);
+            setSearch((value) => (value === null ? "" : null));
+          }}
+        />
         {!isSubagent && ["claude", "codex", "pi"].includes(session.agent) && <SheetAction
           label={branching ? "正在创建分支…" : session.kind === "pty" ? "选择原生对话并创建分支" : "创建会话分支"}
           detail={branchUnavailable ?? (conn?.supportsCapability("session.fork.v1")
@@ -2358,6 +2527,158 @@ export default function SessionScreen() {
         )}
       </Sheet>
 
+      <Sheet
+        visible={composerToolsOpen}
+        title="快捷输入与附件"
+        onClose={() => {
+          composerToolsNavigation.cancel();
+          setComposerToolsOpen(false);
+        }}
+        onDismiss={() => composerToolsNavigation.dismiss()}
+      >
+        {(busy ? settings.quickReplies.busy : settings.quickReplies.idle).length > 0 && (
+          <View style={styles.composerSheetReplies}>
+            <Text style={styles.controlSectionTitle}>快捷回复</Text>
+            <QuickReplies
+              busy={busy}
+              replies={settings.quickReplies}
+              onPick={(reply) => {
+                setComposerToolsOpen(false);
+                send(reply);
+              }}
+            />
+          </View>
+        )}
+        {!isSubagent && (
+          <>
+            <SheetAction
+              label="从相册选择图片"
+              detail={`最多添加 ${String(MAX_IMAGES)} 张截图或照片`}
+              symbol="photo"
+              onPress={() => {
+                composerToolsNavigation.defer(() => { void startPicker("library"); });
+                setComposerToolsOpen(false);
+              }}
+            />
+            <SheetAction
+              label="拍照上传"
+              detail="使用相机拍摄并附加到消息"
+              symbol="paperclip"
+              onPress={() => {
+                composerToolsNavigation.defer(() => { void startPicker("camera"); });
+                setComposerToolsOpen(false);
+              }}
+            />
+          </>
+        )}
+        <SheetAction
+          label="引用项目文件 (@)"
+          detail="搜索并关联当前工作区的文件路径"
+          symbol="folder.fill"
+          onPress={() => {
+            setComposerToolsOpen(false);
+            insertQuickCharacter("@");
+          }}
+        />
+        <SheetAction
+          label="调用 Skill ($)"
+          detail="选择当前项目可用的 Agent Skill"
+          symbol="command"
+          onPress={() => {
+            setComposerToolsOpen(false);
+            insertQuickCharacter("$");
+          }}
+        />
+        <SheetAction
+          label="斜杠命令 (/)"
+          detail="切换模型、进入 Plan 或压缩上下文"
+          symbol="terminal"
+          onPress={() => {
+            setComposerToolsOpen(false);
+            insertQuickCharacter("/");
+          }}
+        />
+      </Sheet>
+
+      <Sheet
+        visible={terminalExtract !== null}
+        title="终端文字与链接"
+        onClose={() => setTerminalExtract(null)}
+      >
+        {terminalExtract && (
+          <View style={styles.terminalExtractWrap}>
+            {terminalExtract.urls.length > 0 && (
+              <View style={styles.terminalExtractSection}>
+                <Text style={styles.controlSectionTitle}>识别到的链接（可一键打开登录或预览）</Text>
+                {terminalExtract.urls.slice(0, 6).map((url) => (
+                  <View key={url} style={styles.terminalUrlRow}>
+                    <Text style={styles.terminalUrlText} numberOfLines={2} selectable>
+                      {url}
+                    </Text>
+                    <View style={styles.terminalUrlActions}>
+                      <Pressable
+                        onPress={() => {
+                          void Clipboard.setStringAsync(url).then(() => toast("已复制链接"));
+                        }}
+                        style={({ pressed }) => [styles.terminalExtractSmallBtn, pressed && styles.composerBtnPressed]}
+                        accessibilityRole="button"
+                        accessibilityLabel={`复制链接 ${url}`}
+                      >
+                        <Text style={styles.terminalExtractSmallBtnText}>复制</Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={() => {
+                          void Linking.openURL(url).catch(() => toast("无法打开该链接"));
+                        }}
+                        style={({ pressed }) => [styles.terminalExtractPrimaryBtn, pressed && styles.composerBtnPressed]}
+                        accessibilityRole="button"
+                        accessibilityLabel={`打开链接 ${url}`}
+                      >
+                        <Text style={styles.terminalExtractPrimaryBtnText}>打开</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            <View style={styles.terminalExtractHeaderRow}>
+              <Text style={styles.controlSectionTitle}>长按可自由划选复制文字</Text>
+              <View style={styles.terminalUrlActions}>
+                <Pressable
+                  onPress={() => {
+                    if (!terminalExtract.viewport) return;
+                    void Clipboard.setStringAsync(terminalExtract.viewport).then(() => toast("已复制近期输出"));
+                  }}
+                  style={({ pressed }) => [styles.terminalExtractSmallBtn, pressed && styles.composerBtnPressed]}
+                  accessibilityRole="button"
+                  accessibilityLabel="复制近期终端输出"
+                >
+                  <Text style={styles.terminalExtractSmallBtnText}>复制近期</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    if (!terminalExtract.full) return;
+                    void Clipboard.setStringAsync(terminalExtract.full).then(() => toast("已复制全部输出"));
+                  }}
+                  style={({ pressed }) => [styles.terminalExtractSmallBtn, pressed && styles.composerBtnPressed]}
+                  accessibilityRole="button"
+                  accessibilityLabel="复制全部提取文字"
+                >
+                  <Text style={styles.terminalExtractSmallBtnText}>复制全部</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            <ScrollView style={styles.terminalExtractBox} nestedScrollEnabled>
+              <Text selectable style={styles.terminalExtractCode}>
+                {terminalExtract.viewport || "当前终端暂无可提取文字。"}
+              </Text>
+            </ScrollView>
+          </View>
+        )}
+      </Sheet>
+
       {deliveryError && (
         <View
           style={styles.deliveryError}
@@ -2378,19 +2699,8 @@ export default function SessionScreen() {
           <Text style={styles.attachmentErrorText}>{attachmentError}</Text>
         </View>
       )}
-      {isChat && <View testID="chat-composer" style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
-        <View style={[styles.composerRow, composerExpanded && styles.composerRowExpanded]}>
-          {!composerExpanded && <DismissKey visible={focused} />}
-          {isChat && !isSubagent && !composerExpanded && (
-            <Pressable
-              style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
-              onPress={attach}
-              accessibilityRole="button"
-              accessibilityLabel="添加图片"
-            >
-              <Icon name="paperclip" size={17} color={color.textDim} />
-            </Pressable>
-          )}
+      {isChat && <View testID="chat-composer" style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 10) }]}>
+        <View style={[styles.composerCard, focused && styles.composerCardFocused]}>
           <View
             style={[
               styles.inputShell,
@@ -2413,12 +2723,12 @@ export default function SessionScreen() {
               placeholder={
                 isChat
                   ? isSubagent
-                    ? `给 ${subagent?.name ?? "子 Agent"} 发消息`
+                    ? `给 ${subagent?.name ?? "子 Agent"} 发消息…`
                     : busy
                       ? busyDelivery === "steer"
-                        ? "立即引导当前任务…"
-                        : "消息将排到队尾…"
-                      : `给 ${session?.agent ?? "agent"} 发消息 · @文件 · $Skill · /命令`
+                        ? "引导当前任务…"
+                        : "排队下一条消息…"
+                      : `发消息给 ${session?.agent ?? "Agent"}…`
                   : terminalInputEnabled
                     ? "输入命令，回车执行"
                     : terminalEnded
@@ -2476,51 +2786,187 @@ export default function SessionScreen() {
                       ? "arrow.down.right.and.arrow.up.left"
                       : "arrow.up.left.and.arrow.down.right"
                   }
-                  size={17}
-                  color={color.textDim}
+                  size={14}
+                  color={color.textFaint}
                 />
               </Pressable>
             )}
           </View>
-          {isChat && !composerExpanded && <VoiceButton onTranscript={appendTranscript} />}
-          {!composerExpanded && composerSendButton}
-        </View>
-        {isChat && composerExpanded && (
-          <View style={styles.expandedComposerActions}>
-            <DismissKey visible={focused} />
-            {!isSubagent && (
+
+          {!composerExpanded ? (
+            <View style={styles.composerRow}>
               <Pressable
-                style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
-                onPress={attach}
+                style={({ pressed }) => [styles.plusBtn, pressed && styles.composerBtnPressed]}
+                onPress={() => {
+                  composerToolsNavigation.cancel();
+                  Keyboard.dismiss();
+                  setComposerToolsOpen(true);
+                }}
+                hitSlop={6}
                 accessibilityRole="button"
-                accessibilityLabel="添加图片"
+                accessibilityLabel="添加图片或快捷操作"
               >
-                <Icon name="paperclip" size={17} color={color.textDim} />
+                <Icon name="plus" size={16} color={color.text} weight="semibold" />
               </Pressable>
-            )}
-            <ScrollView
-              horizontal
-              style={styles.composerQuickScroll}
-              keyboardShouldPersistTaps="always"
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.composerQuickChars}
-            >
-              {EXPANDED_COMPOSER_TOOLS.map((tool) => (
-                <Pressable
-                  key={tool.label}
-                  style={({ pressed }) => [styles.quickChar, pressed && styles.composerBtnPressed]}
-                  onPress={() => insertQuickCharacter(tool.value, tool.cursorOffset ?? 0)}
-                  accessibilityRole="button"
-                  accessibilityLabel={`插入${tool.label}`}
+              {isStructured && (!isSubagent || coordinatorRun) ? (
+                <ScrollView
+                  horizontal
+                  style={styles.composerMetaScroll}
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="always"
+                  contentContainerStyle={styles.composerMetaStrip}
                 >
-                  <Text style={styles.quickCharText}>{tool.label}</Text>
+                  {coordinatorRun && !isSubagent && (
+                    <Pressable
+                      style={({ pressed }) => [styles.composerMetaPill, styles.composerMetaPillAccent, pressed && styles.controlPressed]}
+                      onPress={() => router.push(orchestrationRoute(hostId, coordinatorRun.id))}
+                      hitSlop={6}
+                      accessibilityRole="button"
+                      accessibilityLabel="打开 Goal 任务图"
+                    >
+                      <Icon name="point.3.connected.trianglepath.dotted" size={11} color={color.accent} />
+                      <Text style={[styles.composerMetaText, styles.composerMetaTextAccent]}>Goal 任务图</Text>
+                    </Pressable>
+                  )}
+                  {!isSubagent && agentControls && (
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.composerMetaPill,
+                        displayedMode === "plan" && styles.composerMetaPillAccent,
+                        pressed && styles.controlPressed,
+                      ]}
+                      onPress={openControls}
+                      hitSlop={6}
+                      accessibilityRole="button"
+                      accessibilityLabel={session.agent === "deepseek" ? "模型与推理强度" : "模型与 Plan 模式"}
+                    >
+                      <Text
+                        style={[
+                          styles.composerMetaText,
+                          displayedMode === "plan" && styles.composerMetaTextAccent,
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {displayedMode === "plan" ? "Plan 模式" : displayedModel?.split("/").at(-1) ?? "模型"}
+                      </Text>
+                      <Icon name="chevron.down" size={9} color={displayedMode === "plan" ? color.accent : color.textFaint} />
+                    </Pressable>
+                  )}
+                  {!isSubagent && (
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.composerMetaPill,
+                        policy === "yolo" && styles.composerMetaPillDanger,
+                        pressed && styles.controlPressed,
+                      ]}
+                      onPress={choosePolicy}
+                      hitSlop={6}
+                      accessibilityRole="button"
+                      accessibilityLabel={`审批策略：${policyLabel[policy]}`}
+                    >
+                      <Text
+                        style={[
+                          styles.composerMetaText,
+                          policy === "yolo" && styles.composerMetaTextDanger,
+                        ]}
+                      >
+                        {policyLabel[policy]}
+                      </Text>
+                    </Pressable>
+                  )}
+                  {!isSubagent && session.agent === "deepseek" && supportsDeepseekTrajectory && (
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.composerMetaPill,
+                        deepseekView === "trajectory" && styles.composerMetaPillAccent,
+                        pressed && styles.controlPressed,
+                      ]}
+                      onPress={() => setDeepseekView((current) => (current === "chat" ? "trajectory" : "chat"))}
+                      hitSlop={6}
+                      accessibilityRole="button"
+                      accessibilityLabel={deepseekView === "trajectory" ? "切换到普通对话视图" : "切换到执行轨迹视图"}
+                    >
+                      <Text style={[styles.composerMetaText, deepseekView === "trajectory" && styles.composerMetaTextAccent]}>
+                        {deepseekView === "trajectory" ? "轨迹视图" : "切换轨迹"}
+                      </Text>
+                    </Pressable>
+                  )}
+                  {!isSubagent && busy && (
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.composerMetaPill,
+                        busyDelivery === "steer" && styles.composerMetaPillWarn,
+                        pressed && styles.controlPressed,
+                      ]}
+                      onPress={() => setBusyDelivery((current) => (current === "queue" ? "steer" : "queue"))}
+                      hitSlop={6}
+                      accessibilityRole="button"
+                      accessibilityLabel={`当前发送方式：${busyDelivery === "steer" ? "引导当前任务" : "排到队尾"}，点按切换`}
+                    >
+                      <Text style={[styles.composerMetaText, busyDelivery === "steer" && styles.composerMetaTextWarn]}>
+                        {busyDelivery === "steer" ? "引导" : "排队"}
+                      </Text>
+                    </Pressable>
+                  )}
+                </ScrollView>
+              ) : (
+                <View style={styles.composerMetaSpacer} />
+              )}
+              <DismissKey visible={focused} />
+              {isChat && draft.trim().length === 0 && images.length === 0 && (
+                <VoiceButton onTranscript={appendTranscript} />
+              )}
+              {busy && !isSubagent && !canSend ? (
+                <Pressable
+                  style={({ pressed }) => [styles.stopBtn, pressed && styles.sendBtnPressed]}
+                  onPress={() => conn.interrupt(sid)}
+                  hitSlop={6}
+                  accessibilityRole="button"
+                  accessibilityLabel="停止当前任务"
+                >
+                  <Icon name="stop.circle" size={18} color={color.danger} />
                 </Pressable>
-              ))}
-            </ScrollView>
-            <VoiceButton onTranscript={appendTranscript} />
-            {composerSendButton}
-          </View>
-        )}
+              ) : (
+                composerSendButton
+              )}
+            </View>
+          ) : (
+            <View style={styles.expandedComposerActions}>
+              <DismissKey visible={focused} />
+              {!isSubagent && (
+                <Pressable
+                  style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
+                  onPress={attach}
+                  accessibilityRole="button"
+                  accessibilityLabel="添加图片"
+                >
+                  <Icon name="paperclip" size={16} color={color.textDim} />
+                </Pressable>
+              )}
+              <ScrollView
+                horizontal
+                style={styles.composerQuickScroll}
+                keyboardShouldPersistTaps="always"
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.composerQuickChars}
+              >
+                {EXPANDED_COMPOSER_TOOLS.map((tool) => (
+                  <Pressable
+                    key={tool.label}
+                    style={({ pressed }) => [styles.quickChar, pressed && styles.composerBtnPressed]}
+                    onPress={() => insertQuickCharacter(tool.value, tool.cursorOffset ?? 0)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`插入${tool.label}`}
+                  >
+                    <Text style={styles.quickCharText}>{tool.label}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+              <VoiceButton onTranscript={appendTranscript} />
+              {composerSendButton}
+            </View>
+          )}
+        </View>
       </View>}
       </KeyboardAvoidingView>
     </View>
@@ -2544,52 +2990,136 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   },
   sessionRail: {
     flexShrink: 0,
-    backgroundColor: color.surface,
-    borderRightWidth: StyleSheet.hairlineWidth,
-    borderRightColor: color.border,
+    minWidth: 0,
+    overflow: "hidden",
+    backgroundColor: color.bg,
   },
   sessionRailHeader: {
-    minHeight: 45,
-    paddingHorizontal: 14,
+    minHeight: 44,
+    paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: color.border,
+    gap: 6,
   },
-  sessionRailTitle: { color: color.text, fontSize: 13, fontWeight: "700" },
+  sessionRailHeaderLeft: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  sessionRailAddBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
+  sessionRailTitle: { color: color.textDim, fontSize: 12, fontWeight: "700", letterSpacing: 0.2 },
   sessionRailCount: {
     minWidth: 22,
     paddingHorizontal: 6,
     paddingVertical: 2,
     overflow: "hidden",
     borderRadius: 999,
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: color.surface,
     color: color.textDim,
-    fontSize: 10,
+    fontSize: 10.5,
+    fontWeight: "600",
     textAlign: "center",
   },
-  sessionRailList: { gap: 7, padding: 10 },
-  sessionRailItem: {
+  sessionRailList: { gap: 8, paddingHorizontal: 10, paddingBottom: 16 },
+  sessionRailSection: { gap: 3, paddingBottom: 4 },
+  sessionRailSubHeader: {
+    flexDirection: "row",
+    alignItems: "center",
     gap: 5,
-    paddingHorizontal: 11,
-    paddingVertical: 10,
-    borderRadius: 11,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.border,
-    backgroundColor: color.bg,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  sessionRailSubTitle: { color: color.textFaint, fontSize: 11, fontWeight: "600" },
+  sessionRailWorkspaceGroup: { gap: 3 },
+  sessionRailWorkspaceHeader: {
+    minHeight: 34,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 6,
+    borderRadius: 10,
+  },
+  sessionRailWorkspaceToggle: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 32,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  sessionRailWorkspaceName: {
+    flex: 1,
+    minWidth: 0,
+    color: color.text,
+    fontSize: 12.5,
+    fontWeight: "700",
+  },
+  sessionRailWorkspaceCount: {
+    color: color.textFaint,
+    fontSize: 10.5,
+    fontVariant: ["tabular-nums"],
+  },
+  sessionRailInlineAdd: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sessionRailTreeChildren: {
+    marginLeft: 12,
+    paddingLeft: 8,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderLeftColor: color.border,
+    gap: 2,
+  },
+  sessionRailTaskSubgroup: { marginTop: 4, gap: 2 },
+  sessionRailTaskSubTitle: {
+    color: color.textFaint,
+    fontSize: 10.5,
+    fontWeight: "600",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  sessionRailItem: {
+    gap: 3,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    backgroundColor: "transparent",
   },
   sessionRailItemSelected: {
-    borderColor: color.accentDim,
-    backgroundColor: color.accentBg,
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
   },
   sessionRailItemTop: { flexDirection: "row", alignItems: "center", gap: 7 },
-  sessionRailStatus: { width: 7, height: 7, borderRadius: 4 },
-  sessionRailItemTitle: { flex: 1, color: color.text, fontSize: 12.5, fontWeight: "600" },
-  sessionRailAgent: { color: color.textFaint, fontSize: 9.5 },
-  sessionRailPath: { color: color.textFaint, fontSize: 9.5, fontFamily: MONOSPACE_FONT },
-  sessionRailPreview: { color: color.textDim, fontSize: 10.5, lineHeight: 15 },
-  headerBack: { width: 36, minHeight: 44, alignItems: "flex-start", justifyContent: "center" },
+  sessionRailStatus: { width: 6, height: 6, borderRadius: 3 },
+  sessionRailItemTitle: { flex: 1, color: color.text, fontSize: 13.5, fontWeight: "600", letterSpacing: -0.1 },
+  sessionRailPath: { color: color.textFaint, fontSize: 11, marginLeft: 22 },
+  headerBack: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    marginRight: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
   loadState: {
     flex: 1,
     alignItems: "center",
@@ -2604,24 +3134,24 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   loadRetry: {
     minHeight: 40,
     justifyContent: "center",
-    borderRadius: 10,
-    paddingHorizontal: 14,
+    borderRadius: 12,
+    paddingHorizontal: 16,
     backgroundColor: color.accent,
   },
   loadRetryText: { color: color.onAccent, fontSize: 13, fontWeight: "700" },
   loadBack: {
     minHeight: 40,
     justifyContent: "center",
-    borderRadius: 10,
-    paddingHorizontal: 14,
+    borderRadius: 12,
+    paddingHorizontal: 16,
     backgroundColor: color.surfaceRaised,
   },
   loadBackText: { color: color.text, fontSize: 13, fontWeight: "600" },
   loadButtonPressed: { opacity: 0.55 },
 
-  headerTitle: { alignItems: "center", justifyContent: "center", minWidth: 0 },
-  headerNameRow: { flexDirection: "row", alignItems: "center", gap: 4, maxWidth: "100%" },
-  headerName: { color: color.text, fontSize: 16, fontWeight: "600", flexShrink: 1 },
+  headerTitle: { alignItems: "flex-start", justifyContent: "center", minWidth: 0, overflow: "hidden" },
+  headerNameRow: { flexDirection: "row", alignItems: "center", gap: 5, maxWidth: "100%", minWidth: 0 },
+  headerName: { color: color.text, fontSize: 16, fontWeight: "600", letterSpacing: -0.2, flexShrink: 1 },
   switcherItem: {
     flexDirection: "row",
     alignItems: "center",
@@ -2636,12 +3166,20 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   switcherTitle: { color: color.text, fontSize: 14.5, fontWeight: "600" },
   switcherMeta: { color: color.textDim, fontSize: 11.5 },
   switcherCurrent: { color: color.textFaint, fontSize: 11.5 },
-  headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 2 },
+  headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 1 },
   headerDot: { width: 5, height: 5, borderRadius: 3 },
-  headerSub: { color: color.textDim, fontSize: 10.5, flexShrink: 1 },
-  // Reserve the stop slot so the toolbar width stays stable as a turn starts or finishes.
-  headerRight: { flexDirection: "row", alignItems: "center" },
-  headerAction: { width: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
+  headerSub: { color: color.textDim, fontSize: 11, flexShrink: 1 },
+  headerRight: { flexDirection: "row", alignItems: "center", gap: 6 },
+  headerAction: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
 
   modeBar: {
     flexDirection: "row",
@@ -2773,6 +3311,58 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   terminalEndedButton: { minHeight: 44, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 8, backgroundColor: "#3A5BA8", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
   terminalEndedButtonText: { color: "#fff", fontSize: 14, fontWeight: "600" },
   terminalActionError: { color: "#F0D798", fontSize: 13, lineHeight: 19 },
+  terminalExtractWrap: { gap: 12 },
+  terminalExtractSection: { gap: 8 },
+  terminalExtractHeaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
+  terminalUrlRow: {
+    gap: 8,
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.bg,
+  },
+  terminalUrlText: {
+    color: color.accent,
+    fontSize: 12,
+    lineHeight: 17,
+    fontFamily: MONOSPACE_FONT,
+  },
+  terminalUrlActions: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 8 },
+  terminalExtractSmallBtn: {
+    minHeight: 32,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  terminalExtractSmallBtnText: { color: color.text, fontSize: 12, fontWeight: "600" },
+  terminalExtractPrimaryBtn: {
+    minHeight: 32,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: color.text,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  terminalExtractPrimaryBtnText: { color: color.bg, fontSize: 12, fontWeight: "700" },
+  terminalExtractBox: {
+    maxHeight: 280,
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: "#14161B",
+  },
+  terminalExtractCode: {
+    color: "#E6E8EE",
+    fontSize: 12,
+    lineHeight: 18,
+    fontFamily: MONOSPACE_FONT,
+  },
 
   reconnBar: {
     flexDirection: "row",
@@ -3045,109 +3635,171 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   windowPct: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"] },
 
   composer: {
-    gap: 8,
-    paddingHorizontal: 10,
-    paddingTop: 8,
+    paddingHorizontal: 12,
+    paddingTop: 6,
     paddingBottom: 10,
-    backgroundColor: color.surface,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: color.border,
+    backgroundColor: color.bg,
   },
-  composerRow: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
-  composerRowExpanded: { flexDirection: "column", alignItems: "stretch", gap: 0 },
+  composerCard: {
+    width: "100%",
+    maxWidth: 880,
+    minWidth: 0,
+    alignSelf: "center",
+    borderRadius: 24,
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    paddingHorizontal: 10,
+    paddingTop: 6,
+    paddingBottom: 8,
+    gap: 4,
+    overflow: "hidden",
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  composerCardFocused: {
+    borderColor: color.textFaint,
+  },
+  composerMetaScroll: { flex: 1, minWidth: 0 },
+  composerMetaSpacer: { flex: 1 },
+  composerMetaStrip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 2,
+  },
+  composerMetaPill: {
+    minHeight: 28,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: color.surfaceRaised,
+  },
+  composerMetaPillAccent: { backgroundColor: color.accentBg },
+  composerMetaPillWarn: { backgroundColor: color.warnBg },
+  composerMetaPillDanger: { backgroundColor: color.dangerBg },
+  composerMetaText: { color: color.textDim, fontSize: 11.5, fontWeight: "600" },
+  composerMetaTextAccent: { color: color.accent },
+  composerMetaTextWarn: { color: color.warn },
+  composerMetaTextDanger: { color: color.danger },
+  composerSheetReplies: { gap: 6, paddingBottom: 8 },
+  composerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 2,
+  },
+  composerRowExpanded: { flexDirection: "column", alignItems: "stretch", gap: 8 },
   expandedComposerActions: {
-    minHeight: 44,
+    minHeight: 40,
     flexDirection: "row",
     alignItems: "center",
     gap: 7,
+    paddingHorizontal: 2,
+    paddingTop: 4,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
   },
   composerQuickScroll: { flex: 1 },
   composerQuickChars: { alignItems: "center", gap: 7, paddingHorizontal: 2 },
   quickChar: {
     minWidth: 54,
-    height: 36,
+    height: 34,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: 10,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.border,
+    borderRadius: 999,
     backgroundColor: color.surfaceRaised,
-    paddingHorizontal: 10,
+    paddingHorizontal: 11,
   },
   quickCharText: { color: color.text, fontSize: 11.5, fontWeight: "600", fontFamily: MONOSPACE_FONT },
+  plusBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: color.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   iconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     backgroundColor: color.surfaceRaised,
     alignItems: "center",
     justifyContent: "center",
   },
   composerBtnPressed: { backgroundColor: color.pressed },
   inputShell: {
-    flex: 1,
+    width: "100%",
     minWidth: 0,
     flexDirection: "row",
     alignItems: "stretch",
     overflow: "hidden",
-    borderRadius: 20,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.border,
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: "transparent",
   },
-  inputShellFocused: {
-    borderColor: color.accentDim,
-  },
+  inputShellFocused: {},
   inputShellExpanded: {
     flex: 0,
     width: "100%",
-    borderRadius: 14,
   },
   input: {
     flex: 1,
     minWidth: 0,
-    minHeight: 40,
+    minHeight: 38,
     backgroundColor: "transparent",
-    paddingHorizontal: 14,
-    paddingRight: 8,
-    paddingTop: 9,
-    paddingBottom: 9,
+    paddingHorizontal: 8,
+    paddingRight: 4,
+    paddingTop: 6,
+    paddingBottom: 6,
     color: color.text,
-    fontSize: 15,
-    lineHeight: 21,
+    fontSize: 15.5,
+    lineHeight: 22,
   },
-  inputChat: { maxHeight: 132 },
+  inputChat: { maxHeight: 140 },
   inputExpanded: {
     minHeight: 160,
     maxHeight: 220,
-    paddingTop: 14,
-    paddingBottom: 14,
+    paddingTop: 10,
+    paddingBottom: 10,
     textAlignVertical: "top",
   },
   composerResizeButton: {
     flexShrink: 0,
     alignSelf: "flex-start",
+    width: 30,
+    height: 30,
+    marginTop: 2,
+    marginRight: 2,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 15,
+  },
+  composerResizeButtonExpanded: { backgroundColor: color.surfaceRaised },
+  inputDisabled: { color: color.textFaint, opacity: 0.7 },
+  stopBtn: {
+    backgroundColor: color.dangerBg,
+    borderRadius: 17,
     width: 34,
     height: 34,
-    marginTop: 3,
-    marginRight: 3,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: 17,
-    backgroundColor: color.surface,
   },
-  composerResizeButtonExpanded: { marginTop: 7, marginRight: 7 },
-  inputDisabled: { color: color.textFaint, opacity: 0.7 },
   sendBtn: {
-    backgroundColor: color.accent,
-    borderRadius: 20,
-    width: 40,
-    height: 40,
+    backgroundColor: color.text,
+    borderRadius: 17,
+    width: 34,
+    height: 34,
     alignItems: "center",
     justifyContent: "center",
   },
-  sendBtnDim: { backgroundColor: color.surfaceRaised, opacity: 0.72 },
-  sendBtnPressed: { transform: [{ scale: 0.94 }] },
+  sendBtnDim: { backgroundColor: color.surfaceRaised, opacity: 0.55 },
+  sendBtnPressed: { transform: [{ scale: 0.93 }] },
   deliveryError: {
     paddingHorizontal: 12,
     paddingVertical: 8,

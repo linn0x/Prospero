@@ -45,6 +45,7 @@ export function subscribeFocusedChat(options: {
     queued = [];
     options.events(batch);
     cursor.current = receivedSeq;
+    options.unread();
   };
   const offSnapshot = conn.events.on("chatSnapshot", (message) => {
     if (!active || message.sid !== sid) return;
@@ -58,8 +59,7 @@ export function subscribeFocusedChat(options: {
     if (!active || message.sid !== sid || message.evSeq <= receivedSeq) return;
     receivedSeq = message.evSeq;
     queued.push(message.body);
-    if (timer === null) timer = setTimeout(flush, 16);
-    options.unread();
+    if (timer === null) timer = setTimeout(flush, 8);
   });
   const offOutput = conn.events.on("toolOutput", (message) => {
     if (!active || message.sid !== sid) return;
@@ -107,6 +107,9 @@ export function pollFocusedSubagent(options: {
   return () => { active = false; clearInterval(timer); offConnected(); };
 }
 
+const TERMINAL_ACK_WINDOW_STEP = 64;
+const TERMINAL_ACK_COALESCE_MS = 24;
+
 /** Keep the retained terminal buffer and resume cursor aligned when leaving the route. */
 export function subscribeFocusedTerminal(options: {
   conn: Pick<HostConnection, "events" | "ack">;
@@ -118,20 +121,37 @@ export function subscribeFocusedTerminal(options: {
   attach(): void;
 }): () => void {
   let active = true;
+  let lastAckedSeq = options.cursor.current;
   let ackTimer: ReturnType<typeof setTimeout> | null = null;
+  const sendAckNow = (seq: number) => {
+    if (ackTimer !== null) {
+      clearTimeout(ackTimer);
+      ackTimer = null;
+    }
+    lastAckedSeq = seq;
+    options.conn.ack(options.sid, seq);
+  };
   const offSnapshot = options.conn.events.on("snapshot", (message) => {
     if (!active || message.sid !== options.sid) return;
     options.snapshot(message);
     options.cursor.current = message.seq;
+    lastAckedSeq = message.seq;
   });
   const offOutput = options.conn.events.on("output", (message) => {
     if (!active || message.sid !== options.sid || message.seq <= options.cursor.current) return;
     options.output(message);
     options.cursor.current = message.seq;
-    if (ackTimer === null) ackTimer = setTimeout(() => {
-      ackTimer = null;
-      options.conn.ack(options.sid, options.cursor.current);
-    }, 500);
+    // 高吞吐 / 高 RTT 中继下若等 500ms 才回 ACK，服务端窗口打满后会周期性断流卡死。
+    // 回放帧或累计超过 64 个序号时立即流水线确认，其余尾帧在 24ms 内合并确认。
+    if (message.replay === true || message.seq - lastAckedSeq >= TERMINAL_ACK_WINDOW_STEP) {
+      sendAckNow(message.seq);
+    } else if (ackTimer === null) {
+      ackTimer = setTimeout(() => {
+        ackTimer = null;
+        lastAckedSeq = options.cursor.current;
+        options.conn.ack(options.sid, options.cursor.current);
+      }, TERMINAL_ACK_COALESCE_MS);
+    }
   });
   const attach = () => { if (active) options.attach(); };
   const offConnected = options.conn.events.on("connected", attach);
@@ -144,6 +164,7 @@ export function subscribeFocusedTerminal(options: {
     if (ackTimer !== null) {
       clearTimeout(ackTimer);
       ackTimer = null;
+      lastAckedSeq = options.cursor.current;
       options.conn.ack(options.sid, options.cursor.current);
     }
   };

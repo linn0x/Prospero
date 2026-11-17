@@ -68,13 +68,29 @@ async function open() {
   return tree!;
 }
 const findButton = (root: ReactTestRenderer, label: string) => root.root.findAllByType("button").find(node => node.props.accessibilityLabel === label)!;
+const findAgentChip = (root: ReactTestRenderer, agent: string) => {
+  const span = root.root.findAllByType("span").find(node => node.children.includes(agent))!;
+  let button = span.parent;
+  while (button && button.type !== "button") button = button.parent;
+  return button!;
+};
+async function expandAdvanced(root: ReactTestRenderer) {
+  const toggle = findButton(root, "高级设置");
+  if (!toggle.props.accessibilityState?.expanded) {
+    await act(async () => toggle.props.onPress());
+  }
+}
 
 describe("new conversation entry", () => {
-  it("shows account and terminal controls immediately without a directory modal covering them", async () => {
+  it("surfaces subscription/model-source auth at top level while keeping terminal/policy controls collapsed by default", async () => {
     const view = await open();
     expect(fixture.snapshot.mock.calls.every(args => (args as unknown[])[0] === null)).toBe(true);
     expect(view.root.findAllByType("dialog")).toHaveLength(0);
+    const advanced = findButton(view, "高级设置");
+    expect(advanced.props.accessibilityState.expanded).toBe(false);
     expect(findButton(view, "选择账号或 API")).toBeDefined();
+    expect(findButton(view, "创建终端会话")).toBeUndefined();
+    await expandAdvanced(view);
     expect(findButton(view, "创建终端会话")).toBeDefined();
   });
 
@@ -93,6 +109,7 @@ describe("new conversation entry", () => {
   it("defaults Codex terminal launches to bypass while allowing a stricter policy", async () => {
     fixture.params.cwd = "/work";
     const view = await open();
+    await expandAdvanced(view);
     await act(async () => findButton(view, "创建终端会话").props.onPress());
     await act(async () => findButton(view, "选择账号或 API").props.onPress());
     const account = view.root.findAllByType("button").find(node => node.props.accessibilityRole === "radio" && node.props.accessibilityLabel.startsWith("电脑 API"))!;
@@ -109,6 +126,7 @@ describe("new conversation entry", () => {
   it.each(["claude", "codex"])("launches a %s terminal with bypass by default", async (agent) => {
     fixture.params.cwd = "/work";
     const view = await open();
+    await expandAdvanced(view);
     await act(async () => findButton(view, "创建终端会话").props.onPress());
     if (agent === "codex") {
       await act(async () => findButton(view, "选择账号或 API").props.onPress());
@@ -126,6 +144,7 @@ describe("new conversation entry", () => {
   it("keeps the structured Claude default separate from the terminal default", async () => {
     fixture.params.cwd = "/work";
     const view = await open();
+    await expandAdvanced(view);
     expect(findButton(view, "审批策略：逐条").props.accessibilityState.checked).toBe(true);
     await act(async () => findButton(view, "创建终端会话").props.onPress());
     expect(findButton(view, "审批策略：YOLO").props.accessibilityState.checked).toBe(true);
@@ -147,7 +166,10 @@ describe("new conversation entry", () => {
       ? { ok: true, sources: [source] }
       : { ok: true, accountId: bound.id, accounts: [bound], sources: [source] });
     const view = await open();
+    await act(async () => findAgentChip(view, "codex").props.onPress());
+    await expandAdvanced(view);
     await act(async () => findButton(view, "创建终端会话").props.onPress());
+    await act(async () => findButton(view, "切换到 API 模型源").props.onPress());
     await act(async () => findButton(view, "从模型源选择模型").props.onPress());
     await act(async () => findButton(view, "模型源 TRAE Queue，35 个已启用模型").props.onPress());
     const search = view.root.findAllByType("input").find(node => node.props.accessibilityLabel === "搜索模型源中的模型")!;
@@ -180,7 +202,10 @@ describe("new conversation entry", () => {
       return { ok: true, accountId: bound.id, accounts: [bound], sources: [updated] };
     });
     const view = await open();
+    await act(async () => findAgentChip(view, "codex").props.onPress());
+    await expandAdvanced(view);
     await act(async () => findButton(view, "创建终端会话").props.onPress());
+    await act(async () => findButton(view, "切换到 API 模型源").props.onPress());
     await act(async () => findButton(view, "从模型源选择模型").props.onPress());
     await act(async () => findButton(view, "模型源 TRAE Queue，1 个已启用模型").props.onPress());
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });

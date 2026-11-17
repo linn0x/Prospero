@@ -42,8 +42,14 @@ export function terminalFontSizeForSystem(fontScale: number): TerminalFontSize {
 export function terminalFontSizeForPreference(
   preference: TerminalFontPreference,
   fontScale: number,
+  viewportWidth?: number,
 ): TerminalFontSize {
-  return preference.mode === "custom" ? preference.size : terminalFontSizeForSystem(fontScale);
+  if (preference.mode === "custom") return preference.size;
+  if (viewportWidth !== undefined && Number.isFinite(viewportWidth) && viewportWidth > 0 && viewportWidth < 460) {
+    const scale = Number.isFinite(fontScale) && fontScale > 0 ? fontScale : 1;
+    return clampTerminalFontSize(10 * scale);
+  }
+  return terminalFontSizeForSystem(fontScale);
 }
 
 /** A+/A− 从当前档位移动一格，不会产生不在档位表中的字号。 */

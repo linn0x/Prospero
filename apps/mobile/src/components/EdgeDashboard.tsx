@@ -79,14 +79,14 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
   const workspaceOrders = useWorkspaceOrders();
   const projects = useMemo(() => orderEdgeWorkspaces(data.projects, workspaceOrders), [data.projects, workspaceOrders]);
   const rows = useMemo<ListRow[]>(() => selectedHosts.length === 0 ? [] : [
-    ...(data.approvals.length ? [{ kind: "heading" as const, key: "approvals", title: `待审批 · ${data.approvals.length}` },
+    ...(data.approvals.length ? [{ kind: "heading" as const, key: "approvals", title: `收件箱 · ${data.approvals.length}` },
       ...data.approvals.map((value) => ({ kind: "session" as const, key: `approval:${value.key}`, value }))] : []),
-    { kind: "heading", key: "recent", title: "最近对话", create: "session" },
+    { kind: "heading", key: "recent", title: "最近继续", create: "session" },
     ...data.recent.map((value) => ({ kind: "session" as const, key: `recent:${value.key}`, value })),
-    ...(data.recent.length ? [] : [{ kind: "empty" as const, key: "recent-empty", title: "创建或打开对话后，会显示在这里。" }]),
-    { kind: "heading", key: "projects", title: `工作目录 · ${data.projects.length}`, create: "directory" },
+    ...(data.recent.length ? [] : [{ kind: "empty" as const, key: "recent-empty", title: "创建或打开会话后，会显示在这里。" }]),
+    { kind: "heading", key: "projects", title: `工作区 · ${data.projects.length}`, create: "directory" },
     ...projects.map((value) => ({ kind: "project" as const, key: `project:${value.key}`, value })),
-    ...(data.projects.length ? [] : [{ kind: "empty" as const, key: "projects-empty", title: "设备上的工作目录会在连接后同步。" }]),
+    ...(data.projects.length ? [] : [{ kind: "empty" as const, key: "projects-empty", title: "电脑上的工作区会在连接后同步。" }]),
   ], [data, projects, selectedHosts.length]);
   const connected = selectedHosts.filter((host) => runtimes[host.id]?.status === "connected").length;
   const loading = selectedHosts.some((host) => ["connecting", "reconnecting"].includes(runtimes[host.id]?.status ?? "idle"));
@@ -179,21 +179,21 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
       renderItem={({ item }) => item.kind === "heading" ? <View style={styles.sectionHeading}>
         <Text style={styles.heading}>{item.title}</Text>
         {item.create && <Pressable accessibilityRole="button"
-          accessibilityLabel={item.create === "directory" ? "新建目录" : "新建对话"}
+          accessibilityLabel={item.create === "directory" ? "添加工作区" : "新建会话"}
           accessibilityState={{ disabled: readyHosts.length === 0 }} disabled={!readyHosts.length}
           onPress={() => startCreate(item.create!)} style={[styles.button, !readyHosts.length && styles.unselected]}>
-          <Icon name="plus" size={14} color={palette.accent} /><Text style={styles.link}>{item.create === "directory" ? "新建目录" : "新对话"}</Text>
+          <Icon name="plus" size={14} color={palette.accent} /><Text style={styles.link}>{item.create === "directory" ? "添加工作区" : "新建会话"}</Text>
         </Pressable>}
       </View> : item.kind === "empty" ? <Text style={styles.sectionEmpty}>{item.title}</Text>
         : item.kind === "session" ? sessionRow(item.value) : projectRow(item.value)}
       ItemSeparatorComponent={() => <View style={styles.gap} />}
     />
-    <Sheet visible={createKind !== null} title={createKind === "directory" ? "选择新建目录的设备" : "选择新对话的设备"}
+    <Sheet visible={createKind !== null} title={createKind === "directory" ? "选择添加工作区的电脑" : "选择新建会话的电脑"}
       onClose={() => { navigation.cancel(); setCreateKind(null); }} onDismiss={() => navigation.dismiss()}>
       {readyHosts.map((host) => <SheetAction key={host.id} label={host.name} detail={edgeDeviceConnectionLabel(runtimes[host.id])} symbol="desktopcomputer"
         onPress={() => { const kind = createKind; navigation.defer(() => kind === "directory" ? onCreateDirectory(host.id) : onCreateSession(host.id)); setCreateKind(null); }} />)}
     </Sheet>
-    <PromptDialog visible={editing !== null} title="工作目录名称" message={editing ? `${editing.host.name} · ${editing.project.path}` : undefined}
+    <PromptDialog visible={editing !== null} title="编辑工作区名称" message={editing ? `${editing.host.name} · ${editing.project.path}` : undefined}
       value={alias} onChangeText={setAlias} onCancel={() => setEditing(null)} onSubmit={(value) => {
         if (editing) { const aliases = { ...homeSettings.workspaceAliases }; const key = workspaceAliasKey(editing.host.id, editing.project.path);
           if (value.trim()) aliases[key] = value.trim(); else delete aliases[key];

@@ -187,7 +187,7 @@ describe("mounted conversation theme", () => {
       const palette = paletteForScheme(scheme);
       expect(disclosure().props.accessibilityState.expanded).toBe(true);
       expect(style(disclosure())).toMatchObject({ backgroundColor: palette.surfaceRaised });
-      expect(textColor(text(root, "检查这个项目"))).toBe(palette.onAccent);
+      expect(textColor(text(root, "检查这个项目"))).toBe(palette.text);
       expect(textColor(text(root, "检查完成"))).toBe(palette.text);
       assertExplicitColors(root);
     }
