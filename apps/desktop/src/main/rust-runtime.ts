@@ -562,7 +562,7 @@ export class RustRuntime {
       || !this.cachedHealth
       || !this.cachedDevices
       || !this.cachedSchedules
-      || now - this.slowMetadataReadAt >= 5_000;
+      || now - this.slowMetadataReadAt >= 15_000;
     const skipOrchestrationProbe = tabsOnly
       && this.orchestrationReady
       && !this.orchestrationRetryPending
@@ -631,7 +631,7 @@ export class RustRuntime {
     } else if (refreshOrchestration || !orchCursor) {
       this.orchestrationRetryPending = true;
     }
-    this.nextDevicesPollAt = Date.now() + 2_000;
+    this.nextDevicesPollAt = Date.now() + 15_000;
     const queueById = new Map(queues.queues.map(queue => [queue.sessionId, queue.items]));
     const controlsById = new Map(controls.controls.map(item => [item.sessionId, item]));
     const sessions = [...active.items, ...recent.items].map(head => rustSessionInfo(head, queueById.get(head.id), controlsById.get(head.id)));
@@ -932,7 +932,7 @@ export class RustRuntime {
       const { client } = this.current();
       const now = Date.now();
       const shouldPollDevices = now >= this.nextDevicesPollAt;
-      if (shouldPollDevices) this.nextDevicesPollAt = now + 2_000;
+      if (shouldPollDevices) this.nextDevicesPollAt = now + 15_000;
       if (sseHealthy) {
         const devices = shouldPollDevices ? await client.devices(this.controller.signal).catch(() => null) : null;
         if (devices && typeof this.store.setApiDevices === "function") {
@@ -941,7 +941,7 @@ export class RustRuntime {
         const hasActiveOrchestration = this.store.snapshot().orchestration?.runs?.some(
           (run) => run["status"] === "active" || run["status"] === "running",
         ) === true;
-        if (this.orchestrationRetryPending || !this.orchestrationReady || hasActiveOrchestration) {
+        if (this.orchestrationRetryPending || !this.orchestrationReady || (hasActiveOrchestration && now - this.orchestrationReadAt >= 4_000)) {
           await this.refresh();
         }
         delay = SSE_MAINTENANCE_INTERVAL_MS;

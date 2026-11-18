@@ -614,7 +614,8 @@ function sidebarSessionRowEqual(
     left.nativeSession?.nativeId !== right.nativeSession?.nativeId ||
     left.title !== right.title ||
     left.displayTitle !== right.displayTitle ||
-    left.preview !== right.preview ||
+    sessionLabel(left) !== sessionLabel(right) ||
+    sidebarSessionLabel(left) !== sidebarSessionLabel(right) ||
     left.cwd !== right.cwd ||
     left.status !== right.status ||
     left.createdAt !== right.createdAt ||
@@ -728,7 +729,7 @@ function DaemonAgentsCard({
   );
 }
 
-function ShellSidebar({
+const ShellSidebar = memo(function ShellSidebar({
   snapshot,
   view,
   activeId,
@@ -1979,7 +1980,7 @@ function ShellSidebar({
       />
     </Sidebar>
   );
-}
+});
 
 function ProjectRenameDialog({
   project,
@@ -3251,7 +3252,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       let changed = false;
       for (const session of liveTracked) {
         const existing = currentById.get(session.id);
-        if (!existing || existing.status !== session.status || existing.title !== session.title || existing.displayTitle !== session.displayTitle || existing.preview !== session.preview || existing.terminalMode !== session.terminalMode) {
+        if (!existing || existing.status !== session.status || existing.title !== session.title || existing.displayTitle !== session.displayTitle || (!session.title && !session.displayTitle && existing.preview !== session.preview) || existing.model !== session.model || existing.effort !== session.effort || existing.terminalMode !== session.terminalMode) {
           changed = true;
           break;
         }
@@ -3740,6 +3741,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     window.addEventListener("keydown", navigate);
     return () => window.removeEventListener("keydown", navigate);
   }, [navigation]);
+  const exitFocus = useCallback(() => setFocus(false), []);
+  const retryRemote = useCallback(() => { void remote.refresh(); }, [remote.refresh]);
   const workspaceFocus = focus && view === "workspaces";
   const localWorkspaceVisible = view === "workspaces" && !activeRemote && !(activeRemoteId && !remote.ready);
   const [localWorkspaceVisited, setLocalWorkspaceVisited] = useState(false);
@@ -3783,10 +3786,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onUpdateRemote={remote.upsert}
         onForgetRemote={remote.forget}
         focus={workspaceFocus}
-        onExitFocus={() => setFocus(false)}
+        onExitFocus={exitFocus}
         remoteError={remote.error}
         remoteLoading={remote.loading}
-        onRetryRemote={() => void remote.refresh()}
+        onRetryRemote={retryRemote}
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
 

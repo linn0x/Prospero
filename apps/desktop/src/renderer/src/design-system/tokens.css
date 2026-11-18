@@ -79,7 +79,7 @@
   --chrome-highlight: #ffffff66;
   --overlay-glass: color-mix(in srgb, var(--popover) 84%, transparent);
   --glass-border: color-mix(in srgb, var(--foreground) 12%, transparent);
-  --glass-filter: blur(18px) saturate(108%);
+  --glass-filter: blur(8px);
   --glass-shadow: 0 18px 48px #24345124;
   --glass-scrim: #1720332e;
   --liquid-fill: color-mix(in srgb, var(--surface-1) 76%, transparent);

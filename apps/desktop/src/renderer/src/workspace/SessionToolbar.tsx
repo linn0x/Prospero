@@ -41,8 +41,12 @@ export function SessionToolbar({ session, account: _account, unread = false, con
       <div className="session-toolbar-identity" title={`${sessionLabel(session)} · ${session.cwd}`}>
         <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} />
         <span className="session-toolbar-path">{shortPath(session.cwd)}</span>
+        <span className="session-toolbar-sep" aria-hidden="true">·</span>
         <span className="session-toolbar-chip">{session.agent} · {kindBadge}</span>
-        {modelName && <span className="session-toolbar-chip session-toolbar-model" title={rawModel}>{modelName}</span>}
+        {session.kind === "pty" && modelName && <>
+          <span className="session-toolbar-sep" aria-hidden="true">·</span>
+          <span className="session-toolbar-chip session-toolbar-model" title={rawModel}>{modelName}</span>
+        </>}
       </div>
       <div className="pane-toolbar-actions">
         {["running", "starting", "waiting_input", "waiting_approval"].includes(session.status) && <Button variant="ghost" size="xs" disabled={busy} aria-label={t("停止当前轮次", "Stop current turn")} onClick={() => void action(() => window.prospero.interruptSession(session.id))}><DesktopIcon name="stop" />{t("停止", "Stop")}</Button>}

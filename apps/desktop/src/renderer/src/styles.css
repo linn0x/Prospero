@@ -433,17 +433,14 @@ kbd {
 .tone-warning { color: var(--warning); }
 .tone-danger { color: var(--danger); }
 .tone-success { color: var(--success); }
-.status-mark { display: inline-block; flex: none; width: 7px; height: 7px; border-radius: 999px; background: var(--muted-foreground); transform-origin: center; }
+.status-mark { display: inline-block; flex: none; width: 7px; height: 7px; border-radius: 999px; background: var(--muted-foreground); }
 .status-mark[data-state="completed"], .status-mark[data-state="running"] { background: var(--success); }
 .status-mark[data-state="terminated"] { background: var(--danger); }
 .status-mark[data-state="approval"], .status-mark[data-state="input"] { background: var(--primary); }
-.status-mark[data-motion="breathe"] { animation: session-status-breathe 2s ease-in-out infinite; }
-.status-mark[data-motion="bounce"] { animation: session-status-bounce 1.3s ease-in-out infinite; }
-.status-mark[data-motion="blink"] { animation: session-status-blink 1.6s ease-in-out infinite; }
-@keyframes session-status-breathe { 0%, 100% { transform: scale(.8); } 50% { transform: scale(1.35); } }
-@keyframes session-status-bounce { 0%, 45%, 100% { transform: translateY(0); } 22% { transform: translateY(-3px); } 65% { transform: translateY(-1.5px); } }
-@keyframes session-status-blink { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
-@media (prefers-reduced-motion: reduce) { .status-mark[data-motion] { animation: none !important; transform: none; opacity: 1; } }
+.session-toolbar .status-mark[data-motion="breathe"],
+.workspace-tab.is-active .status-mark[data-motion="breathe"] { animation: session-status-blink 2.4s ease-in-out infinite; }
+@keyframes session-status-blink { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .status-mark[data-motion] { animation: none !important; opacity: 1; } }
 .agent-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .agent-card-identity { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 11px; }
 .agent-card-identity [data-slot="card-description"] { margin-top: 3px; }
@@ -996,10 +993,9 @@ kbd {
   overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--muted-foreground) 28%, transparent);
   border-radius: var(--ui-radius-panel);
-  background: color-mix(in srgb, var(--card) 92%, transparent);
+  background: var(--card);
   box-shadow: 0 4px 14px #0000001f;
   cursor: crosshair;
-  backdrop-filter: blur(8px);
 }
 .run-graph-minimap canvas { display: block; width: 100%; height: 100%; }
 .run-graph-controls {
