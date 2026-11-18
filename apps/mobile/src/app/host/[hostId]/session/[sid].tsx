@@ -22,7 +22,6 @@ import { StatusBar } from "expo-status-bar";
 import { NavigationBar } from "expo-navigation-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { KeyboardAvoidingView, KeyboardEvents } from "react-native-keyboard-controller";
-import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { DismissedModalAction } from "@/lib/host-screen-flow";
@@ -83,8 +82,7 @@ import { groupSessionsByProject } from "@/lib/session-projects";
 import { WorkspaceFolderIcon } from "@/components/WorkspaceDisclosure";
 import {
   buildAlignedWorkspaceTree,
-  desktopSidebarSessionLabel,
-  sessionWorkbenchSubtitle,
+  sidebarSessionRowDisplay,
   sortWorkspaceSessions,
   useHydratedWorkspaceConcepts,
   workspacePathKey,
@@ -223,7 +221,6 @@ function SessionHeaderTitle({
   const styles = useStyles();
   const { palette: color } = useMobileTheme();
   const statusColor = statusColors(color);
-  const { width } = useWindowDimensions();
   const shellTerminal = isShellTerminal(session);
   const busy = !subagent && !shellTerminal && (session?.status === "running" || session?.status === "starting");
   const elapsed = useElapsed(
@@ -245,7 +242,7 @@ function SessionHeaderTitle({
   const Container = onSwitch ? Pressable : View;
   return (
     <Container
-      style={[styles.headerTitle, { maxWidth: Math.max(100, Math.min(width >= 600 ? 440 : 290, width - 160)) }]}
+      style={styles.headerTitle}
       {...(onSwitch
         ? {
             onPress: onSwitch,
@@ -378,6 +375,7 @@ function FoldableSessionRail({
   currentId,
   hostId,
   width,
+  topInset = 0,
   isSubagent = false,
   worktreeAssets = NO_RAIL_WORKTREE_ASSETS,
 }: {
@@ -385,6 +383,7 @@ function FoldableSessionRail({
   currentId: string;
   hostId: string;
   width: number;
+  topInset?: number;
   isSubagent?: boolean;
   worktreeAssets?: readonly OrchestrationWorktreeAsset[];
 }) {
@@ -451,12 +450,8 @@ function FoldableSessionRail({
 
   const renderRailSession = (item: SessionInfo, showFolder = false) => {
     const selected = !isSubagent && item.id === currentId;
-    const label = desktopSidebarSessionLabel(item);
-    const folder = item.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? item.cwd;
-    const subtitle = sessionWorkbenchSubtitle(
-      item,
-      showFolder ? { showWorkspace: folder } : undefined,
-    );
+    const folder = showFolder ? (item.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? item.cwd) : undefined;
+    const display = sidebarSessionRowDisplay(item, folder ? { folderLabel: folder } : undefined);
     return (
       <Pressable
         key={item.id}
@@ -472,24 +467,24 @@ function FoldableSessionRail({
         accessibilityLabel={`打开会话 ${item.title}`}
       >
         {selected && <View style={styles.sessionRailActiveBar} />}
-        <View style={styles.sessionRailItemTop}>
-          <AgentIcon agent={item.agent} size={13} badge badgeOutline={false} />
-          <Text
-            style={[styles.sessionRailItemTitle, selected && styles.sessionRailItemTitleSelected]}
-            numberOfLines={1}
-          >
-            {label}
-          </Text>
-          <View
-            style={[
-              styles.sessionRailStatus,
-              { backgroundColor: statusColor[item.status] ?? color.textFaint },
-            ]}
-          />
-        </View>
-        <Text style={styles.sessionRailPath} numberOfLines={1}>
-          {subtitle}
+        <AgentIcon agent={item.agent} size={13} badge badgeOutline={false} />
+        <Text
+          style={[styles.sessionRailItemTitle, selected && styles.sessionRailItemTitleSelected]}
+          numberOfLines={1}
+        >
+          {display.title}
         </Text>
+        {display.meta ? (
+          <Text style={styles.sessionRailMeta} numberOfLines={1}>
+            {display.meta}
+          </Text>
+        ) : null}
+        <View
+          style={[
+            styles.sessionRailStatus,
+            { backgroundColor: statusColor[item.status] ?? color.textFaint },
+          ]}
+        />
       </Pressable>
     );
   };
@@ -497,7 +492,7 @@ function FoldableSessionRail({
   const allRailWorkspaces = [...workspaces, ...orphanTaskWorkspaces];
 
   return (
-    <View style={[styles.sessionRail, { width }]}>
+    <View style={[styles.sessionRail, { width, paddingTop: topInset }]}>
       <View style={styles.sessionRailHeader}>
         <Pressable
           accessibilityRole="button"
@@ -632,7 +627,6 @@ export default function SessionScreen() {
   const font = fontForPalette(color);
   const { settings, updateSettings } = useSettingsPreferences();
   const insets = useSafeAreaInsets();
-  const headerHeight = useHeaderHeight();
   const adaptiveLayout = useAdaptiveLayout();
   const { fontScale } = useWindowDimensions();
   const { hostId, sid, subagentId } = useLocalSearchParams<{
@@ -1617,6 +1611,7 @@ export default function SessionScreen() {
           currentId={sid}
           hostId={hostId}
           width={sessionRailWidth}
+          topInset={insets.top}
           isSubagent={isSubagent}
           worktreeAssets={orchestration?.worktreeAssets}
         />
@@ -1644,89 +1639,86 @@ export default function SessionScreen() {
           },
         ]}
         behavior="padding"
-        keyboardVerticalOffset={immersiveTerminal ? 0 : headerHeight}
+        keyboardVerticalOffset={0}
       >
         {screenFocused && immersiveTerminal && <><StatusBar hidden /><NavigationBar hidden /></>}
-        <Stack.Screen
-        options={{
-          headerShown: !immersiveTerminal,
-          headerTitleAlign: "left",
-          headerBackVisible: false,
-          headerLeft: () => (
-            <Pressable
-              style={({ pressed }) => [styles.headerBack, pressed && styles.composerBtnPressed]}
-              onPress={returnToHost}
-              hitSlop={10}
-              accessibilityRole="button"
-              accessibilityLabel="返回项目会话列表"
-            >
-              <Icon name="chevron.left" size={17} color={color.text} weight="semibold" />
-            </Pressable>
-          ),
-          headerTitle: () => (
-            <SessionHeaderTitle
-              session={session}
-              pending={pending}
-              tightest={tightest}
-              {...(subagent ? { subagent } : {})}
-              {...(canSwitchSession ? { onSwitch: openSwitcher } : {})}
-            />
-          ),
-          headerRight: () => (
-            <View style={styles.headerRight}>
-              {shellTerminal && !terminalEnded && (
+        <Stack.Screen options={{ headerShown: false }} />
+        {!immersiveTerminal && (
+          <View style={[styles.sessionTopBar, { paddingTop: insets.top }]}>
+            <View style={styles.sessionTopBarInner}>
+              {(!showSessionRail || isSubagent) && (
+                <Pressable
+                  style={({ pressed }) => [styles.headerBack, pressed && styles.composerBtnPressed]}
+                  onPress={returnToHost}
+                  hitSlop={10}
+                  accessibilityRole="button"
+                  accessibilityLabel="返回项目会话列表"
+                >
+                  <Icon name="chevron.left" size={16} color={color.text} weight="semibold" />
+                </Pressable>
+              )}
+              <SessionHeaderTitle
+                session={session}
+                pending={pending}
+                tightest={tightest}
+                {...(subagent ? { subagent } : {})}
+                {...(canSwitchSession ? { onSwitch: openSwitcher } : {})}
+              />
+              <View style={styles.headerRight}>
+                {shellTerminal && !terminalEnded && (
+                  <Pressable
+                    style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
+                    onPress={confirmKill}
+                    disabled={terminalClose.closing}
+                    hitSlop={8}
+                    accessibilityRole="button"
+                    accessibilityLabel="关闭终端"
+                  >
+                    {terminalClose.closing ? <ActivityIndicator size="small" color={color.danger} /> : <Icon name="xmark" size={15} color={color.danger} />}
+                  </Pressable>
+                )}
+                {!isChat && (
+                  <Pressable
+                    style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
+                    onPress={() => setTerminalFullscreen(true)}
+                    hitSlop={8}
+                    accessibilityRole="button"
+                    accessibilityLabel="终端全屏"
+                  >
+                    <Icon name="arrow.up.left.and.arrow.down.right" size={14} color={color.textDim} />
+                  </Pressable>
+                )}
                 <Pressable
                   style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
-                  onPress={confirmKill}
-                  disabled={terminalClose.closing}
+                  onPress={() => router.push(`/host/${hostId}/files/${sid}`)}
                   hitSlop={8}
                   accessibilityRole="button"
-                  accessibilityLabel="关闭终端"
+                  accessibilityLabel="浏览项目文件"
                 >
-                  {terminalClose.closing ? <ActivityIndicator color={color.danger} /> : <Icon name="xmark" size={17} color={color.danger} />}
+                  <Icon name="folder.fill" size={15} color={color.textDim} />
                 </Pressable>
-              )}
-              {!isChat && (
                 <Pressable
                   style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
-                  onPress={() => setTerminalFullscreen(true)}
+                  onPress={() => router.push(`/host/${hostId}/git/${sid}`)}
+                  hitSlop={8}
                   accessibilityRole="button"
-                  accessibilityLabel="终端全屏"
+                  accessibilityLabel="查看项目改动"
                 >
-                  <Icon name="arrow.up.left.and.arrow.down.right" size={16} color={color.text} />
+                  <Icon name="arrow.triangle.branch" size={15} color={color.textDim} />
                 </Pressable>
-              )}
-              <Pressable
-                style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
-                onPress={() => router.push(`/host/${hostId}/files/${sid}`)}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="浏览项目文件"
-              >
-                <Icon name="folder.fill" size={16} color={color.text} />
-              </Pressable>
-              <Pressable
-                style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
-                onPress={() => router.push(`/host/${hostId}/git/${sid}`)}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="查看项目改动"
-              >
-                <Icon name="arrow.triangle.branch" size={16} color={color.text} />
-              </Pressable>
-              <Pressable
-                style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
-                onPress={openMenu}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="更多会话操作"
-              >
-                <Icon name="ellipsis.circle" size={17} color={color.text} />
-              </Pressable>
+                <Pressable
+                  style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
+                  onPress={openMenu}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="更多会话操作"
+                >
+                  <Icon name="ellipsis.circle" size={15} color={color.textDim} />
+                </Pressable>
+              </View>
             </View>
-          ),
-        }}
-      />
+          </View>
+        )}
       {runtime.status !== "connected" && (
         <View style={styles.reconnBar}>
           <View style={styles.reconnCopy}>
@@ -2976,7 +2968,7 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     backgroundColor: color.surface,
   },
   sessionRailHeader: {
-    minHeight: 42,
+    minHeight: 40,
     paddingHorizontal: 10,
     flexDirection: "row",
     alignItems: "center",
@@ -2984,6 +2976,18 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     gap: 6,
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: color.border,
+  },
+  sessionTopBar: {
+    backgroundColor: color.surface,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  sessionTopBarInner: {
+    minHeight: 40,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   sessionRailHomeBtn: {
     width: 26,
@@ -3088,10 +3092,13 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   },
   sessionRailItem: {
     position: "relative",
-    gap: 2,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    borderRadius: 8,
+    minHeight: 30,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 5,
+    borderRadius: 6,
     backgroundColor: "transparent",
   },
   sessionRailItemSelected: {
@@ -3100,27 +3107,23 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   sessionRailActiveBar: {
     position: "absolute",
     left: 0,
-    top: 6,
-    bottom: 6,
-    width: 3,
+    top: 5,
+    bottom: 5,
+    width: 2.5,
     borderRadius: 2,
     backgroundColor: color.accent,
   },
-  sessionRailItemTop: { flexDirection: "row", alignItems: "center", gap: 6 },
-  sessionRailStatus: { width: 6, height: 6, borderRadius: 3 },
-  sessionRailItemTitle: { flex: 1, color: color.textDim, fontSize: 12.5, fontWeight: "500" },
-  sessionRailItemTitleSelected: { color: color.text, fontWeight: "700" },
-  sessionRailPath: { color: color.textFaint, fontSize: 10.5, marginLeft: 19 },
+  sessionRailStatus: { width: 5.5, height: 5.5, borderRadius: 3, flexShrink: 0 },
+  sessionRailItemTitle: { flex: 1, minWidth: 0, color: color.textDim, fontSize: 12.5, fontWeight: "500" },
+  sessionRailItemTitleSelected: { color: color.text, fontWeight: "600" },
+  sessionRailMeta: { color: color.textFaint, fontSize: 10.5, fontVariant: ["tabular-nums"], flexShrink: 0 },
   headerBack: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    marginRight: 8,
+    width: 28,
+    height: 28,
+    borderRadius: 6,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: color.surface,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.border,
+    backgroundColor: "transparent",
   },
   loadState: {
     flex: 1,
@@ -3151,9 +3154,9 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   loadBackText: { color: color.text, fontSize: 13, fontWeight: "600" },
   loadButtonPressed: { opacity: 0.55 },
 
-  headerTitle: { alignItems: "flex-start", justifyContent: "center", minWidth: 0, overflow: "hidden" },
+  headerTitle: { flex: 1, alignItems: "flex-start", justifyContent: "center", minWidth: 0, overflow: "hidden" },
   headerNameRow: { flexDirection: "row", alignItems: "center", gap: 5, maxWidth: "100%", minWidth: 0 },
-  headerName: { color: color.text, fontSize: 16, fontWeight: "600", letterSpacing: -0.2, flexShrink: 1 },
+  headerName: { color: color.text, fontSize: 13.5, fontWeight: "600", letterSpacing: -0.2, lineHeight: 16, flexShrink: 1 },
   switcherItem: {
     flexDirection: "row",
     alignItems: "center",
@@ -3168,19 +3171,17 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
   switcherTitle: { color: color.text, fontSize: 14.5, fontWeight: "600" },
   switcherMeta: { color: color.textDim, fontSize: 11.5 },
   switcherCurrent: { color: color.textFaint, fontSize: 11.5 },
-  headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 1 },
+  headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 1 },
   headerDot: { width: 5, height: 5, borderRadius: 3 },
-  headerSub: { color: color.textDim, fontSize: 11, flexShrink: 1 },
-  headerRight: { flexDirection: "row", alignItems: "center", gap: 6 },
+  headerSub: { color: color.textDim, fontSize: 10.5, lineHeight: 13, flexShrink: 1 },
+  headerRight: { flexDirection: "row", alignItems: "center", gap: 2, flexShrink: 0 },
   headerAction: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 28,
+    height: 28,
+    borderRadius: 6,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: color.surface,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.border,
+    backgroundColor: "transparent",
   },
 
   modeBar: {

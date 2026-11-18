@@ -275,6 +275,45 @@ function formatSessionStamp(timestamp: number): string {
   return `${String(date.getMonth() + 1)}/${String(date.getDate())} ${hhmm}`;
 }
 
+function formatCompactSidebarStamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime()) || timestamp <= 0) return "";
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  }
+  return `${String(date.getMonth() + 1)}/${String(date.getDate())}`;
+}
+
+/**
+ * Produces single-line IDE sidebar row text: when a session uses the generic
+ * agent default title (`Codex`, `Terminal`, etc.), appends the model or short
+ * id inline so sibling rows stay compact yet immediately distinguishable.
+ */
+export function sidebarSessionRowDisplay(
+  session: SessionInfo,
+  options?: { folderLabel?: string },
+): { title: string; meta: string } {
+  const label = desktopSidebarSessionLabel(session);
+  const fallbackAgent = AGENT_SHORT_LABELS[session.agent.toLowerCase()] ?? session.agent;
+  const escapedAgent = session.agent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedFallback = fallbackAgent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const isGenericDefault = new RegExp(
+    `^(?:${escapedFallback}|${escapedAgent})(?:\\s+副本|\\s+Copy)?$`,
+    "i",
+  ).test(label);
+  const modelRaw = (session.agentControls?.currentModel || session.model || "").trim();
+  const modelShort = modelRaw ? (modelRaw.split("/").at(-1) ?? modelRaw) : "";
+  const preview = session.preview?.trim().replace(/\s+/g, " ") || "";
+  const disambiguator = isGenericDefault ? (modelShort || preview || `#${session.id.slice(0, 4)}`) : "";
+  const title = disambiguator ? `${label} · ${disambiguator}` : label;
+  const stamp = formatCompactSidebarStamp(session.createdAt);
+  const meta = [options?.folderLabel?.trim() || null, stamp || null]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
+  return { title, meta };
+}
+
 /**
  * Builds a compact, disambiguating metadata line for workbench and sidebar rows
  * so multiple sessions in the same workspace (e.g. several Codex TUI tabs) are

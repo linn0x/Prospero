@@ -170,7 +170,7 @@ export function SplitPaneDivider({
           styles.seamLine,
           {
             width: seamWidth,
-            backgroundColor: dragging ? palette.text : palette.border,
+            backgroundColor: dragging ? palette.accent : palette.border,
           },
         ]}
       />
@@ -178,21 +178,14 @@ export function SplitPaneDivider({
         <View
           pointerEvents="none"
           style={[
-            styles.thumbPill,
+            styles.gripBar,
             {
-              backgroundColor: dragging ? palette.text : palette.surface,
-              borderColor: dragging ? palette.text : palette.border,
+              backgroundColor: dragging ? palette.accent : palette.textFaint,
+              opacity: dragging ? 1 : 0.45,
             },
-            dragging && styles.thumbPillDragging,
+            dragging && styles.gripBarDragging,
           ]}
-        >
-          <View
-            style={[
-              styles.thumbGrip,
-              { backgroundColor: dragging ? palette.bg : palette.textFaint },
-            ]}
-          />
-        </View>
+        />
       )}
     </View>
   );
@@ -213,21 +206,14 @@ const styles = StyleSheet.create({
     top: 0,
     bottom: 0,
   },
-  thumbPill: {
-    width: 8,
+  gripBar: {
+    width: 3,
+    height: 28,
+    borderRadius: 1.5,
+  },
+  gripBarDragging: {
+    width: 4,
     height: 40,
-    borderRadius: 999,
-    borderWidth: StyleSheet.hairlineWidth,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  thumbPillDragging: {
-    width: 10,
-    height: 52,
-  },
-  thumbGrip: {
-    width: 2,
-    height: 16,
-    borderRadius: 1,
+    borderRadius: 2,
   },
 });

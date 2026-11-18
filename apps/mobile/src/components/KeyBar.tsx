@@ -5,7 +5,7 @@ import * as Haptics from "expo-haptics";
 import { toast } from "@/components/Toast";
 import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
 import type { TerminalModifiers } from "@/lib/keys";
-import { MIN_TOUCH_TARGET, type TerminalFontPreference } from "@/lib/terminal-font-size";
+import { type TerminalFontPreference } from "@/lib/terminal-font-size";
 
 interface KeyDef {
   label: string;
@@ -131,6 +131,7 @@ function HoldRepeatKey({
       <Pressable
         onPress={onTrigger}
         disabled={disabled}
+        hitSlop={KEY_TOUCH_SLOP}
         style={({ pressed }) => [styles.key, disabled && styles.keyDisabled, pressed && styles.keyPressed]}
         accessibilityRole="keyboardkey"
         accessibilityLabel={accessibilityLabel}
@@ -143,6 +144,7 @@ function HoldRepeatKey({
   return (
     <Pressable
       disabled={disabled}
+      hitSlop={KEY_TOUCH_SLOP}
       onPressIn={() => {
         if (disabled) return;
         repeatedRef.current = false;
@@ -380,13 +382,16 @@ export const KeyBar = forwardRef<KeyBarHandle, KeyBarProps>(function KeyBar(
             disabled={!enabled || composerSending}
             style={({ pressed }) => [
               styles.composerSendBtn,
+              composerText.length > 0 && styles.composerSendBtnActive,
               (!enabled || composerSending) && styles.keyDisabled,
               pressed && styles.composerSendPressed,
             ]}
             accessibilityRole="button"
             accessibilityLabel="发送到终端并执行"
           >
-            <Text style={styles.composerSendText}>{composerText.length > 0 ? "发送 ⏎" : "回车 ⏎"}</Text>
+            <Text style={[styles.composerSendText, composerText.length > 0 && styles.composerSendTextActive]}>
+              {composerText.length > 0 ? "发送 ⏎" : "回车 ⏎"}
+            </Text>
           </Pressable>
         </View>
       )}
@@ -502,7 +507,7 @@ export const KeyBar = forwardRef<KeyBarHandle, KeyBarProps>(function KeyBar(
 
           <View style={styles.sep} />
 
-          {KEYS.filter((k) => PRIMARY_KEYS.has(k.label) || expanded).map((k) => (
+          {KEYS.filter((k) => (PRIMARY_KEYS.has(k.label) || expanded) && !(onSendText && composerOpen && k.label === "Esc")).map((k) => (
             <Fragment key={k.label}>
               <HoldRepeatKey
                 label={k.label}
@@ -698,156 +703,168 @@ export const KeyBar = forwardRef<KeyBarHandle, KeyBarProps>(function KeyBar(
   );
 });
 
+const KEY_TOUCH_SLOP = { top: 6, bottom: 6, left: 3, right: 3 };
+
 const styles = StyleSheet.create({
   bar: {
-    backgroundColor: "#14161B",
+    backgroundColor: "#111318",
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#272B36",
+    borderTopColor: "#232732",
   },
   composerRow: {
     flexDirection: "row",
     alignItems: "flex-end",
-    gap: 6,
+    gap: 5,
     paddingHorizontal: 8,
-    paddingVertical: 7,
+    paddingVertical: 5,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#242833",
-    backgroundColor: "#101217",
+    borderBottomColor: "#20242F",
+    backgroundColor: "#0D0F14",
   },
   composerEscBtn: {
-    minHeight: 40,
-    paddingHorizontal: 10,
-    borderRadius: 10,
+    minHeight: 32,
+    paddingHorizontal: 9,
+    borderRadius: 7,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#3D2B2E",
-    backgroundColor: "#251A1D",
+    borderColor: "#2B303E",
+    backgroundColor: "#1A1E27",
     alignItems: "center",
     justifyContent: "center",
   },
   composerEscText: {
-    color: "#F78C8C",
-    fontSize: 12.5,
-    fontWeight: "700",
+    color: "#CFD5E3",
+    fontSize: 12,
+    fontWeight: "600",
   },
   composerInput: {
     flex: 1,
-    minHeight: 40,
-    maxHeight: 118,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-    borderRadius: 10,
+    minHeight: 32,
+    maxHeight: 112,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 7,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#343A4C",
-    backgroundColor: "#1B1F29",
-    color: "#F3F5FA",
-    fontSize: 14,
-    lineHeight: 20,
+    borderColor: "#2C3140",
+    backgroundColor: "#161A23",
+    color: "#EDF0F7",
+    fontSize: 13.5,
+    lineHeight: 19,
   },
   composerIconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 10,
+    width: 32,
+    height: 32,
+    borderRadius: 7,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2E3342",
-    backgroundColor: "#1E222C",
+    borderColor: "#2B303E",
+    backgroundColor: "#1A1E27",
     alignItems: "center",
     justifyContent: "center",
   },
   composerSecondaryBtn: {
-    minHeight: 40,
-    paddingHorizontal: 10,
-    borderRadius: 10,
+    minHeight: 32,
+    paddingHorizontal: 9,
+    borderRadius: 7,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2E3342",
-    backgroundColor: "#1E222C",
+    borderColor: "#2B303E",
+    backgroundColor: "#1A1E27",
     alignItems: "center",
     justifyContent: "center",
   },
   composerSecondaryText: {
-    color: "#CBD2E0",
-    fontSize: 12.5,
+    color: "#C5CCDB",
+    fontSize: 12,
     fontWeight: "600",
   },
   composerSendBtn: {
-    minHeight: 40,
-    paddingHorizontal: 13,
-    borderRadius: 10,
-    backgroundColor: "#F3F5FA",
+    minHeight: 32,
+    paddingHorizontal: 11,
+    borderRadius: 7,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#313747",
+    backgroundColor: "#1E232E",
     alignItems: "center",
     justifyContent: "center",
+  },
+  composerSendBtnActive: {
+    borderColor: "#3A72EB",
+    backgroundColor: "#2F6FEB",
   },
   composerSendPressed: {
     opacity: 0.84,
   },
   composerSendText: {
-    color: "#0F1218",
-    fontSize: 13,
+    color: "#D3D9E6",
+    fontSize: 12.5,
+    fontWeight: "600",
+  },
+  composerSendTextActive: {
+    color: "#FFFFFF",
     fontWeight: "700",
   },
   primaryRow: { flexDirection: "row", alignItems: "center" },
-  content: { paddingHorizontal: 8, paddingVertical: 5, gap: 5, alignItems: "center" },
+  content: { paddingHorizontal: 8, paddingVertical: 4, gap: 4, alignItems: "center" },
   moreKey: {
-    width: 46,
-    minHeight: MIN_TOUCH_TARGET,
+    width: 40,
+    minHeight: 36,
     alignItems: "center",
     justifyContent: "center",
     borderLeftWidth: StyleSheet.hairlineWidth,
-    borderLeftColor: "#272B36",
+    borderLeftColor: "#232732",
   },
-  moreText: { color: "#A7AFBF", fontSize: 19, fontWeight: "600" },
+  moreText: { color: "#9AA3B5", fontSize: 17, fontWeight: "600" },
   key: {
-    minWidth: MIN_TOUCH_TARGET,
-    minHeight: MIN_TOUCH_TARGET,
-    backgroundColor: "#1F232D",
-    borderRadius: 9,
+    minWidth: 34,
+    minHeight: 30,
+    backgroundColor: "#1B1F29",
+    borderRadius: 6,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2E3342",
-    paddingHorizontal: 10,
-    paddingVertical: 7,
+    borderColor: "#2B303E",
+    paddingHorizontal: 9,
+    paddingVertical: 5,
     alignItems: "center",
     justifyContent: "center",
   },
   composerToggleKey: {
-    paddingHorizontal: 11,
-    backgroundColor: "#232836",
-    borderColor: "#384056",
+    paddingHorizontal: 9,
+    backgroundColor: "#1D2230",
+    borderColor: "#30384C",
   },
   composerToggleText: {
     fontWeight: "600",
   },
-  keyPressed: { backgroundColor: "#2D3240", transform: [{ scale: 0.96 }] },
+  keyPressed: { backgroundColor: "#2A3040", transform: [{ scale: 0.96 }] },
   keyDisabled: { opacity: 0.38 },
-  modifier: { borderWidth: 1, borderColor: "#383E4E" },
-  modifierOn: { backgroundColor: "#26467D", borderColor: "#7EA7FF" },
-  keyText: { color: "#EAECEF", fontSize: 13, fontVariant: ["tabular-nums"] },
+  modifier: { borderWidth: StyleSheet.hairlineWidth, borderColor: "#323848" },
+  modifierOn: { backgroundColor: "#213C6E", borderColor: "#6B98FA" },
+  keyText: { color: "#E4E7EE", fontSize: 12.5, fontVariant: ["tabular-nums"] },
   keyTextOn: { color: "#FFFFFF", fontWeight: "700" },
-  followSystemKey: { paddingHorizontal: 12 },
-  followSystemKeyActive: { backgroundColor: "#1E3050", borderWidth: 1, borderColor: "#3A5BA8" },
+  followSystemKey: { paddingHorizontal: 10 },
+  followSystemKeyActive: { backgroundColor: "#1D2F4F", borderWidth: StyleSheet.hairlineWidth, borderColor: "#3A5BA8" },
   followSystemKeyText: { color: "#AFC8FF" },
-  sep: { width: 1, alignSelf: "stretch", marginHorizontal: 3, backgroundColor: "#272B36" },
+  sep: { width: 1, height: 18, alignSelf: "center", marginHorizontal: 2, backgroundColor: "#232732" },
   ctrlTray: {
-    minHeight: MIN_TOUCH_TARGET,
+    minHeight: 36,
     flexDirection: "row",
     alignItems: "center",
-    paddingLeft: 12,
+    paddingLeft: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#242833",
+    borderBottomColor: "#20242F",
   },
-  ctrlLabel: { color: "#7EA7FF", fontSize: 12, fontWeight: "600", marginRight: 6 },
-  ctrlContent: { gap: 5, paddingVertical: 4, paddingRight: 12 },
+  ctrlLabel: { color: "#7EA7FF", fontSize: 11.5, fontWeight: "600", marginRight: 6 },
+  ctrlContent: { gap: 4, paddingVertical: 4, paddingRight: 10 },
   ctrlKey: {
-    width: MIN_TOUCH_TARGET,
-    height: MIN_TOUCH_TARGET,
-    borderRadius: 9,
+    width: 32,
+    height: 30,
+    borderRadius: 6,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2E3342",
+    borderColor: "#2B303E",
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#1E222B",
+    backgroundColor: "#1B1F29",
   },
   ctrlKeyText: { color: "#EAECEF", fontSize: 12, fontWeight: "600" },
   offlineNotice: {
-    minHeight: 38,
+    minHeight: 34,
     flexDirection: "row",
     alignItems: "center",
     gap: 10,

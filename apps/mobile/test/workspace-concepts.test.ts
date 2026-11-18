@@ -8,6 +8,7 @@ import {
   homeInboxSessions,
   inboxReasonLabel,
   sessionWorkbenchSubtitle,
+  sidebarSessionRowDisplay,
   sortWorkspaceSessions,
 } from "../src/lib/workspace-concepts";
 import {
@@ -52,6 +53,17 @@ describe("Desktop workspace & auth concept alignment", () => {
         makeSession("s3", "/Users/dev/Prospero", { agent: "claude", title: "Claude Code · 对齐工作区概念" }),
       ),
     ).toBe("对齐工作区概念");
+    expect(
+      sidebarSessionRowDisplay(
+        makeSession("abcd1234", "/Users/dev/Prospero", { title: "codex · Prospero", model: "openai/gpt-6.2-sol", createdAt: 0 }),
+      ),
+    ).toEqual({ title: "Codex · gpt-6.2-sol", meta: "" });
+    expect(
+      sidebarSessionRowDisplay(
+        makeSession("85a51111", "/Users/dev/Prospero", { agent: "shell", kind: "pty", title: "shell", createdAt: 0 }),
+        { folderLabel: "Prospero" },
+      ),
+    ).toEqual({ title: "Terminal · #85a5", meta: "Prospero" });
   });
 
   it("collects both approval and question sessions into Inbox just like Desktop", () => {

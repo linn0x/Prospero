@@ -50,6 +50,7 @@ import {
   homeInboxSessions,
   inboxReasonLabel,
   sessionWorkbenchSubtitle,
+  sidebarSessionRowDisplay,
   sortWorkspaceSessions,
   useHydratedWorkspaceConcepts,
   workspacePathKey,
@@ -126,12 +127,6 @@ function statusTone(status: string, palette: ThemePalette): string {
   if (status === "waiting_input") return palette.accent;
   if (status === "died" || status === "failed") return palette.danger;
   return palette.textFaint;
-}
-
-function recentStamp(timestamp: number): string {
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime()) || timestamp <= 0) return "";
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 export function HomeDashboard({
@@ -522,33 +517,28 @@ export function HomeDashboard({
   };
 
   const renderSidebarTreeSession = (session: SessionInfo, options?: { showFolder?: boolean }) => {
-    const label = desktopSidebarSessionLabel(session);
-    const stamp = recentStamp(session.createdAt);
-    const modelShort = (session.agentControls?.currentModel || session.model || "").split("/").at(-1);
     const folder = options?.showFolder
       ? displayProjectName(session.cwd, projectName(session.cwd))
-      : "";
-    const meta = [folder, modelShort, stamp].filter(Boolean).join(" · ");
+      : undefined;
+    const display = sidebarSessionRowDisplay(session, folder ? { folderLabel: folder } : undefined);
 
     return (
       <Pressable
         key={session.id}
         accessibilityRole="button"
-        accessibilityLabel={`打开会话 ${label}，${sessionStatusLabel[session.status]}`}
+        accessibilityLabel={`打开会话 ${display.title}，${sessionStatusLabel[session.status]}`}
         onPress={() => onOpenSession(selectedHost.id, session.id)}
         style={({ pressed }) => [styles.treeSessionRow, pressed && styles.rowPressed]}
       >
         <AgentIcon agent={session.agent} size={13} badge badgeOutline={false} />
-        <View style={styles.treeSessionCopy}>
-          <Text style={styles.treeSessionLabel} numberOfLines={1}>
-            {label}
+        <Text style={styles.treeSessionTitle} numberOfLines={1}>
+          {display.title}
+        </Text>
+        {display.meta ? (
+          <Text style={styles.treeSessionMeta} numberOfLines={1}>
+            {display.meta}
           </Text>
-          {meta ? (
-            <Text style={styles.treeSessionMeta} numberOfLines={1}>
-              {meta}
-            </Text>
-          ) : null}
-        </View>
+        ) : null}
         <View
           style={[
             styles.statusDotSmall,
@@ -1866,17 +1856,18 @@ function createStyles(palette: ThemePalette) {
       borderLeftColor: palette.border,
     },
     treeSessionRow: {
-      minHeight: 32,
+      minHeight: 30,
       flexDirection: "row",
       alignItems: "center",
-      gap: 7,
+      gap: 6,
       paddingHorizontal: 7,
       paddingVertical: 4,
       borderRadius: 6,
     },
     treeSessionCopy: { flex: 1, minWidth: 0, gap: 1 },
+    treeSessionTitle: { flex: 1, minWidth: 0, color: palette.text, fontSize: 12.5, fontWeight: "500" },
     treeSessionLabel: { color: palette.text, fontSize: 12.5, fontWeight: "500" },
-    treeSessionMeta: { color: palette.textFaint, fontSize: 10.5 },
+    treeSessionMeta: { color: palette.textFaint, fontSize: 10.5, fontVariant: ["tabular-nums"], flexShrink: 0 },
     treeWorktreeSub: { marginTop: 4, gap: 1 },
     treeWorktreeSubTitle: {
       color: palette.textFaint,
