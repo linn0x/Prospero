@@ -13,10 +13,9 @@ const dismissKeySource = readFileSync(
 );
 
 describe("Android session composer interactions", () => {
-  it("does not let the right-edge drawer gesture overlap the active send button", () => {
-    expect(sessionSource).toContain(
-      'edgeWidth={Platform.OS === "android" && focused ? 0 : 28}',
-    );
+  it("does not wrap the session screen in a swipeable right drawer that blocks buttons or split-pane drags", () => {
+    expect(sessionSource).not.toContain("ReanimatedDrawerLayout");
+    expect(sessionSource).not.toContain("SessionQuickPanel");
     expect(sessionSource).toContain("onPress={() => send(draftRef.current)}");
   });
 

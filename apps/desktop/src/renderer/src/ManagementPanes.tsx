@@ -92,7 +92,6 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     <div className="page devices-page">
       <header className="page-header">
         <div>
-          <span className="eyebrow">{t("远程控制", "REMOTE CONTROL")}</span>
           <h1>{t("移动端", "Mobile")}</h1>
           <p>{t("配对手机，查看会话、回复问题并管理这台电脑上的 Agent。", "Pair a phone to inspect sessions, answer questions and manage agents on this computer.")}</p>
         </div>
@@ -263,7 +262,7 @@ export function LogsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       setBusy(false);
     }
   };
-  return <div className="page logs-page"><header className="page-header"><div><span className="eyebrow">{t("结构化日志", "STRUCTURED LOGS")}</span><h1>{t("诊断", "Diagnostics")}</h1><p>{t("按需检查 daemon、relay 与 terminal 日志；敏感令牌会在写入前遮盖。", "Inspect daemon, relay, and terminal logs when needed. Sensitive tokens are redacted before writing.")}</p>{error && <div className="inline-error" role="alert">{error}</div>}{notice && <p className="security-note" role="status" aria-live="polite">{notice}</p>}</div><button aria-busy={busy} disabled={busy || !snapshot.logs} onClick={() => void clear()}><Trash2 size={14} aria-hidden="true" />{busy ? t("清空中", "Clearing") : t("清空", "Clear")}</button></header><section className="diagnostics-runtime" aria-label={t("运行时验收状态", "Runtime acceptance status")}>
+  return <div className="page logs-page"><header className="page-header"><div><h1>{t("诊断", "Diagnostics")}</h1><p>{t("按需检查 daemon、relay 与 terminal 日志；敏感令牌会在写入前遮盖。", "Inspect daemon, relay, and terminal logs when needed. Sensitive tokens are redacted before writing.")}</p>{error && <div className="inline-error" role="alert">{error}</div>}{notice && <p className="security-note" role="status" aria-live="polite">{notice}</p>}</div><button aria-busy={busy} disabled={busy || !snapshot.logs} onClick={() => void clear()}><Trash2 size={14} aria-hidden="true" />{busy ? t("清空中", "Clearing") : t("清空", "Clear")}</button></header><section className="diagnostics-runtime" aria-label={t("运行时验收状态", "Runtime acceptance status")}>
     <div><Server size={16} aria-hidden="true" /><strong>{runtime ? `${runtime.backend === "rust" ? "Rust" : "Legacy"} backend` : t("本地 daemon", "Local daemon")}</strong></div>
     <div className="diagnostics-checks">{runtimeChecks.map(item => <span key={item.label} className={item.ok ? "is-ok" : "is-missing"}><Check size={12} aria-hidden="true" />{item.label}</span>)}</div>
   </section><pre className="log-view">{snapshot.logs || t("暂无日志。启动 daemon 后，运行信息会出现在这里。", "No logs yet. Runtime details will appear here after the daemon starts.")}</pre></div>;

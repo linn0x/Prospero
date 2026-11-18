@@ -2,12 +2,10 @@ import { useCallback } from "react";
 import { useFocusEffect } from "expo-router";
 import { getHosts } from "./hosts";
 import { useApp } from "./store";
-import { useOrderedDevices } from "./device-order-preferences";
 import { toast } from "@/components/Toast";
 
 export function useSettingsDevices() {
-  const storedHosts = useApp((state) => state.hosts);
-  const hosts = useOrderedDevices(storedHosts);
+  const hosts = useApp((state) => state.hosts);
   const runtimes = useApp((state) => state.runtimes);
   useFocusEffect(useCallback(() => {
     let active = true;

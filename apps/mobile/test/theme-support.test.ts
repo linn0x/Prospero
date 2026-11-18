@@ -86,7 +86,7 @@ describe("mobile theme support", () => {
   });
 
   it("publishes the selected palette before syncing Android appearance", () => {
-    const settings = readFileSync(join(mobileRoot, "src", "app", "settings", "appearance.tsx"), "utf8");
+    const settings = readFileSync(join(mobileRoot, "src", "app", "settings.tsx"), "utf8");
     const shared = readFileSync(join(mobileRoot, "src", "components", "settings", "SettingsLayout.tsx"), "utf8");
     const layout = readFileSync(join(mobileRoot, "src", "app", "_layout.tsx"), "utf8");
 
@@ -98,19 +98,12 @@ describe("mobile theme support", () => {
     expect(layout).toContain("applyNativeThemeMode(themeMode);");
   });
 
-  it("does not rerender unrelated home and progress trees for a theme-only change", () => {
+  it("does not rerender unrelated home trees for a theme-only change", () => {
     const home = readFileSync(join(mobileRoot, "src", "app", "index.tsx"), "utf8");
-    const progressBridge = readFileSync(
-      join(mobileRoot, "src", "components", "RunningSessionProgressBridge.tsx"),
-      "utf8",
-    );
 
     expect(home).not.toContain("useApp((state) => state.homeSettings) ??");
     expect(home).toContain("state.homeSettings?.recentSessionLimit");
     expect(home).toContain("state.homeSettings?.workspaceAliases");
-    expect(progressBridge).not.toContain("useApp((state) => state.homeSettings) ??");
-    expect(progressBridge).toContain("state.homeSettings?.backgroundProgressEnabled");
-    expect(progressBridge).toContain("state.homeSettings?.overlayProgressEnabled");
   });
 
   it.each(["light", "dark"] as const)("keeps %s theme text at readable contrast", (scheme) => {

@@ -1,28 +1,31 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const mobileRoot = join(import.meta.dirname, "..");
 
 describe("mobile settings page", () => {
-  it("routes each category to its own page and keeps device actions under device management", () => {
+  it("consolidates appearance, devices, and quick replies on a single settings screen", () => {
     const settings = readFileSync(join(mobileRoot, "src", "app", "settings.tsx"), "utf8");
 
-    for (const page of ["appearance", "notifications", "devices", "quick-replies"]) {
-      expect(settings).toContain(`router.push("/settings/${page}")`);
-      expect(readFileSync(join(mobileRoot, "src", "app", "settings", `${page}.tsx`), "utf8")).toContain("<SettingsPage");
+    expect(settings).toContain("settings.themeMode");
+    expect(settings).toContain("settings.recentSessionLimit");
+    expect(settings).toContain("settings.deviceSwitcherHapticsEnabled");
+    expect(settings).toContain("settings.conversationFontSize");
+    expect(settings).toContain('router.push("/pair")');
+    expect(settings).toContain("<DeviceConnectionRow");
+    expect(settings).toContain("DEFAULT_QUICK_REPLIES");
+
+    for (const removedRoute of ["appearance", "notifications", "devices", "quick-replies", "home"]) {
+      expect(existsSync(join(mobileRoot, "src", "app", "settings", `${removedRoute}.tsx`))).toBe(false);
     }
-    expect(settings).not.toContain("<Switch");
-    expect(settings).not.toContain('router.push("/settings/home")');
-    const appearance = readFileSync(join(mobileRoot, "src", "app", "settings", "appearance.tsx"), "utf8");
-    expect(appearance).toContain("settings.recentSessionLimit");
-    expect(appearance).toContain("settings.deviceSwitcherHapticsEnabled");
-    expect(appearance).toContain("settings.conversationFontSize");
-    expect(settings).not.toContain("<DeviceConnectionRow");
-    const devices = readFileSync(join(mobileRoot, "src", "app", "settings", "devices.tsx"), "utf8");
-    expect(devices).toContain('router.push("/device-order")');
-    expect(devices).toContain('router.push("/pair")');
-    const connections = readFileSync(join(mobileRoot, "src", "components", "settings", "DeviceConnectionRow.tsx"), "utf8");
+    expect(existsSync(join(mobileRoot, "src", "app", "device-order.tsx"))).toBe(false);
+    expect(existsSync(join(mobileRoot, "src", "app", "workspace-order.tsx"))).toBe(false);
+
+    const connections = readFileSync(
+      join(mobileRoot, "src", "components", "settings", "DeviceConnectionRow.tsx"),
+      "utf8",
+    );
     expect(connections).toContain('pathname: "/host/[hostId]/edit"');
     expect(connections).toContain("host.relay.url");
   });

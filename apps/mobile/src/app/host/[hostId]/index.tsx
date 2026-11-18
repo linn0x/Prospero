@@ -58,7 +58,6 @@ import {
   setSessionHidden,
 } from "@/lib/session-preferences";
 import { groupSessionsByProject } from "@/lib/session-projects";
-import { useOrderedWorkspaces } from "@/lib/workspace-order-preferences";
 import { flattenHostSessionProjects } from "@/lib/host-session-list";
 import {
   coordinatorRunsBySession,
@@ -181,7 +180,7 @@ export default function HostScreen() {
   const [terminalApprovalPolicy, setTerminalApprovalPolicy] = useState<ApprovalPolicy>("yolo");
   const [createYoloConfirmOpen, setCreateYoloConfirmOpen] = useState(false);
   const [goal, setGoal] = useState("");
-  const [cwd, setCwd] = useState("");
+  const [cwd, setCwd] = useState(() => (typeof quickCreateCwd === "string" ? quickCreateCwd.trim() : ""));
   const [banner, setBanner] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | AgentKind>("all");
   const [composing, setComposing] = useState(quickCreate === "conversation" || quickCreate === "directory");
@@ -736,7 +735,13 @@ export default function HostScreen() {
       setApprovalPolicy("strict");
       setTerminalApprovalPolicy("yolo");
       setCreateYoloConfirmOpen(false);
-      if (hostId) router.push(`/host/${hostId}/session/${session.id}`);
+      if (hostId) {
+        if (quickCreate === "conversation" || quickCreate === "directory") {
+          router.replace(`/host/${hostId}/session/${session.id}`);
+        } else {
+          router.push(`/host/${hostId}/session/${session.id}`);
+        }
+      }
     }, (error) => {
       resetPendingCreate();
       if (error instanceof SessionCreateError && error.reason === "conversation_active_writer" && resumeTitle) {
@@ -754,7 +759,7 @@ export default function HostScreen() {
     }
     setCreateDelivery(result.disposition);
     setCreateStartedAt(Date.now());
-  }, [hostId, pendingCreate, resetPendingCreate]);
+  }, [hostId, pendingCreate, quickCreate, resetPendingCreate]);
 
   // 深链 prospero://host/<id>?create=shell&cmd=…:连上后自动建会话(自动化测试/快捷指令用)
   useEffect(() => {
@@ -867,8 +872,7 @@ export default function HostScreen() {
     ].map((session) => [session.id, session]))),
     [contextualGoalCoordinators, goalVisibility, sessions],
   );
-  const unorderedProjects = useMemo(() => groupSessionsByProject(topLevelSessions), [topLevelSessions]);
-  const projects = useOrderedWorkspaces(hostId, unorderedProjects);
+  const projects = useMemo(() => groupSessionsByProject(topLevelSessions), [topLevelSessions]);
   const sessionListItems = useMemo(
     () => flattenHostSessionProjects(projects, collapsedProjects),
     [projects, collapsedProjects],
@@ -1155,6 +1159,10 @@ export default function HostScreen() {
               <Pressable
                 onPress={() => {
                   if (pendingCreate.pending) setBanner("已停止等待；请求可能已在电脑完成，请先查看会话列表。");
+                  if (createDelivery === null && (quickCreate === "conversation" || quickCreate === "directory")) {
+                    leaveHost();
+                    return;
+                  }
                   resetPendingCreate();
                   setComposing(false);
                   setSelectedResume(null);

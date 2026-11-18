@@ -4,8 +4,6 @@ import { Stack, router, useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { HomeDashboard } from "@/components/HomeDashboard";
-import { EdgeDashboard } from "@/components/EdgeDashboard";
-import { HomeModeTitle } from "@/components/HomeModeTitle";
 import { toast } from "@/components/Toast";
 import { Icon } from "@/components/Icon";
 import { Sheet, SheetAction } from "@/components/Sheet";
@@ -17,8 +15,7 @@ import {
   REMOTE_TERMINAL_UNAVAILABLE,
 } from "@/lib/terminal-session";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
-import { dropConnection, getConnection, peekConnection, wireAppStateReconnect } from "@/lib/connection";
-import { selectedEdgeHosts, useEdgePreferences } from "@/lib/edge-preferences";
+import { getConnection, peekConnection, wireAppStateReconnect } from "@/lib/connection";
 import { resolveHomeHostSelection } from "@/lib/home-dashboard";
 import {
   DEFAULT_HOME_SETTINGS,
@@ -35,7 +32,6 @@ import {
 import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { clearSessionPreferences } from "@/lib/session-preferences";
 import { useApp } from "@/lib/store";
-import { useOrderedDevices } from "@/lib/device-order-preferences";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { font, radius, space, useMobileTheme, type ThemePalette } from "@/lib/theme";
 
@@ -51,22 +47,12 @@ export default function HostsScreen() {
     bottomInset: insets.bottom,
     fontScale,
   });
-  const [storedHosts, setLocal] = useState<StoredHost[]>([]);
-  const hosts = useOrderedDevices(storedHosts);
+  const [hosts, setLocal] = useState<StoredHost[]>([]);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
   const [terminalPickerOpen, setTerminalPickerOpen] = useState(false);
   const [terminalNavigation] = useState(() => new DismissedModalAction());
   useEffect(() => () => terminalNavigation.cancel(), [terminalNavigation]);
-  const [choosingEdgeOrchestration, setChoosingEdgeOrchestration] = useState(false);
-  const mode = useEdgePreferences((state) => state.mode);
-  const edgeHostIds = useEdgePreferences((state) => state.selectedHostIds);
-  const edgeHydrated = useEdgePreferences((state) => state.hydrated);
-  const hydrateEdge = useEdgePreferences((state) => state.hydrate);
-  const setMode = useEdgePreferences((state) => state.setMode);
-  const selectEdgeHosts = useEdgePreferences((state) => state.selectHosts);
-  const edgeHosts = useMemo(() => selectedEdgeHosts(hosts, edgeHostIds), [hosts, edgeHostIds]);
-  useEffect(() => { void hydrateEdge(); }, [hydrateEdge]);
   const setHosts = useApp((state) => state.setHosts);
   // 首页设置只消费这三个业务字段；主题由显式上下文单独驱动，避免订阅整个
   // 设置对象时把无关配置变化也扩散到设备和工作区列表。
@@ -92,10 +78,42 @@ export default function HostsScreen() {
   const setHomeSettings = useApp((state) => state.setHomeSettings);
   const runtimes = useApp((state) => state.runtimes);
   const effectiveSelectedHostId = resolveHomeHostSelection(hosts, selectedHostId);
-  const terminalHosts = useMemo(() => {
-    const candidates = mode === "edge" ? edgeHosts : hosts.filter((host) => host.id === effectiveSelectedHostId);
-    return candidates.filter((host) => supportsRemoteTerminal(runtimes[host.id]?.hostInfo));
-  }, [mode, edgeHosts, hosts, effectiveSelectedHostId, runtimes]);
+  const selectedHost = useMemo(
+    () => hosts.find((host) => host.id === effectiveSelectedHostId) ?? hosts[0] ?? null,
+    [effectiveSelectedHostId, hosts],
+  );
+  const selectedRuntime = selectedHost ? runtimes[selectedHost.id] : undefined;
+  const hostDotColor =
+    selectedRuntime?.status === "connected"
+      ? (selectedRuntime.rttMs !== null && selectedRuntime.rttMs !== undefined && selectedRuntime.rttMs >= 300
+          ? palette.warn
+          : palette.success)
+      : selectedRuntime?.status === "connecting" || selectedRuntime?.status === "reconnecting"
+        ? palette.warn
+        : selectedRuntime?.status === "failed"
+          ? palette.danger
+          : palette.textFaint;
+  const hostBadgeLabel =
+    selectedRuntime?.status === "connected"
+      ? (selectedRuntime.rttMs !== null && selectedRuntime.rttMs !== undefined
+          ? `${String(selectedRuntime.rttMs)}ms`
+          : "在线")
+      : selectedRuntime?.status === "connecting"
+        ? "连接中"
+        : selectedRuntime?.status === "reconnecting"
+          ? "重连"
+          : selectedRuntime?.status === "failed"
+            ? "离线"
+            : "待连接";
+  const terminalHosts = useMemo(
+    () =>
+      hosts.filter(
+        (host) =>
+          host.id === effectiveSelectedHostId &&
+          supportsRemoteTerminal(runtimes[host.id]?.hostInfo),
+      ),
+    [hosts, effectiveSelectedHostId, runtimes],
+  );
   const activeTerminalCount = useMemo(
     () =>
       terminalHosts.reduce(
@@ -108,7 +126,7 @@ export default function HostsScreen() {
       ),
     [runtimes, terminalHosts],
   );
-  const selectedConnection = mode === "normal" && effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
+  const selectedConnection = effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
   const orchestration = useOrchestrationSnapshot(
     selectedConnection,
     effectiveSelectedHostId ? runtimes[effectiveSelectedHostId]?.status ?? "idle" : "idle",
@@ -139,28 +157,14 @@ export default function HostsScreen() {
   );
 
   useFocusEffect(useCallback(() => {
-    if (!edgeHydrated) return;
     let cancelled = false;
-    const activeHosts = mode === "edge" ? edgeHosts : hosts;
-    // Drop excluded sockets from the reconnect registry as well as the live connection.
-    // This runs only on the home screen; opening a device still permits a direct connection.
-    if (mode === "edge") {
-      const included = new Set(activeHosts.map((host) => host.id));
-      for (const host of hosts) if (!included.has(host.id)) dropConnection(host.id);
-    }
     void getDeviceKeys().then((keys) => {
       if (cancelled) return;
       wireAppStateReconnect();
-      for (const host of activeHosts) getConnection(host, keys).start();
+      for (const host of hosts) getConnection(host, keys).start();
     }).catch(() => { if (!cancelled) toast("读取配对凭证失败，请重新打开首页"); });
     return () => { cancelled = true; };
-  }, [edgeHosts, edgeHydrated, hosts, mode]));
-
-  const toggleMode = useCallback(() => {
-    setDevicePickerOpen(false);
-    setChoosingEdgeOrchestration(false);
-    setMode(mode === "edge" ? "normal" : "edge");
-  }, [mode, setMode]);
+  }, [hosts]));
 
   const openTerminal = (): void => {
     if (terminalHosts.length === 1) {
@@ -173,18 +177,8 @@ export default function HostsScreen() {
   };
 
   const openOrchestration = useCallback(() => {
-    if (mode === "normal") {
-      if (effectiveSelectedHostId) router.push(`/host/${effectiveSelectedHostId}/orchestration`);
-      return;
-    }
-    if (edgeHosts.length === 0) {
-      toast("请先点击设备卡片，选择要编排的设备");
-    } else if (edgeHosts.length === 1) {
-      router.push(`/host/${edgeHosts[0]!.id}/orchestration`);
-    } else {
-      setChoosingEdgeOrchestration((current) => !current);
-    }
-  }, [edgeHosts, effectiveSelectedHostId, mode]);
+    if (effectiveSelectedHostId) router.push(`/host/${effectiveSelectedHostId}/orchestration`);
+  }, [effectiveSelectedHostId]);
 
   const onSelectHost = useCallback((hostId: string): void => {
     setSelectedHostId(hostId);
@@ -223,9 +217,62 @@ export default function HostsScreen() {
         options={{
           title: "Prospero",
           headerTitleAlign: "left",
-          headerTitle: () => <HomeModeTitle edge={mode === "edge"} onToggle={toggleMode} />,
+          ...(selectedHost
+            ? {
+                headerTitle: () => (
+                  <Pressable
+                    testID={`home-device-card-${selectedHost.id}`}
+                    accessibilityRole="button"
+                    accessibilityState={{ expanded: devicePickerOpen }}
+                    accessibilityLabel={`选择电脑，当前为 ${selectedHost.name}，${hostBadgeLabel}`}
+                    accessibilityHint="切换或管理已配对电脑"
+                    onPress={onToggleDevicePicker}
+                    style={({ pressed }) => [styles.hostPill, pressed && styles.headerButtonPressed]}
+                  >
+                    <View style={[styles.hostPillDot, { backgroundColor: hostDotColor }]} />
+                    <Text style={styles.hostPillName} numberOfLines={1}>
+                      {selectedHost.name}
+                    </Text>
+                    <Text style={styles.hostPillMeta} numberOfLines={1}>
+                      {hostBadgeLabel}
+                    </Text>
+                    <Icon name="chevron.down" size={11} color={palette.textFaint} />
+                  </Pressable>
+                ),
+              }
+            : {}),
           headerRight: () => (
             <View style={styles.headerActions}>
+              {effectiveSelectedHostId !== null && (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="新建会话"
+                  accessibilityHint="在当前电脑新建对话或终端会话"
+                  onPress={() =>
+                    router.push({
+                      pathname: "/host/[hostId]",
+                      params: { hostId: effectiveSelectedHostId, quickCreate: "conversation" },
+                    })
+                  }
+                  style={({ pressed }) => [
+                    styles.headerPrimaryButton,
+                    pressed && styles.ctaPressed,
+                  ]}
+                >
+                  <Icon name="plus" size={16} color={palette.bg} weight="semibold" />
+                </Pressable>
+              )}
+              {effectiveSelectedHostId !== null && (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="账号与模型源"
+                  accessibilityHint="管理当前电脑的 Agent 登录态与模型源"
+                  onPress={() => router.push(`/host/${effectiveSelectedHostId}/accounts`)}
+                  style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
+                >
+                  <Icon name="command" size={16} color={palette.text} />
+                </Pressable>
+              )}
               {terminalHosts.length > 0 && (
                 <Pressable
                   accessibilityRole="button"
@@ -246,8 +293,7 @@ export default function HostsScreen() {
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="任务编排"
-                  accessibilityHint={mode === "edge" ? "打开所选电脑的任务编排，多台电脑时在卡片中选择" : "打开当前电脑的任务编排页面"}
-                  accessibilityState={{ expanded: mode === "edge" && choosingEdgeOrchestration }}
+                  accessibilityHint="打开当前电脑的任务编排页面"
                   onPress={openOrchestration}
                   style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
                 >
@@ -302,30 +348,6 @@ export default function HostsScreen() {
             </Pressable>
           </View>
         </ScrollView>
-      ) : mode === "edge" ? (
-        <EdgeDashboard
-          hosts={hosts}
-          selectedHosts={edgeHosts}
-          runtimes={runtimes}
-          bottomInset={insets.bottom}
-          homeSettings={homeSettings}
-          onSelectHosts={(ids) => { setChoosingEdgeOrchestration(false); selectEdgeHosts(ids); }}
-          choosingOrchestration={choosingEdgeOrchestration}
-          onCancelOrchestration={() => setChoosingEdgeOrchestration(false)}
-          onOpenOrchestration={(hostId) => {
-            if (!edgeHosts.some((host) => host.id === hostId)) return;
-            setChoosingEdgeOrchestration(false);
-            router.push(`/host/${hostId}/orchestration`);
-          }}
-          onOpenHost={(hostId) => router.push(`/host/${hostId}`)}
-          onOpenSession={(hostId, sessionId) => router.push(`/host/${hostId}/session/${sessionId}`)}
-          onRefreshHost={(hostId) => peekConnection(hostId)?.kick()}
-          onCreateSession={(hostId, cwd) => router.push({ pathname: "/host/[hostId]", params: {
-            hostId, quickCreate: "conversation", ...(cwd ? { cwd } : {}),
-          } })}
-          onCreateDirectory={(hostId) => router.push({ pathname: "/host/[hostId]", params: { hostId, quickCreate: "directory" } })}
-          onChangeHomeSettings={onChangeHomeSettings}
-        />
       ) : (
         <HomeDashboard
           hosts={hosts}
@@ -340,6 +362,7 @@ export default function HostsScreen() {
           worktreeAssets={orchestration?.worktreeAssets}
           onSelectHost={onSelectHost}
           onOpenHost={(hostId) => router.push(`/host/${hostId}`)}
+          onOpenAccounts={(hostId) => router.push(`/host/${hostId}/accounts`)}
           onOpenSession={(hostId, sessionId) =>
             router.push(`/host/${hostId}/session/${sessionId}`)
           }
@@ -392,10 +415,38 @@ function createStyles(palette: ThemePalette) {
   };
   return StyleSheet.create({
   container: { flex: 1, backgroundColor: palette.bg },
+  hostPill: {
+    height: 34,
+    maxWidth: 230,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    borderRadius: radius.pill,
+    backgroundColor: palette.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.border,
+  },
+  hostPillDot: { width: 7, height: 7, borderRadius: 3.5, flexShrink: 0 },
+  hostPillName: { color: palette.text, fontSize: 13.5, fontWeight: "700", letterSpacing: -0.2, flexShrink: 1 },
+  hostPillMeta: {
+    color: palette.textFaint,
+    fontSize: 11,
+    fontVariant: ["tabular-nums"],
+    flexShrink: 0,
+  },
   headerActions: { flexDirection: "row", alignItems: "center", gap: 6 },
+  headerPrimaryButton: {
+    width: 34,
+    height: 34,
+    borderRadius: radius.pill,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: palette.text,
+  },
   headerButton: {
-    width: 36,
-    height: 36,
+    width: 34,
+    height: 34,
     borderRadius: radius.pill,
     alignItems: "center",
     justifyContent: "center",

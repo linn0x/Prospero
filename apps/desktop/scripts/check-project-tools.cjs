@@ -174,17 +174,8 @@ app.on("browser-window-created", (_event, window) => {
       const layout = await run("(() => {const root=document.querySelector('.project-tools-shell');const preview=document.querySelector('.project-preview-area').getBoundingClientRect();return {overflow:root.scrollWidth>root.clientWidth,previewWidth:preview.width,previewHeight:preview.height}})()");
       assert.equal(layout.overflow, false); assert(layout.previewWidth > 200); assert(layout.previewHeight > 300);
       await assertSplit();
-      const workspaceLayout = await require("./workspace-layout-checks.cjs")({ window, run, wait, click, screenshot, shellCreates: () => shellCreates });
-      const tabStrips = await require("./tab-strip-checks.cjs")({ window, run, wait, click, fill, screenshot, sessionIds: sessions.map(session => session.id) });
-      const statusMaterial = await require("./status-material-checks.cjs")({ window, run, wait, click, screenshot, sessions, updateSession: (id, patch) => {
-        Object.assign(sessions.find(session => session.id === id), patch);
-        fs.writeFileSync(path.join(home, "status.json"), JSON.stringify({ pid: process.pid, port: server.address().port, controlToken: "isolated-ui-test", sessions }));
-      } });
       assert.deepEqual(errors.filter(message => /Uncaught|Maximum update|unique.*key|validateDOMNesting/.test(message)), []);
       const result = { ok: true, project, output, layout, checks: ["right dock keeps conversation", "hide/reopen preserves draft", "overlay preserves editor", "project switch preserves draft", "files", "markdown", "syntax", "tabs", "unsaved guard", "save", "search shortcut and jump", "diff", "stage", "commit", "create", "image", "light/dark", "compact"] };
-      result.workspaceLayout = workspaceLayout;
-      result.tabStrips = tabStrips;
-      result.statusMaterial = statusMaterial;
       fs.writeFileSync(path.join(output, "result.json"), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result)); log("Passed");
       clearTimeout(deadline); app.exit(0);
     } catch (error) { log(error.stack); console.error(error); console.error(errors); await screenshot("failure"); clearTimeout(deadline); app.exit(1); }

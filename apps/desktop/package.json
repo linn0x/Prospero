@@ -30,7 +30,6 @@
     "install:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh install",
     "uninstall:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh uninstall",
     "dist:mac": "npm run build:native:mac && npm run prepare:runtime:mac && npm run build && electron-builder --mac",
-    "preview:ux": "npm run build && electron scripts/preview-ux.cjs",
     "build:native:mac": "node scripts/build-native-ghostty.mjs",
     "check:native:scroll": "electron scripts/check-native-scroll.cjs",
     "check:native:mac": "electron scripts/check-native-ghostty.cjs",

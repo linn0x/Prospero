@@ -22,12 +22,6 @@ import { StatusBar } from "expo-status-bar";
 import { NavigationBar } from "expo-navigation-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { KeyboardAvoidingView, KeyboardEvents } from "react-native-keyboard-controller";
-import ReanimatedDrawerLayout, {
-  DrawerKeyboardDismissMode,
-  DrawerPosition,
-  DrawerType,
-  type DrawerLayoutMethods,
-} from "react-native-gesture-handler/ReanimatedDrawerLayout";
 import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
@@ -62,7 +56,6 @@ import { Icon } from "@/components/Icon";
 import { KeyBar, type KeyBarHandle } from "@/components/KeyBar";
 import { PerfHud } from "@/components/PerfHud";
 import { QuickReplies } from "@/components/QuickReplies";
-import { SessionQuickPanel } from "@/components/SessionQuickPanel";
 import { SplitPaneDivider } from "@/components/SplitPaneDivider";
 import { Terminal, type TerminalExtractedText, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
@@ -91,6 +84,7 @@ import { WorkspaceFolderIcon } from "@/components/WorkspaceDisclosure";
 import {
   buildAlignedWorkspaceTree,
   desktopSidebarSessionLabel,
+  sessionWorkbenchSubtitle,
   sortWorkspaceSessions,
   useHydratedWorkspaceConcepts,
   workspacePathKey,
@@ -101,7 +95,6 @@ import { coordinatorRunsBySession, orchestrationRoute } from "@/lib/orchestratio
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { deliveryFailureText } from "@/lib/outbound-queue";
 import { sessionLoadState } from "@/lib/session-load-state";
-import { useSessionAttention } from "@/lib/session-attention";
 import { appendVoiceTranscript } from "@/lib/voice-input";
 import {
   SYSTEM_TERMINAL_FONT_PREFERENCE,
@@ -460,6 +453,10 @@ function FoldableSessionRail({
     const selected = !isSubagent && item.id === currentId;
     const label = desktopSidebarSessionLabel(item);
     const folder = item.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? item.cwd;
+    const subtitle = sessionWorkbenchSubtitle(
+      item,
+      showFolder ? { showWorkspace: folder } : undefined,
+    );
     return (
       <Pressable
         key={item.id}
@@ -474,9 +471,13 @@ function FoldableSessionRail({
         accessibilityState={{ selected }}
         accessibilityLabel={`打开会话 ${item.title}`}
       >
+        {selected && <View style={styles.sessionRailActiveBar} />}
         <View style={styles.sessionRailItemTop}>
-          <AgentIcon agent={item.agent} size={14} badge badgeOutline={false} />
-          <Text style={styles.sessionRailItemTitle} numberOfLines={1}>
+          <AgentIcon agent={item.agent} size={13} badge badgeOutline={false} />
+          <Text
+            style={[styles.sessionRailItemTitle, selected && styles.sessionRailItemTitleSelected]}
+            numberOfLines={1}
+          >
             {label}
           </Text>
           <View
@@ -487,7 +488,7 @@ function FoldableSessionRail({
           />
         </View>
         <Text style={styles.sessionRailPath} numberOfLines={1}>
-          {showFolder ? `${folder} · ${statusText[item.status]}` : statusText[item.status]}
+          {subtitle}
         </Text>
       </Pressable>
     );
@@ -498,6 +499,15 @@ function FoldableSessionRail({
   return (
     <View style={[styles.sessionRail, { width }]}>
       <View style={styles.sessionRailHeader}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="返回工作台"
+          hitSlop={6}
+          onPress={() => router.replace("/")}
+          style={({ pressed }) => [styles.sessionRailHomeBtn, pressed && styles.controlPressed]}
+        >
+          <Icon name="house.fill" size={12} color={color.textDim} />
+        </Pressable>
         <View style={styles.sessionRailHeaderLeft}>
           <Text style={styles.sessionRailTitle}>工作区</Text>
           <Text style={styles.sessionRailCount}>{String(allRailWorkspaces.length)}</Text>
@@ -564,6 +574,11 @@ function FoldableSessionRail({
                   }
                   style={({ pressed }) => [styles.sessionRailWorkspaceToggle, pressed && styles.controlPressed]}
                 >
+                  <Icon
+                    name={expanded ? "chevron.down" : "chevron.right"}
+                    size={10}
+                    color={color.textFaint}
+                  />
                   <WorkspaceFolderIcon expanded={expanded} size={13} color={color.textDim} />
                   <Text style={styles.sessionRailWorkspaceName} numberOfLines={1}>
                     {displayName}
@@ -684,10 +699,6 @@ export default function SessionScreen() {
   }, [draft]);
 
   const session = sid ? runtime.sessions[sid] : undefined;
-  const markCompletionRead = useSessionAttention((state) => state.markCompletionRead);
-  useEffect(() => {
-    if (session) markCompletionRead(hostId, session);
-  }, [hostId, markCompletionRead, session]);
   const supportsDeepseekTrajectory = conn?.supportsDeepseekTrajectory ?? false;
   const effectiveDeepseekView = supportsDeepseekTrajectory ? deepseekView : "chat";
   const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
@@ -791,8 +802,6 @@ export default function SessionScreen() {
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const termRef = useRef<TerminalHandle>(null);
   const keyBarRef = useRef<KeyBarHandle>(null);
-  const quickPanelRef = useRef<DrawerLayoutMethods>(null);
-  const [quickPanelActive, setQuickPanelActive] = useState(false);
   const [terminalFontPreference, setTerminalFontPreference] = useState<TerminalFontPreference>(
     () => cachedTerminalFontPreference ?? SYSTEM_TERMINAL_FONT_PREFERENCE,
   );
@@ -1403,13 +1412,11 @@ export default function SessionScreen() {
     if (router.canGoBack()) router.back();
     else if (isSubagent && hostId && sid) {
       router.replace({ pathname: "/host/[hostId]/session/[sid]", params: { hostId, sid } });
-    } else if (hostId) router.replace(`/host/${hostId}`);
-    else router.replace("/");
+    } else router.replace("/");
   };
 
   const returnToHostOverview = (): void => {
-    if (hostId) router.replace(`/host/${hostId}`);
-    else router.replace("/");
+    router.replace("/");
   };
 
   const retryColdStart = (): void => {
@@ -1531,21 +1538,6 @@ export default function SessionScreen() {
     setMenuOpen(true);
   };
 
-  const openQuickPanel = (): void => {
-    Keyboard.dismiss();
-    setQuickPanelActive(true);
-    quickPanelRef.current?.openDrawer();
-  };
-
-  const closeQuickPanel = (): void => {
-    quickPanelRef.current?.closeDrawer();
-  };
-
-  const leaveQuickPanel = (open: () => void): void => {
-    closeQuickPanel();
-    open();
-  };
-
   // 输入以 / 开头时给命令候选；@/$ 候选由 daemon 按当前项目生成。
   const commandHints =
     isChat && !isSubagent && session && composerToken?.kind === "command"
@@ -1586,7 +1578,6 @@ export default function SessionScreen() {
     void Haptics.selectionAsync();
   };
 
-  const quickPanelWidth = Math.min(380, Math.max(280, adaptiveLayout.width * 0.88), adaptiveLayout.width);
   const composerSendButton = (
     <Pressable
       style={({ pressed }) => [
@@ -1619,58 +1610,6 @@ export default function SessionScreen() {
   );
 
   return (
-    <ReanimatedDrawerLayout
-      ref={quickPanelRef}
-      drawerPosition={DrawerPosition.RIGHT}
-      drawerType={DrawerType.FRONT}
-      drawerWidth={quickPanelWidth}
-      drawerBackgroundColor={color.surface}
-      overlayColor="rgba(0, 0, 0, 0.48)"
-      // The send button occupies the rightmost 50 px. Android's drawer pan handler used to
-      // claim taps in the 28 px edge strip while the composer was active, so nearly half of
-      // the button intermittently stopped receiving onPress. The header menu remains usable.
-      edgeWidth={Platform.OS === "android" && focused ? 0 : 28}
-      minSwipeDistance={12}
-      keyboardDismissMode={DrawerKeyboardDismissMode.ON_DRAG}
-      onDrawerOpen={() => setQuickPanelActive(true)}
-      onDrawerClose={() => setQuickPanelActive(false)}
-      renderNavigationView={() => (
-        <SessionQuickPanel
-          active={quickPanelActive}
-          connected={runtime.status === "connected"}
-          conn={conn}
-          session={session}
-          pending={pending}
-          coordinatorAvailable={coordinatorRun !== null && !isSubagent}
-          {...(!shellTerminal && supportsRemoteTerminal(runtime.hostInfo)
-            ? {
-                terminalAction: {
-                  active: existingWorkspaceShell !== null,
-                  onPress: () =>
-                    leaveQuickPanel(() => {
-                      if (existingWorkspaceShell) {
-                        router.push(`/host/${hostId}/session/${existingWorkspaceShell.id}`);
-                        return;
-                      }
-                      router.push({
-                        pathname: "/host/[hostId]/terminals",
-                        params: { hostId, cwd: session.cwd },
-                      });
-                    }),
-                },
-              }
-            : {})}
-          onClose={closeQuickPanel}
-          onOpenGit={() => leaveQuickPanel(() => router.push(`/host/${hostId}/git/${sid}`))}
-          onOpenFiles={() => leaveQuickPanel(() => router.push(`/host/${hostId}/files/${sid}`))}
-          onOpenCoordinator={() => {
-            if (coordinatorRun) {
-              leaveQuickPanel(() => router.push(orchestrationRoute(hostId, coordinatorRun.id)));
-            }
-          }}
-        />
-      )}
-    >
     <View style={[styles.adaptiveRoot, showSessionRail && styles.adaptiveRootSplit]}>
       {showSessionRail && (
         <FoldableSessionRail
@@ -1759,13 +1698,21 @@ export default function SessionScreen() {
               )}
               <Pressable
                 style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
-                onPress={openQuickPanel}
+                onPress={() => router.push(`/host/${hostId}/files/${sid}`)}
                 hitSlop={8}
                 accessibilityRole="button"
-                accessibilityLabel="打开会话工具"
-                accessibilityHint="查看文件改动、Git 分支和项目文件"
+                accessibilityLabel="浏览项目文件"
               >
-                <Icon name="square.stack.3d.up" size={16} color={color.text} />
+                <Icon name="folder.fill" size={16} color={color.text} />
+              </Pressable>
+              <Pressable
+                style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
+                onPress={() => router.push(`/host/${hostId}/git/${sid}`)}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="查看项目改动"
+              >
+                <Icon name="arrow.triangle.branch" size={16} color={color.text} />
               </Pressable>
               <Pressable
                 style={({ pressed }) => [styles.headerAction, pressed && styles.composerBtnPressed]}
@@ -2248,7 +2195,42 @@ export default function SessionScreen() {
             }}
           />
         ) : null}
-        {/* 文件与改动已提到标题栏,这里不再重复。 */}
+        <SheetAction
+          label="浏览项目文件"
+          detail="查看工作区目录结构与文件内容"
+          symbol="folder.fill"
+          onPress={() => {
+            setMenuOpen(false);
+            router.push(`/host/${hostId}/files/${sid}`);
+          }}
+        />
+        <SheetAction
+          label="查看项目改动"
+          detail="查看 Git 分支、工作树状态与代码改动"
+          symbol="arrow.triangle.branch"
+          onPress={() => {
+            setMenuOpen(false);
+            router.push(`/host/${hostId}/git/${sid}`);
+          }}
+        />
+        {!shellTerminal && supportsRemoteTerminal(runtime.hostInfo) && (
+          <SheetAction
+            label={existingWorkspaceShell ? "切换到工作区终端" : "打开工作区终端"}
+            detail={existingWorkspaceShell ? "进入当前项目正在运行的 Shell 终端" : "在当前项目目录启动或管理 Shell 终端"}
+            symbol="terminal"
+            onPress={() => {
+              setMenuOpen(false);
+              if (existingWorkspaceShell) {
+                router.push(`/host/${hostId}/session/${existingWorkspaceShell.id}`);
+                return;
+              }
+              router.push({
+                pathname: "/host/[hostId]/terminals",
+                params: { hostId, cwd: session.cwd },
+              });
+            }}
+          />
+        )}
         {(!session.archived || isStructured || ["claude", "codex", "pi"].includes(session.agent)) && <SheetAction
           label={session.archived ? "继续对话" : "停止并归档"}
           detail={session.archived ? "恢复原生对话上下文" : "停止执行、释放资源并保留历史"}
@@ -2970,7 +2952,6 @@ export default function SessionScreen() {
       </View>}
       </KeyboardAvoidingView>
     </View>
-    </ReanimatedDrawerLayout>
   );
 }
 
@@ -2992,15 +2973,27 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     flexShrink: 0,
     minWidth: 0,
     overflow: "hidden",
-    backgroundColor: color.bg,
+    backgroundColor: color.surface,
   },
   sessionRailHeader: {
-    minHeight: 44,
-    paddingHorizontal: 12,
+    minHeight: 42,
+    paddingHorizontal: 10,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     gap: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  sessionRailHomeBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 7,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: color.surfaceRaised,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
   },
   sessionRailHeaderLeft: {
     flex: 1,
@@ -3010,30 +3003,30 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     gap: 6,
   },
   sessionRailAddBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
+    width: 26,
+    height: 26,
+    borderRadius: 7,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: color.surface,
+    backgroundColor: color.surfaceRaised,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
   },
   sessionRailTitle: { color: color.textDim, fontSize: 12, fontWeight: "700", letterSpacing: 0.2 },
   sessionRailCount: {
-    minWidth: 22,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
     overflow: "hidden",
-    borderRadius: 999,
-    backgroundColor: color.surface,
-    color: color.textDim,
+    borderRadius: 6,
+    backgroundColor: color.surfaceRaised,
+    color: color.textFaint,
     fontSize: 10.5,
     fontWeight: "600",
+    fontVariant: ["tabular-nums"],
     textAlign: "center",
   },
-  sessionRailList: { gap: 8, paddingHorizontal: 10, paddingBottom: 16 },
-  sessionRailSection: { gap: 3, paddingBottom: 4 },
+  sessionRailList: { gap: 4, paddingHorizontal: 8, paddingTop: 6, paddingBottom: 16 },
+  sessionRailSection: { gap: 2, paddingBottom: 4 },
   sessionRailSubHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -3041,30 +3034,30 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     paddingHorizontal: 6,
     paddingVertical: 2,
   },
-  sessionRailSubTitle: { color: color.textFaint, fontSize: 11, fontWeight: "600" },
-  sessionRailWorkspaceGroup: { gap: 3 },
+  sessionRailSubTitle: { color: color.textFaint, fontSize: 11, fontWeight: "700" },
+  sessionRailWorkspaceGroup: { gap: 1 },
   sessionRailWorkspaceHeader: {
     minHeight: 34,
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
     paddingHorizontal: 6,
-    borderRadius: 10,
+    borderRadius: 7,
   },
   sessionRailWorkspaceToggle: {
     flex: 1,
     minWidth: 0,
-    minHeight: 32,
+    minHeight: 30,
     flexDirection: "row",
     alignItems: "center",
-    gap: 7,
+    gap: 6,
   },
   sessionRailWorkspaceName: {
     flex: 1,
     minWidth: 0,
     color: color.text,
-    fontSize: 12.5,
-    fontWeight: "700",
+    fontSize: 13,
+    fontWeight: "600",
   },
   sessionRailWorkspaceCount: {
     color: color.textFaint,
@@ -3072,9 +3065,9 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     fontVariant: ["tabular-nums"],
   },
   sessionRailInlineAdd: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
+    width: 22,
+    height: 22,
+    borderRadius: 6,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -3094,21 +3087,30 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     paddingVertical: 2,
   },
   sessionRailItem: {
-    gap: 3,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 12,
+    position: "relative",
+    gap: 2,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    borderRadius: 8,
     backgroundColor: "transparent",
   },
   sessionRailItemSelected: {
-    backgroundColor: color.surface,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
   },
-  sessionRailItemTop: { flexDirection: "row", alignItems: "center", gap: 7 },
+  sessionRailActiveBar: {
+    position: "absolute",
+    left: 0,
+    top: 6,
+    bottom: 6,
+    width: 3,
+    borderRadius: 2,
+    backgroundColor: color.accent,
+  },
+  sessionRailItemTop: { flexDirection: "row", alignItems: "center", gap: 6 },
   sessionRailStatus: { width: 6, height: 6, borderRadius: 3 },
-  sessionRailItemTitle: { flex: 1, color: color.text, fontSize: 13.5, fontWeight: "600", letterSpacing: -0.1 },
-  sessionRailPath: { color: color.textFaint, fontSize: 11, marginLeft: 22 },
+  sessionRailItemTitle: { flex: 1, color: color.textDim, fontSize: 12.5, fontWeight: "500" },
+  sessionRailItemTitleSelected: { color: color.text, fontWeight: "700" },
+  sessionRailPath: { color: color.textFaint, fontSize: 10.5, marginLeft: 19 },
   headerBack: {
     width: 36,
     height: 36,

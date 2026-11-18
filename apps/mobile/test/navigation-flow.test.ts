@@ -8,29 +8,26 @@ const read = (...parts: string[]): string =>
 const sessionScreen = read("app", "host", "[hostId]", "session", "[sid].tsx");
 const hostScreen = read("app", "host", "[hostId]", "index.tsx");
 const homeScreen = read("app", "index.tsx");
-const quickPanel = read("components", "SessionQuickPanel.tsx");
 
 describe("首页动线", () => {
-  it("标题栏可直达当前电脑的任务编排", () => {
+  it("标题栏可直达当前电脑的账号与模型源和任务编排", () => {
+    expect(homeScreen).toContain('accessibilityLabel="账号与模型源"');
+    expect(homeScreen).toContain("`/host/${effectiveSelectedHostId}/accounts`");
     expect(homeScreen).toContain('accessibilityLabel="任务编排"');
     expect(homeScreen).toContain("`/host/${effectiveSelectedHostId}/orchestration`");
+    expect(homeScreen).not.toContain("EdgeDashboard");
+    expect(homeScreen).not.toContain("HomeModeTitle");
   });
 });
 
 describe("会话页动线", () => {
-  it("文件与项目改动从标题栏打开的右侧快捷面板直达", () => {
-    expect(sessionScreen).toContain('accessibilityLabel="打开会话工具"');
-    expect(sessionScreen).toContain("drawerPosition={DrawerPosition.RIGHT}");
-    expect(sessionScreen).toContain("onOpenGit={() => leaveQuickPanel");
-    expect(sessionScreen).toContain("onOpenFiles={() => leaveQuickPanel");
-    expect(quickPanel).toContain("onPress={onOpenGit}");
-    expect(quickPanel).toContain('label="项目文件"');
-    expect(quickPanel).toContain("onPress={onOpenFiles}");
-  });
-
-  it("移到标题栏之后菜单里不再重复同两项", () => {
-    expect(sessionScreen).not.toContain('label="浏览项目文件"');
-    expect(sessionScreen).not.toContain('label="查看项目改动"');
+  it("移除右侧滑动抽屉，文件与项目改动直接在顶栏和菜单里直达", () => {
+    expect(sessionScreen).not.toContain("ReanimatedDrawerLayout");
+    expect(sessionScreen).not.toContain("SessionQuickPanel");
+    expect(sessionScreen).toContain('accessibilityLabel="浏览项目文件"');
+    expect(sessionScreen).toContain("`/host/${hostId}/files/${sid}`");
+    expect(sessionScreen).toContain('accessibilityLabel="查看项目改动"');
+    expect(sessionScreen).toContain("`/host/${hostId}/git/${sid}`");
   });
 
   it("切换会话用 replace，来回切不堆积返回栈", () => {

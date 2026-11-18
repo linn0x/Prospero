@@ -8,7 +8,7 @@ type Handler = (e: object) => void;
 
 /** 只跑 term.html 里的捏合 + 单指滚动两段，触摸事件手工喂。 */
 function gestures() {
-  const html = readFileSync(join(import.meta.dirname, "../../daemon/term.html"), "utf8")
+  const html = readFileSync(join(import.meta.dirname, "../assets/term.html"), "utf8")
     .replaceAll("\r\n", "\n");
   const start = html.indexOf("  // 双指缩放进行中时");
   const end = html.indexOf("  (function tapToFocus", start);
@@ -26,7 +26,11 @@ function gestures() {
     options: { fontSize: 12 },
     modes: { mouseTrackingMode: "none" },
     buffer: { active: { type: "normal" } },
-    element: { querySelector: () => ({ getBoundingClientRect: () => ({ height: 800 }) }) },
+    element: {
+      style: {} as Record<string, string>,
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 400, height: 800 }),
+      querySelector: () => ({ getBoundingClientRect: () => ({ height: 800 }) }),
+    },
     scrollLines: vi.fn(),
   };
   const post = vi.fn();
@@ -34,6 +38,8 @@ function gestures() {
   const context = {
     document: { getElementById: () => el },
     term, post, doFit: vi.fn(),
+    baseFontSize: 12,
+    wideColsTarget: 0,
     performance: { now: () => now },
     requestAnimationFrame: () => 0,
     cancelAnimationFrame: () => undefined,
@@ -85,6 +91,7 @@ describe("终端触摸手势", () => {
       g.move({ identifier: 1, clientX: 200 - d, clientY: 300 });
       g.move({ identifier: 2, clientX: 300 + d, clientY: 300 });
     }
+    g.up(2);
     expect(g.term.options.fontSize).toBeGreaterThan(12);
     expect(g.post).toHaveBeenCalledWith(expect.objectContaining({ kind: "fontSize" }));
     expect(g.term.scrollLines).not.toHaveBeenCalled();

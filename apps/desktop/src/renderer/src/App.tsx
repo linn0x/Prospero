@@ -1,7 +1,7 @@
 import { isSessionEndedStatus, needsNativeBinding } from "../../shared/session-state";
 import { chatBranchDisabledReason } from "./workspace/chat-branch";
 import { scheduleDeferredRequest } from "./deferred-request";
-import { attentionSummary, pendingRequests, type AttentionFilter } from "./attention/attention-state";
+import { attentionSummary, pendingRequests } from "./attention/attention-state";
 import { WindowsTitlebar } from "./app-shell/WindowsTitlebar";
 import { notify } from "./notifications/notifications";
 import { useNavigationHistory } from "./app-shell/use-navigation-history";
@@ -28,11 +28,8 @@ import {
   Archive,
   ArchiveRestore,
   ArrowDownAZ,
-  ArrowRight,
   BookOpen,
-  Bot,
   Boxes,
-  CheckCircle2,
   ChevronRight,
   CircleAlert,
   CircleStop,
@@ -42,7 +39,6 @@ import {
   FolderKanban,
   FolderOpen,
   FolderPlus,
-  LayoutDashboard,
   ListChecks,
   LoaderCircle,
   Mail,
@@ -65,7 +61,6 @@ import {
 import type {
   AgentModel,
   DesktopSnapshot,
-  JsonObject,
   SessionCreateInput,
   SessionInfo,
   SessionPage,
@@ -79,7 +74,7 @@ import {
   prefetchAccountUsage,
 } from "./account-usage-cache";
 import { isMissingSessionError, reportError, shortPath, text } from "./state";
-import { useLocale, type Language } from "./locale";
+import { useLocale } from "./locale";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   SIDEBAR_COLLAPSE_WIDTH,
@@ -96,7 +91,6 @@ import {
   restoredSessionIds,
   sidebarProjectSessions,
   sessionRestoreRetryDelay,
-  sortProjectsByRecentActivity,
   sortSidebarSessions,
   upsertHydratedSession,
   validOpenSessionIds,
@@ -128,7 +122,6 @@ import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -237,7 +230,6 @@ const SIDEBAR_PINNED_PREVIEW_LIMIT = 24;
 const SIDEBAR_SEARCH_PAGE_SIZE = 60;
 const SIDEBAR_SEARCH_VISIBLE_LIMIT = 120;
 const HYDRATED_SESSION_CACHE_LIMIT = 120;
-const INBOX_TASK_PAGE_SIZE = 50;
 const COMMAND_RESULT_LIMIT = 60;
 const SEARCH_QUERY_MAX_LENGTH = 500;
 const OPEN_SESSIONS_STORAGE_KEY = "prospero.openSessions";
@@ -284,26 +276,6 @@ const WorkspaceHistory = lazy(() =>
     default: module.WorkspaceHistory,
   })),
 );
-const OverviewAttention = lazy(() =>
-  import("./attention/OverviewAttention").then((module) => ({
-    default: module.OverviewAttention,
-  })),
-);
-const AttentionGroup = lazy(() =>
-  import("./attention/AttentionGroups").then((module) => ({
-    default: module.AttentionGroup,
-  })),
-);
-const AttentionFilters = lazy(() =>
-  import("./attention/AttentionGroups").then((module) => ({
-    default: module.AttentionFilters,
-  })),
-);
-const AttentionDetails = lazy(() =>
-  import("./attention/AttentionGroups").then((module) => ({
-    default: module.AttentionDetails,
-  })),
-);
 const WorkspacePicker = lazy(() =>
   import("./remote-workspaces/AddWorkspaceDialog").then((module) => ({
     default: module.WorkspacePicker,
@@ -344,8 +316,6 @@ const SkillsPane = lazy(() =>
 );
 
 type View =
-  | "overview"
-  | "inbox"
   | "remote"
   | "mobile"
   | "workspaces"
@@ -355,8 +325,6 @@ type View =
   | "diagnostics"
   | "settings";
 const views = new Set<View>([
-  "overview",
-  "inbox",
   "remote",
   "mobile",
   "workspaces",
@@ -369,11 +337,11 @@ const views = new Set<View>([
 
 function readStoredView(): View {
   try {
-    const value = localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY) as View | null;
-    if (["files", "search", "git"].includes(value ?? "")) return "workspaces";
-    return value && views.has(value) ? value : "overview";
+    const value = localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY) as string | null;
+    if (!value || ["overview", "inbox", "files", "search", "git"].includes(value)) return "workspaces";
+    return views.has(value as View) ? (value as View) : "workspaces";
   } catch {
-    return "overview";
+    return "workspaces";
   }
 }
 
@@ -387,8 +355,6 @@ function readStoredActiveSession(): string | undefined {
 type NavItem = { id: View; label: string; icon: ComponentType };
 
 const primaryNav: NavItem[] = [
-  { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "inbox", label: "Inbox", icon: Mail },
   { id: "workspaces", label: "Workspaces", icon: FolderKanban },
   { id: "runs", label: "Runs", icon: Workflow },
 ];
@@ -407,20 +373,6 @@ function getViewCopy(
 ): { title: string; description: string } {
   return (
     {
-      overview: {
-        title: t("概览", "Overview"),
-        description: t(
-          "需要处理的工作与当前运行状态",
-          "Work requiring attention and current runtime status",
-        ),
-      },
-      inbox: {
-        title: t("收件箱", "Inbox"),
-        description: t(
-          "审批、回复与失败恢复",
-          "Approvals, replies, and failure recovery",
-        ),
-      },
       remote: {
         title: t("远程电脑", "Remote computers"),
         description: t("通过局域网或中继控制其他电脑的 Shell", "Control another computer’s Shell over LAN or relay"),
@@ -701,28 +653,6 @@ function sidebarSessionRowEqual(
   );
 }
 
-function relativeTime(value: unknown, language: Language): string {
-  if (typeof value !== "number" || !Number.isFinite(value))
-    return language === "zh" ? "刚刚" : "now";
-  const minutes = Math.floor(Math.max(0, Date.now() - value) / 60_000);
-  if (minutes < 1) return language === "zh" ? "刚刚" : "now";
-  if (minutes < 60) return `${String(minutes)}m`;
-  const hours = Math.floor(minutes / 60);
-  return hours < 24
-    ? `${String(hours)}h`
-    : `${String(Math.floor(hours / 24))}d`;
-}
-
-function newestRecord(records: JsonObject[]): JsonObject | undefined {
-  return records.reduce<JsonObject | undefined>((latest, record) => {
-    const value = record["updatedAt"] ?? record["createdAt"];
-    const latestValue = latest?.["updatedAt"] ?? latest?.["createdAt"];
-    const time = typeof value === "number" ? value : Date.parse(String(value ?? ""));
-    const latestTime = typeof latestValue === "number" ? latestValue : Date.parse(String(latestValue ?? ""));
-    return !latest || (Number.isFinite(time) ? time : 0) > (Number.isFinite(latestTime) ? latestTime : 0) ? record : latest;
-  }, undefined);
-}
-
 function DaemonAgentsCard({
   snapshot,
   usage,
@@ -802,12 +732,13 @@ function ShellSidebar({
   snapshot,
   view,
   activeId,
-  botSession,
-  botBusy,
-  onOpenBotSession,
-  onConfigureBotSession,
+  botSession: _botSession,
+  botBusy: _botBusy,
+  onOpenBotSession: _onOpenBotSession,
+  onConfigureBotSession: _onConfigureBotSession,
   onView,
   onOpenSession,
+  onOpenRuns,
   onNewSession,
   onTogglePin,
   onToggleArchive,
@@ -837,6 +768,7 @@ function ShellSidebar({
   onConfigureBotSession?: (() => void) | undefined;
   onView: (view: View) => void;
   onOpenSession: (id: string, session?: SessionInfo) => void;
+  onOpenRuns: (runId?: string, taskId?: string) => void;
   onNewSession: (project?: string) => void;
   onTogglePin: (id: string) => void;
   onToggleArchive: (id: string) => void;
@@ -878,8 +810,10 @@ function ShellSidebar({
     onAddWorkspace();
     closeMobileSidebar();
   }, [closeMobileSidebar, onAddWorkspace]);
+  const [attentionOpen, setAttentionOpen] = useState(true);
   const [workspaceOpen, setWorkspaceOpen] = useState(true);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const attention = useMemo(() => attentionSummary(snapshot), [snapshot]);
   const managedLayout = useMemo(
     () => groupManagedWorkspaces(snapshot.projects, snapshot.orchestration),
     [snapshot.projects, snapshot.orchestration],
@@ -1588,6 +1522,107 @@ function ShellSidebar({
           </SidebarGroup>
         </nav>
         <div className="sidebar-workspace-scroll" role="region" aria-label={t("工作区与会话", "Workspaces and sessions")}>
+        {(attention.total > 0 || !snapshot.daemon.running) && <>
+          <SidebarSeparator className="sidebar-detail-section" />
+          <Collapsible
+            open={attentionOpen}
+            onOpenChange={setAttentionOpen}
+            className="group/attention sidebar-detail-section sidebar-attention-group"
+          >
+            <SidebarGroup className="workspace-sidebar-group">
+              <SidebarGroupLabel render={<CollapsibleTrigger />}>
+                <span>{t("待处理", "Needs attention")}</span>
+                <span className="sidebar-attention-count">{!snapshot.daemon.running ? Math.max(1, attention.total) : attention.total}</span>
+                <ChevronRight className="workspace-group-chevron" />
+              </SidebarGroupLabel>
+              <CollapsibleContent>
+                <SidebarGroupContent>
+                  <SidebarMenu className="sidebar-attention-list">
+                    {!snapshot.daemon.running && (
+                      <SidebarMenuItem>
+                        <SidebarMenuButton
+                          className="sidebar-attention-row tone-danger"
+                          disabled={snapshot.daemon.starting}
+                          tooltip={snapshot.daemon.lastError || t("本地服务离线，点击连接", "Local runtime offline; click to connect")}
+                          onClick={() => void window.prospero.startDaemon()}
+                        >
+                          <WifiOff />
+                          <span className="truncate">{snapshot.daemon.starting ? t("正在连接服务…", "Connecting…") : t("Daemon 离线 · 点击重连", "Daemon offline · Reconnect")}</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    )}
+                    {attention.approvalSessions.slice(0, 4).map((session) => (
+                      <SidebarMenuItem key={`attn-approval:${session.id}`}>
+                        <SidebarMenuButton
+                          className="sidebar-attention-row"
+                          isActive={view === "workspaces" && activeId === session.id}
+                          tooltip={`${sidebarSessionLabel(session)} · ${t("等待确认", "Needs approval")}`}
+                          onClick={() => selectSession(session.id, session)}
+                        >
+                          <ListChecks className="tone-warning" />
+                          <span className="truncate">{sidebarSessionLabel(session)}</span>
+                          <span className="sidebar-attention-badge">{pendingRequests(session, "approvals")}</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    ))}
+                    {attention.questionSessions.slice(0, 4).map((session) => (
+                      <SidebarMenuItem key={`attn-question:${session.id}`}>
+                        <SidebarMenuButton
+                          className="sidebar-attention-row"
+                          isActive={view === "workspaces" && activeId === session.id}
+                          tooltip={`${sidebarSessionLabel(session)} · ${t("等待回答", "Needs reply")}`}
+                          onClick={() => selectSession(session.id, session)}
+                        >
+                          <MessageSquare className="tone-warning" />
+                          <span className="truncate">{sidebarSessionLabel(session)}</span>
+                          <span className="sidebar-attention-badge">{pendingRequests(session, "questions")}</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    ))}
+                    {attention.gates.slice(0, 3).map((gate) => {
+                      const ctx = attention.context(gate);
+                      const label = ctx.title || text(gate["question"], t("任务需要确认", "Gate pending"));
+                      return (
+                        <SidebarMenuItem key={`attn-gate:${text(gate["id"])}`}>
+                          <SidebarMenuButton
+                            className="sidebar-attention-row"
+                            tooltip={label}
+                            onClick={() => {
+                              onOpenRuns(text(gate["runId"]), text(gate["taskId"]) || undefined);
+                              closeMobileSidebar();
+                            }}
+                          >
+                            <ListChecks className="tone-warning" />
+                            <span className="truncate">{label}</span>
+                            <span className="sidebar-attention-badge">Gate</span>
+                          </SidebarMenuButton>
+                        </SidebarMenuItem>
+                      );
+                    })}
+                    {attention.tasks.slice(0, 3).map((task) => {
+                      const label = text(task["title"], t("任务失败", "Task failed"));
+                      return (
+                        <SidebarMenuItem key={`attn-task:${text(task["id"])}`}>
+                          <SidebarMenuButton
+                            className="sidebar-attention-row"
+                            tooltip={`${label} · ${status(text(task["status"]))}`}
+                            onClick={() => {
+                              onOpenRuns(text(task["runId"]), text(task["id"]));
+                              closeMobileSidebar();
+                            }}
+                          >
+                            <CircleAlert className="tone-danger" />
+                            <span className="truncate">{label}</span>
+                          </SidebarMenuButton>
+                        </SidebarMenuItem>
+                      );
+                    })}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </CollapsibleContent>
+            </SidebarGroup>
+          </Collapsible>
+        </>}
         {(pinned.length > 0 || pinnedLoading) && <>
           <SidebarSeparator className="sidebar-detail-section" />
           <SidebarGroup className="sidebar-detail-section">
@@ -1943,649 +1978,6 @@ function ShellSidebar({
         title={t("拖动调整宽度 · 双击恢复默认", "Drag to resize · Double-click to reset")}
       />
     </Sidebar>
-  );
-}
-
-function PageHeading({
-  eyebrow,
-  title,
-  description,
-  actions,
-}: {
-  eyebrow?: string;
-  title: string;
-  description: string;
-  actions?: React.ReactNode;
-}) {
-  return (
-    <header className="view-heading">
-      <div className="flex min-w-0 flex-col gap-1">
-        {eyebrow && <span className="eyebrow">{eyebrow}</span>}
-        <h1>{title}</h1>
-        <p>{description}</p>
-      </div>
-      {actions && <div className="view-actions">{actions}</div>}
-    </header>
-  );
-}
-
-function OverviewPane({
-  snapshot,
-  onOpenSession,
-  onOpenInbox,
-  onOpenRuns,
-  onOpenWorkspaces,
-  onNewSession,
-  onAddWorkspace,
-}: {
-  snapshot: DesktopSnapshot;
-  onOpenSession: (id: string) => void;
-  onOpenInbox: () => void;
-  onOpenRuns: (runId?: string, taskId?: string) => void;
-  onOpenWorkspaces: () => void;
-  onNewSession: (project: string) => void;
-  onAddWorkspace: () => void;
-}) {
-  const { t, status } = useLocale();
-  const activeSessions = snapshot.daemon.sessions.filter((session) =>
-    ["running", "starting", "waiting_approval", "waiting_input"].includes(
-      session.status,
-    ),
-  );
-  const activeRun = newestRecord(
-    snapshot.orchestration.runs.filter(
-      (run) => text(run["status"]) === "active",
-    ),
-  ) ?? newestRecord(snapshot.orchestration.runs);
-  const runId = text(activeRun?.["id"]);
-  const runTasks = snapshot.orchestration.tasks.filter(
-    (task) => text(task["runId"]) === runId,
-  );
-  const doneCount = runTasks.filter((task) =>
-    ["done", "completed", "succeeded"].includes(text(task["status"])),
-  ).length;
-  const progress = runTasks.length
-    ? Math.round((doneCount / runTasks.length) * 100)
-    : 0;
-  const orderedActiveSessions = sortSidebarSessions(
-    activeSessions,
-    undefined,
-    snapshot.pinnedSessionIds,
-    snapshot.unreadSessionIds,
-  );
-  const recentProjects = sortProjectsByRecentActivity(
-    snapshot.projects,
-    snapshot.daemon.sessions,
-  ).slice(0, 4);
-  return (
-    <div className="view-scroll">
-      <div className="view-container overview-view">
-        <h1 className="sr-only">{t("概览", "Overview")}</h1>
-        <div className="overview-grid">
-          <OverviewAttention snapshot={snapshot} onOpenSession={onOpenSession} onOpenRuns={onOpenRuns} onOpenInbox={onOpenInbox} />
-          <Card className="run-focus-card" data-liquid-glass="panel" role="region" aria-labelledby="overview-run-title">
-            <CardHeader>
-              <div className="flex items-center justify-between gap-3">
-                <Badge variant="outline">{t("当前运行", "CURRENT RUN")}</Badge>
-                {activeRun && (
-                  <Badge variant="secondary">
-                    {status(text(activeRun["status"]))}
-                  </Badge>
-                )}
-              </div>
-              <CardTitle id="overview-run-title" role="heading" aria-level={2}>
-                {text(
-                  activeRun?.["objective"],
-                  t("还没有正在运行的 Run", "No active run yet"),
-                )}
-              </CardTitle>
-              <CardDescription>
-                {activeRun
-                  ? t(
-                      `${String(doneCount)} / ${String(runTasks.length)} 个任务已完成`,
-                      `${String(doneCount)} of ${String(runTasks.length)} tasks complete`,
-                    )
-                  : t(
-                      "从运行页创建目标并拆分任务",
-                      "Create a goal in Runs and break it into tasks",
-                    )}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-5">
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-muted-foreground">
-                    {t("运行进度", "Run progress")}
-                  </span>
-                  <strong>{progress}%</strong>
-                </div>
-                <Progress
-                  value={progress}
-                  aria-label={t(
-                    `运行进度 ${String(progress)}%`,
-                    `Run progress: ${String(progress)}%`,
-                  )}
-                />
-              </div>
-              <div className="run-task-preview">
-                {runTasks.slice(0, 4).map((task) => (
-                  <div key={text(task["id"])}>
-                    <StatusMark status={text(task["status"])} />
-                    <span className="truncate">{text(task["title"])}</span>
-                    <small>{status(text(task["status"]))}</small>
-                  </div>
-                ))}
-                {runTasks.length === 0 && (
-                  <p className="text-sm text-muted-foreground">
-                    {t(
-                      "任务会在这里形成一条轻量工作流。",
-                      "Tasks will form a lightweight workflow here.",
-                    )}
-                  </p>
-                )}
-              </div>
-            </CardContent>
-            <CardFooter>
-              <Button variant="ghost" size="sm" onClick={() => onOpenRuns(runId || undefined)}>
-                {t("查看任务编排", "View orchestration")}{" "}
-                <ArrowRight data-icon="inline-end" />
-              </Button>
-            </CardFooter>
-          </Card>
-          <Card className="active-work-card" data-liquid-glass="panel" role="region" aria-labelledby="overview-active-title">
-            <CardHeader>
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <CardTitle id="overview-active-title" role="heading" aria-level={2}>{t("活跃工作", "Active work")}</CardTitle>
-                  <CardDescription>
-                    {t(
-                      "正在工作的 Agent 与最近上下文",
-                      "Active agents and recent context",
-                    )}
-                  </CardDescription>
-                </div>
-                <Badge variant="outline">{activeSessions.length}</Badge>
-              </div>
-            </CardHeader>
-            <CardContent className="active-agent-list">
-              {orderedActiveSessions.slice(0, 6).map((session) => (
-                <button
-                  type="button"
-                  key={session.id}
-                  title={`${sessionLabel(session)} · ${shortPath(session.cwd)}`}
-                  onClick={() => onOpenSession(session.id)}
-                >
-                  <Avatar>
-                    <AvatarFallback>
-                      <AgentLogo agent={session.agent} size={18} />
-                    </AvatarFallback>
-                  </Avatar>
-                  <span className="min-w-0 flex-1">
-                    <strong className="truncate">
-                      {sessionLabel(session)}
-                    </strong>
-                    <small>
-                      <StatusMark status={session.status} busySince={session.busySince} />
-                      {session.agent} · {status(session.status)} ·{" "}
-                      {shortPath(session.cwd)}
-                    </small>
-                  </span>
-                  <ChevronRight aria-hidden="true" />
-                </button>
-              ))}
-              {activeSessions.length === 0 && (
-                <div className="calm-empty">
-                  <Bot />
-                  <div>
-                    <strong>{t("没有活跃 Agent", "No active agents")}</strong>
-                    <p>
-                      {t(
-                        "新建会话后会显示在这里。",
-                        "New sessions will appear here.",
-                      )}
-                    </p>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-            <CardFooter>
-              <Button variant="ghost" size="sm" onClick={onOpenWorkspaces}>
-                {t("打开工作台", "Open workspaces")}
-                <ArrowRight data-icon="inline-end" />
-              </Button>
-            </CardFooter>
-          </Card>
-        </div>
-        <section className="recent-section" aria-labelledby="recent-workspaces-title">
-          <div className="section-heading">
-            <div>
-              <h2 id="recent-workspaces-title">{t("最近的工作区", "Recent workspaces")}</h2>
-              <p>
-                {t(
-                  "回到上次离开的项目与会话",
-                  "Return to projects and sessions where you left off",
-                )}
-              </p>
-            </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={onAddWorkspace}
-            >
-              <FolderPlus data-icon="inline-start" />
-              {t("添加工作区", "Add workspace")}
-            </Button>
-          </div>
-          <div className="workspace-cards">
-            {recentProjects.map((project) => {
-              const sessions = snapshot.daemon.sessions
-                .filter((session) => projectForSession([project], session))
-                .sort(
-                  (left, right) =>
-                    (right.createdAt ?? 0) - (left.createdAt ?? 0),
-                );
-              const name =
-                project.split(/[\\/]/).filter(Boolean).at(-1) ?? project;
-              return (
-                <Card size="sm" key={project} data-liquid-glass="panel">
-                  <CardHeader>
-                    <div className="workspace-symbol">
-                      <FolderKanban />
-                    </div>
-                    <CardTitle title={name}>{name}</CardTitle>
-                    <CardDescription title={project}>
-                      {shortPath(project)}
-                    </CardDescription>
-                  </CardHeader>
-                  <CardFooter>
-                    <span>
-                      {sessions.length} {t("个会话", "sessions")}
-                    </span>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t(`打开 ${name}`, `Open ${name}`)}
-                      onClick={() =>
-                        sessions[0]
-                          ? onOpenSession(sessions[0].id)
-                          : onNewSession(project)
-                      }
-                    >
-                      <ArrowRight />
-                    </Button>
-                  </CardFooter>
-                </Card>
-              );
-            })}
-            {snapshot.projects.length === 0 && (
-              <Empty>
-                <EmptyHeader>
-                  <EmptyMedia variant="icon">
-                    <FolderPlus />
-                  </EmptyMedia>
-                  <EmptyTitle>
-                    {t("添加第一个工作区", "Add your first workspace")}
-                  </EmptyTitle>
-                  <EmptyDescription>
-                    {t(
-                      "选择本地项目后开始与 Agent 协作。",
-                      "Choose a local project to start collaborating with an agent.",
-                    )}
-                  </EmptyDescription>
-                </EmptyHeader>
-                <EmptyContent>
-                  <Button onClick={onAddWorkspace}>
-                    {t("选择文件夹", "Choose folder")}
-                  </Button>
-                </EmptyContent>
-              </Empty>
-            )}
-          </div>
-        </section>
-      </div>
-    </div>
-  );
-}
-
-function InboxPane({
-  snapshot,
-  onOpenSession,
-  onOpenRuns,
-}: {
-  snapshot: DesktopSnapshot;
-  onOpenSession: (id: string) => void;
-  onOpenRuns: (runId?: string, taskId?: string) => void;
-}) {
-  const { t, status } = useLocale();
-  const [gateDecisions, setGateDecisions] = useState<Record<string, string>>(
-    {},
-  );
-  const gateSubmissionRef = useRef(new Set<string>());
-  const [gateSubmissions, setGateSubmissions] = useState<Record<string, string>>({});
-  const [gateErrors, setGateErrors] = useState<Record<string, string>>({});
-  const taskSubmissionRef = useRef(new Set<string>());
-  const [taskSubmissions, setTaskSubmissions] = useState<Set<string>>(new Set());
-  const [taskErrors, setTaskErrors] = useState<Record<string, string>>({});
-  const [taskIssueLimit, setTaskIssueLimit] = useState(INBOX_TASK_PAGE_SIZE);
-  const attention = useMemo(() => attentionSummary(snapshot), [snapshot]);
-  const [filter, setFilter] = useState<AttentionFilter>("all");
-  const { gates, tasks: taskIssues, total } = attention;
-  const visibleTaskIssues = taskIssues.slice(0, taskIssueLimit);
-  const resolveInboxGate = async (gateId: string, decision: string): Promise<void> => {
-    if (gateSubmissionRef.current.has(gateId)) return;
-    gateSubmissionRef.current.add(gateId);
-    setGateSubmissions((current) => ({ ...current, [gateId]: decision }));
-    setGateErrors((current) => {
-      const next = { ...current };
-      delete next[gateId];
-      return next;
-    });
-    try {
-      await window.prospero.resolveGate(gateId, decision);
-      setGateDecisions((current) => ({ ...current, [gateId]: "" }));
-    } catch (reason) {
-      setGateErrors((current) => ({ ...current, [gateId]: reportError(reason) }));
-    } finally {
-      gateSubmissionRef.current.delete(gateId);
-      setGateSubmissions((current) => {
-        const next = { ...current };
-        delete next[gateId];
-        return next;
-      });
-    }
-  };
-  const retryInboxTask = async (taskId: string): Promise<void> => {
-    if (taskSubmissionRef.current.has(taskId)) return;
-    taskSubmissionRef.current.add(taskId);
-    setTaskSubmissions((current) => new Set(current).add(taskId));
-    setTaskErrors((current) => {
-      const next = { ...current };
-      delete next[taskId];
-      return next;
-    });
-    try {
-      await window.prospero.orchestrationAction("task.retry", {
-        operationId: crypto.randomUUID(),
-        taskId,
-      });
-    } catch (reason) {
-      setTaskErrors((current) => ({ ...current, [taskId]: reportError(reason) }));
-    } finally {
-      taskSubmissionRef.current.delete(taskId);
-      setTaskSubmissions((current) => {
-        const next = new Set(current);
-        next.delete(taskId);
-        return next;
-      });
-    }
-  };
-  const gateActions = (gate: JsonObject): React.ReactNode => {
-    const gateId = text(gate["id"]);
-    const errorId = `gate-error-${encodeURIComponent(gateId)}`;
-    const options = Array.isArray(gate["options"])
-      ? (gate["options"] as unknown[]).map(String)
-      : [];
-    const submitting = gateSubmissions[gateId];
-    const error = gateErrors[gateId];
-    if (options.length > 0) {
-      return <>
-        {options.map((option) => (
-          <Button
-            key={option}
-            variant="outline"
-            size="sm"
-            disabled={Boolean(submitting)}
-            onClick={() => void resolveInboxGate(gateId, option)}
-          >
-            {submitting === option && <Spinner data-icon="inline-start" />}
-            {option}
-          </Button>
-        ))}
-        {error && <span className="w-full text-xs text-destructive" role="alert">{error}</span>}
-      </>;
-    }
-    const decision = gateDecisions[gateId] ?? "";
-    return (
-      <>
-        <div className="gate-freeform-row">
-          <Input
-            value={decision}
-            maxLength={20_000}
-            disabled={Boolean(submitting)}
-            aria-label={t("输入 Gate 决定", "Enter gate decision")}
-            aria-describedby={error ? errorId : undefined}
-            aria-invalid={Boolean(error)}
-            placeholder={t("输入决定", "Enter a decision")}
-            onChange={(event) =>
-              setGateDecisions((current) => ({
-                ...current,
-                [gateId]: event.target.value,
-              }))
-            }
-            onKeyDown={(event) => {
-              if (event.nativeEvent.isComposing || event.key !== "Enter" || !decision.trim() || submitting) return;
-              event.preventDefault();
-              void resolveInboxGate(gateId, decision.trim());
-            }}
-          />
-          <Button
-            size="sm"
-            disabled={!decision.trim() || Boolean(submitting)}
-            onClick={() => void resolveInboxGate(gateId, decision.trim())}
-          >
-            {submitting && <Spinner data-icon="inline-start" />}
-            {submitting ? t("提交中…", "Submitting…") : t("确认", "Confirm")}
-          </Button>
-        </div>
-        {error && <span id={errorId} className="w-full text-xs text-destructive" role="alert">{error}</span>}
-      </>
-    );
-  };
-  const sessionCard = (session: SessionInfo, kind: "approvals" | "questions") => (
-            <Card className="inbox-item tone-warning" key={`${kind}-${session.id}`} role="article">
-              <CardHeader>
-                <div className="inbox-item-head">
-                  <span className="attention-icon tone-warning" aria-hidden="true">
-                    <MessageSquare />
-                  </span>
-                  <div>
-                    <CardTitle role="heading" aria-level={3} title={sessionLabel(session)}>{sessionLabel(session)}</CardTitle>
-                    <CardDescription>
-                      {session.agent} · {shortPath(session.cwd)}
-                    </CardDescription>
-                  </div>
-                  <Badge variant="secondary">
-                    {kind === "approvals" ? t("待确认", "Needs approval") : t("待回答", "Needs a reply")}
-                  </Badge>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <p className="line-clamp-3">
-                  {kind === "approvals"
-                    ? t(
-                        `${String(pendingRequests(session, kind))} 个权限请求等待处理`,
-                        `${String(pendingRequests(session, kind))} permission requests awaiting review`,
-                      )
-                    : t(
-                        `${String(pendingRequests(session, kind))} 个问题等待回复`,
-                        `${String(pendingRequests(session, kind))} questions awaiting a reply`,
-                      )}
-                </p>
-              </CardContent>
-              <CardFooter>
-                <Button size="sm" onClick={() => onOpenSession(session.id)}>
-                  {t("打开会话", "Open session")}
-                </Button>
-              </CardFooter>
-            </Card>
-  );
-  return (
-    <div className="view-scroll">
-      <div className="view-container inbox-view">
-        <PageHeading
-          eyebrow={t("行动队列", "ACTION QUEUE")}
-          title={t("收件箱", "Inbox")}
-          description={t(
-            "处理待确认、待回答和失败任务。",
-            "Review requests, answer questions, and recover tasks.",
-          )}
-          actions={
-            <Badge variant="secondary" aria-live="polite">
-              {total} {t("项待处理", "open")}
-            </Badge>
-          }
-        />
-        <AttentionFilters value={filter} counts={attention.counts} total={total} onChange={setFilter} />
-        <div className="inbox-list">
-          {!snapshot.daemon.running && (
-            <Card className="inbox-item tone-danger" role="article">
-              <CardHeader>
-                <div className="inbox-item-head">
-                  <span className="attention-icon tone-danger" aria-hidden="true">
-                    <WifiOff />
-                  </span>
-                  <div>
-                    <CardTitle role="heading" aria-level={2}>
-                      {t("运行环境已断开", "Runtime disconnected")}
-                    </CardTitle>
-                    <CardDescription>
-                      Prospero daemon · {isMac ? t("此 Mac", "This Mac") : t("本机 Windows", "This Windows PC")}
-                    </CardDescription>
-                  </div>
-                  <Badge variant="destructive">{t("离线", "Offline")}</Badge>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <p>
-                  {snapshot.daemon.lastError ||
-                    t(
-                      "本地运行环境不可用，当前会话暂时无法继续执行。",
-                      "The local runtime is unavailable, so active sessions cannot continue.",
-                    )}
-                </p>
-              </CardContent>
-              <CardFooter>
-                <Button
-                  aria-busy={snapshot.daemon.starting}
-                  disabled={snapshot.daemon.starting}
-                  onClick={() => void window.prospero.startDaemon()}
-                >
-                  {snapshot.daemon.starting
-                    ? t("正在连接…", "Connecting…")
-                    : t("重新连接", "Reconnect")}
-                </Button>
-              </CardFooter>
-            </Card>
-          )}
-          {(filter === "all" || filter === "approvals") && <AttentionGroup id="inbox-approvals" title={t("待确认", "Needs approval")} count={attention.counts.approvals}>
-          {gates.map((gate) => (
-            <Card className="inbox-item tone-warning" key={text(gate["id"])} role="article">
-              <CardHeader>
-                <div className="inbox-item-head">
-                  <span className="attention-icon tone-warning" aria-hidden="true">
-                    <ListChecks />
-                  </span>
-                  <div>
-                    <CardTitle role="heading" aria-level={3} title={text(gate["question"])}>
-                      {attention.context(gate).title || t("任务需要确认", "Task needs a decision")}
-                    </CardTitle>
-                    <CardDescription>
-                      {attention.context(gate).project || t("审批请求", "Approval request")}
-                    </CardDescription>
-                  </div>
-                  <Badge variant="secondary">
-                    {t("需要决定", "Needs decision")}
-                  </Badge>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <AttentionDetails summary={t("查看请求并处理", "Review request and respond")} text={[text(gate["question"]), text(gate["reason"])].filter(Boolean).join("\n\n")}>
-                  <div className="flex flex-wrap gap-2">{gateActions(gate)}</div>
-                </AttentionDetails>
-              </CardContent>
-              <CardFooter className="flex-wrap">
-                <Button variant="ghost" size="sm" onClick={() => onOpenRuns(text(gate["runId"]), text(gate["taskId"]) || undefined)}>
-                  {t("查看任务编排", "View orchestration")}
-                </Button>
-              </CardFooter>
-            </Card>
-          ))}
-          {attention.approvalSessions.map(session => sessionCard(session, "approvals"))}
-          </AttentionGroup>}
-          {(filter === "all" || filter === "questions") && <AttentionGroup id="inbox-questions" title={t("待回答", "Needs a reply")} count={attention.counts.questions}>
-            {attention.questionSessions.map(session => sessionCard(session, "questions"))}
-          </AttentionGroup>}
-          {(filter === "all" || filter === "issues") && <AttentionGroup id="inbox-issues" title={t("失败与阻塞", "Failures & blockers")} count={attention.counts.issues}>
-          {visibleTaskIssues.map((task) => (
-            <Card className="inbox-item tone-danger" key={text(task["id"])} role="article">
-              <CardHeader>
-                <div className="inbox-item-head">
-                  <span className="attention-icon tone-danger" aria-hidden="true">
-                    <CircleAlert />
-                  </span>
-                  <div>
-                    <CardTitle role="heading" aria-level={3} title={text(task["title"])}>
-                      {text(task["title"], t("任务失败", "Task failed"))}
-                    </CardTitle>
-                    <CardDescription>
-                      {attention.context(task).project || t("任务", "Task")}
-                    </CardDescription>
-                  </div>
-                  <Badge variant="destructive">
-                    {status(text(task["status"]))}
-                  </Badge>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <AttentionDetails summary={t("查看完整任务", "Read full task")} text={[text(task["title"]), text(task["spec"])].filter(Boolean).join("\n\n")} />
-              </CardContent>
-              <CardFooter className="flex-wrap">
-                <Button variant="outline" size="sm" onClick={() => onOpenRuns(text(task["runId"]), text(task["id"]))}>
-                  {t("查看运行", "View run")}
-                </Button>
-                {text(task["status"]) === "failed" && (
-                  <Button
-                    size="sm"
-                    disabled={taskSubmissions.has(text(task["id"]))}
-                    onClick={() => void retryInboxTask(text(task["id"]))}
-                  >
-                    {taskSubmissions.has(text(task["id"])) && <Spinner data-icon="inline-start" />}
-                    {taskSubmissions.has(text(task["id"])) ? t("重试中…", "Retrying…") : t("重试", "Retry")}
-                  </Button>
-                )}
-                {taskErrors[text(task["id"])] && <span className="w-full text-xs text-destructive" role="alert">{taskErrors[text(task["id"])]}</span>}
-              </CardFooter>
-            </Card>
-          ))}
-          {visibleTaskIssues.length < taskIssues.length && (
-            <Button
-              variant="outline"
-              onClick={() => setTaskIssueLimit((current) => current + INBOX_TASK_PAGE_SIZE)}
-            >
-              {t("显示更多失败任务", "Show more failed tasks")} · {taskIssues.length - visibleTaskIssues.length}
-            </Button>
-          )}
-          </AttentionGroup>}
-          {filter !== "all" && attention.counts[filter] === 0 && <p className="text-muted-foreground">{t("这一分类暂无待处理事项。", "No pending items in this category.")}</p>}
-          {total === 0 && filter === "all" && (
-            <Empty className="inbox-empty">
-              <EmptyHeader>
-                <EmptyMedia variant="icon">
-                  <Archive />
-                </EmptyMedia>
-                <EmptyTitle>{t("收件箱已清空", "Inbox is clear")}</EmptyTitle>
-                <EmptyDescription>
-                  {t(
-                    "当前没有需要你审批、回复或恢复的工作。",
-                    "Nothing needs your approval, reply, or recovery.",
-                  )}
-                </EmptyDescription>
-              </EmptyHeader>
-            </Empty>
-          )}
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -4375,6 +3767,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onConfigureBotSession={configureBotSession}
         onView={selectView}
         onOpenSession={openSession}
+        onOpenRuns={openRun}
         onNewSession={openNewSession}
         onTogglePin={togglePin}
         onToggleArchive={toggleArchive}
@@ -4419,23 +3812,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               </div>
             }
           >
-            {view === "overview" ? (
-              <OverviewPane
-                snapshot={sessionSnapshot}
-                onOpenSession={openSession}
-                onOpenInbox={() => setView("inbox")}
-                onOpenRuns={openRun}
-                onOpenWorkspaces={() => setView("workspaces")}
-                onNewSession={openNewSession}
-                onAddWorkspace={openAddWorkspace}
-              />
-            ) : view === "inbox" ? (
-              <InboxPane
-                snapshot={sessionSnapshot}
-                onOpenSession={openSession}
-                onOpenRuns={openRun}
-              />
-            ) : view === "remote" ? (
+            {view === "remote" ? (
               <RemoteHostsPane settings={sessionSnapshot.settings} />
             ) : view === "mobile" ? (
               <DevicesPane snapshot={sessionSnapshot} />

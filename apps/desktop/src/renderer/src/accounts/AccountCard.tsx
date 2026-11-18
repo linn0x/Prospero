@@ -28,7 +28,7 @@ export function AccountCard({ account, usage, disabled, busy, error, apiValidati
   const pending = (type: string) => busy === id + ":" + type;
   return <article className={"account-card account-card-rich provider-" + engine} aria-label={text(account["name"], agent)}>
     <div className="account-card-head">
-      <div className="provider-logo"><AgentLogo agent={engine} size={24} /></div>
+      <div className="provider-logo"><AgentLogo agent={engine} size={18} /></div>
       <div><strong>{text(account["name"], agent)}</strong><p>{hasApi ? accountApiProtocolLabel(accountApiProtocolFromProfile(profile, agent)) : agent + " · " + status(text(account["status"]))}{number(account["activeSessions"]) > 0 && " · " + number(account["activeSessions"]) + " " + t("个会话", "sessions")}</p></div>
       {account["isDefault"] === true && <span className="pill"><DesktopIcon name="check" size={12} />{t("默认", "Default")}</span>}
     </div>

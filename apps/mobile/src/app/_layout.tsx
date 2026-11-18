@@ -8,7 +8,6 @@ import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { ToastHost } from "@/components/Toast";
-import { RunningSessionProgressBridge } from "@/components/RunningSessionProgressBridge";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { DEFAULT_HOME_SETTINGS, normalizeHomeSettings } from "@/lib/home-preferences";
 import { useApp } from "@/lib/store";
@@ -80,7 +79,6 @@ export default function RootLayout() {
                 contentStyle: { backgroundColor: palette.bg },
               }}
             />
-            <RunningSessionProgressBridge />
             <ToastHost />
           </ThemeProvider>
         </MobileThemeContext.Provider>

@@ -118,9 +118,13 @@ describe("home dashboard", () => {
     ).toBe("darwin · 15.6 · arm64");
   });
 
-  it("动态目录关闭 Android cell 裁剪，收敛单一设备胶囊并支持折叠屏双栏", () => {
+  it("采用桌面端 IDE 工作台布局：紧凑工作区树、顶栏设备切换与多会话信息区分", () => {
     const dashboard = readFileSync(
       join(import.meta.dirname, "..", "src", "components", "HomeDashboard.tsx"),
+      "utf8",
+    );
+    const home = readFileSync(
+      join(import.meta.dirname, "..", "src", "app", "index.tsx"),
       "utf8",
     );
 
@@ -134,30 +138,26 @@ describe("home dashboard", () => {
     expect(dashboard).not.toContain("onOpenSettings");
     expect(dashboard).not.toContain("DeviceDetailCarousel");
     expect(dashboard).not.toContain("DeviceQuickSwitcher");
-    expect(dashboard).not.toContain("点按展开 · 左滑操作");
+    expect(dashboard).not.toContain("styles.deviceCapsule");
     expect(dashboard).toContain("normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS)");
-    expect(dashboard).toContain("projectCardPressed: { borderRadius: radius.md");
     expect(dashboard).toContain('name="pencil"');
     expect(dashboard).toContain("<SwipeRow");
     expect(dashboard).toContain('id: "create-session"');
     expect(dashboard).toContain('id: "edit-workspace"');
     expect(dashboard).toContain("workspaceAliasKey(selectedHost.id, editingProject.path)");
-    expect(dashboard).toContain("name={brand}");
-    expect(dashboard).toContain("styles.deviceCapsule");
-    expect(dashboard).toContain("styles.deviceFleetPill");
     expect(dashboard).toContain("hostConnectionTone(selectedRuntime, palette)");
-    expect(dashboard).toContain('`${String(runtime.rttMs)}ms`');
-    expect(dashboard).toContain("orderedHosts.slice(1).map");
-    expect(dashboard).toContain("styles.fleetCurrentStatus");
-    expect(dashboard).toContain("hostConnectionLabel(selectedRuntime)");
     expect(dashboard).toContain("adaptiveLayout.splitPanes");
+    expect(dashboard).toContain("SplitPaneDivider");
+    expect(dashboard).toContain("styles.treeChildrenGuide");
+    expect(dashboard).toContain("sessionWorkbenchSubtitle(");
     expect(dashboard).toContain('testID="home-approval-sessions"');
     expect(dashboard).toContain("homeInboxSessions(selectedRuntime?.sessions)");
-    expect(dashboard).toContain(".filter((item) => !inboxIds.has(item.id))");
-    expect(dashboard).toContain("useHomeLocatorMotion(");
-    expect(dashboard).toContain("sessionNeedsLocatorMotion(");
-    expect(dashboard).toContain("sessionNeedsMotion(session) ? locatorWiggleStyle : styles.locatorRest");
-    expect(dashboard).toContain("completionBaselineReady");
+    expect(dashboard).not.toContain("useHomeLocatorMotion");
+    expect(dashboard).not.toContain("sessionNeedsLocatorMotion");
+    expect(dashboard).toContain('label="账号与模型源"');
+    expect(dashboard).toContain('accessibilityLabel="在当前工作区打开终端"');
+    expect(home).toContain("styles.hostPill");
+    expect(home).toContain('accessibilityLabel="新建会话"');
   });
 
   it("底部弹层由原生可见性负责关闭，不依赖可能中断的动画回调", () => {

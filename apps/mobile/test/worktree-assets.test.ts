@@ -107,23 +107,6 @@ describe("worktree asset presentation", () => {
     cleanupRecordedBeforeStateUpdate.cleanup = cleaned.cleanup;
     expect(worktreeEffectiveState(cleanupRecordedBeforeStateUpdate)).toBe("cleaned");
     expect(worktreeCanClean(cleanupRecordedBeforeStateUpdate)).toBe(false);
-
-    const shellSource = readFileSync(
-      join(import.meta.dirname, "..", "..", "shell", "Sources", "ProsperoShell", "OrchestrationStatus.swift"),
-      "utf8",
-    );
-    expect(shellSource).toMatch(
-      /func orchestrationWorktreeState\([\s\S]*?asset\.state == "cleaned" \|\| asset\.cleanup != nil[\s\S]*?return "cleaned"/,
-    );
-    expect(shellSource).toMatch(
-      /func orchestrationWorktreeCanClean\([\s\S]*?guard orchestrationWorktreeState\(asset\) != "cleaned" else \{ return false \}/,
-    );
-    const dashboardSource = readFileSync(
-      join(import.meta.dirname, "..", "..", "shell", "Sources", "ProsperoShell", "Dashboard.swift"),
-      "utf8",
-    );
-    expect(dashboardSource).toContain("orchestrationWorktreeState(asset)");
-    expect(dashboardSource).toContain("orchestrationWorktreeCanClean(asset)");
   });
 
   it("retains a daemon diagnostic in an unchecked worktree summary", () => {
@@ -167,29 +150,6 @@ describe("worktree asset presentation", () => {
     expect(worktreeRunDeletionNotice([], () => "unused", "/legacy-run-worktree"))
       .toContain("自动 Run 工作树。它会保留在主机上：\n/legacy-run-worktree");
     expect(worktreeRunDeletionNotice([], () => "unused", null)).toBe("");
-  });
-
-  it("keeps the Mac legacy fallback limited to empty assets from Run workspaces", () => {
-    const shellSource = readFileSync(
-      join(
-        import.meta.dirname,
-        "..",
-        "..",
-        "shell",
-        "Sources",
-        "ProsperoShell",
-        "OrchestrationStatus.swift",
-      ),
-      "utf8",
-    );
-
-    expect(shellSource).toContain("func orchestrationRunDeletionNotice(");
-    expect(shellSource).toMatch(
-      /guard assets\.isEmpty,[\s\S]*?automation\?\.workspace == "run",[\s\S]*?let workspacePath = automation\?\.workspacePath/,
-    );
-    expect(shellSource).toContain(
-      'return "\\n\\n删除编排不会清理自动 Run 工作树。它会保留在主机上：\\n\\(workspacePath)"',
-    );
   });
 
   it("keeps compact worktree controls at a 44pt target with explicit accessibility metadata", () => {

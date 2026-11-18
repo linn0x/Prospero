@@ -266,6 +266,49 @@ export function desktopSidebarSessionLabel(session: SessionInfo): string {
   return raw;
 }
 
+function formatSessionStamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime()) || timestamp <= 0) return "";
+  const now = new Date();
+  const hhmm = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (date.toDateString() === now.toDateString()) return hhmm;
+  return `${String(date.getMonth() + 1)}/${String(date.getDate())} ${hhmm}`;
+}
+
+/**
+ * Builds a compact, disambiguating metadata line for workbench and sidebar rows
+ * so multiple sessions in the same workspace (e.g. several Codex TUI tabs) are
+ * distinguishable at a glance.
+ */
+export function sessionWorkbenchSubtitle(
+  session: SessionInfo,
+  options?: { showWorkspace?: string },
+): string {
+  const modeLabel = session.kind === "pty" ? "TUI" : "对话";
+  const modelRaw = (session.agentControls?.currentModel || session.model || "").trim();
+  const modelShort = modelRaw ? (modelRaw.split("/").at(-1) ?? modelRaw) : "";
+  const account = session.accountName?.trim() || "";
+  const preview = session.preview?.trim().replace(/\s+/g, " ") || "";
+  const stamp = formatSessionStamp(session.createdAt);
+  const label = desktopSidebarSessionLabel(session);
+  const fallbackAgent = AGENT_SHORT_LABELS[session.agent.toLowerCase()] ?? session.agent;
+  const isGenericDefault = label.toLowerCase() === fallbackAgent.toLowerCase();
+  const shortId = isGenericDefault && !preview && !modelShort ? `#${session.id.slice(0, 4)}` : "";
+
+  return [
+    options?.showWorkspace?.trim() || null,
+    session.archived ? "已归档" : null,
+    modeLabel,
+    modelShort || null,
+    account || null,
+    shortId || null,
+    preview || null,
+    stamp || null,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
+}
+
 /**
  * Mirrors Desktop `Inbox` / `OverviewAttention`: collects both pending approvals
  * (`需要授权`) and pending questions (`需要输入`).

@@ -1,10 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
-import { useFocusEffect } from "expo-router";
 import {
-  AccessibilityInfo,
   Alert,
-  Animated,
   AppState,
   FlatList,
   Pressable,
@@ -15,6 +11,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { useFocusEffect } from "expo-router";
 import type { OrchestrationWorktreeAsset, SessionInfo } from "@prospero/protocol";
 
 import { AgentIcon } from "@/components/AgentIcon";
@@ -23,14 +20,13 @@ import { PromptDialog } from "@/components/PromptDialog";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { SplitPaneDivider } from "@/components/SplitPaneDivider";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
-import { WorkspaceHeader } from "@/components/WorkspaceHeader";
+import { WorkspaceFolderIcon } from "@/components/WorkspaceDisclosure";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
-import { useOrderedWorkspaces } from "@/lib/workspace-order-preferences";
-import { WorkspaceDisclosure, WorkspaceFolderIcon, WorkspaceChevron } from "@/components/WorkspaceDisclosure";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import type { HostConnection } from "@/lib/connection";
 import type { StoredHost } from "@/lib/hosts";
 import {
+  compactWorkspacePath,
   homeHostStats,
   homeRecentSessions,
   homeRecentSummary,
@@ -43,28 +39,24 @@ import {
   workspaceAliasKey,
   type HomeSettings,
 } from "@/lib/home-preferences";
-import {
-  completionBaselineHostKey,
-  sessionNeedsLocatorMotion,
-  useSessionAttention,
-} from "@/lib/session-attention";
 import { projectName, type SessionProject } from "@/lib/session-projects";
 import { supportsRemoteTerminal } from "@/lib/terminal-session";
 import type { ConnStatus, HostRuntime } from "@/lib/store";
-import { recentSessions as recentSessionStore, recentSessionTime } from "@/lib/recent-sessions";
-import { useHomeLocatorMotion } from "@/lib/use-home-locator-motion";
+import { recentSessions as recentSessionStore } from "@/lib/recent-sessions";
 import {
   buildAlignedWorkspaceTree,
   desktopSidebarSessionLabel,
   filterMobileSessionsByQuery,
   homeInboxSessions,
   inboxReasonLabel,
+  sessionWorkbenchSubtitle,
   sortWorkspaceSessions,
   useHydratedWorkspaceConcepts,
   workspacePathKey,
 } from "@/lib/workspace-concepts";
 import {
   font,
+  MONOSPACE_FONT,
   radius,
   space,
   useMobileTheme,
@@ -72,6 +64,7 @@ import {
 } from "@/lib/theme";
 
 type HomeDashboardStyles = ReturnType<typeof createStyles>;
+type WorkbenchFilter = "workspace" | "all" | "running" | "archived";
 const NO_MANAGED_WORKSPACES: readonly string[] = [];
 const NO_WORKTREE_ASSETS: readonly OrchestrationWorktreeAsset[] = [];
 
@@ -111,22 +104,16 @@ function hostDetail(host: StoredHost, runtime: HostRuntime | undefined): string 
     .join(" · ");
 }
 
-function workspaceDetail(project: SessionProject, childTaskCount = 0): string {
-  if (project.pendingCount > 0) return `${String(project.pendingCount)} 项待处理`;
-  if (project.runningCount > 0) return `${String(project.runningCount)} 个运行中`;
-  if (childTaskCount > 0 && project.sessions.length === 0) {
-    return `${String(childTaskCount)} 个任务工作区`;
+function hostConnectionTone(runtime: HostRuntime | undefined, palette: ThemePalette): string {
+  const status = runtime?.status ?? "idle";
+  if (status === "connected") {
+    return runtime?.rttMs !== null && runtime?.rttMs !== undefined && runtime.rttMs >= 300
+      ? palette.warn
+      : palette.success;
   }
-  return `${String(project.sessions.length)} 个会话`;
-}
-
-function recentTime(timestamp: number): string {
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) return "";
-  const now = new Date();
-  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-  if (date.toDateString() === now.toDateString()) return time;
-  return `${String(date.getMonth() + 1)}/${String(date.getDate())} ${time}`;
+  if (status === "connecting" || status === "reconnecting") return palette.warn;
+  if (status === "failed") return palette.danger;
+  return palette.textFaint;
 }
 
 function statusTone(status: string, palette: ThemePalette): string {
@@ -141,55 +128,10 @@ function statusTone(status: string, palette: ThemePalette): string {
   return palette.textFaint;
 }
 
-function hostConnectionTone(runtime: HostRuntime | undefined, palette: ThemePalette): string {
-  const status = runtime?.status ?? "idle";
-  if (status === "connected") {
-    return runtime?.rttMs !== null && runtime?.rttMs !== undefined && runtime.rttMs >= 300
-      ? palette.warn
-      : palette.success;
-  }
-  if (status === "connecting" || status === "reconnecting") return palette.warn;
-  return palette.danger;
-}
-
-function hostConnectionLabel(runtime: HostRuntime | undefined): string {
-  const status = runtime?.status ?? "idle";
-  if (status === "connected") {
-    return runtime?.rttMs !== null && runtime?.rttMs !== undefined
-      ? `${String(runtime.rttMs)}ms`
-      : "在线";
-  }
-  if (status === "connecting") return "连接中";
-  if (status === "reconnecting") return "重连中";
-  if (status === "failed") return "失败";
-  return "离线";
-}
-
-function HostPlatformIcon({
-  platform,
-  palette,
-}: {
-  platform: string | undefined;
-  palette: ThemePalette;
-}) {
-  const normalized = platform?.toLowerCase() ?? "";
-  const brand = normalized === "win32" || normalized.includes("windows")
-    ? "windows"
-    : normalized === "darwin" || normalized.includes("mac")
-      ? "apple"
-      : normalized.includes("linux")
-        ? "linux"
-        : null;
-
-  return brand ? (
-    <FontAwesome6
-      name={brand}
-      size={15}
-      color={palette.text}
-    />
-  ) : (
-    <Icon name="desktopcomputer" size={15} color={palette.text} />
-  );
+function recentStamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime()) || timestamp <= 0) return "";
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 export function HomeDashboard({
@@ -199,10 +141,11 @@ export function HomeDashboard({
   connection = null,
   devicePickerOpen,
   bottomInset,
-  onToggleDevicePicker,
+  onToggleDevicePicker: _onToggleDevicePicker,
   onCloseDevicePicker,
   onSelectHost,
   onOpenHost,
+  onOpenAccounts,
   onOpenSession,
   onEditHost,
   onDeleteHost,
@@ -226,6 +169,7 @@ export function HomeDashboard({
   onCloseDevicePicker: () => void;
   onSelectHost: (hostId: string) => void;
   onOpenHost: (hostId: string) => void;
+  onOpenAccounts?: (hostId: string) => void;
   onOpenSession: (hostId: string, sessionId: string) => void;
   onEditHost: (hostId: string) => void;
   onDeleteHost: (host: StoredHost) => void;
@@ -244,10 +188,6 @@ export function HomeDashboard({
   const splitPanes = adaptiveLayout.splitPanes ?? null;
   const splitLayout = splitPanes !== null;
   const styles = useMemo(() => createStyles(palette), [palette]);
-  const deviceBarWidth = splitPanes ? splitPanes.start : adaptiveLayout.width;
-  const compactWorkspaceActions = deviceBarWidth < 430;
-  const ultraCompactSidebar = deviceBarWidth < 260;
-  const recentCardWidth = Math.min(236, Math.max(180, (splitPanes?.end ?? adaptiveLayout.width) - 64));
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0];
   const homeListRef = useRef<FlatList<SessionProject>>(null);
   useEffect(() => {
@@ -273,22 +213,6 @@ export function HomeDashboard({
     setWorkspaceSort,
   } = useHydratedWorkspaceConcepts();
 
-  const [reduceMotion, setReduceMotion] = useState(false);
-  useEffect(() => {
-    let mounted = true;
-    void AccessibilityInfo.isReduceMotionEnabled().then((enabled) => {
-      if (mounted) setReduceMotion(enabled);
-    });
-    const subscription = AccessibilityInfo.addEventListener(
-      "reduceMotionChanged",
-      setReduceMotion,
-    );
-    return () => {
-      mounted = false;
-      subscription.remove();
-    };
-  }, []);
-
   const effectiveHomeSettings = normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS);
   const displayProjectName = useCallback(
     (path: string, fallback: string): string =>
@@ -298,11 +222,10 @@ export function HomeDashboard({
     [effectiveHomeSettings.workspaceAliases, selectedHost],
   );
 
-  const unorderedProjects = useMemo(
+  const allProjects = useMemo(
     () => homeWorkspaceProjects(selectedRuntime?.sessions),
     [selectedRuntime?.sessions],
   );
-  const allProjects = useOrderedWorkspaces(selectedHost?.id, unorderedProjects);
 
   const savedHostWorkspaces = useMemo(
     () => (selectedHost ? savedWorkspaces[selectedHost.id] ?? [] : []),
@@ -347,6 +270,27 @@ export function HomeDashboard({
     ],
   );
 
+  const allLiveSessions = useMemo(
+    () =>
+      sortWorkspaceSessions(
+        Object.values(selectedRuntime?.sessions ?? {}).filter((session) => session.archived !== true),
+        pinnedSessionIds,
+      ),
+    [pinnedSessionIds, selectedRuntime?.sessions],
+  );
+  const runningSessionList = useMemo(
+    () =>
+      allLiveSessions.filter(
+        (session) =>
+          session.status === "running" ||
+          session.status === "starting" ||
+          session.status === "waiting_approval" ||
+          session.status === "waiting_input" ||
+          (session.pendingPermissions ?? 0) > 0 ||
+          (session.pendingQuestions ?? 0) > 0,
+      ),
+    [allLiveSessions],
+  );
   const inboxSessions = useMemo(
     () => homeInboxSessions(selectedRuntime?.sessions),
     [selectedRuntime?.sessions],
@@ -356,14 +300,8 @@ export function HomeDashboard({
     [inboxSessions],
   );
   const pinnedSessionList = useMemo(
-    () =>
-      sortWorkspaceSessions(
-        Object.values(selectedRuntime?.sessions ?? {}).filter(
-          (session) => session.archived !== true && pinnedSessionIds.has(session.id),
-        ),
-        pinnedSessionIds,
-      ),
-    [pinnedSessionIds, selectedRuntime?.sessions],
+    () => allLiveSessions.filter((session) => pinnedSessionIds.has(session.id)),
+    [allLiveSessions, pinnedSessionIds],
   );
   const archivedSessionList = useMemo(
     () =>
@@ -382,33 +320,12 @@ export function HomeDashboard({
     [effectiveHomeSettings.recentSessionLimit, inboxIds, recentUsage, selectedRuntime?.sessions],
   );
 
-  const completionReads = useSessionAttention((state) => state.completionReads);
-  const completionBaselineReady = useSessionAttention((state) => Boolean(
-    selectedHost && state.completionBaselineHosts[completionBaselineHostKey(selectedHost.id)],
-  ));
-  const sessionNeedsMotion = useCallback(
-    (session: SessionInfo): boolean => Boolean(selectedHost) && sessionNeedsLocatorMotion(
-      selectedHost.id,
-      session,
-      completionReads,
-      completionBaselineReady,
-    ),
-    [completionBaselineReady, completionReads, selectedHost],
-  );
-  const hasLocatorMotion = useMemo(
-    () => allProjects.some((project) => project.sessions.some(sessionNeedsMotion)),
-    [allProjects, sessionNeedsMotion],
-  );
-  const locatorWiggleStyle = useHomeLocatorMotion(
-    selectedHost?.id,
-    hasLocatorMotion && !reduceMotion,
-  );
-
   const [expandedProjectKeys, setExpandedProjectKeys] = useState<Set<string>>(() => new Set());
   const [expandedChildTaskKeys, setExpandedChildTaskKeys] = useState<Set<string>>(() => new Set());
   const [selectedSplitPath, setSelectedSplitPath] = useState<string | null>(null);
+  const [workbenchFilter, setWorkbenchFilter] = useState<WorkbenchFilter>("workspace");
+  const [phoneFilter, setPhoneFilter] = useState<"all" | "running" | "archived">("all");
   const [expandedTaskHostId, setExpandedTaskHostId] = useState<string | null>(null);
-  const [quickCreateOpen, setQuickCreateOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [archivedSheetOpen, setArchivedSheetOpen] = useState(false);
   const [addWorkspacePickerOpen, setAddWorkspacePickerOpen] = useState(false);
@@ -418,7 +335,6 @@ export function HomeDashboard({
   const [editingProject, setEditingProject] = useState<SessionProject | null>(null);
   const [projectAlias, setProjectAlias] = useState("");
   const [deviceNavigation] = useState(() => new DismissedModalAction());
-  const [createNavigation] = useState(() => new DismissedModalAction());
   const [workspaceMenuNavigation] = useState(() => new DismissedModalAction());
   const closeDevicePickerRef = useRef(onCloseDevicePicker);
   useEffect(() => {
@@ -433,16 +349,14 @@ export function HomeDashboard({
 
   const cancelOverlays = useCallback(() => {
     deviceNavigation.cancel();
-    createNavigation.cancel();
     workspaceMenuNavigation.cancel();
     closeDevicePickerRef.current();
-    setQuickCreateOpen(false);
     setWorkspaceMenuOpen(false);
     setArchivedSheetOpen(false);
     setAddWorkspacePickerOpen(false);
     setManualWorkspaceOpen(false);
     setEditingProject(null);
-  }, [createNavigation, deviceNavigation, workspaceMenuNavigation]);
+  }, [deviceNavigation, workspaceMenuNavigation]);
 
   useFocusEffect(useCallback(() => cancelOverlays, [cancelOverlays]));
   useEffect(() => {
@@ -472,10 +386,10 @@ export function HomeDashboard({
   if (!selectedHost) return null;
 
   const stats = homeHostStats(selectedRuntime?.sessions);
-  const orderedHosts = [selectedHost, ...hosts.filter((candidate) => candidate.id !== selectedHost.id)];
   const taskProjectsExpanded = expandedTaskHostId === selectedHost.id;
   const taskRunningCount = taskProjects.reduce((total, project) => total + project.runningCount, 0);
   const taskPendingCount = taskProjects.reduce((total, project) => total + project.pendingCount, 0);
+  const canOpenTerminal = Boolean(onOpenTerminals && supportsRemoteTerminal(selectedRuntime?.hostInfo));
 
   const openAddWorkspaceFlow = (): void => {
     if (connection && selectedRuntime?.status === "connected") {
@@ -490,6 +404,7 @@ export function HomeDashboard({
     if (!trimmed) return;
     addWorkspace(selectedHost.id, trimmed);
     setSelectedSplitPath(trimmed);
+    setWorkbenchFilter("workspace");
     const projectKey = `${selectedHost.id}:${trimmed}`;
     setExpandedProjectKeys((current) => {
       const next = new Set(current);
@@ -518,30 +433,28 @@ export function HomeDashboard({
     projects.length > 1 &&
     projects.every((project) => expandedProjectKeys.has(`${selectedHost.id}:${project.path}`));
 
-  const renderSessionRow = (
+  const renderWorkbenchRow = (
     session: SessionInfo,
     index = 0,
-    options?: { showWorkspacePath?: boolean },
+    options?: { showWorkspacePath?: boolean; dense?: boolean },
   ) => {
     const conciseTitle = desktopSidebarSessionLabel(session);
     const isRunning = session.status === "running" || session.status === "starting";
     const isAttention = session.status === "waiting_approval" || session.status === "waiting_input";
     const isPinned = pinnedSessionIds.has(session.id);
-    const subtitle = options?.showWorkspacePath
-      ? [
-          displayProjectName(session.cwd, projectName(session.cwd)),
-          session.archived ? "已归档" : null,
-          session.preview?.trim() || `${session.agent} · ${session.kind === "pty" ? "终端" : "对话"}`,
-        ]
-          .filter(Boolean)
-          .join(" · ")
-      : session.preview?.trim() || `${session.agent} · ${session.kind === "pty" ? "终端" : "对话"}`;
+    const workspaceLabel = options?.showWorkspacePath
+      ? displayProjectName(session.cwd, projectName(session.cwd))
+      : undefined;
+    const subtitle = sessionWorkbenchSubtitle(
+      session,
+      workspaceLabel ? { showWorkspace: workspaceLabel } : undefined,
+    );
+    const modeTag = session.kind === "pty" ? "TUI" : "对话";
 
     return (
       <View key={session.id}>
-        {index > 0 && <View style={styles.sessionDivider} />}
+        {index > 0 && <View style={styles.rowHairline} />}
         <SwipeRow
-          clipRadius={12}
           actions={[
             {
               id: "pin-session",
@@ -558,44 +471,42 @@ export function HomeDashboard({
             accessibilityLabel={`打开会话 ${conciseTitle}，${sessionStatusLabel[session.status]}`}
             onPress={() => onOpenSession(selectedHost.id, session.id)}
             style={({ pressed }) => [
-              styles.sessionRow,
-              pressed && styles.sessionRowPressed,
+              styles.workbenchRow,
+              options?.dense && styles.workbenchRowDense,
+              pressed && styles.rowPressed,
             ]}
           >
-            <Animated.View
-              style={sessionNeedsMotion(session) ? locatorWiggleStyle : styles.locatorRest}
-            >
-              <AgentIcon agent={session.agent} size={16} badge badgeOutline={false} />
-            </Animated.View>
-            <View style={styles.sessionCopy}>
-              <View style={styles.sessionTitleRow}>
-                <Text style={styles.sessionTitle} numberOfLines={1}>
+            <AgentIcon agent={session.agent} size={15} badge badgeOutline={false} />
+            <View style={styles.workbenchRowCopy}>
+              <View style={styles.workbenchRowHead}>
+                <Text style={styles.workbenchRowTitle} numberOfLines={1}>
                   {conciseTitle}
                 </Text>
-                {isPinned && !options?.showWorkspacePath && (
-                  <Icon name="pin.fill" size={11} color={palette.textFaint} />
-                )}
+                <View style={styles.modeChip}>
+                  <Text style={styles.modeChipText}>{modeTag}</Text>
+                </View>
+                {isPinned && <Icon name="pin.fill" size={10} color={palette.textFaint} />}
               </View>
-              <Text style={styles.sessionPreview} numberOfLines={1}>
+              <Text style={styles.workbenchRowSub} numberOfLines={1}>
                 {subtitle}
               </Text>
             </View>
             <View
               style={[
-                styles.sessionState,
-                isRunning && styles.sessionStateActive,
-                isAttention && styles.sessionStateWarn,
+                styles.statusBadge,
+                isRunning && styles.statusBadgeActive,
+                isAttention && styles.statusBadgeWarn,
               ]}
             >
               <View
                 style={[
-                  styles.sessionStatusDot,
+                  styles.statusDotSmall,
                   { backgroundColor: statusTone(session.status, palette) },
                 ]}
               />
               <Text
                 style={[
-                  styles.sessionStatusText,
+                  styles.statusBadgeText,
                   isRunning && { color: palette.success, fontWeight: "600" },
                   isAttention && { color: palette.warn, fontWeight: "600" },
                 ]}
@@ -603,20 +514,64 @@ export function HomeDashboard({
                 {session.archived ? "已归档" : sessionStatusLabel[session.status]}
               </Text>
             </View>
-            <Icon name="chevron.right" size={12} color={palette.textFaint} />
+            <Icon name="chevron.right" size={11} color={palette.textFaint} />
           </Pressable>
         </SwipeRow>
       </View>
     );
   };
 
-  const renderNestedTaskWorkspaces = (parentPath: string, childTasks: readonly SessionProject[]) => {
+  const renderSidebarTreeSession = (session: SessionInfo, options?: { showFolder?: boolean }) => {
+    const label = desktopSidebarSessionLabel(session);
+    const stamp = recentStamp(session.createdAt);
+    const modelShort = (session.agentControls?.currentModel || session.model || "").split("/").at(-1);
+    const folder = options?.showFolder
+      ? displayProjectName(session.cwd, projectName(session.cwd))
+      : "";
+    const meta = [folder, modelShort, stamp].filter(Boolean).join(" · ");
+
+    return (
+      <Pressable
+        key={session.id}
+        accessibilityRole="button"
+        accessibilityLabel={`打开会话 ${label}，${sessionStatusLabel[session.status]}`}
+        onPress={() => onOpenSession(selectedHost.id, session.id)}
+        style={({ pressed }) => [styles.treeSessionRow, pressed && styles.rowPressed]}
+      >
+        <AgentIcon agent={session.agent} size={13} badge badgeOutline={false} />
+        <View style={styles.treeSessionCopy}>
+          <Text style={styles.treeSessionLabel} numberOfLines={1}>
+            {label}
+          </Text>
+          {meta ? (
+            <Text style={styles.treeSessionMeta} numberOfLines={1}>
+              {meta}
+            </Text>
+          ) : null}
+        </View>
+        <View
+          style={[
+            styles.statusDotSmall,
+            { backgroundColor: statusTone(session.status, palette) },
+          ]}
+        />
+      </Pressable>
+    );
+  };
+
+  const renderNestedTaskWorkspaces = (
+    parentPath: string,
+    childTasks: readonly SessionProject[],
+    dense = false,
+  ) => {
     if (childTasks.length === 0) return null;
     const toggleKey = `${selectedHost.id}:${workspacePathKey(parentPath)}`;
     const childRunning = childTasks.reduce((sum, item) => sum + item.runningCount, 0);
     const childPending = childTasks.reduce((sum, item) => sum + item.pendingCount, 0);
     const autoExpand = childRunning > 0 || childPending > 0;
-    const expanded = expandedChildTaskKeys.has(toggleKey) || (autoExpand && !expandedChildTaskKeys.has(`closed:${toggleKey}`));
+    const expanded =
+      expandedChildTaskKeys.has(toggleKey) ||
+      (autoExpand && !expandedChildTaskKeys.has(`closed:${toggleKey}`));
 
     return (
       <View style={styles.nestedTaskWrap}>
@@ -637,53 +592,48 @@ export function HomeDashboard({
               return next;
             })
           }
-          style={({ pressed }) => [styles.nestedTaskToggle, pressed && styles.pressed]}
+          style={({ pressed }) => [styles.nestedTaskToggle, pressed && styles.rowPressed]}
         >
-          <Icon name="arrow.triangle.branch" size={13} color={palette.textDim} />
+          <Icon name={expanded ? "chevron.down" : "chevron.right"} size={11} color={palette.textFaint} />
+          <Icon name="arrow.triangle.branch" size={12} color={palette.textDim} />
           <Text style={styles.nestedTaskTitle} numberOfLines={1}>
             任务工作区 · {String(childTasks.length)}
           </Text>
           {(childRunning > 0 || childPending > 0) && (
-            <Text style={[styles.nestedTaskMeta, childPending > 0 && styles.projectPending]} numberOfLines={1}>
+            <Text style={[styles.nestedTaskMeta, childPending > 0 && styles.pendingText]} numberOfLines={1}>
               {[
-                childRunning > 0 ? `${String(childRunning)} 运行中` : null,
+                childRunning > 0 ? `${String(childRunning)} 运行` : null,
                 childPending > 0 ? `${String(childPending)} 待处理` : null,
               ]
                 .filter(Boolean)
                 .join(" · ")}
             </Text>
           )}
-          <Icon
-            name={expanded ? "chevron.down" : "chevron.right"}
-            size={12}
-            color={palette.textFaint}
-          />
         </Pressable>
         {expanded && (
           <View style={styles.nestedTaskList}>
             {childTasks.map((taskProject) => {
               const sortedTaskSessions = sortWorkspaceSessions(taskProject.sessions, pinnedSessionIds);
               return (
-                <View key={taskProject.path} style={styles.nestedTaskCard}>
-                  <View style={styles.nestedTaskCardHeader}>
-                    <View style={styles.nestedTaskCardCopy}>
-                      <Text style={styles.nestedTaskCardName} numberOfLines={1}>
-                        {displayProjectName(taskProject.path, taskProject.name)}
-                      </Text>
-                      <Text style={styles.nestedTaskCardPath} numberOfLines={1} ellipsizeMode="middle">
-                        {taskProject.path}
-                      </Text>
-                    </View>
+                <View key={taskProject.path} style={styles.nestedTaskGroup}>
+                  <View style={styles.nestedTaskGroupHead}>
+                    <Text style={styles.nestedTaskGroupName} numberOfLines={1}>
+                      {displayProjectName(taskProject.path, taskProject.name)}
+                    </Text>
                     <Pressable
                       accessibilityRole="button"
                       accessibilityLabel={`在 ${taskProject.name} 中新建会话`}
                       onPress={() => onCreateSession(selectedHost.id, taskProject.path)}
-                      style={({ pressed }) => [styles.inlinePlusBtn, pressed && styles.pressed]}
+                      style={({ pressed }) => [styles.treeInlineBtn, pressed && styles.rowPressed]}
                     >
-                      <Icon name="plus" size={13} color={palette.textDim} weight="semibold" />
+                      <Icon name="plus" size={12} color={palette.textDim} weight="semibold" />
                     </Pressable>
                   </View>
-                  {sortedTaskSessions.map((session, idx) => renderSessionRow(session, idx))}
+                  <View style={styles.nestedTaskSessions}>
+                    {sortedTaskSessions.map((session, idx) =>
+                      renderWorkbenchRow(session, idx, { dense }),
+                    )}
+                  </View>
                 </View>
               );
             })}
@@ -699,21 +649,17 @@ export function HomeDashboard({
     const isPinned = pinnedWorkspaceKeys.has(pathKey);
     const isSaved = savedWorkspaceKeys.has(pathKey);
     const childTasks = childTaskWorkspacesByKey.get(pathKey) ?? [];
-    const singleAutoExpanded = projects.length === 1 && !expandedProjectKeys.has(`collapsed:${projectKey}`);
-    const expanded = singleAutoExpanded || expandedProjectKeys.has(projectKey);
     const splitSelected = splitLayout && activeSplitProject?.path === project.path;
+    const singleAutoExpanded =
+      projects.length === 1 && !expandedProjectKeys.has(`collapsed:${projectKey}`);
+    const expanded = splitLayout
+      ? (splitSelected && !expandedProjectKeys.has(`collapsed:${projectKey}`)) ||
+        expandedProjectKeys.has(projectKey)
+      : singleAutoExpanded || expandedProjectKeys.has(projectKey);
     const displayName = displayProjectName(project.path, project.name);
-    const projectHasLocatorMotion =
-      project.sessions.some(sessionNeedsMotion) ||
-      childTasks.some((child) => child.sessions.some(sessionNeedsMotion));
     const sortedSessions = sortWorkspaceSessions(project.sessions, pinnedSessionIds);
     const combinedPending = project.pendingCount + childTasks.reduce((s, c) => s + c.pendingCount, 0);
     const combinedRunning = project.runningCount + childTasks.reduce((s, c) => s + c.runningCount, 0);
-    const summaryProject: SessionProject = {
-      ...project,
-      pendingCount: combinedPending,
-      runningCount: combinedRunning,
-    };
 
     const swipeActions: SwipeAction[] = [
       {
@@ -757,74 +703,114 @@ export function HomeDashboard({
         : []),
     ];
 
-    const headerRow = (
-      <SwipeRow clipRadius={radius.md} actions={swipeActions}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityState={splitLayout ? { selected: splitSelected } : { expanded }}
-          accessibilityLabel={`${displayName}，${workspaceDetail(summaryProject, childTasks.length)}，${project.path}`}
-          onPress={() => {
-            if (splitLayout) {
-              setSelectedSplitPath(project.path);
-              return;
-            }
-            setExpandedProjectKeys((current) => {
-              const next = new Set(current);
-              if (projects.length === 1) {
-                const collapseMarker = `collapsed:${projectKey}`;
-                if (next.has(collapseMarker)) next.delete(collapseMarker);
-                else next.add(collapseMarker);
-                return next;
-              }
-              if (next.has(projectKey)) next.delete(projectKey);
-              else next.add(projectKey);
-              return next;
-            });
-          }}
-          style={({ pressed }) => [
-            styles.projectHeader,
-            splitLayout && styles.projectHeaderSplit,
-            splitSelected && styles.projectHeaderSelected,
-            pressed && styles.projectCardPressed,
-          ]}
-        >
-          <View style={[styles.projectIcon, splitSelected && styles.projectIconSelected]}>
-            <Animated.View style={projectHasLocatorMotion ? locatorWiggleStyle : styles.locatorRest}>
-              <WorkspaceFolderIcon
-                expanded={splitLayout ? splitSelected : expanded}
-                size={15}
-                color={splitSelected ? palette.bg : palette.textDim}
-              />
-            </Animated.View>
-          </View>
-          <WorkspaceHeader
-            hostId={selectedHost.id}
-            path={project.path}
-            sid={project.sessions[0]?.id}
-            name={isPinned ? `📌 ${displayName}` : displayName}
-            sessionCount={project.sessions.length}
-            compact={splitLayout}
-            activity={
-              combinedPending > 0 || combinedRunning > 0 || childTasks.length > 0
-                ? {
-                    label: workspaceDetail(summaryProject, childTasks.length),
-                    pending: combinedPending > 0,
-                  }
-                : undefined
-            }
-          />
-        </Pressable>
-      </SwipeRow>
-    );
+    const toggleWorkspaceTree = (): void => {
+      if (splitLayout) {
+        if (!splitSelected) {
+          setSelectedSplitPath(project.path);
+          setWorkbenchFilter("workspace");
+          setExpandedProjectKeys((current) => {
+            const next = new Set(current);
+            next.delete(`collapsed:${projectKey}`);
+            next.add(projectKey);
+            return next;
+          });
+          return;
+        }
+        setExpandedProjectKeys((current) => {
+          const next = new Set(current);
+          if (expanded) {
+            next.delete(projectKey);
+            next.add(`collapsed:${projectKey}`);
+          } else {
+            next.delete(`collapsed:${projectKey}`);
+            next.add(projectKey);
+          }
+          return next;
+        });
+        return;
+      }
+      setExpandedProjectKeys((current) => {
+        const next = new Set(current);
+        if (projects.length === 1) {
+          const collapseMarker = `collapsed:${projectKey}`;
+          if (next.has(collapseMarker)) next.delete(collapseMarker);
+          else next.add(collapseMarker);
+          return next;
+        }
+        if (next.has(projectKey)) next.delete(projectKey);
+        else next.add(projectKey);
+        return next;
+      });
+    };
 
     if (splitLayout) {
       return (
-        <View
-          key={projectKey}
-          collapsable={false}
-          style={[styles.projectCardSplit, splitSelected && styles.projectCardSplitSelected]}
-        >
-          {headerRow}
+        <View key={projectKey} collapsable={false} style={styles.treeFolderBlock}>
+          <SwipeRow clipRadius={8} actions={swipeActions}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ selected: splitSelected, expanded }}
+              accessibilityLabel={`${displayName}，${String(project.sessions.length)} 个会话，${project.path}`}
+              onPress={toggleWorkspaceTree}
+              style={({ pressed }) => [
+                styles.treeFolderRow,
+                splitSelected && styles.treeFolderRowSelected,
+                pressed && styles.rowPressed,
+              ]}
+            >
+              {splitSelected && <View style={styles.treeActiveBar} />}
+              <Icon
+                name={expanded ? "chevron.down" : "chevron.right"}
+                size={10}
+                color={palette.textFaint}
+              />
+              <WorkspaceFolderIcon
+                expanded={expanded}
+                size={14}
+                color={splitSelected ? palette.accent : palette.textDim}
+              />
+              <Text
+                style={[styles.treeFolderName, splitSelected && styles.treeFolderNameSelected]}
+                numberOfLines={1}
+              >
+                {displayName}
+              </Text>
+              {isPinned && <Icon name="pin.fill" size={10} color={palette.textFaint} />}
+              {(combinedPending > 0 || combinedRunning > 0) && (
+                <View
+                  style={[
+                    styles.treeActivityDot,
+                    { backgroundColor: combinedPending > 0 ? palette.warn : palette.success },
+                  ]}
+                />
+              )}
+              <Text style={styles.treeFolderCount}>{String(project.sessions.length)}</Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`在 ${displayName} 中新建会话`}
+                hitSlop={6}
+                onPress={() => onCreateSession(selectedHost.id, project.path)}
+                style={({ pressed }) => [styles.treeInlineBtn, pressed && styles.rowPressed]}
+              >
+                <Icon name="plus" size={12} color={palette.textDim} weight="semibold" />
+              </Pressable>
+            </Pressable>
+          </SwipeRow>
+          {expanded && (sortedSessions.length > 0 || childTasks.length > 0) && (
+            <View style={styles.treeChildrenGuide}>
+              {sortedSessions.map((session) => renderSidebarTreeSession(session))}
+              {childTasks.map((taskWs) => (
+                <View key={taskWs.path} style={styles.treeWorktreeSub}>
+                  <Text style={styles.treeWorktreeSubTitle} numberOfLines={1}>
+                    ⑂ {displayProjectName(taskWs.path, taskWs.name)}
+                  </Text>
+                  {sortWorkspaceSessions(taskWs.sessions, pinnedSessionIds).map((session) =>
+                    renderSidebarTreeSession(session),
+                  )}
+                </View>
+              ))}
+            </View>
+          )}
         </View>
       );
     }
@@ -833,67 +819,57 @@ export function HomeDashboard({
       <View
         key={projectKey}
         collapsable={false}
-        style={[styles.projectCard, expanded && styles.projectCardExpanded]}
+        style={[styles.phoneWorkspaceBlock, expanded && styles.phoneWorkspaceBlockExpanded]}
       >
-        <WorkspaceDisclosure
-          expanded={expanded}
-          header={(disclosureProgress) => (
-            <SwipeRow clipRadius={radius.md} actions={swipeActions}>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityState={{ expanded }}
-                accessibilityLabel={`${displayName}，${workspaceDetail(summaryProject, childTasks.length)}，${project.path}`}
-                onPress={() => setExpandedProjectKeys((current) => {
-                  const next = new Set(current);
-                  if (projects.length === 1) {
-                    const collapseMarker = `collapsed:${projectKey}`;
-                    if (next.has(collapseMarker)) next.delete(collapseMarker);
-                    else next.add(collapseMarker);
-                    return next;
-                  }
-                  if (next.has(projectKey)) next.delete(projectKey);
-                  else next.add(projectKey);
-                  return next;
-                })}
-                style={({ pressed }) => [styles.projectHeader, pressed && styles.projectCardPressed]}
-              >
-                <View style={styles.projectIcon}>
-                  <Animated.View style={projectHasLocatorMotion ? locatorWiggleStyle : styles.locatorRest}>
-                    <WorkspaceFolderIcon expanded={expanded} size={15} color={palette.textDim} />
-                  </Animated.View>
-                </View>
-                <WorkspaceHeader
-                  hostId={selectedHost.id}
-                  path={project.path}
-                  sid={project.sessions[0]?.id}
-                  name={isPinned ? `📌 ${displayName}` : displayName}
-                  sessionCount={project.sessions.length}
-                  activity={
-                    combinedPending > 0 || combinedRunning > 0 || childTasks.length > 0
-                      ? {
-                          label: workspaceDetail(summaryProject, childTasks.length),
-                          pending: combinedPending > 0,
-                        }
-                      : undefined
-                  }
-                />
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={`在 ${displayName} 中新建会话`}
-                  hitSlop={6}
-                  onPress={() => onCreateSession(selectedHost.id, project.path)}
-                  style={({ pressed }) => [styles.inlinePlusBtn, pressed && styles.pressed]}
-                >
-                  <Icon name="plus" size={13} color={palette.textDim} weight="semibold" />
-                </Pressable>
-                <WorkspaceChevron progress={disclosureProgress} size={14} color={palette.textFaint} />
-              </Pressable>
-            </SwipeRow>
-          )}
-        >
-          <View style={styles.sessionList}>
+        <SwipeRow clipRadius={10} actions={swipeActions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded }}
+            accessibilityLabel={`${displayName}，${String(project.sessions.length)} 个会话，${project.path}`}
+            onPress={toggleWorkspaceTree}
+            style={({ pressed }) => [styles.phoneFolderRow, pressed && styles.rowPressed]}
+          >
+            <Icon
+              name={expanded ? "chevron.down" : "chevron.right"}
+              size={11}
+              color={palette.textFaint}
+            />
+            <WorkspaceFolderIcon expanded={expanded} size={15} color={palette.textDim} />
+            <View style={styles.phoneFolderCopy}>
+              <View style={styles.phoneFolderTitleRow}>
+                <Text style={styles.phoneFolderName} numberOfLines={1}>
+                  {displayName}
+                </Text>
+                {isPinned && <Icon name="pin.fill" size={10} color={palette.textFaint} />}
+              </View>
+              <Text style={styles.phoneFolderPath} numberOfLines={1} ellipsizeMode="middle">
+                {compactWorkspacePath(project.path)}
+              </Text>
+            </View>
+            {(combinedPending > 0 || combinedRunning > 0) && (
+              <View
+                style={[
+                  styles.treeActivityDot,
+                  { backgroundColor: combinedPending > 0 ? palette.warn : palette.success },
+                ]}
+              />
+            )}
+            <Text style={styles.treeFolderCount}>{String(project.sessions.length)}</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`在 ${displayName} 中新建会话`}
+              hitSlop={6}
+              onPress={() => onCreateSession(selectedHost.id, project.path)}
+              style={({ pressed }) => [styles.treeInlineBtn, pressed && styles.rowPressed]}
+            >
+              <Icon name="plus" size={13} color={palette.textDim} weight="semibold" />
+            </Pressable>
+          </Pressable>
+        </SwipeRow>
+        {expanded ? (
+          <View style={styles.phoneSessionTree}>
             {sortedSessions.length > 0 ? (
-              sortedSessions.map((session, idx) => renderSessionRow(session, idx))
+              sortedSessions.map((session, idx) => renderWorkbenchRow(session, idx, { dense: true }))
             ) : (
               <View style={styles.emptySavedWorkspace}>
                 <Text style={styles.emptySavedWorkspaceText}>此工作区暂无活跃会话</Text>
@@ -901,7 +877,7 @@ export function HomeDashboard({
                   <Pressable
                     accessibilityRole="button"
                     onPress={() => onCreateSession(selectedHost.id, project.path)}
-                    style={({ pressed }) => [styles.emptySavedPrimaryBtn, pressed && styles.createButtonPressed]}
+                    style={({ pressed }) => [styles.emptySavedPrimaryBtn, pressed && styles.ctaPressed]}
                   >
                     <Icon name="plus" size={12} color={palette.bg} weight="semibold" />
                     <Text style={styles.emptySavedPrimaryText}>新建会话</Text>
@@ -910,7 +886,7 @@ export function HomeDashboard({
                     <Pressable
                       accessibilityRole="button"
                       onPress={() => forgetWorkspace(selectedHost.id, project.path)}
-                      style={({ pressed }) => [styles.emptySavedGhostBtn, pressed && styles.pressed]}
+                      style={({ pressed }) => [styles.emptySavedGhostBtn, pressed && styles.rowPressed]}
                     >
                       <Text style={styles.emptySavedGhostText}>从列表移除</Text>
                     </Pressable>
@@ -918,277 +894,150 @@ export function HomeDashboard({
                 </View>
               </View>
             )}
-            {renderNestedTaskWorkspaces(project.path, childTasks)}
+            {renderNestedTaskWorkspaces(project.path, childTasks, true)}
           </View>
-        </WorkspaceDisclosure>
+        ) : null}
       </View>
     );
   };
 
-  const deviceBar = (
-    <View style={styles.deviceBar}>
-      <Pressable
-        testID={`home-device-card-${selectedHost.id}`}
-        accessibilityRole="button"
-        accessibilityState={{ expanded: devicePickerOpen }}
-        accessibilityLabel={`选择电脑，${String(hosts.length)} 台已配对，当前为 ${selectedHost.name}，${hostConnectionLabel(selectedRuntime)}`}
-        accessibilityHint="打开已配对电脑与管理列表"
-        onPress={() => {
-          deviceNavigation.cancel();
-          onToggleDevicePicker();
-        }}
-        style={({ pressed }) => [styles.deviceCapsule, pressed && styles.pressed]}
-      >
-        <View style={styles.sectionIcon}>
-          <HostPlatformIcon platform={selectedRuntime?.hostInfo?.platform} palette={palette} />
+  const connectionBanner =
+    selectedRuntime?.status !== "connected" ? (
+      <View style={styles.connBanner}>
+        <View style={styles.connBannerLeft}>
+          <View
+            style={[
+              styles.statusDotSmall,
+              { backgroundColor: hostConnectionTone(selectedRuntime, palette) },
+            ]}
+          />
+          <Text style={styles.connBannerText} numberOfLines={1}>
+            {selectedRuntime?.status === "failed"
+              ? (selectedRuntime.lastError ?? `${selectedHost.name} 连接失败`)
+              : `${selectedHost.name} · ${statusLabel[selectedRuntime?.status ?? "idle"]}`}
+          </Text>
         </View>
-        <View style={styles.deviceHeaderCopy}>
-          <View style={styles.deviceNameRow}>
-            <Text style={styles.deviceHeaderName} numberOfLines={1}>{selectedHost.name}</Text>
-            <Icon name="chevron.down" size={10} color={palette.textFaint} />
-          </View>
-          <View style={styles.deviceMetaRow}>
-            <View style={styles.deviceFleetPill}>
-              <View
-                style={[
-                  styles.fleetStatusDot,
-                  { backgroundColor: hostConnectionTone(selectedRuntime, palette) },
-                ]}
-              />
-              <Text style={styles.fleetCurrentStatus} numberOfLines={1}>
-                {hostConnectionLabel(selectedRuntime)}
-              </Text>
-              {orderedHosts.slice(1).map((candidate, index) =>
-                index >= 3 ? null : (
-                  <View
-                    key={candidate.id}
-                    style={[
-                      styles.fleetStatusDot,
-                      { backgroundColor: hostConnectionTone(runtimes[candidate.id], palette) },
-                    ]}
-                  />
-                ),
-              )}
-            </View>
-            {!ultraCompactSidebar && (
-              <Text style={styles.deviceMeta} numberOfLines={1}>
-                {stats.runningCount > 0
-                  ? `${String(stats.runningCount)} 运行中`
-                  : `${String(stats.sessionCount)} 会话`}
-              </Text>
-            )}
-          </View>
-        </View>
-      </Pressable>
-
-      <View style={styles.deviceActions}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="新建会话或添加工作区"
-          onPress={() => {
-            createNavigation.cancel();
-            setQuickCreateOpen(true);
-          }}
-          style={({ pressed }) => [
-            styles.createButton,
-            compactWorkspaceActions && styles.createButtonCompact,
-            pressed && styles.createButtonPressed,
-          ]}
+          accessibilityLabel="重新连接"
+          onPress={() => onRefreshHost(selectedHost.id)}
+          hitSlop={8}
         >
-          <Icon name="plus" size={15} color={palette.bg} weight="semibold" />
-          {!compactWorkspaceActions && <Text style={styles.createButtonText}>新建</Text>}
+          <Text style={styles.connRetry}>重试</Text>
         </Pressable>
       </View>
-    </View>
-  );
+    ) : null;
 
   const inboxSection = inboxSessions.length > 0 ? (
-    <View style={styles.approvalSection} testID="home-approval-sessions">
-      <View style={styles.sectionHeading}>
-        <View style={styles.sectionTitleGroup}>
-          <Text style={styles.sectionTitle}>收件箱</Text>
-          <Text style={styles.approvalCount}>{String(inboxSessions.length)}</Text>
-        </View>
+    <View style={styles.sidebarSection} testID="home-approval-sessions">
+      <View style={styles.sidebarSectionHead}>
+        <Text style={styles.sidebarSectionLabel}>待处理</Text>
+        <Text style={styles.inboxBadge}>{String(inboxSessions.length)}</Text>
       </View>
-      <ScrollView
-        horizontal={!splitLayout}
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={splitLayout ? styles.approvalStack : styles.recentList}
-      >
-        {inboxSessions.map((session) => {
-          const isApproval =
-            session.status === "waiting_approval" || (session.pendingPermissions ?? 0) > 0;
-          return (
-            <Pressable
-              key={session.id}
-              accessibilityRole="button"
-              accessibilityLabel={`打开收件箱会话 ${desktopSidebarSessionLabel(session)}，${inboxReasonLabel(session)}`}
-              onPress={() => onOpenSession(selectedHost.id, session.id)}
-              style={({ pressed }) => [
-                styles.approvalCard,
-                !isApproval && styles.inboxInputCard,
-                !splitLayout && { width: recentCardWidth },
-                pressed && styles.recentCardPressed,
-              ]}
-            >
-              <Animated.View style={locatorWiggleStyle}>
-                <AgentIcon agent={session.agent} size={17} badge badgeOutline={false} />
-              </Animated.View>
-              <View style={styles.recentCopy}>
-                <Text style={styles.recentTitle} numberOfLines={1}>
-                  {desktopSidebarSessionLabel(session)}
-                </Text>
-                <Text
-                  style={[styles.approvalDetail, !isApproval && styles.inboxInputDetail]}
-                  numberOfLines={1}
-                >
-                  {[inboxReasonLabel(session), displayProjectName(session.cwd, projectName(session.cwd))]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </Text>
-              </View>
-              <Icon
-                name={isApproval ? "exclamationmark.triangle.fill" : "bubble.left.and.text.bubble.right"}
-                size={14}
-                color={isApproval ? palette.warn : palette.accent}
-              />
-            </Pressable>
-          );
-        })}
-      </ScrollView>
+      {inboxSessions.map((session) => {
+        const isApproval =
+          session.status === "waiting_approval" || (session.pendingPermissions ?? 0) > 0;
+        return (
+          <Pressable
+            key={session.id}
+            accessibilityRole="button"
+            accessibilityLabel={`打开收件箱会话 ${desktopSidebarSessionLabel(session)}，${inboxReasonLabel(session)}`}
+            onPress={() => onOpenSession(selectedHost.id, session.id)}
+            style={({ pressed }) => [
+              styles.inboxRow,
+              isApproval ? styles.inboxRowWarn : styles.inboxRowAccent,
+              pressed && styles.rowPressed,
+            ]}
+          >
+            <AgentIcon agent={session.agent} size={14} badge badgeOutline={false} />
+            <View style={styles.treeSessionCopy}>
+              <Text style={styles.treeSessionLabel} numberOfLines={1}>
+                {desktopSidebarSessionLabel(session)}
+              </Text>
+              <Text
+                style={[styles.inboxRowDetail, !isApproval && styles.inboxRowDetailAccent]}
+                numberOfLines={1}
+              >
+                {`${inboxReasonLabel(session)} · ${displayProjectName(session.cwd, projectName(session.cwd))}`}
+              </Text>
+            </View>
+            <Icon
+              name={isApproval ? "exclamationmark.triangle.fill" : "bubble.left.and.text.bubble.right"}
+              size={12}
+              color={isApproval ? palette.warn : palette.accent}
+            />
+          </Pressable>
+        );
+      })}
     </View>
   ) : null;
 
   const pinnedSection = !isSearching && pinnedSessionList.length > 0 ? (
-    <View style={styles.pinnedSection}>
-      <View style={styles.sectionHeading}>
-        <View style={styles.sectionTitleGroup}>
-          <Icon name="pin.fill" size={11} color={palette.textFaint} />
-          <Text style={styles.sectionTitle}>置顶</Text>
-          <Text style={styles.sectionMetaCount}>{String(pinnedSessionList.length)}</Text>
-        </View>
+    <View style={styles.sidebarSection}>
+      <View style={styles.sidebarSectionHead}>
+        <Icon name="pin.fill" size={10} color={palette.textFaint} />
+        <Text style={styles.sidebarSectionLabel}>置顶会话</Text>
       </View>
-      <View style={styles.pinnedCard}>
-        {pinnedSessionList.map((session, idx) =>
-          renderSessionRow(session, idx, { showWorkspacePath: true }),
-        )}
-      </View>
+      {pinnedSessionList.map((session) => renderSidebarTreeSession(session, { showFolder: true }))}
     </View>
   ) : null;
 
-  const recentSection = !isSearching && visibleRecentSessions.length > 0 ? (
-    <View style={styles.recentSection} testID="home-recent-section">
-      <View style={styles.sectionHeading}>
-        <Text style={styles.sectionTitle}>最近继续</Text>
-      </View>
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.recentList}
-      >
-        {visibleRecentSessions.map((session) => {
-          const timeText = recentTime(recentSessionTime(session, recentUsage[session.id]));
-          return (
+  const searchAndToolbar = (
+    <View style={styles.toolbarBlock}>
+      <View style={styles.searchToolbarRow}>
+        <View style={styles.searchField}>
+          <Icon name="magnifyingglass" size={13} color={palette.textFaint} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="搜索会话、状态或路径"
+            placeholderTextColor={palette.textFaint}
+            selectionColor={palette.accent}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+            accessibilityLabel="搜索会话、状态或路径"
+          />
+          {isSearching && (
             <Pressable
-              key={session.id}
               accessibilityRole="button"
-              accessibilityLabel={`打开最近会话 ${desktopSidebarSessionLabel(session)}，${homeRecentSummary(session, recentUsage[session.id])}`}
-              onPress={() => onOpenSession(selectedHost.id, session.id)}
-              style={({ pressed }) => [
-                styles.recentCard,
-                { width: recentCardWidth },
-                pressed && styles.recentCardPressed,
-              ]}
+              accessibilityLabel="清空搜索"
+              hitSlop={8}
+              onPress={() => setSearchQuery("")}
+              style={styles.searchClearBtn}
             >
-              <Animated.View style={sessionNeedsMotion(session) ? locatorWiggleStyle : styles.locatorRest}>
-                <AgentIcon agent={session.agent} size={17} badge badgeOutline={false} />
-              </Animated.View>
-              <View style={styles.recentCopy}>
-                <Text style={styles.recentTitle} numberOfLines={1}>
-                  {desktopSidebarSessionLabel(session)}
-                </Text>
-                <Text style={styles.recentMeta} numberOfLines={1}>
-                  {[displayProjectName(session.cwd, projectName(session.cwd)), timeText].filter(Boolean).join(" · ")}
-                </Text>
-              </View>
-              <View
-                style={[
-                  styles.sessionStatusDot,
-                  { backgroundColor: statusTone(session.status, palette) },
-                ]}
-              />
+              <Icon name="xmark.circle.fill" size={13} color={palette.textFaint} />
             </Pressable>
-          );
-        })}
-      </ScrollView>
-    </View>
-  ) : null;
-
-  const workspaceSectionHeader = (projects.length > 0 || taskProjects.length > 0 || isSearching || archivedSessionList.length > 0) ? (
-    <View style={styles.workspaceHeaderBlock}>
-      <View style={styles.sectionHeading}>
-        <View style={styles.sectionTitleGroup}>
-          <Text style={styles.sectionTitle}>工作区</Text>
-          <Text style={styles.sectionMetaCount}>{String(projects.length)}</Text>
-          {workspaceSort === "name" && !ultraCompactSidebar && (
-            <Text style={styles.sectionMetaCount}>· 按名称</Text>
           )}
         </View>
-        <View style={styles.sectionHeadingActions}>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="添加工作区"
-            hitSlop={6}
-            onPress={openAddWorkspaceFlow}
-            style={({ pressed }) => [styles.sectionActionBtn, pressed && styles.pressed]}
-          >
-            <Icon name="plus" size={14} color={palette.textDim} weight="semibold" />
-          </Pressable>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="工作区更多操作"
-            hitSlop={6}
-            onPress={() => {
-              workspaceMenuNavigation.cancel();
-              setWorkspaceMenuOpen(true);
-            }}
-            style={({ pressed }) => [styles.sectionActionBtn, pressed && styles.pressed]}
-          >
-            <Icon name="ellipsis.circle" size={15} color={palette.textDim} />
-          </Pressable>
-        </View>
-      </View>
-      <View style={styles.workspaceSearchBar}>
-        <Icon name="magnifyingglass" size={13} color={palette.textFaint} />
-        <TextInput
-          style={styles.workspaceSearchInput}
-          placeholder="搜索会话、状态或路径"
-          placeholderTextColor={palette.textFaint}
-          selectionColor={palette.accent}
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-          autoCapitalize="none"
-          autoCorrect={false}
-          returnKeyType="search"
-          accessibilityLabel="搜索会话、状态或路径"
-        />
-        {isSearching && (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="清空搜索"
-            hitSlop={8}
-            onPress={() => setSearchQuery("")}
-            style={styles.searchClearBtn}
-          >
-            <Icon name="xmark.circle.fill" size={14} color={palette.textFaint} />
-          </Pressable>
-        )}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="添加工作区"
+          hitSlop={6}
+          onPress={openAddWorkspaceFlow}
+          style={({ pressed }) => [styles.toolbarIconBtn, pressed && styles.rowPressed]}
+        >
+          <Icon name="folder.badge.plus" size={15} color={palette.textDim} />
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="工作区更多操作"
+          hitSlop={6}
+          onPress={() => {
+            workspaceMenuNavigation.cancel();
+            setWorkspaceMenuOpen(true);
+          }}
+          style={({ pressed }) => [styles.toolbarIconBtn, pressed && styles.rowPressed]}
+        >
+          <Icon name="ellipsis.circle" size={15} color={palette.textDim} />
+        </Pressable>
       </View>
       {isSearching && (
-        <View style={styles.pinnedCard}>
+        <View style={styles.workbenchTable}>
           {searchResults.length > 0 ? (
             searchResults.map((session, idx) =>
-              renderSessionRow(session, idx, { showWorkspacePath: true }),
+              renderWorkbenchRow(session, idx, { showWorkspacePath: true, dense: true }),
             )
           ) : (
             <Text style={styles.searchEmptyText}>没有匹配的会话</Text>
@@ -1196,36 +1045,256 @@ export function HomeDashboard({
         </View>
       )}
     </View>
-  ) : null;
+  );
 
   const taskWorkspaceFooter = !isSearching && taskProjects.length > 0 ? (
-    <View style={styles.taskSection}>
+    <View style={styles.taskFooter}>
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded: taskProjectsExpanded }}
         accessibilityLabel={`任务工作区，${String(taskProjects.length)} 个工作树，${String(taskRunningCount)} 个运行中，${String(taskPendingCount)} 项待处理`}
         onPress={() => setExpandedTaskHostId(taskProjectsExpanded ? null : selectedHost.id)}
-        style={({ pressed }) => [styles.taskHeading, pressed && styles.pressed]}
+        style={({ pressed }) => [styles.taskFooterHead, pressed && styles.rowPressed]}
       >
-        <View style={styles.taskHeadingCopy}>
-          <Text style={styles.taskTitle}>任务工作区 · {String(taskProjects.length)}</Text>
-          <Text style={[styles.taskSummary, taskPendingCount > 0 && styles.projectPending]}>
-            {`${String(taskRunningCount)} 个运行中 · ${String(taskPendingCount)} 项待处理`}
-          </Text>
-        </View>
         <Icon
           name={taskProjectsExpanded ? "chevron.down" : "chevron.right"}
-          size={14}
+          size={11}
           color={palette.textFaint}
         />
+        <Icon name="arrow.triangle.branch" size={12} color={palette.textDim} />
+        <Text style={styles.taskFooterTitle} numberOfLines={1}>
+          任务工作区 · {String(taskProjects.length)}
+        </Text>
+        {taskRunningCount + taskPendingCount > 0 && (
+          <Text style={[styles.taskFooterCount, taskPendingCount > 0 && styles.pendingText]}>
+            {taskPendingCount > 0 ? `${String(taskPendingCount)} 待处理` : `${String(taskRunningCount)} 运行`}
+          </Text>
+        )}
       </Pressable>
       {taskProjectsExpanded && (
-        <View style={styles.taskProjects}>{taskProjects.map(renderProject)}</View>
+        <View style={styles.taskFooterChildren}>{taskProjects.map(renderProject)}</View>
       )}
     </View>
   ) : null;
 
+  const recentChipStrip = !isSearching && visibleRecentSessions.length > 0 ? (
+    <View style={styles.recentStripWrap} testID="home-recent-section">
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.recentStripContent}
+      >
+        <Text style={styles.recentStripLabel}>最近</Text>
+        {visibleRecentSessions.map((session) => (
+          <Pressable
+            key={session.id}
+            accessibilityRole="button"
+            accessibilityLabel={`打开最近会话 ${desktopSidebarSessionLabel(session)}，${homeRecentSummary(session, recentUsage[session.id])}`}
+            onPress={() => onOpenSession(selectedHost.id, session.id)}
+            style={({ pressed }) => [styles.recentChip, pressed && styles.rowPressed]}
+          >
+            <AgentIcon agent={session.agent} size={12} badge badgeOutline={false} />
+            <Text style={styles.recentChipTitle} numberOfLines={1}>
+              {`${displayProjectName(session.cwd, projectName(session.cwd))} · ${desktopSidebarSessionLabel(session)}`}
+            </Text>
+            <View
+              style={[
+                styles.statusDotSmall,
+                { backgroundColor: statusTone(session.status, palette) },
+              ]}
+            />
+          </Pressable>
+        ))}
+      </ScrollView>
+    </View>
+  ) : null;
+
+  const activeWorkspaceLabel = activeSplitProject
+    ? displayProjectName(activeSplitProject.path, activeSplitProject.name)
+    : "工作区";
+  const activeWorkspaceSessions = activeSplitProject
+    ? sortWorkspaceSessions(activeSplitProject.sessions, pinnedSessionIds)
+    : [];
+
+  const workbenchListSessions =
+    workbenchFilter === "all"
+      ? allLiveSessions
+      : workbenchFilter === "running"
+        ? runningSessionList
+        : workbenchFilter === "archived"
+          ? archivedSessionList
+          : activeWorkspaceSessions;
+
   const visibleWorkspaceList = isSearching ? [] : projects;
+
+  const splitRightPane = (
+    <ScrollView
+      style={{ width: splitPanes?.end, flexGrow: 0, overflow: "hidden" }}
+      contentContainerStyle={[styles.workbenchScroll, { paddingBottom: bottomInset + space.xl }]}
+      keyboardShouldPersistTaps="handled"
+      showsVerticalScrollIndicator={false}
+    >
+      {connectionBanner}
+      <View style={styles.filterChipRow}>
+        {(
+          [
+            { id: "workspace", label: activeWorkspaceLabel },
+            { id: "all", label: `全部活跃 ${String(allLiveSessions.length)}` },
+            { id: "running", label: `运行中 ${String(stats.runningCount)}` },
+            { id: "archived", label: `已归档 ${String(archivedSessionList.length)}` },
+          ] as const
+        ).map((tab) => {
+          const active = workbenchFilter === tab.id;
+          return (
+            <Pressable
+              key={tab.id}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: active }}
+              onPress={() => setWorkbenchFilter(tab.id)}
+              style={({ pressed }) => [
+                styles.filterChip,
+                active && styles.filterChipActive,
+                pressed && styles.rowPressed,
+              ]}
+            >
+              <Text
+                style={[styles.filterChipText, active && styles.filterChipTextActive]}
+                numberOfLines={1}
+              >
+                {tab.label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {recentChipStrip}
+
+      {workbenchFilter === "workspace" && activeSplitProject ? (
+        <View style={styles.workbenchDetail}>
+          <View style={styles.workbenchHeader}>
+            <View style={styles.workbenchHeaderCopy}>
+              <View style={styles.workbenchTitleRow}>
+                <Text style={styles.workbenchTitle} numberOfLines={1}>
+                  {activeWorkspaceLabel}
+                </Text>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="重命名工作区"
+                  hitSlop={6}
+                  onPress={() => {
+                    setEditingProject(activeSplitProject);
+                    setProjectAlias(activeWorkspaceLabel);
+                  }}
+                  style={({ pressed }) => [styles.microIconBtn, pressed && styles.rowPressed]}
+                >
+                  <Icon name="pencil" size={12} color={palette.textFaint} />
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    pinnedWorkspaceKeys.has(workspacePathKey(activeSplitProject.path))
+                      ? "取消置顶工作区"
+                      : "置顶工作区"
+                  }
+                  hitSlop={6}
+                  onPress={() => togglePinWorkspace(selectedHost.id, activeSplitProject.path)}
+                  style={({ pressed }) => [styles.microIconBtn, pressed && styles.rowPressed]}
+                >
+                  <Icon
+                    name={
+                      pinnedWorkspaceKeys.has(workspacePathKey(activeSplitProject.path))
+                        ? "pin.fill"
+                        : "pin"
+                    }
+                    size={12}
+                    color={
+                      pinnedWorkspaceKeys.has(workspacePathKey(activeSplitProject.path))
+                        ? palette.accent
+                        : palette.textFaint
+                    }
+                  />
+                </Pressable>
+              </View>
+              <Text style={styles.workbenchPath} numberOfLines={1} ellipsizeMode="middle">
+                {compactWorkspacePath(activeSplitProject.path)}
+              </Text>
+            </View>
+            <View style={styles.workbenchActions}>
+              {canOpenTerminal && (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="在当前工作区打开终端"
+                  onPress={() => onOpenTerminals?.(selectedHost.id, activeSplitProject.path)}
+                  style={({ pressed }) => [styles.workbenchGhostBtn, pressed && styles.rowPressed]}
+                >
+                  <Icon name="terminal" size={13} color={palette.text} />
+                  <Text style={styles.workbenchGhostText}>终端</Text>
+                </Pressable>
+              )}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="在当前工作区新建会话"
+                onPress={() => onCreateSession(selectedHost.id, activeSplitProject.path)}
+                style={({ pressed }) => [styles.workbenchPrimaryBtn, pressed && styles.ctaPressed]}
+              >
+                <Icon name="plus" size={13} color={palette.bg} weight="semibold" />
+                <Text style={styles.workbenchPrimaryText}>新建会话</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <View style={styles.workbenchTable}>
+            {activeWorkspaceSessions.length > 0 ? (
+              activeWorkspaceSessions.map((session, idx) => renderWorkbenchRow(session, idx))
+            ) : (
+              <View style={styles.emptySavedWorkspace}>
+                <Text style={styles.emptySavedWorkspaceText}>此工作区暂无活跃会话</Text>
+                <View style={styles.emptySavedWorkspaceActions}>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => onCreateSession(selectedHost.id, activeSplitProject.path)}
+                    style={({ pressed }) => [styles.emptySavedPrimaryBtn, pressed && styles.ctaPressed]}
+                  >
+                    <Icon name="plus" size={12} color={palette.bg} weight="semibold" />
+                    <Text style={styles.emptySavedPrimaryText}>新建会话</Text>
+                  </Pressable>
+                  {savedWorkspaceKeys.has(workspacePathKey(activeSplitProject.path)) && (
+                    <Pressable
+                      accessibilityRole="button"
+                      onPress={() => forgetWorkspace(selectedHost.id, activeSplitProject.path)}
+                      style={({ pressed }) => [styles.emptySavedGhostBtn, pressed && styles.rowPressed]}
+                    >
+                      <Text style={styles.emptySavedGhostText}>从列表移除</Text>
+                    </Pressable>
+                  )}
+                </View>
+              </View>
+            )}
+            {renderNestedTaskWorkspaces(activeSplitProject.path, activeSplitChildTasks)}
+          </View>
+        </View>
+      ) : (
+        <View style={styles.workbenchDetail}>
+          <View style={styles.workbenchTable}>
+            {workbenchListSessions.length > 0 ? (
+              workbenchListSessions.map((session, idx) =>
+                renderWorkbenchRow(session, idx, { showWorkspacePath: true }),
+              )
+            ) : (
+              <Text style={styles.searchEmptyText}>
+                {workbenchFilter === "running"
+                  ? "当前没有运行中或等待处理的会话"
+                  : workbenchFilter === "archived"
+                    ? "当前没有已归档会话"
+                    : "暂无活跃会话"}
+              </Text>
+            )}
+          </View>
+        </View>
+      )}
+    </ScrollView>
+  );
 
   return (
     <>
@@ -1234,12 +1303,12 @@ export function HomeDashboard({
           <FlatList
             ref={homeListRef}
             testID="home-workspace-list"
-            style={{ width: splitPanes.start, flexGrow: 0, overflow: "hidden" }}
+            style={[styles.sidebarSurface, { width: splitPanes.start, flexGrow: 0, overflow: "hidden" }]}
             data={visibleWorkspaceList}
-            extraData={activeSplitProject?.path}
+            extraData={`${activeSplitProject?.path ?? ""}:${String(expandedProjectKeys.size)}`}
             keyExtractor={(project) => project.path}
             removeClippedSubviews={false}
-            contentContainerStyle={[styles.splitLeftList, { paddingBottom: bottomInset + space.xl }]}
+            contentContainerStyle={[styles.sidebarContent, { paddingBottom: bottomInset + space.xl }]}
             keyboardShouldPersistTaps="handled"
             refreshControl={
               <RefreshControl
@@ -1252,24 +1321,29 @@ export function HomeDashboard({
               />
             }
             ListHeaderComponent={
-              <View style={styles.headerContent}>
-                {deviceBar}
+              <View style={styles.sidebarHeader}>
+                {searchAndToolbar}
                 {inboxSection}
                 {pinnedSection}
-                {workspaceSectionHeader}
+                <View style={styles.sidebarSectionHead}>
+                  <Text style={styles.sidebarSectionLabel}>工作区</Text>
+                  <Text style={styles.sidebarCount}>{String(projects.length)}</Text>
+                  {workspaceSort === "name" && <Text style={styles.sidebarCount}>· 名称</Text>}
+                </View>
               </View>
             }
-            ListEmptyComponent={!isSearching && taskProjects.length === 0 ? (
-              <WorkspaceEmptyState
-                host={selectedHost}
-                runtime={selectedRuntime}
-                onAddWorkspace={openAddWorkspaceFlow}
-                onRefresh={() => onRefreshHost(selectedHost.id)}
-                palette={palette}
-                styles={styles}
-              />
-            ) : null}
-            ItemSeparatorComponent={() => <View style={styles.projectGap} />}
+            ListEmptyComponent={
+              !isSearching && taskProjects.length === 0 ? (
+                <WorkspaceEmptyState
+                  host={selectedHost}
+                  runtime={selectedRuntime}
+                  onAddWorkspace={openAddWorkspaceFlow}
+                  onRefresh={() => onRefreshHost(selectedHost.id)}
+                  palette={palette}
+                  styles={styles}
+                />
+              ) : null
+            }
             renderItem={({ item }) => renderProject(item)}
             ListFooterComponent={taskWorkspaceFooter}
           />
@@ -1284,78 +1358,17 @@ export function HomeDashboard({
             onCommit={adaptiveLayout.commitSplitStart}
             onReset={adaptiveLayout.resetSplitStart}
           />
-          <ScrollView
-            style={{ width: splitPanes.end, flexGrow: 0, overflow: "hidden" }}
-            contentContainerStyle={[styles.splitRightContent, { paddingBottom: bottomInset + space.xl }]}
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator={false}
-          >
-            {recentSection}
-            {activeSplitProject ? (
-              <View style={styles.splitProjectDetail}>
-                <View style={styles.splitProjectHeader}>
-                  <View style={styles.splitProjectCopy}>
-                    <Text style={styles.splitProjectTitle} numberOfLines={1}>
-                      {displayProjectName(activeSplitProject.path, activeSplitProject.name)}
-                    </Text>
-                    <Text style={styles.splitProjectPath} numberOfLines={1} ellipsizeMode="middle">
-                      {activeSplitProject.path}
-                    </Text>
-                  </View>
-                  <Pressable
-                    accessibilityRole="button"
-                    accessibilityLabel="在当前工作区新建会话"
-                    onPress={() => onCreateSession(selectedHost.id, activeSplitProject.path)}
-                    style={({ pressed }) => [styles.splitCreateBtn, pressed && styles.createButtonPressed]}
-                  >
-                    <Icon name="plus" size={14} color={palette.bg} weight="semibold" />
-                    <Text style={styles.splitCreateText}>新建会话</Text>
-                  </Pressable>
-                </View>
-                <View style={styles.splitSessionCard}>
-                  {activeSplitProject.sessions.length > 0 ? (
-                    sortWorkspaceSessions(activeSplitProject.sessions, pinnedSessionIds).map(
-                      (session, idx) => renderSessionRow(session, idx),
-                    )
-                  ) : (
-                    <View style={styles.emptySavedWorkspace}>
-                      <Text style={styles.emptySavedWorkspaceText}>此工作区暂无活跃会话</Text>
-                      <View style={styles.emptySavedWorkspaceActions}>
-                        <Pressable
-                          accessibilityRole="button"
-                          onPress={() => onCreateSession(selectedHost.id, activeSplitProject.path)}
-                          style={({ pressed }) => [styles.emptySavedPrimaryBtn, pressed && styles.createButtonPressed]}
-                        >
-                          <Icon name="plus" size={12} color={palette.bg} weight="semibold" />
-                          <Text style={styles.emptySavedPrimaryText}>新建会话</Text>
-                        </Pressable>
-                        {savedWorkspaceKeys.has(workspacePathKey(activeSplitProject.path)) && (
-                          <Pressable
-                            accessibilityRole="button"
-                            onPress={() => forgetWorkspace(selectedHost.id, activeSplitProject.path)}
-                            style={({ pressed }) => [styles.emptySavedGhostBtn, pressed && styles.pressed]}
-                          >
-                            <Text style={styles.emptySavedGhostText}>从列表移除</Text>
-                          </Pressable>
-                        )}
-                      </View>
-                    </View>
-                  )}
-                  {renderNestedTaskWorkspaces(activeSplitProject.path, activeSplitChildTasks)}
-                </View>
-              </View>
-            ) : null}
-          </ScrollView>
+          {splitRightPane}
         </View>
       ) : (
         <FlatList
           ref={homeListRef}
           testID="home-workspace-list"
-          data={visibleWorkspaceList}
-          extraData={expandedProjectKeys}
+          data={phoneFilter === "all" && !isSearching ? projects : []}
+          extraData={`${String(expandedProjectKeys.size)}:${phoneFilter}`}
           keyExtractor={(project) => project.path}
           removeClippedSubviews={false}
-          contentContainerStyle={[styles.list, { paddingBottom: bottomInset + space.xl }]}
+          contentContainerStyle={[styles.phoneList, { paddingBottom: bottomInset + space.xl }]}
           keyboardShouldPersistTaps="handled"
           refreshControl={
             <RefreshControl
@@ -1368,27 +1381,74 @@ export function HomeDashboard({
             />
           }
           ListHeaderComponent={
-            <View style={styles.headerContent}>
-              {deviceBar}
+            <View style={styles.phoneHeader}>
+              {connectionBanner}
+              {searchAndToolbar}
+              <View style={styles.filterChipRow}>
+                {(
+                  [
+                    { id: "all", label: `工作区 ${String(projects.length)}` },
+                    { id: "running", label: `运行中 ${String(stats.runningCount)}` },
+                    { id: "archived", label: `已归档 ${String(archivedSessionList.length)}` },
+                  ] as const
+                ).map((tab) => {
+                  const active = phoneFilter === tab.id;
+                  return (
+                    <Pressable
+                      key={tab.id}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected: active }}
+                      onPress={() => setPhoneFilter(tab.id)}
+                      style={({ pressed }) => [
+                        styles.filterChip,
+                        active && styles.filterChipActive,
+                        pressed && styles.rowPressed,
+                      ]}
+                    >
+                      <Text
+                        style={[styles.filterChipText, active && styles.filterChipTextActive]}
+                        numberOfLines={1}
+                      >
+                        {tab.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
               {inboxSection}
-              {recentSection}
+              {recentChipStrip}
               {pinnedSection}
-              {workspaceSectionHeader}
+              {!isSearching && phoneFilter !== "all" && (
+                <View style={styles.workbenchTable}>
+                  {(phoneFilter === "running" ? runningSessionList : archivedSessionList).length > 0 ? (
+                    (phoneFilter === "running" ? runningSessionList : archivedSessionList).map(
+                      (session, idx) =>
+                        renderWorkbenchRow(session, idx, { showWorkspacePath: true, dense: true }),
+                    )
+                  ) : (
+                    <Text style={styles.searchEmptyText}>
+                      {phoneFilter === "running" ? "当前没有运行中的会话" : "当前没有已归档会话"}
+                    </Text>
+                  )}
+                </View>
+              )}
             </View>
           }
-          ListEmptyComponent={!isSearching && taskProjects.length === 0 ? (
-            <WorkspaceEmptyState
-              host={selectedHost}
-              runtime={selectedRuntime}
-              onAddWorkspace={openAddWorkspaceFlow}
-              onRefresh={() => onRefreshHost(selectedHost.id)}
-              palette={palette}
-              styles={styles}
-            />
-          ) : null}
-          ItemSeparatorComponent={() => <View style={styles.projectGap} />}
+          ListEmptyComponent={
+            !isSearching && phoneFilter === "all" && taskProjects.length === 0 ? (
+              <WorkspaceEmptyState
+                host={selectedHost}
+                runtime={selectedRuntime}
+                onAddWorkspace={openAddWorkspaceFlow}
+                onRefresh={() => onRefreshHost(selectedHost.id)}
+                palette={palette}
+                styles={styles}
+              />
+            ) : null
+          }
+          ItemSeparatorComponent={() => <View style={styles.phoneProjectGap} />}
           renderItem={({ item }) => renderProject(item)}
-          ListFooterComponent={taskWorkspaceFooter}
+          ListFooterComponent={phoneFilter === "all" ? taskWorkspaceFooter : null}
         />
       )}
 
@@ -1415,14 +1475,11 @@ export function HomeDashboard({
                     deviceNavigation.cancel();
                     onSelectHost(host.id);
                   }}
-                  style={({ pressed }) => [
-                    styles.deviceRow,
-                    pressed && styles.pressed,
-                  ]}
+                  style={({ pressed }) => [styles.deviceRow, pressed && styles.rowPressed]}
                 >
                   <View
                     style={[
-                      styles.statusDot,
+                      styles.statusDotSmall,
                       { backgroundColor: hostConnectionTone(runtime, palette) },
                     ]}
                   />
@@ -1444,7 +1501,7 @@ export function HomeDashboard({
                       deviceNavigation.defer(() => onEditHost(host.id));
                       onCloseDevicePicker();
                     }}
-                    style={({ pressed }) => [styles.deviceAction, pressed && styles.pressed]}
+                    style={({ pressed }) => [styles.deviceAction, pressed && styles.rowPressed]}
                   >
                     <Icon name="pencil" size={16} color={palette.textDim} />
                   </Pressable>
@@ -1471,11 +1528,11 @@ export function HomeDashboard({
           })}
           <View style={styles.deviceSheetDivider} />
           <SheetAction
-            label={`打开 ${selectedHost.name} 主机页`}
-            detail="查看机器状态、账号与模型源及全部会话"
-            symbol="desktopcomputer"
+            label="账号与模型源"
+            detail="管理 Claude、Codex、Antigravity、Pi 登录态与 API 模型源"
+            symbol="command"
             onPress={() => {
-              deviceNavigation.defer(() => onOpenHost(selectedHost.id));
+              deviceNavigation.defer(() => (onOpenAccounts ?? onOpenHost)(selectedHost.id));
               onCloseDevicePicker();
             }}
           />
@@ -1489,47 +1546,6 @@ export function HomeDashboard({
             }}
           />
         </View>
-      </Sheet>
-
-      <Sheet
-        visible={quickCreateOpen}
-        title="新建"
-        onClose={() => {
-          createNavigation.cancel();
-          setQuickCreateOpen(false);
-        }}
-        onDismiss={() => createNavigation.dismiss()}
-      >
-        <SheetAction
-          label="新建会话"
-          detail={`在 ${selectedHost.name} 选择工作区并启动 Agent 或终端`}
-          symbol="bubble.left.and.text.bubble.right"
-          onPress={() => {
-            createNavigation.defer(() => onCreateSession(selectedHost.id));
-            setQuickCreateOpen(false);
-          }}
-        />
-        {onOpenTerminals && supportsRemoteTerminal(selectedRuntime?.hostInfo) && (
-          <SheetAction
-            label="新建终端"
-            detail={`在 ${selectedHost.name} 打开电脑的默认 Shell 终端`}
-            symbol="terminal"
-            onPress={() => {
-              const targetCwd = splitLayout ? activeSplitProject?.path : undefined;
-              createNavigation.defer(() => onOpenTerminals(selectedHost.id, targetCwd));
-              setQuickCreateOpen(false);
-            }}
-          />
-        )}
-        <SheetAction
-          label="添加工作区"
-          detail="从电脑浏览选择文件夹，固定到工作区列表"
-          symbol="folder.badge.plus"
-          onPress={() => {
-            createNavigation.defer(openAddWorkspaceFlow);
-            setQuickCreateOpen(false);
-          }}
-        />
       </Sheet>
 
       <Sheet
@@ -1598,9 +1614,9 @@ export function HomeDashboard({
             当前电脑上没有已归档会话。在会话菜单中选择「停止并归档」后，历史记录会保存在这里。
           </Text>
         ) : (
-          <View style={styles.archivedList}>
+          <View style={styles.workbenchTable}>
             {archivedSessionList.map((session, idx) =>
-              renderSessionRow(session, idx, { showWorkspacePath: true }),
+              renderWorkbenchRow(session, idx, { showWorkspacePath: true, dense: true }),
             )}
           </View>
         )}
@@ -1684,13 +1700,11 @@ function WorkspaceEmptyState({
   const unavailable = status === "failed" || status === "idle";
   return (
     <View style={styles.workspaceEmpty}>
-      <View style={styles.emptyIcon}>
-        <Icon
-          name={unavailable ? "exclamationmark.triangle.fill" : "folder.fill"}
-          size={24}
-          color={unavailable ? palette.warn : palette.textFaint}
-        />
-      </View>
+      <Icon
+        name={unavailable ? "exclamationmark.triangle.fill" : "folder.fill"}
+        size={26}
+        color={unavailable ? palette.warn : palette.textFaint}
+      />
       <Text style={styles.emptyTitle}>
         {status === "connecting" || status === "reconnecting"
           ? `正在连接 ${host.name}`
@@ -1710,7 +1724,7 @@ function WorkspaceEmptyState({
       <Pressable
         accessibilityRole="button"
         onPress={unavailable ? onRefresh : onAddWorkspace}
-        style={({ pressed }) => [styles.emptyAction, pressed && styles.emptyActionPressed]}
+        style={({ pressed }) => [styles.emptyAction, pressed && styles.rowPressed]}
       >
         <Text style={styles.emptyActionText}>{unavailable ? "重新连接" : "添加工作区"}</Text>
       </Pressable>
@@ -1726,148 +1740,410 @@ function createStyles(palette: ThemePalette) {
     meta: { ...font.meta, color: palette.textFaint },
   };
   return StyleSheet.create({
-    splitContainer: { flex: 1, flexDirection: "row", minHeight: 0 },
-    splitLeftList: { paddingHorizontal: 14, paddingTop: space.xs },
-    splitGutter: {
-      flexShrink: 0,
-      backgroundColor: palette.bg,
-      borderRightWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-    },
-    splitRightContent: { paddingHorizontal: 20, paddingTop: space.sm, gap: 18 },
-    splitProjectDetail: { gap: 12 },
-    splitProjectHeader: {
+    splitContainer: { flex: 1, flexDirection: "row", minHeight: 0, backgroundColor: palette.bg },
+    sidebarSurface: { backgroundColor: palette.surface },
+    sidebarContent: { paddingHorizontal: 8, paddingTop: 8, gap: 2 },
+    sidebarHeader: { gap: 8, paddingBottom: 6 },
+    sidebarSection: { gap: 2, paddingTop: 4 },
+    sidebarSectionHead: {
       flexDirection: "row",
       alignItems: "center",
-      justifyContent: "space-between",
-      gap: space.md,
-      paddingHorizontal: 2,
+      gap: 6,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
     },
-    splitProjectCopy: { flex: 1, minWidth: 0, gap: 3 },
-    splitProjectTitle: { ...themedFont.title, fontSize: 22, letterSpacing: -0.5 },
-    splitProjectPath: { ...themedFont.meta, fontSize: 12 },
-    splitCreateBtn: {
+    sidebarSectionLabel: { color: palette.textFaint, fontSize: 11, fontWeight: "700", letterSpacing: 0.3 },
+    sidebarCount: { color: palette.textFaint, fontSize: 11, fontVariant: ["tabular-nums"] },
+
+    toolbarBlock: { gap: 6 },
+    searchToolbarRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+    searchField: {
+      flex: 1,
+      minWidth: 0,
+      height: 32,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      paddingHorizontal: 8,
+      borderRadius: 8,
+      backgroundColor: palette.surfaceRaised,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+    },
+    searchInput: { flex: 1, minWidth: 0, paddingVertical: 0, color: palette.text, fontSize: 12.5 },
+    searchClearBtn: { width: 20, height: 20, alignItems: "center", justifyContent: "center" },
+    toolbarIconBtn: {
+      width: 30,
+      height: 30,
+      borderRadius: 8,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: palette.surfaceRaised,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+    },
+    searchEmptyText: { ...themedFont.meta, textAlign: "center", paddingVertical: 20 },
+
+    inboxBadge: {
+      color: palette.warn,
+      backgroundColor: palette.warnBg,
+      fontSize: 10.5,
+      fontWeight: "700",
+      paddingHorizontal: 6,
+      paddingVertical: 1,
+      borderRadius: radius.pill,
+      overflow: "hidden",
+    },
+    inboxRow: {
+      minHeight: 38,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      paddingHorizontal: 8,
+      paddingVertical: 6,
+      borderRadius: 8,
+    },
+    inboxRowWarn: { backgroundColor: palette.warnBg },
+    inboxRowAccent: { backgroundColor: palette.accentBg },
+    inboxRowDetail: { color: palette.warn, fontSize: 11, fontWeight: "600" },
+    inboxRowDetailAccent: { color: palette.accent },
+
+    treeFolderBlock: { gap: 1 },
+    treeFolderRow: {
+      position: "relative",
       minHeight: 36,
       flexDirection: "row",
       alignItems: "center",
-      gap: 5,
-      paddingHorizontal: 14,
-      borderRadius: radius.pill,
-      backgroundColor: palette.text,
+      gap: 6,
+      paddingHorizontal: 8,
+      paddingVertical: 6,
+      borderRadius: 8,
     },
-    splitCreateText: { color: palette.bg, fontSize: 13, fontWeight: "600" },
-    splitSessionCard: {
-      borderRadius: 18,
+    treeFolderRowSelected: {
+      backgroundColor: palette.surfaceRaised,
+    },
+    treeActiveBar: {
+      position: "absolute",
+      left: 0,
+      top: 7,
+      bottom: 7,
+      width: 3,
+      borderRadius: 2,
+      backgroundColor: palette.accent,
+    },
+    treeFolderName: {
+      flex: 1,
+      minWidth: 0,
+      color: palette.textDim,
+      fontSize: 13.5,
+      fontWeight: "500",
+    },
+    treeFolderNameSelected: {
+      color: palette.text,
+      fontWeight: "700",
+    },
+    treeActivityDot: { width: 6, height: 6, borderRadius: 3, flexShrink: 0 },
+    treeFolderCount: {
+      color: palette.textFaint,
+      fontSize: 11,
+      fontVariant: ["tabular-nums"],
+      flexShrink: 0,
+    },
+    treeInlineBtn: {
+      width: 24,
+      height: 24,
+      borderRadius: 6,
+      alignItems: "center",
+      justifyContent: "center",
+      flexShrink: 0,
+    },
+    treeChildrenGuide: {
+      marginLeft: 13,
+      paddingLeft: 8,
+      paddingVertical: 2,
+      gap: 1,
+      borderLeftWidth: StyleSheet.hairlineWidth,
+      borderLeftColor: palette.border,
+    },
+    treeSessionRow: {
+      minHeight: 32,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 7,
+      paddingHorizontal: 7,
+      paddingVertical: 4,
+      borderRadius: 6,
+    },
+    treeSessionCopy: { flex: 1, minWidth: 0, gap: 1 },
+    treeSessionLabel: { color: palette.text, fontSize: 12.5, fontWeight: "500" },
+    treeSessionMeta: { color: palette.textFaint, fontSize: 10.5 },
+    treeWorktreeSub: { marginTop: 4, gap: 1 },
+    treeWorktreeSubTitle: {
+      color: palette.textFaint,
+      fontSize: 10.5,
+      fontWeight: "600",
+      paddingHorizontal: 7,
+      paddingVertical: 2,
+    },
+
+    workbenchScroll: { paddingHorizontal: 18, paddingTop: 12, gap: 12 },
+    connBanner: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 8,
       backgroundColor: palette.surface,
       borderWidth: StyleSheet.hairlineWidth,
       borderColor: palette.border,
-      paddingHorizontal: 6,
-      paddingVertical: 4,
+    },
+    connBannerLeft: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8 },
+    connBannerText: { color: palette.textDim, fontSize: 12.5, flex: 1 },
+    connRetry: { color: palette.accent, fontSize: 12.5, fontWeight: "700" },
+
+    filterChipRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
+    filterChip: {
+      minHeight: 28,
+      maxWidth: 160,
+      justifyContent: "center",
+      paddingHorizontal: 10,
+      borderRadius: 8,
+      backgroundColor: palette.surface,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+    },
+    filterChipActive: {
+      backgroundColor: palette.text,
+      borderColor: palette.text,
+    },
+    filterChipText: { color: palette.textDim, fontSize: 12, fontWeight: "600" },
+    filterChipTextActive: { color: palette.bg },
+
+    recentStripWrap: { minHeight: 28 },
+    recentStripContent: { alignItems: "center", gap: 6, paddingRight: 8 },
+    recentStripLabel: { color: palette.textFaint, fontSize: 11, fontWeight: "700", marginRight: 2 },
+    recentChip: {
+      height: 26,
+      maxWidth: 190,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      paddingHorizontal: 8,
+      borderRadius: 7,
+      backgroundColor: palette.surface,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+    },
+    recentChipTitle: { color: palette.textDim, fontSize: 11.5, fontWeight: "500", flexShrink: 1 },
+
+    workbenchDetail: { gap: 10 },
+    workbenchHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 10,
+    },
+    workbenchHeaderCopy: { flex: 1, minWidth: 0, gap: 2 },
+    workbenchTitleRow: { flexDirection: "row", alignItems: "center", gap: 4, minWidth: 0 },
+    workbenchTitle: { ...themedFont.title, fontSize: 18, letterSpacing: -0.3, flexShrink: 1 },
+    microIconBtn: { width: 24, height: 24, borderRadius: 6, alignItems: "center", justifyContent: "center" },
+    workbenchPath: {
+      color: palette.textFaint,
+      fontSize: 11.5,
+      fontFamily: MONOSPACE_FONT,
+    },
+    workbenchActions: { flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 0 },
+    workbenchGhostBtn: {
+      minHeight: 32,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 5,
+      paddingHorizontal: 10,
+      borderRadius: 8,
+      backgroundColor: palette.surface,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+    },
+    workbenchGhostText: { color: palette.text, fontSize: 12.5, fontWeight: "600" },
+    workbenchPrimaryBtn: {
+      minHeight: 32,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 4,
+      paddingHorizontal: 12,
+      borderRadius: 8,
+      backgroundColor: palette.text,
+    },
+    workbenchPrimaryText: { color: palette.bg, fontSize: 12.5, fontWeight: "600" },
+    ctaPressed: { opacity: 0.82 },
+
+    workbenchTable: {
+      borderRadius: 10,
+      backgroundColor: palette.surface,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
       overflow: "hidden",
     },
+    rowHairline: {
+      height: StyleSheet.hairlineWidth,
+      backgroundColor: palette.border,
+      marginLeft: 38,
+    },
+    workbenchRow: {
+      minHeight: 48,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+    },
+    workbenchRowDense: { minHeight: 44, paddingHorizontal: 10, paddingVertical: 7 },
+    rowPressed: { backgroundColor: palette.pressed },
+    workbenchRowCopy: { flex: 1, minWidth: 0, gap: 2 },
+    workbenchRowHead: { flexDirection: "row", alignItems: "center", gap: 6, minWidth: 0 },
+    workbenchRowTitle: { ...themedFont.body, fontSize: 13.5, fontWeight: "600", flexShrink: 1 },
+    modeChip: {
+      paddingHorizontal: 5,
+      paddingVertical: 1,
+      borderRadius: 4,
+      backgroundColor: palette.surfaceRaised,
+    },
+    modeChipText: {
+      color: palette.textFaint,
+      fontSize: 10,
+      fontWeight: "600",
+      fontFamily: MONOSPACE_FONT,
+    },
+    workbenchRowSub: { color: palette.textFaint, fontSize: 11.5 },
+    statusBadge: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 5,
+      paddingHorizontal: 7,
+      paddingVertical: 2.5,
+      borderRadius: radius.pill,
+      backgroundColor: palette.surfaceRaised,
+    },
+    statusBadgeActive: { backgroundColor: palette.successBg },
+    statusBadgeWarn: { backgroundColor: palette.warnBg },
+    statusDotSmall: { width: 6, height: 6, borderRadius: 3, flexShrink: 0 },
+    statusBadgeText: { color: palette.textDim, fontSize: 11 },
 
-    list: {
+    phoneList: {
       flexGrow: 1,
       width: "100%",
       maxWidth: 720,
       alignSelf: "center",
-      paddingHorizontal: space.lg,
+      paddingHorizontal: space.md,
+      paddingTop: space.xs,
     },
-    headerContent: { gap: 14, paddingTop: space.xs, paddingBottom: 10 },
-    deviceBar: {
+    phoneHeader: { gap: 10, paddingBottom: 10 },
+    phoneProjectGap: { height: 6 },
+    phoneWorkspaceBlock: {
+      borderRadius: 10,
+      backgroundColor: palette.surface,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      overflow: "hidden",
+    },
+    phoneWorkspaceBlockExpanded: { borderColor: palette.border },
+    phoneFolderRow: {
+      minHeight: 44,
       flexDirection: "row",
       alignItems: "center",
       gap: 8,
-      minWidth: 0,
-    },
-    deviceCapsule: {
-      flex: 1,
-      minWidth: 0,
-      minHeight: 50,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 9,
       paddingHorizontal: 10,
       paddingVertical: 7,
-      borderRadius: 16,
+    },
+    phoneFolderCopy: { flex: 1, minWidth: 0, gap: 1 },
+    phoneFolderTitleRow: { flexDirection: "row", alignItems: "center", gap: 5, minWidth: 0 },
+    phoneFolderName: { ...themedFont.body, fontSize: 14, fontWeight: "600", flexShrink: 1 },
+    phoneFolderPath: { color: palette.textFaint, fontSize: 11, fontFamily: MONOSPACE_FONT },
+    phoneSessionTree: {
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: palette.border,
+    },
+
+    taskFooter: { paddingTop: 8, gap: 4 },
+    taskFooterHead: {
+      minHeight: 34,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      paddingHorizontal: 8,
+      borderRadius: 8,
+      backgroundColor: palette.surfaceRaised,
+    },
+    taskFooterTitle: { flex: 1, minWidth: 0, color: palette.textDim, fontSize: 12, fontWeight: "600" },
+    taskFooterCount: { color: palette.textFaint, fontSize: 11 },
+    taskFooterChildren: { gap: 4, paddingLeft: 6 },
+    pendingText: { color: palette.warn, fontWeight: "600" },
+
+    nestedTaskWrap: {
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: palette.border,
+      backgroundColor: palette.surfaceRaised,
+    },
+    nestedTaskToggle: {
+      minHeight: 34,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+    },
+    nestedTaskTitle: { flex: 1, minWidth: 0, color: palette.textDim, fontSize: 12, fontWeight: "600" },
+    nestedTaskMeta: { color: palette.textFaint, fontSize: 11 },
+    nestedTaskList: { gap: 6, paddingHorizontal: 8, paddingBottom: 8 },
+    nestedTaskGroup: {
+      borderRadius: 8,
       backgroundColor: palette.surface,
       borderWidth: StyleSheet.hairlineWidth,
       borderColor: palette.border,
       overflow: "hidden",
     },
-    sectionIcon: {
-      width: 30,
-      height: 30,
-      flexShrink: 0,
+    nestedTaskGroupHead: {
+      flexDirection: "row",
       alignItems: "center",
-      justifyContent: "center",
-      borderRadius: 9,
-      backgroundColor: palette.surfaceRaised,
+      justifyContent: "space-between",
+      paddingHorizontal: 10,
+      paddingVertical: 5,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: palette.border,
     },
-    deviceHeaderCopy: { flex: 1, minWidth: 0, gap: 3, overflow: "hidden" },
-    deviceNameRow: { flexDirection: "row", alignItems: "center", gap: 5, minWidth: 0 },
-    deviceHeaderName: { ...themedFont.body, fontSize: 14.5, fontWeight: "700", letterSpacing: -0.2, flex: 1, minWidth: 0 },
-    deviceMetaRow: { flexDirection: "row", alignItems: "center", gap: 6, minWidth: 0, overflow: "hidden" },
-    deviceMeta: { color: palette.textFaint, fontSize: 11, flexShrink: 1, minWidth: 0 },
-    deviceFleetPill: {
-      height: 19,
-      maxWidth: "100%",
-      flexShrink: 1,
+    nestedTaskGroupName: { color: palette.textDim, fontSize: 12, fontWeight: "600", flex: 1 },
+    nestedTaskSessions: {},
+
+    emptySavedWorkspace: { padding: 14, alignItems: "center", gap: 8 },
+    emptySavedWorkspaceText: { ...themedFont.meta, fontSize: 12.5 },
+    emptySavedWorkspaceActions: { flexDirection: "row", alignItems: "center", gap: 8 },
+    emptySavedPrimaryBtn: {
+      minHeight: 30,
       flexDirection: "row",
       alignItems: "center",
       gap: 4,
-      paddingHorizontal: 6,
-      borderRadius: radius.pill,
-      backgroundColor: palette.surfaceRaised,
-      overflow: "hidden",
-    },
-    fleetStatusDot: { width: 5, height: 5, borderRadius: 2.5, flexShrink: 0 },
-    fleetCurrentStatus: {
-      color: palette.textDim,
-      fontSize: 10,
-      fontWeight: "600",
-      fontVariant: ["tabular-nums"],
-      flexShrink: 1,
-    },
-    deviceActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
-    iconButton: {
-      width: 38,
-      height: 38,
-      alignItems: "center",
-      justifyContent: "center",
-      borderRadius: radius.pill,
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-    },
-    createButton: {
-      minHeight: 38,
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "center",
-      gap: 5,
-      paddingHorizontal: 14,
-      borderRadius: radius.pill,
+      paddingHorizontal: 12,
+      borderRadius: 8,
       backgroundColor: palette.text,
     },
-    createButtonCompact: {
-      width: 38,
-      paddingHorizontal: 0,
-    },
-    createButtonPressed: { opacity: 0.82 },
-    createButtonText: { color: palette.bg, fontSize: 13.5, fontWeight: "600" },
-
-    deviceList: {
-      gap: 4,
-      paddingBottom: space.md,
-    },
-    deviceManageRow: {
-      flexDirection: "row",
+    emptySavedPrimaryText: { color: palette.bg, fontSize: 12, fontWeight: "600" },
+    emptySavedGhostBtn: {
+      minHeight: 30,
       alignItems: "center",
-      borderRadius: radius.md,
+      justifyContent: "center",
+      paddingHorizontal: 12,
+      borderRadius: 8,
+      backgroundColor: palette.surfaceRaised,
     },
+    emptySavedGhostText: { color: palette.textDim, fontSize: 12, fontWeight: "500" },
+
+    archivedEmptyNote: { ...themedFont.sub, lineHeight: 20, paddingVertical: 16 },
+    deviceList: { gap: 4, paddingBottom: space.md },
+    deviceManageRow: { flexDirection: "row", alignItems: "center", borderRadius: radius.md },
     deviceRow: {
-      minHeight: 54,
+      minHeight: 52,
       flex: 1,
       flexDirection: "row",
       alignItems: "center",
@@ -1880,374 +2156,33 @@ function createStyles(palette: ThemePalette) {
     deviceRowCopy: { flex: 1, minWidth: 0, gap: 2 },
     deviceRowName: { ...themedFont.body, fontWeight: "600" },
     deviceRowDetail: themedFont.meta,
-    statusDot: { width: 7, height: 7, borderRadius: 3.5 },
     deviceRowActions: { flexDirection: "row", alignItems: "center", paddingRight: 4 },
-    deviceAction: {
-      width: 42,
-      height: 42,
-      alignItems: "center",
-      justifyContent: "center",
-      borderRadius: radius.sm,
-    },
+    deviceAction: { width: 42, height: 42, alignItems: "center", justifyContent: "center", borderRadius: radius.sm },
     dangerPressed: { backgroundColor: palette.dangerBg },
-    deviceSheetDivider: {
-      height: StyleSheet.hairlineWidth,
-      marginVertical: space.xs,
-      backgroundColor: palette.border,
-    },
-    pressed: { backgroundColor: palette.pressed },
-
-    approvalSection: { gap: 6 },
-    approvalStack: { gap: 6 },
-    approvalCount: {
-      color: palette.warn,
-      backgroundColor: palette.warnBg,
-      fontSize: 11,
-      fontWeight: "700",
-      paddingHorizontal: 7,
-      paddingVertical: 2,
-      borderRadius: radius.pill,
-      overflow: "hidden",
-    },
-    approvalCard: {
-      minHeight: 54,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 10,
-      paddingHorizontal: 12,
-      paddingVertical: 9,
-      borderRadius: radius.md,
-      backgroundColor: palette.warnBg,
-    },
-    inboxInputCard: {
-      backgroundColor: palette.accentBg,
-    },
-    approvalDetail: { color: palette.warn, fontSize: 11.5, fontWeight: "600" },
-    inboxInputDetail: { color: palette.accent },
-
-    pinnedSection: { gap: 6 },
-    pinnedCard: {
-      borderRadius: 16,
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-      paddingHorizontal: 6,
-      paddingVertical: 4,
-      overflow: "hidden",
-    },
-
-    workspaceHeaderBlock: { gap: 8 },
-    sectionHeading: {
-      minHeight: 26,
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 8,
-      paddingHorizontal: 4,
-      minWidth: 0,
-    },
-    sectionTitleGroup: {
-      flex: 1,
-      minWidth: 0,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 6,
-      overflow: "hidden",
-    },
-    sectionHeadingActions: {
-      flexShrink: 0,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 4,
-    },
-    sectionActionBtn: {
-      width: 28,
-      height: 28,
-      borderRadius: 14,
-      alignItems: "center",
-      justifyContent: "center",
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-    },
-    sectionTitle: { color: palette.textFaint, fontSize: 12, fontWeight: "600", letterSpacing: 0.3 },
-    sectionMetaCount: { color: palette.textFaint, fontSize: 11.5, fontVariant: ["tabular-nums"] },
-
-    workspaceSearchBar: {
-      minHeight: 36,
-      minWidth: 0,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 7,
-      paddingHorizontal: 11,
-      borderRadius: 12,
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-      overflow: "hidden",
-    },
-    workspaceSearchInput: {
-      flex: 1,
-      minWidth: 0,
-      paddingVertical: 6,
-      color: palette.text,
-      fontSize: 13,
-    },
-    searchClearBtn: {
-      width: 24,
-      height: 24,
-      alignItems: "center",
-      justifyContent: "center",
-    },
-    searchEmptyText: {
-      ...themedFont.meta,
-      textAlign: "center",
-      paddingVertical: 18,
-    },
-
-    recentSection: { gap: 8 },
-    recentList: { gap: 8, paddingRight: space.md },
-    recentCard: {
-      width: 232,
-      minHeight: 52,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 10,
-      paddingHorizontal: 12,
-      paddingVertical: 9,
-      borderRadius: 15,
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-    },
-    recentCardPressed: { backgroundColor: palette.pressed },
-    recentCopy: { flex: 1, minWidth: 0, gap: 2 },
-    recentTitle: { ...themedFont.body, fontSize: 13.5, fontWeight: "600", letterSpacing: -0.1 },
-    recentMeta: { color: palette.textFaint, fontSize: 11 },
-
-    taskSection: { paddingTop: space.lg, gap: space.sm },
-    taskHeading: {
-      minHeight: 50,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: space.sm,
-      paddingHorizontal: space.md,
-      paddingVertical: space.sm,
-      borderRadius: 15,
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-    },
-    taskHeadingCopy: { flex: 1, minWidth: 0, gap: 2 },
-    taskTitle: { ...themedFont.body, fontSize: 14, fontWeight: "600" },
-    taskSummary: { ...themedFont.meta, color: palette.textDim },
-    taskProjects: { gap: space.sm },
-
-    nestedTaskWrap: {
-      marginTop: 6,
-      marginHorizontal: 4,
-      marginBottom: 4,
-      borderRadius: 12,
-      backgroundColor: palette.surfaceRaised,
-      overflow: "hidden",
-    },
-    nestedTaskToggle: {
-      minHeight: 38,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 7,
-      paddingHorizontal: 10,
-      paddingVertical: 7,
-    },
-    nestedTaskTitle: { flex: 1, minWidth: 0, color: palette.textDim, fontSize: 12.5, fontWeight: "600" },
-    nestedTaskMeta: { color: palette.textFaint, fontSize: 11 },
-    nestedTaskList: {
-      gap: 6,
-      paddingHorizontal: 6,
-      paddingBottom: 6,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderTopColor: palette.border,
-    },
-    nestedTaskCard: {
-      marginTop: 6,
-      borderRadius: 10,
-      backgroundColor: palette.surface,
-      paddingHorizontal: 4,
-      paddingVertical: 4,
-    },
-    nestedTaskCardHeader: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 8,
-      paddingHorizontal: 8,
-      paddingVertical: 4,
-    },
-    nestedTaskCardCopy: { flex: 1, minWidth: 0, gap: 1 },
-    nestedTaskCardName: { color: palette.text, fontSize: 12.5, fontWeight: "600" },
-    nestedTaskCardPath: { color: palette.textFaint, fontSize: 10.5 },
-
-    inlinePlusBtn: {
-      width: 28,
-      height: 28,
-      borderRadius: 14,
-      alignItems: "center",
-      justifyContent: "center",
-      backgroundColor: palette.surfaceRaised,
-    },
-
-    emptySavedWorkspace: {
-      paddingHorizontal: 12,
-      paddingVertical: 14,
-      alignItems: "center",
-      gap: 10,
-    },
-    emptySavedWorkspaceText: { ...themedFont.meta, fontSize: 12.5 },
-    emptySavedWorkspaceActions: { flexDirection: "row", alignItems: "center", gap: 8 },
-    emptySavedPrimaryBtn: {
-      minHeight: 32,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 4,
-      paddingHorizontal: 12,
-      borderRadius: radius.pill,
-      backgroundColor: palette.text,
-    },
-    emptySavedPrimaryText: { color: palette.bg, fontSize: 12, fontWeight: "600" },
-    emptySavedGhostBtn: {
-      minHeight: 32,
-      alignItems: "center",
-      justifyContent: "center",
-      paddingHorizontal: 12,
-      borderRadius: radius.pill,
-      backgroundColor: palette.surfaceRaised,
-    },
-    emptySavedGhostText: { color: palette.textDim, fontSize: 12, fontWeight: "500" },
-
-    archivedEmptyNote: { ...themedFont.sub, lineHeight: 20, paddingVertical: 16 },
-    archivedList: { paddingBottom: space.sm },
-
-    projectGap: { height: 6 },
-    projectCard: {
-      minHeight: 58,
-      borderRadius: 16,
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-    },
-    projectCardExpanded: {
-      backgroundColor: palette.surface,
-    },
-    projectCardSplit: {
-      borderRadius: 14,
-      backgroundColor: "transparent",
-    },
-    projectCardSplitSelected: {
-      backgroundColor: palette.surface,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: palette.border,
-    },
-    projectHeader: {
-      minHeight: 58,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 10,
-      paddingHorizontal: 12,
-      paddingVertical: 10,
-      borderRadius: 16,
-    },
-    projectHeaderSplit: {
-      minHeight: 50,
-      paddingHorizontal: 10,
-      paddingVertical: 8,
-      borderRadius: 14,
-    },
-    projectHeaderSelected: {
-      backgroundColor: palette.surface,
-    },
-    projectCardPressed: { borderRadius: radius.md, backgroundColor: palette.pressed },
-    projectIcon: {
-      width: 30,
-      height: 30,
-      alignItems: "center",
-      justifyContent: "center",
-      borderRadius: 9,
-      backgroundColor: palette.surfaceRaised,
-    },
-    projectIconSelected: {
-      backgroundColor: palette.text,
-    },
-    projectPending: { color: palette.warn, fontWeight: "600" },
-    locatorRest: { transform: [{ rotate: "0deg" }] },
-    sessionList: {
-      paddingHorizontal: 6,
-      paddingBottom: 6,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderTopColor: palette.border,
-    },
-    sessionDivider: {
-      height: StyleSheet.hairlineWidth,
-      marginLeft: 48,
-      marginRight: 10,
-      backgroundColor: palette.border,
-    },
-    sessionRow: {
-      minHeight: 56,
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 11,
-      paddingHorizontal: 10,
-      paddingVertical: 9,
-      borderRadius: 12,
-    },
-    sessionRowPressed: { backgroundColor: palette.pressed },
-    sessionCopy: { flex: 1, minWidth: 0, gap: 3 },
-    sessionTitleRow: { flexDirection: "row", alignItems: "center", gap: 5, minWidth: 0 },
-    sessionTitle: { ...themedFont.body, fontSize: 14.5, fontWeight: "600", letterSpacing: -0.15, flexShrink: 1 },
-    sessionPreview: { ...themedFont.meta, color: palette.textFaint, fontSize: 12 },
-    sessionState: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 5,
-      paddingHorizontal: 8,
-      paddingVertical: 3,
-      borderRadius: radius.pill,
-      backgroundColor: palette.surfaceRaised,
-    },
-    sessionStateActive: { backgroundColor: palette.successBg },
-    sessionStateWarn: { backgroundColor: palette.warnBg },
-    sessionStatusDot: { width: 5.5, height: 5.5, borderRadius: 3 },
-    sessionStatusText: { ...themedFont.meta, color: palette.textDim, fontSize: 11 },
+    deviceSheetDivider: { height: StyleSheet.hairlineWidth, marginVertical: space.xs, backgroundColor: palette.border },
 
     workspaceEmpty: {
       flex: 1,
-      minHeight: 240,
+      minHeight: 200,
       alignItems: "center",
       justifyContent: "center",
-      gap: space.md,
-      paddingHorizontal: space.xl,
-      paddingVertical: space.xl,
-      borderRadius: radius.lg,
+      gap: space.sm,
+      padding: space.lg,
+      borderRadius: 10,
       backgroundColor: palette.surface,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
     },
-    emptyIcon: {
-      width: 48,
-      height: 48,
-      alignItems: "center",
-      justifyContent: "center",
-      borderRadius: 16,
-      backgroundColor: palette.surfaceRaised,
-    },
-    emptyTitle: { ...themedFont.title, fontSize: 16, textAlign: "center" },
-    emptyDetail: { ...themedFont.sub, maxWidth: 340, lineHeight: 19, textAlign: "center" },
+    emptyTitle: { ...themedFont.title, fontSize: 15, textAlign: "center" },
+    emptyDetail: { ...themedFont.sub, maxWidth: 320, fontSize: 12.5, lineHeight: 18, textAlign: "center" },
     emptyAction: {
-      minHeight: 44,
+      minHeight: 38,
       alignItems: "center",
       justifyContent: "center",
-      paddingHorizontal: space.xl,
-      borderRadius: radius.pill,
+      paddingHorizontal: space.lg,
+      borderRadius: 8,
       backgroundColor: palette.accentBg,
     },
-    emptyActionPressed: { backgroundColor: palette.pressed },
-    emptyActionText: { color: palette.accent, fontSize: 14, fontWeight: "600" },
+    emptyActionText: { color: palette.accent, fontSize: 13, fontWeight: "600" },
   });
 }

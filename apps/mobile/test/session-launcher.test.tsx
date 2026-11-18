@@ -35,7 +35,6 @@ vi.mock("@/lib/use-host-connection", () => ({ useHostConnection: () => ({ host: 
 vi.mock("@/lib/use-orchestration-snapshot", () => ({ useOrchestrationSnapshot: fixture.snapshot }));
 vi.mock("@/lib/adaptive-layout", () => ({ useAdaptiveLayout: () => ({ width: 390, height: 844, verticalPanes: null }) }));
 vi.mock("@/lib/session-preferences", () => ({ getSessionPreferences: async () => ({ archivedSessionIds: [], hiddenSessionIds: [], collapsedProjects: [] }), setProjectCollapsed: vi.fn(), setSessionHidden: vi.fn() }));
-vi.mock("@/lib/workspace-order-preferences", () => ({ useOrderedWorkspaces: (_id: string, projects: unknown[]) => projects }));
 vi.mock("@/lib/store", () => ({ sortSessions: (sessions: object) => Object.values(sessions) }));
 vi.mock("@/lib/connection", () => ({ SessionCreateError: class extends Error {} }));
 vi.mock("@/lib/theme", () => ({ color: {}, statusColor: {}, font: {}, radius: {}, space: {}, useMobileTheme: () => ({ palette: {} }) }));

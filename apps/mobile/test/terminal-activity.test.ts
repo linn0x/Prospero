@@ -4,7 +4,7 @@ import { runInNewContext } from "node:vm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 function terminalActivity() {
-  const html = readFileSync(join(import.meta.dirname, "../../daemon/term.html"), "utf8")
+  const html = readFileSync(join(import.meta.dirname, "../assets/term.html"), "utf8")
     .replaceAll("\r\n", "\n");
   const start = html.indexOf("  // 首次尺寸");
   const end = html.indexOf("  /**\n   * 入口", start);
@@ -46,7 +46,7 @@ describe("terminal activity bridge", () => {
     expect(terminal.search.clearDecorations).toHaveBeenCalledOnce();
   });
   it("encodes a paste after earlier terminal output without sending it as ordinary input", () => {
-    const html = readFileSync(join(import.meta.dirname, "../../daemon/term.html"), "utf8");
+    const html = readFileSync(join(import.meta.dirname, "../assets/term.html"), "utf8");
     const start = html.indexOf("  let replaying = false;");
     const end = html.indexOf("  /**\n   * 入口", start);
     let onData: (data: string) => void = () => {};

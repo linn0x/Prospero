@@ -6,7 +6,6 @@ import { useLocale } from "./locale";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
@@ -139,13 +138,12 @@ export function SkillsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     <div className="view-scroll">
       <div className="view-container skills-view">
         <header className="view-heading">
-          <div className="flex min-w-0 flex-col gap-1">
-            <span className="eyebrow">{t("能力目录", "CAPABILITY CATALOG")}</span>
+          <div className="flex min-w-0 flex-col gap-0.5">
             <h1>{t("技能", "Skills")}</h1>
             <p>{t("查看当前工作区中可被 Agent 调用的项目、用户与插件 Skills。", "Inspect project, user, and plugin skills available to agents in this workspace.")}</p>
           </div>
           <div className="view-actions">
-            <Button variant="outline" disabled={loading || !project || !snapshot.daemon.running} onClick={() => void refresh()}>
+            <Button variant="outline" size="sm" disabled={loading || !project || !snapshot.daemon.running} onClick={() => void refresh()}>
               {loading ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" aria-hidden="true" />}
               {t("刷新", "Refresh")}
             </Button>
@@ -153,7 +151,7 @@ export function SkillsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
         </header>
 
         <div className="skills-toolbar">
-          <NativeSelect aria-label={t("选择工作区", "Choose workspace")} value={project} onChange={(event) => setProject(event.target.value)}>
+          <NativeSelect size="sm" aria-label={t("选择工作区", "Choose workspace")} value={project} onChange={(event) => setProject(event.target.value)}>
             <NativeSelectOption value="" disabled>{t("选择工作区", "Choose workspace")}</NativeSelectOption>
             {snapshot.projects.map((item) => <NativeSelectOption key={item} value={item}>{projectName(snapshot, item)}</NativeSelectOption>)}
           </NativeSelect>
@@ -173,27 +171,23 @@ export function SkillsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
           <div className="skills-loading" role="status" aria-live="polite"><Spinner /><span>{t("正在扫描技能目录…", "Scanning skill directories…")}</span></div>
         ) : visibleSkills.length > 0 ? (
           <>
-            <div className="skills-grid">
+            <div className="skills-list">
               {renderedSkills.map((skill) => (
-                <Card key={`${skill.scope}:${skill.path}`} className="skill-card">
-                  <CardHeader>
-                    <div className="skill-card-heading">
-                      <span className="skill-icon" aria-hidden="true"><Sparkles /></span>
-                      <div className="min-w-0">
-                        <CardTitle className="truncate" title={skill.name} role="heading" aria-level={2}>{skill.name}</CardTitle>
-                        <CardDescription title={skill.description}>{skill.description || t("此 Skill 未提供说明。", "This skill has no description.")}</CardDescription>
-                      </div>
+                <article key={`${skill.scope}:${skill.path}`} className="skill-row">
+                  <span className="skill-row-icon" aria-hidden="true"><Sparkles /></span>
+                  <div className="skill-row-main">
+                    <div className="skill-row-top">
+                      <h2 className="truncate" title={skill.name}>{skill.name}</h2>
                       <Badge variant={skill.scope === "project" ? "secondary" : "outline"}>{skill.scope}</Badge>
+                      <code className="skill-row-path" title={skill.path}>{shortPath(skill.path)}</code>
                     </div>
-                  </CardHeader>
-                  <CardContent><code title={skill.path}>{shortPath(skill.path)}</code></CardContent>
-                  <CardFooter>
-                    <Button variant="ghost" size="sm" aria-label={t(`在文件管理器中显示 ${skill.name} 的 SKILL.md`, `Show ${skill.name} SKILL.md in the file manager`)} aria-busy={revealBusy === skill.path} disabled={revealBusy !== undefined} onClick={() => void reveal(skill)}>
-                      <FolderOpen data-icon="inline-start" aria-hidden="true" />
-                      {revealBusy === skill.path ? t("正在显示…", "Revealing…") : t("显示 SKILL.md", "Show SKILL.md")}
-                    </Button>
-                  </CardFooter>
-                </Card>
+                    <p className="skill-row-desc" title={skill.description}>{skill.description || t("此 Skill 未提供说明。", "This skill has no description.")}</p>
+                  </div>
+                  <Button variant="ghost" size="xs" className="skill-row-action" aria-label={t(`在文件管理器中显示 ${skill.name} 的 SKILL.md`, `Show ${skill.name} SKILL.md in the file manager`)} aria-busy={revealBusy === skill.path} disabled={revealBusy !== undefined} onClick={() => void reveal(skill)}>
+                    <FolderOpen data-icon="inline-start" aria-hidden="true" />
+                    {revealBusy === skill.path ? t("显示中…", "Revealing…") : t("显示 SKILL.md", "Show SKILL.md")}
+                  </Button>
+                </article>
               ))}
             </div>
             {renderedSkills.length < visibleSkills.length && <div className="flex justify-center"><Button variant="outline" onClick={() => setVisibleLimit((current) => current + SKILLS_PAGE_SIZE)}>{t(`再显示 ${String(Math.min(SKILLS_PAGE_SIZE, visibleSkills.length - renderedSkills.length))} 个`, `Show ${String(Math.min(SKILLS_PAGE_SIZE, visibleSkills.length - renderedSkills.length))} more`)}</Button></div>}

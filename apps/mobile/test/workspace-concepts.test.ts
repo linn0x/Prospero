@@ -7,6 +7,7 @@ import {
   filterMobileSessionsByQuery,
   homeInboxSessions,
   inboxReasonLabel,
+  sessionWorkbenchSubtitle,
   sortWorkspaceSessions,
 } from "../src/lib/workspace-concepts";
 import {
@@ -195,5 +196,24 @@ describe("Desktop workspace & auth concept alignment", () => {
     const resolved = resolveBoundModelSource([source], boundAccount, "codex");
     expect(resolved?.route.id).toBe("r1");
     expect(resolved?.staleRevision).toBe(true);
+  });
+
+  it("disambiguates identical default terminal titles in workbench subtitles", () => {
+    const first = makeSession("a1b2c3d4", "/work/app", {
+      agent: "codex",
+      kind: "pty",
+      title: "Codex",
+      createdAt: new Date(2026, 10, 17, 18, 53).getTime(),
+    });
+    const withModel = makeSession("e5f6g7h8", "/work/app", {
+      agent: "codex",
+      kind: "pty",
+      title: "Codex",
+      model: "openai/gpt-6-astra",
+      preview: "fix split pane",
+      createdAt: new Date(2026, 10, 17, 19, 12).getTime(),
+    });
+    expect(sessionWorkbenchSubtitle(first)).toContain("TUI · #a1b2");
+    expect(sessionWorkbenchSubtitle(withModel, { showWorkspace: "app" })).toContain("app · TUI · gpt-6-astra · fix split pane");
   });
 });

@@ -1,17 +1,17 @@
-import { lazy, Suspense, useCallback, useEffect, useReducer, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Columns2, Files, FolderKanban, FolderPlus, Plus, X } from "lucide-react";
+import { ArrowRight, CircleAlert, Columns2, Files, Folder, FolderPlus, ListChecks, MessageSquare, Plus, WifiOff, X } from "lucide-react";
 import type { DesktopSnapshot, NativeTerminalState, SessionInfo } from "../../../shared/types";
+import { attentionSummary, pendingRequests } from "../attention/attention-state";
 import { Button } from "../components/ui/button";
-import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../components/ui/empty";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "../components/ui/sheet";
 import { useLocale } from "../locale";
 import { cn } from "../lib/utils";
-import { text } from "../state";
+import { shortPath, text } from "../state";
 import { NativeSelect, NativeSelectOption } from "../components/ui/native-select";
 import { fileName } from "../project-tools/tool-state";
 import type { ProjectTool } from "../../../shared/project-tools";
-import { workspaceChromeVisible } from "../workspace-sidebar-state";
+import { projectForSession, sortProjectsByRecentActivity, sortSidebarSessions, workspaceChromeVisible } from "../workspace-sidebar-state";
 import { ContextDock } from "./ContextDock";
 import { clampDockWidth, DOCK_DEFAULT_WIDTH, DOCK_MIN_WIDTH, workspaceDockLayout, openDockTool, sessionDockState, supportsTrajectory, readDockPreferences, updateDockPreferences, writeDockPreferences, type DockState } from "./dock-state";
 import { DockSlot } from "./DockSlot";
@@ -29,11 +29,221 @@ import {
 import { SessionToolbar } from "./SessionToolbar";
 import { NativeTerminalPane, supportsNativeTerminal } from "../NativeTerminalPane";
 import { retainTerminalIds } from "./retained-terminals";
-import { sessionLabel } from "./session-presentation";
+import { isProsperoBotSession, sessionLabel, SessionAgentIcon, StatusMark } from "./session-presentation";
 import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_EVENT } from "./TerminalMouseToggle";
 
 const ChatPane = lazy(() => import("../ChatPane").then((module) => ({ default: module.ChatPane })));
 const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
+
+function WorkspaceEmptyWorkbench({
+  snapshot,
+  onActivate,
+  onNewSession,
+  onOpenRun,
+  onAddWorkspace,
+}: {
+  snapshot: DesktopSnapshot;
+  onActivate: (id: string) => void;
+  onNewSession: (project?: string) => void;
+  onOpenRun: (runId?: string) => void;
+  onAddWorkspace: () => void;
+}) {
+  const { t, status } = useLocale();
+  const attention = useMemo(() => attentionSummary(snapshot), [snapshot]);
+  const nonBotSessions = useMemo(
+    () => snapshot.daemon.sessions.filter((item) => !isProsperoBotSession(item) && !item.archived && !snapshot.archivedSessionIds.includes(item.id)),
+    [snapshot.archivedSessionIds, snapshot.daemon.sessions],
+  );
+  const activeSessions = useMemo(
+    () => sortSidebarSessions(
+      nonBotSessions.filter((item) => ["running", "starting", "waiting_approval", "waiting_input"].includes(item.status)),
+      undefined,
+      snapshot.pinnedSessionIds,
+      snapshot.unreadSessionIds,
+    ),
+    [nonBotSessions, snapshot.pinnedSessionIds, snapshot.unreadSessionIds],
+  );
+  const recentSessions = useMemo(
+    () => (activeSessions.length > 0 ? activeSessions : sortSidebarSessions(nonBotSessions, undefined, snapshot.pinnedSessionIds, snapshot.unreadSessionIds)).slice(0, 6),
+    [activeSessions, nonBotSessions, snapshot.pinnedSessionIds, snapshot.unreadSessionIds],
+  );
+  const recentProjects = useMemo(
+    () => sortProjectsByRecentActivity(snapshot.projects, snapshot.daemon.sessions).slice(0, 8),
+    [snapshot.daemon.sessions, snapshot.projects],
+  );
+  const shortcutHint = window.prospero.platform === "darwin" ? "⌘N" : "Ctrl+N";
+
+  return (
+    <div className="workspace-empty workspace-empty-workbench">
+      <div className="workbench-inner">
+        <header className="workbench-header">
+          <div>
+            <h2>{t("工作台", "Workbench")}</h2>
+            <p>{t("选择工作区或恢复会话，快速进入开发状态", "Resume a recent session or launch a new workspace context")}</p>
+          </div>
+          <div className="workbench-actions">
+            <Button size="sm" onClick={() => onNewSession()}>
+              <Plus data-icon="inline-start" />
+              {t("新建会话", "New session")}
+              <kbd className="workbench-kbd">{shortcutHint}</kbd>
+            </Button>
+            <Button variant="outline" size="sm" onClick={onAddWorkspace}>
+              <FolderPlus data-icon="inline-start" />
+              {t("添加工作区", "Add workspace")}
+            </Button>
+          </div>
+        </header>
+
+        {(attention.total > 0 || !snapshot.daemon.running) && (
+          <section className="workbench-section" aria-label={t("待处理事项", "Needs attention")}>
+            <div className="workbench-section-head">
+              <span>{t("待处理", "Needs attention")}</span>
+              <span>{!snapshot.daemon.running ? Math.max(1, attention.total) : attention.total}</span>
+            </div>
+            <div className="workbench-list">
+              {!snapshot.daemon.running && (
+                <button
+                  type="button"
+                  className="workbench-row is-danger"
+                  disabled={snapshot.daemon.starting}
+                  onClick={() => void window.prospero.startDaemon()}
+                >
+                  <WifiOff className="workbench-row-icon tone-danger" />
+                  <strong className="truncate">{snapshot.daemon.starting ? t("正在连接本地服务…", "Connecting to local daemon…") : t("Daemon 离线", "Daemon is offline")}</strong>
+                  <span className="workbench-path">{snapshot.daemon.lastError || t("点击启动服务以继续会话", "Click to reconnect local runtime")}</span>
+                  <span className="workbench-status">{snapshot.daemon.starting ? t("启动中", "Starting") : t("重连", "Reconnect")}</span>
+                </button>
+              )}
+              {attention.approvalSessions.slice(0, 3).map((item) => (
+                <button type="button" key={`wb-app:${item.id}`} className="workbench-row" onClick={() => onActivate(item.id)}>
+                  <ListChecks className="workbench-row-icon tone-warning" />
+                  <strong className="truncate">{sessionLabel(item)}</strong>
+                  <span className="workbench-tag">{t(`${pendingRequests(item, "approvals")} 项确认`, `${pendingRequests(item, "approvals")} approval`)}</span>
+                  <span className="workbench-path">{shortPath(item.cwd)}</span>
+                  <ArrowRight className="workbench-arrow" />
+                </button>
+              ))}
+              {attention.questionSessions.slice(0, 3).map((item) => (
+                <button type="button" key={`wb-q:${item.id}`} className="workbench-row" onClick={() => onActivate(item.id)}>
+                  <MessageSquare className="workbench-row-icon tone-warning" />
+                  <strong className="truncate">{sessionLabel(item)}</strong>
+                  <span className="workbench-tag">{t(`${pendingRequests(item, "questions")} 个回复`, `${pendingRequests(item, "questions")} reply`)}</span>
+                  <span className="workbench-path">{shortPath(item.cwd)}</span>
+                  <ArrowRight className="workbench-arrow" />
+                </button>
+              ))}
+              {attention.gates.slice(0, 2).map((gate) => (
+                <button type="button" key={`wb-gate:${text(gate["id"])}`} className="workbench-row" onClick={() => onOpenRun(text(gate["runId"]))}>
+                  <ListChecks className="workbench-row-icon tone-warning" />
+                  <strong className="truncate">{attention.context(gate).title || text(gate["question"], t("任务需要确认", "Gate pending"))}</strong>
+                  <span className="workbench-tag">Gate</span>
+                  <span className="workbench-path">{attention.context(gate).project}</span>
+                  <ArrowRight className="workbench-arrow" />
+                </button>
+              ))}
+              {attention.tasks.slice(0, 2).map((task) => (
+                <button type="button" key={`wb-task:${text(task["id"])}`} className="workbench-row" onClick={() => onOpenRun(text(task["runId"]))}>
+                  <CircleAlert className="workbench-row-icon tone-danger" />
+                  <strong className="truncate">{text(task["title"], t("任务失败", "Task failed"))}</strong>
+                  <span className="workbench-tag">{status(text(task["status"]))}</span>
+                  <span className="workbench-path">{attention.context(task).project}</span>
+                  <ArrowRight className="workbench-arrow" />
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <section className="workbench-section" aria-label={activeSessions.length > 0 ? t("活跃会话", "Active sessions") : t("最近会话", "Recent sessions")}>
+          <div className="workbench-section-head">
+            <span>{activeSessions.length > 0 ? t("活跃会话", "Active sessions") : t("最近会话", "Recent sessions")}</span>
+            <span>{recentSessions.length}</span>
+          </div>
+          {recentSessions.length > 0 ? (
+            <div className="workbench-list">
+              {recentSessions.map((item) => (
+                <button
+                  type="button"
+                  key={item.id}
+                  className="workbench-row"
+                  title={`${sessionLabel(item)} · ${item.cwd}`}
+                  onClick={() => onActivate(item.id)}
+                >
+                  <SessionAgentIcon agent={item.agent} unread={snapshot.unreadSessionIds.includes(item.id)} />
+                  <strong className="truncate">{sessionLabel(item)}</strong>
+                  <span className="workbench-tag">{item.kind === "pty" ? (item.agent === "shell" ? "Shell" : "TUI") : "Chat"}</span>
+                  <span className="workbench-path">{shortPath(item.cwd)}</span>
+                  <StatusMark status={item.status} unread={snapshot.unreadSessionIds.includes(item.id)} pendingPermissions={item.pendingPermissions} pendingQuestions={item.pendingQuestions} busySince={item.busySince} />
+                  <span className="workbench-status">{status(item.status)}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="workbench-empty-hint">
+              {t("暂无进行中或最近的会话，点击上方「新建会话」开始。", "No active or recent sessions yet. Click New session above to begin.")}
+            </div>
+          )}
+        </section>
+
+        <section className="workbench-section" aria-label={t("工作区", "Workspaces")}>
+          <div className="workbench-section-head">
+            <span>{t("最近工作区", "Recent workspaces")}</span>
+            <span>{snapshot.projects.length}</span>
+          </div>
+          {recentProjects.length > 0 ? (
+            <div className="workbench-list">
+              {recentProjects.map((project) => {
+                const name = snapshot.projectAliases[project.toLowerCase()] || fileName(project) || project;
+                const projectSessions = nonBotSessions
+                  .filter((item) => projectForSession([project], item))
+                  .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0));
+                const latest = projectSessions[0];
+                const runningCount = projectSessions.filter((item) => ["running", "starting", "waiting_approval", "waiting_input"].includes(item.status)).length;
+                return (
+                  <div key={project} className="workbench-project-row">
+                    <button
+                      type="button"
+                      className="workbench-row"
+                      title={project}
+                      onClick={() => (latest ? onActivate(latest.id) : onNewSession(project))}
+                    >
+                      <Folder className="workbench-row-icon" />
+                      <strong className="truncate">{name}</strong>
+                      <span className="workbench-path">{shortPath(project)}</span>
+                      <span className="workbench-status">
+                        {runningCount > 0
+                          ? t(`${runningCount} 活跃`, `${runningCount} active`)
+                          : t(`${projectSessions.length} 会话`, `${projectSessions.length} sessions`)}
+                      </span>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="workbench-project-add"
+                      aria-label={t(`在 ${name} 中新建会话`, `New session in ${name}`)}
+                      title={t(`在 ${name} 中新建会话`, `New session in ${name}`)}
+                      onClick={() => onNewSession(project)}
+                    >
+                      <Plus />
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="workbench-empty-hint">
+              <span>{t("尚未添加工作区，选择一个本地项目文件夹即可启动 Agent。", "No workspaces added yet. Add a local folder to get started.")}</span>
+              <Button variant="outline" size="xs" onClick={onAddWorkspace}>
+                <FolderPlus data-icon="inline-start" />
+                {t("选择文件夹", "Choose folder")}
+              </Button>
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
 
 function WorkspaceSession({ session, snapshot, focus, onOpenRun, onOpenSession, onSwitchBotSession, onToggleFocus, onMissingSession, onNativeFocus, empty, onSplit, active = true, focused = true, primary = true }: { onSplit?: (() => void) | undefined; active?: boolean; focused?: boolean; primary?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onOpenSession?: (id: string) => void; onSwitchBotSession?: ((session: SessionInfo) => void) | undefined; onToggleFocus: () => void; onMissingSession: (id: string) => void; onNativeFocus?: (id: string) => void }) {
   const { t } = useLocale();
@@ -361,7 +571,7 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onAc
         const next = event.key === "Home" ? SPLIT_RATIO_MIN : event.key === "End" ? SPLIT_RATIO_MAX : ["ArrowLeft", "ArrowUp"].includes(event.key) ? ratio - 5 : ["ArrowRight", "ArrowDown"].includes(event.key) ? ratio + 5 : undefined;
         if (next !== undefined) { event.preventDefault(); dispatchSplitLayout({ type: "set_ratio", ratio: next }); }
       }} />}
-      {session?.kind !== "pty" && <div className="workspace-session-slot" data-position="primary" data-focused={primaryNonPtyFocused || undefined} onPointerDownCapture={() => active && session && focusSession(session.id)} onFocusCapture={() => active && session && focusSession(session.id)}><WorkspaceSession key={session?.id ?? "empty"} onSplit={session && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} active={active} focused={primaryNonPtyFocused} primary={true} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} /></div>}
+      {session?.kind !== "pty" && <div className="workspace-session-slot" data-position="primary" data-focused={primaryNonPtyFocused || undefined} onPointerDownCapture={() => active && session && focusSession(session.id)} onFocusCapture={() => active && session && focusSession(session.id)}><WorkspaceSession key={session?.id ?? "empty"} onSplit={session && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} active={active} focused={primaryNonPtyFocused} primary={true} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<WorkspaceEmptyWorkbench snapshot={snapshot} onActivate={onActivate} onNewSession={onNewSession} onOpenRun={onOpenRun} onAddWorkspace={onAddWorkspace} />} /></div>}
       {splitSession && splitSession.kind !== "pty" && <div key={splitSession.id} className="workspace-session-slot" data-position="secondary" data-focused={focusedId === splitSession.id || undefined} inert={!active} aria-hidden={!active} onPointerDownCapture={() => active && focusSession(splitSession.id)} onFocusCapture={() => active && focusSession(splitSession.id)}><WorkspaceSession session={splitSession} active={active} focused={focusedId === splitSession.id} primary={false} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} /></div>}
     </div>
   </div>;

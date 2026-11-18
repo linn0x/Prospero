@@ -1,21 +1,25 @@
 /* Maintain readable labels instead of shrinking every tab as more sessions open. */
-.topbar-workspace-tabs.tab-strip .workspace-tab { flex: 0 0 196px; min-width: 196px; max-width: 196px; }
+.topbar-workspace-tabs.tab-strip .workspace-tab { flex: 0 0 184px; min-width: 148px; max-width: 210px; height: 26px; border-radius: var(--ui-radius-control, 6px); font-size: var(--ui-text-caption); padding: 0 3px 0 8px; }
+.topbar-workspace-tabs.tab-strip .workspace-tab-action { width: 20px; height: 20px; }
+.topbar-workspace-tabs.tab-strip .workspace-tab-action svg { width: 12px; height: 12px; }
+.topbar-workspace-tabs.tab-strip .tab-strip-overflow > [data-slot=button] { width: 22px; height: 24px; }
 .topbar-workspace-tabs.tab-strip .workspace-tab.workspace-bot-tab {
   order: -1;
   flex: 0 0 auto;
   min-width: auto;
-  max-width: 180px;
+  max-width: 170px;
   width: auto;
-  padding: 0 10px;
-  gap: 6px;
-  margin-right: 4px;
+  height: 26px;
+  padding: 0 8px;
+  gap: 5px;
+  margin-right: 3px;
   cursor: pointer;
 }
 .topbar-workspace-tabs.tab-strip .workspace-bot-tab-badge {
   font-size: 10px;
   line-height: 1.2;
   padding: 1px 5px;
-  border-radius: 999px;
+  border-radius: var(--ui-radius-control, 4px);
   background: color-mix(in srgb, var(--foreground) 10%, transparent);
   color: var(--muted-foreground);
 }
@@ -24,14 +28,14 @@
   order: 9999;
   display: inline-grid;
   flex: none;
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   place-items: center;
   margin-left: 2px;
   padding: 0;
   color: var(--muted-foreground);
   border: 1px solid transparent;
-  border-radius: var(--ui-radius-control, 6px);
+  border-radius: var(--ui-radius-control, 4px);
   background: transparent;
   cursor: pointer;
   transition: background-color 120ms ease, color 120ms ease;
@@ -42,6 +46,6 @@
   background: color-mix(in srgb, var(--foreground) 8%, transparent);
 }
 .topbar-workspace-tabs.tab-strip .workspace-tab-new svg {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
 }

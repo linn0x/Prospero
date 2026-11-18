@@ -78,7 +78,7 @@ export default function RemoteHostsPane({ settings = { terminalFontFamily: "mono
     await refreshHosts();
   };
   return <div className="page remote-computers-page">
-    <header className="page-header"><div><span className="eyebrow">DESKTOP TO DESKTOP</span><h1>{t("远程电脑", "Remote computers")}</h1><p>{t("通过局域网或中继连接其他电脑，在交互式 Shell 中使用 Agent CLI。", "Connect to another computer over LAN or relay and use its agent CLI in an interactive Shell.")}</p></div></header>
+    <header className="page-header"><div><h1>{t("远程电脑", "Remote computers")}</h1><p>{t("通过局域网或中继连接其他电脑，在交互式 Shell 中使用 Agent CLI。", "Connect to another computer over LAN or relay and use its agent CLI in an interactive Shell.")}</p></div></header>
     <section className="form-card remote-control-card" aria-labelledby="remote-hosts-title">
     <div className="section-title"><Server size={16} /><h2 id="remote-hosts-title">{t("已配对电脑", "Paired computers")}</h2><span>{hosts.length}</span></div>
     <details ref={pairingDetails} className="remote-pairing-details" open={hosts.length === 0}><summary>{t("添加远程电脑", "Add remote computer")}</summary>

@@ -316,4 +316,20 @@ describe("Android 折叠屏适配", () => {
     expect(module).toContain("SCREEN_ORIENTATION_FULL_SENSOR");
     expect(module).toContain("SCREEN_ORIENTATION_UNSPECIFIED");
   });
+
+  it("SplitPaneDivider 在根视图启用高优先级 PanResponder 捕获且拥有 >=28dp 原生触控区", () => {
+    const divider = readFileSync(join(import.meta.dirname, "..", "src/components/SplitPaneDivider.tsx"), "utf8");
+    expect(divider).toContain("const TOUCH_SLOP_HALF = 14;");
+    expect(divider).toContain("const touchWidth = Math.max(seamWidth, TOUCH_SLOP_HALF * 2 + 1);");
+    expect(divider).toContain("marginHorizontal: -overlap");
+    expect(divider).toContain("zIndex: 50");
+    expect(divider).toContain("elevation: 12");
+    expect(divider).toContain("onStartShouldSetPanResponder: () => canDrag()");
+    expect(divider).toContain("onStartShouldSetPanResponderCapture: () => canDrag()");
+    expect(divider).toContain("onMoveShouldSetPanResponder: () => canDrag()");
+    expect(divider).toContain("onMoveShouldSetPanResponderCapture: () => canDrag()");
+    expect(divider).toContain("onShouldBlockNativeResponder: () => true");
+    expect(divider).toContain('pointerEvents="none"');
+    expect(divider).not.toContain("<Pressable");
+  });
 });
