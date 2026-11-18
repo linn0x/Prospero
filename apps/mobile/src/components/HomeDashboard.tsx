@@ -530,7 +530,7 @@ export function HomeDashboard({
         onPress={() => onOpenSession(selectedHost.id, session.id)}
         style={({ pressed }) => [styles.treeSessionRow, pressed && styles.rowPressed]}
       >
-        <AgentIcon agent={session.agent} size={13} badge badgeOutline={false} />
+        <AgentIcon agent={session.agent} size={13} />
         <Text style={styles.treeSessionTitle} numberOfLines={1}>
           {display.title}
         </Text>

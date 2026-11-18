@@ -147,6 +147,7 @@ vi.mock("../src/lib/workspace-concepts", async () => {
 vi.mock("@/lib/outbound-queue", () => import("../src/lib/outbound-queue"));
 vi.mock("@/lib/terminal-font-size", () => import("../src/lib/terminal-font-size"));
 vi.mock("@/lib/focused-session-stream", () => import("../src/lib/focused-session-stream"));
+vi.mock("@/lib/theme", () => import("../src/lib/theme"));
 vi.mock("../src/components/terminal-html", () => ({
   TERMINAL_HTML: "<html></html>",
   TERMINAL_FONT_FAMILY: "Mono",

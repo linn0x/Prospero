@@ -467,7 +467,7 @@ function FoldableSessionRail({
         accessibilityLabel={`打开会话 ${item.title}`}
       >
         {selected && <View style={styles.sessionRailActiveBar} />}
-        <AgentIcon agent={item.agent} size={13} badge badgeOutline={false} />
+        <AgentIcon agent={item.agent} size={13} />
         <Text
           style={[styles.sessionRailItemTitle, selected && styles.sessionRailItemTitleSelected]}
           numberOfLines={1}
@@ -1798,8 +1798,8 @@ export default function SessionScreen() {
         </View>
       )}
       {!isChat && search !== null && <View style={styles.terminalSearchBar}>
-        <Icon name="magnifyingglass" size={16} color="#a1a8b8" />
-        <TextInput style={styles.terminalSearchInput} placeholder="查找终端内容" placeholderTextColor="#6e7687"
+        <Icon name="magnifyingglass" size={16} color={color.textFaint} />
+        <TextInput style={styles.terminalSearchInput} placeholder="查找终端内容" placeholderTextColor={color.textFaint}
           value={search} autoFocus autoCapitalize="none" autoCorrect={false} returnKeyType="search"
           onChangeText={(value) => { setSearch(value); termRef.current?.search(value, false, true); }}
           onSubmitEditing={() => termRef.current?.search(search)} />
@@ -1893,14 +1893,14 @@ export default function SessionScreen() {
               {immersiveTerminal && <View style={[styles.terminalFullscreenControls, { top: Platform.OS === "ios" ? Math.max(0, insets.top - 44) : Math.max(8, insets.top) }]}>
                 <Pressable accessibilityRole="button" accessibilityLabel={terminalToolsVisible ? "隐藏终端工具" : "显示终端工具"}
                   accessibilityState={{ expanded: terminalToolsVisible }} onPress={() => setTerminalToolsVisible((value) => !value)} style={styles.terminalFullscreenButton}>
-                  <Icon name="ellipsis.circle" size={18} color="#e6e8ee" />
+                  <Icon name="ellipsis.circle" size={18} color={color.text} />
                 </Pressable>
                 <Pressable accessibilityRole="button" accessibilityLabel="退出终端全屏" onPress={() => setTerminalFullscreen(false)} style={styles.terminalFullscreenButton}>
-                  <Icon name="arrow.down.right.and.arrow.up.left" size={17} color="#e6e8ee" />
+                  <Icon name="arrow.down.right.and.arrow.up.left" size={17} color={color.text} />
                 </Pressable>
               </View>}
             </View>
-            {!terminalEnded && (!immersiveTerminal || !terminalToolsVisible) && <View style={{ paddingBottom: terminalKeyboardVisible || immersiveTerminal ? 0 : insets.bottom, backgroundColor: "#14161B" }}><KeyBar
+            {!terminalEnded && (!immersiveTerminal || !terminalToolsVisible) && <View style={{ paddingBottom: terminalKeyboardVisible || immersiveTerminal ? 0 : insets.bottom, backgroundColor: color.bg }}><KeyBar
               ref={keyBarRef}
               onKey={terminalKeyboard.sendKey}
               onShortcut={terminalKeyboard.paste}
@@ -2953,8 +2953,8 @@ const MAX_IMAGES = MAX_COMPOSER_IMAGES;
 const useStyles = createThemedStyles((color) => StyleSheet.create({
   adaptiveRoot: { flex: 1, backgroundColor: color.bg },
   adaptiveRootSplit: { flexDirection: "row" },
-  container: { flex: 1, backgroundColor: color.bg },
-  sessionDetail: { minWidth: 0 },
+  container: { flex: 1, backgroundColor: color.surface },
+  sessionDetail: { minWidth: 0, backgroundColor: color.surface },
   sessionFoldGutter: {
     flexShrink: 0,
     backgroundColor: color.bg,
@@ -2965,7 +2965,7 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     flexShrink: 0,
     minWidth: 0,
     overflow: "hidden",
-    backgroundColor: color.surface,
+    backgroundColor: color.bg,
   },
   sessionRailHeader: {
     minHeight: 40,
@@ -2995,7 +2995,7 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     borderRadius: 7,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: color.surface,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
   },
@@ -3012,7 +3012,7 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     borderRadius: 7,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: color.surface,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
   },
@@ -3022,7 +3022,9 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     paddingVertical: 1,
     overflow: "hidden",
     borderRadius: 6,
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
     color: color.textFaint,
     fontSize: 10.5,
     fontWeight: "600",
@@ -3102,7 +3104,9 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     backgroundColor: "transparent",
   },
   sessionRailItemSelected: {
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
   },
   sessionRailActiveBar: {
     position: "absolute",
@@ -3301,15 +3305,15 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#16171a",
+    backgroundColor: color.surface,
   },
-  terminalStack: { flex: 1, backgroundColor: "#16171a" },
-  terminalFullscreenControls: { position: "absolute", right: 8, flexDirection: "row", borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, borderColor: "#2c2e35", backgroundColor: "rgba(29, 30, 34, 0.9)", overflow: "hidden" },
+  terminalStack: { flex: 1, backgroundColor: color.surface },
+  terminalFullscreenControls: { position: "absolute", right: 8, flexDirection: "row", borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, borderColor: color.border, backgroundColor: color.surface, overflow: "hidden" },
   terminalFullscreenButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
-  terminalSearchBar: { minHeight: 48, flexDirection: "row", alignItems: "center", paddingLeft: 12, backgroundColor: "#1d1e22", borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "#2c2e35" },
-  terminalSearchInput: { flex: 1, color: "#e6e8ee", paddingHorizontal: 10, paddingVertical: 8, fontSize: 14 },
+  terminalSearchBar: { minHeight: 48, flexDirection: "row", alignItems: "center", paddingLeft: 12, backgroundColor: color.surface, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: color.border },
+  terminalSearchInput: { flex: 1, color: color.text, paddingHorizontal: 10, paddingVertical: 8, fontSize: 14 },
   terminalSearchAction: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
-  terminalSearchActionText: { color: "#e6e8ee", fontSize: 20 },
+  terminalSearchActionText: { color: color.text, fontSize: 20 },
   terminalEndedActions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 10 },
   terminalEndedButton: { minHeight: 44, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 8, backgroundColor: "#3A5BA8", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
   terminalEndedButtonText: { color: "#fff", fontSize: 14, fontWeight: "600" },
@@ -3358,10 +3362,10 @@ const useStyles = createThemedStyles((color) => StyleSheet.create({
     borderRadius: 10,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
-    backgroundColor: "#14161B",
+    backgroundColor: color.surfaceRaised,
   },
   terminalExtractCode: {
-    color: "#E6E8EE",
+    color: color.text,
     fontSize: 12,
     lineHeight: 18,
     fontFamily: MONOSPACE_FONT,

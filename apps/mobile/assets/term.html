@@ -8,11 +8,15 @@
 <style>
   :root {
     color-scheme: dark;
-    --term-bg: #16171a;
-    --term-surface: #1d1e22;
-    --term-blue: #7ea7ff;
-    --term-cyan: #7dcfff;
-    --term-fg: #e6e8ee;
+    --term-bg: #14171F;
+    --term-surface: #1D212B;
+    --term-border: #232834;
+    --term-blue: #7EA7FF;
+    --term-cyan: #7DCFFF;
+    --term-fg: #F5F7FA;
+    --term-scroll: rgba(126, 167, 255, 0.25);
+    --term-toast-bg: rgba(29, 33, 43, 0.94);
+    --term-toast-border: rgba(126, 167, 255, 0.28);
   }
   html, body {
     margin: 0;
@@ -22,14 +26,6 @@
     overflow: hidden;
   }
   body { position: relative; }
-  body::before {
-    content: "";
-    position: absolute;
-    inset: 0;
-    z-index: 4;
-    pointer-events: none;
-    box-shadow: inset 0 1px rgba(255, 255, 255, 0.04);
-  }
   /*
    * 终端贴底:键盘弹出/收起、折叠屏展开时容器高度逐帧变化，而行数要等尺寸
    * 稳定后才重算。底部对齐让提示符一路贴着键盘上沿走，多出/不够的高度落在
@@ -48,12 +44,12 @@
   .xterm .xterm-viewport {
     overflow-y: auto !important;
     -webkit-overflow-scrolling: touch;
-    scrollbar-color: rgba(122, 162, 247, 0.34) transparent;
+    scrollbar-color: var(--term-scroll) transparent;
   }
   .xterm .xterm-viewport::-webkit-scrollbar { width: 9px; }
   .xterm .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
   .xterm .xterm-viewport::-webkit-scrollbar-thumb {
-    background: rgba(122, 162, 247, 0.25);
+    background: var(--term-scroll);
     border: 3px solid var(--term-bg);
     border-radius: 999px;
   }
@@ -67,10 +63,10 @@
     z-index: 8;
     max-width: min(320px, calc(100vw - 28px));
     padding: 6px 10px;
-    border: 1px solid rgba(122, 162, 247, 0.28);
+    border: 1px solid var(--term-toast-border);
     border-radius: 7px;
-    background: rgba(31, 33, 48, 0.94);
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+    background: var(--term-toast-bg);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
     color: var(--term-fg);
     font: 11px ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
     opacity: 0;
@@ -124,6 +120,62 @@
       : DEFAULT_FONT_FAMILY;
   }
 
+  const DARK_THEME = {
+    background: "#14171F",
+    foreground: "#F5F7FA",
+    cursor: "#F5F7FA",
+    cursorAccent: "#14171F",
+    selectionBackground: "#26457A",
+    selectionInactiveBackground: "#1D212B",
+    scrollbarSliderBackground: "#7EA7FF33",
+    scrollbarSliderHoverBackground: "#7DCFFF66",
+    scrollbarSliderActiveBackground: "#7DCFFF88",
+    black: "#14171F",
+    brightBlack: "#8E97A6",
+    red: "#F56B6B",
+    brightRed: "#F7768E",
+    green: "#52D18E",
+    brightGreen: "#9ECE6A",
+    yellow: "#F2AC42",
+    brightYellow: "#E0AF68",
+    blue: "#7EA7FF",
+    brightBlue: "#7EA7FF",
+    magenta: "#BB9AF7",
+    brightMagenta: "#BB9AF7",
+    cyan: "#7DCFFF",
+    brightCyan: "#7DCFFF",
+    white: "#B8C0CC",
+    brightWhite: "#F5F7FA",
+  };
+  const LIGHT_THEME = {
+    background: "#FFFFFF",
+    foreground: "#0F141C",
+    cursor: "#2454CC",
+    cursorAccent: "#FFFFFF",
+    selectionBackground: "#DAE5FF",
+    selectionInactiveBackground: "#EEF0F5",
+    scrollbarSliderBackground: "#2454CC29",
+    scrollbarSliderHoverBackground: "#2454CC55",
+    scrollbarSliderActiveBackground: "#2454CC77",
+    black: "#0F141C",
+    brightBlack: "#5E6978",
+    red: "#B42323",
+    brightRed: "#D13838",
+    green: "#147247",
+    brightGreen: "#1D8F59",
+    yellow: "#945200",
+    brightYellow: "#B26500",
+    blue: "#2454CC",
+    brightBlue: "#3667DF",
+    magenta: "#7457C7",
+    brightMagenta: "#8A6CE0",
+    cyan: "#0F7490",
+    brightCyan: "#188AAA",
+    white: "#475262",
+    brightWhite: "#0F141C",
+  };
+  const initialThemeScheme = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+
   const term = new window.Terminal({
     scrollback: 3000,
     fontSize: 12,
@@ -133,35 +185,7 @@
     lineHeight: 1.16,
     letterSpacing: 0.1,
     minimumContrastRatio: 4.5,
-    // Tokyo Night —— 与 iTerm2 默认 profile 的深色配色逐值一致,
-    // 让 Mac 壳里的 tmux 终端和用户平时的 iTerm 看起来是同一个终端。
-    theme: {
-      background: "#16171a",
-      foreground: "#e6e8ee",
-      cursor: "#e6e8ee",
-      cursorAccent: "#16171a",
-      selectionBackground: "#2c3e66",
-      selectionInactiveBackground: "#232a3b",
-      scrollbarSliderBackground: "#7ea7ff33",
-      scrollbarSliderHoverBackground: "#7dcfff66",
-      scrollbarSliderActiveBackground: "#7dcfff88",
-      black: "#16171a",
-      brightBlack: "#4a4e59",
-      red: "#f7768e",
-      brightRed: "#f7768e",
-      green: "#9ece6a",
-      brightGreen: "#9ece6a",
-      yellow: "#e0af68",
-      brightYellow: "#e0af68",
-      blue: "#7ea7ff",
-      brightBlue: "#7ea7ff",
-      magenta: "#bb9af7",
-      brightMagenta: "#bb9af7",
-      cyan: "#7dcfff",
-      brightCyan: "#7dcfff",
-      white: "#c1c7d0",
-      brightWhite: "#f5f7fa",
-    },
+    theme: initialThemeScheme === "light" ? LIGHT_THEME : DARK_THEME,
     allowProposedApi: true,
     cursorBlink: true,
     cursorStyle: "bar",
@@ -188,6 +212,34 @@
   function repaint() {
     try { term.refresh(0, term.rows - 1); } catch (e) {}
   }
+  let currentThemeScheme = "";
+  function applyTheme(scheme) {
+    const next = scheme === "light" ? "light" : "dark";
+    if (next === currentThemeScheme) return;
+    currentThemeScheme = next;
+    const root = document.documentElement;
+    root.style.colorScheme = next;
+    if (next === "light") {
+      root.style.setProperty("--term-bg", "#FFFFFF");
+      root.style.setProperty("--term-surface", "#EEF0F5");
+      root.style.setProperty("--term-border", "#E2E5EC");
+      root.style.setProperty("--term-fg", "#0F141C");
+      root.style.setProperty("--term-scroll", "rgba(36, 84, 204, 0.22)");
+      root.style.setProperty("--term-toast-bg", "rgba(238, 240, 245, 0.96)");
+      root.style.setProperty("--term-toast-border", "#E2E5EC");
+    } else {
+      root.style.setProperty("--term-bg", "#14171F");
+      root.style.setProperty("--term-surface", "#1D212B");
+      root.style.setProperty("--term-border", "#232834");
+      root.style.setProperty("--term-fg", "#F5F7FA");
+      root.style.setProperty("--term-scroll", "rgba(126, 167, 255, 0.25)");
+      root.style.setProperty("--term-toast-bg", "rgba(29, 33, 43, 0.94)");
+      root.style.setProperty("--term-toast-border", "rgba(126, 167, 255, 0.28)");
+    }
+    term.options.theme = next === "light" ? LIGHT_THEME : DARK_THEME;
+    repaint();
+  }
+  applyTheme(initialThemeScheme);
   try {
     const gl = new window.WebglAddon.WebglAddon();
     // 折叠屏展开/合上会把 Activity 挪到另一块显示器,GPU 上下文可能随之丢失。
@@ -572,6 +624,8 @@
         else if (m.previous) search.findPrevious(m.text);
         else search.findNext(m.text, { incremental: m.incremental === true });
       }
+    } else if (m.kind === "theme") {
+      applyTheme(m.scheme);
     } else if (m.kind === "clear") {
       term.clear();
     } else if (m.kind === "toast") {

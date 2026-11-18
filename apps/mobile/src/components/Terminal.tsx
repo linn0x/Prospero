@@ -12,6 +12,7 @@ import { toast } from "@/components/Toast";
 import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
 import { subscribeFocusedTerminal } from "@/lib/focused-session-stream";
 import { useFocusedSessionEffect } from "@/lib/use-focused-session-effect";
+import { useMobileTheme } from "@/lib/theme";
 import { TERMINAL_HTML, TERMINAL_FONT_FAMILY } from "./terminal-html";
 
 // source 对象保持稳定,避免会话状态刷新时让原生 WebView 误判为需要重新加载。
@@ -111,6 +112,8 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   },
   ref,
 ) {
+  const { scheme, palette } = useMobileTheme();
+  const schemeRef = useRef(scheme);
   const webRef = useRef<WebView>(null);
   const readyRef = useRef(false);
   const activeRef = useRef(false);
@@ -228,6 +231,11 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   );
 
   useEffect(() => {
+    schemeRef.current = scheme;
+    if (readyRef.current) rx({ kind: "theme", scheme });
+  }, [scheme, rx]);
+
+  useEffect(() => {
     fontSizeRef.current = fontSize;
     if (readyRef.current) rx({ kind: "font", size: fontSize, family: TERMINAL_FONT_FAMILY });
   }, [fontSize, rx]);
@@ -324,6 +332,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           attachedRef.current = false;
           lastSentSizeRef.current = null;
           lastSeqRef.current = 0;
+          rx({ kind: "theme", scheme: schemeRef.current });
           rx({ kind: "activity", active: activeRef.current, metrics: metricsRef.current });
           rx({ kind: "wideCols", cols: wideColsRef.current });
           rx({ kind: "font", size: fontSizeRef.current, family: TERMINAL_FONT_FAMILY });
@@ -468,12 +477,12 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   );
 
   return (
-    <View style={styles.wrap}>
+    <View style={[styles.wrap, { backgroundColor: palette.surface }]}>
       <WebView
         ref={webRef}
         source={TERMINAL_SOURCE}
         onMessage={onMessage}
-        style={styles.web}
+        style={[styles.web, { backgroundColor: palette.surface }]}
         keyboardDisplayRequiresUserAction={false}
         setSupportMultipleWindows={false}
         allowsLinkPreview={false}
@@ -485,25 +494,43 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
       />
       {!inputEnabled && (
         <View
-          style={[styles.inputFrozen, sessionEnded && styles.endedNotice]}
+          style={[
+            styles.inputFrozen,
+            !sessionEnded && {
+              backgroundColor:
+                scheme === "light" ? "rgba(242, 244, 247, 0.82)" : "rgba(11, 13, 18, 0.72)",
+            },
+            sessionEnded && styles.endedNotice,
+          ]}
           pointerEvents={sessionEnded ? "box-none" : "auto"}
         >
           <View
-            style={styles.inputFrozenCard}
+            style={[
+              styles.inputFrozenCard,
+              { backgroundColor: palette.warnBg, borderColor: palette.border },
+            ]}
             accessible={!sessionEnded}
             accessibilityLiveRegion="polite"
             accessibilityLabel={disconnectedMessage}
           >
-            <Text style={styles.inputFrozenText}>{disconnectedMessage}</Text>
+            <Text style={[styles.inputFrozenText, { color: palette.warn }]}>
+              {disconnectedMessage}
+            </Text>
             {sessionEnded && endedActions}
             {onRetryConnection && (
               <Pressable
-                style={({ pressed }) => [styles.inputFrozenRetry, pressed && styles.inputFrozenRetryPressed]}
+                style={({ pressed }) => [
+                  styles.inputFrozenRetry,
+                  { backgroundColor: palette.accent },
+                  pressed && styles.inputFrozenRetryPressed,
+                ]}
                 onPress={onRetryConnection}
                 accessibilityRole="button"
                 accessibilityLabel="重新连接主机后继续终端输入"
               >
-                <Text style={styles.inputFrozenRetryText}>重试连接</Text>
+                <Text style={[styles.inputFrozenRetryText, { color: palette.onAccent }]}>
+                  重试连接
+                </Text>
               </Pressable>
             )}
           </View>

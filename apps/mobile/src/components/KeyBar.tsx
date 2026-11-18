@@ -1,4 +1,4 @@
-import { Fragment, forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { Fragment, forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
@@ -6,6 +6,7 @@ import { toast } from "@/components/Toast";
 import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
 import type { TerminalModifiers } from "@/lib/keys";
 import { type TerminalFontPreference } from "@/lib/terminal-font-size";
+import { useMobileTheme, type ThemePalette } from "@/lib/theme";
 
 interface KeyDef {
   label: string;
@@ -88,18 +89,22 @@ export interface KeyBarProps {
   onRetry?: () => void;
 }
 
+type KeyBarStyles = ReturnType<typeof createStyles>;
+
 function HoldRepeatKey({
   label,
   accessibilityLabel,
   disabled,
   repeatable,
   onTrigger,
+  styles,
 }: {
   label: string;
   accessibilityLabel: string;
   disabled: boolean;
   repeatable?: boolean;
   onTrigger: () => void;
+  styles: KeyBarStyles;
 }) {
   const triggerRef = useRef(onTrigger);
   useEffect(() => {
@@ -199,6 +204,8 @@ export const KeyBar = forwardRef<KeyBarHandle, KeyBarProps>(function KeyBar(
   },
   ref,
 ) {
+  const { palette } = useMobileTheme();
+  const styles = useMemo(() => createStyles(palette), [palette]);
   const { ctrl, option } = modifiers;
   const [expanded, setExpanded] = useState(false);
   const [composerOpen, setComposerOpen] = useState(() => defaultComposerOpen ?? Boolean(onSendText));
@@ -355,7 +362,8 @@ export const KeyBar = forwardRef<KeyBarHandle, KeyBarProps>(function KeyBar(
               if (historyIndex !== -1) setHistoryIndex(-1);
             }}
             placeholder={composerPlaceholder}
-            placeholderTextColor="#8B93A6"
+            placeholderTextColor={palette.textFaint}
+            selectionColor={palette.accent}
             autoCapitalize="none"
             autoCorrect={false}
             multiline
@@ -514,6 +522,7 @@ export const KeyBar = forwardRef<KeyBarHandle, KeyBarProps>(function KeyBar(
                 accessibilityLabel={k.accessibilityLabel ?? k.label}
                 disabled={!enabled}
                 repeatable={k.repeatable}
+                styles={styles}
                 onTrigger={() => {
                   if (k.seq === "\x1b[Z") sendRawShortcut(k.seq);
                   else send(k.seq);
@@ -705,174 +714,176 @@ export const KeyBar = forwardRef<KeyBarHandle, KeyBarProps>(function KeyBar(
 
 const KEY_TOUCH_SLOP = { top: 6, bottom: 6, left: 3, right: 3 };
 
-const styles = StyleSheet.create({
-  bar: {
-    backgroundColor: "#111318",
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#232732",
-  },
-  composerRow: {
-    flexDirection: "row",
-    alignItems: "flex-end",
-    gap: 5,
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#20242F",
-    backgroundColor: "#0D0F14",
-  },
-  composerEscBtn: {
-    minHeight: 32,
-    paddingHorizontal: 9,
-    borderRadius: 7,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2B303E",
-    backgroundColor: "#1A1E27",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  composerEscText: {
-    color: "#CFD5E3",
-    fontSize: 12,
-    fontWeight: "600",
-  },
-  composerInput: {
-    flex: 1,
-    minHeight: 32,
-    maxHeight: 112,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 7,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2C3140",
-    backgroundColor: "#161A23",
-    color: "#EDF0F7",
-    fontSize: 13.5,
-    lineHeight: 19,
-  },
-  composerIconBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 7,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2B303E",
-    backgroundColor: "#1A1E27",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  composerSecondaryBtn: {
-    minHeight: 32,
-    paddingHorizontal: 9,
-    borderRadius: 7,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2B303E",
-    backgroundColor: "#1A1E27",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  composerSecondaryText: {
-    color: "#C5CCDB",
-    fontSize: 12,
-    fontWeight: "600",
-  },
-  composerSendBtn: {
-    minHeight: 32,
-    paddingHorizontal: 11,
-    borderRadius: 7,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#313747",
-    backgroundColor: "#1E232E",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  composerSendBtnActive: {
-    borderColor: "#3A72EB",
-    backgroundColor: "#2F6FEB",
-  },
-  composerSendPressed: {
-    opacity: 0.84,
-  },
-  composerSendText: {
-    color: "#D3D9E6",
-    fontSize: 12.5,
-    fontWeight: "600",
-  },
-  composerSendTextActive: {
-    color: "#FFFFFF",
-    fontWeight: "700",
-  },
-  primaryRow: { flexDirection: "row", alignItems: "center" },
-  content: { paddingHorizontal: 8, paddingVertical: 4, gap: 4, alignItems: "center" },
-  moreKey: {
-    width: 40,
-    minHeight: 36,
-    alignItems: "center",
-    justifyContent: "center",
-    borderLeftWidth: StyleSheet.hairlineWidth,
-    borderLeftColor: "#232732",
-  },
-  moreText: { color: "#9AA3B5", fontSize: 17, fontWeight: "600" },
-  key: {
-    minWidth: 34,
-    minHeight: 30,
-    backgroundColor: "#1B1F29",
-    borderRadius: 6,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2B303E",
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  composerToggleKey: {
-    paddingHorizontal: 9,
-    backgroundColor: "#1D2230",
-    borderColor: "#30384C",
-  },
-  composerToggleText: {
-    fontWeight: "600",
-  },
-  keyPressed: { backgroundColor: "#2A3040", transform: [{ scale: 0.96 }] },
-  keyDisabled: { opacity: 0.38 },
-  modifier: { borderWidth: StyleSheet.hairlineWidth, borderColor: "#323848" },
-  modifierOn: { backgroundColor: "#213C6E", borderColor: "#6B98FA" },
-  keyText: { color: "#E4E7EE", fontSize: 12.5, fontVariant: ["tabular-nums"] },
-  keyTextOn: { color: "#FFFFFF", fontWeight: "700" },
-  followSystemKey: { paddingHorizontal: 10 },
-  followSystemKeyActive: { backgroundColor: "#1D2F4F", borderWidth: StyleSheet.hairlineWidth, borderColor: "#3A5BA8" },
-  followSystemKeyText: { color: "#AFC8FF" },
-  sep: { width: 1, height: 18, alignSelf: "center", marginHorizontal: 2, backgroundColor: "#232732" },
-  ctrlTray: {
-    minHeight: 36,
-    flexDirection: "row",
-    alignItems: "center",
-    paddingLeft: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#20242F",
-  },
-  ctrlLabel: { color: "#7EA7FF", fontSize: 11.5, fontWeight: "600", marginRight: 6 },
-  ctrlContent: { gap: 4, paddingVertical: 4, paddingRight: 10 },
-  ctrlKey: {
-    width: 32,
-    height: 30,
-    borderRadius: 6,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#2B303E",
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "#1B1F29",
-  },
-  ctrlKeyText: { color: "#EAECEF", fontSize: 12, fontWeight: "600" },
-  offlineNotice: {
-    minHeight: 34,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    paddingHorizontal: 12,
-    backgroundColor: "#3A2E17",
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#655022",
-  },
-  offlineText: { flex: 1, color: "#EAC77C", fontSize: 11.5, lineHeight: 16 },
-  offlineRetry: { color: "#FFFFFF", fontSize: 12, fontWeight: "700" },
-});
+function createStyles(palette: ThemePalette) {
+  return StyleSheet.create({
+    bar: {
+      backgroundColor: palette.bg,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: palette.border,
+    },
+    composerRow: {
+      flexDirection: "row",
+      alignItems: "flex-end",
+      gap: 5,
+      paddingHorizontal: 8,
+      paddingVertical: 5,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: palette.border,
+      backgroundColor: palette.bg,
+    },
+    composerEscBtn: {
+      minHeight: 32,
+      paddingHorizontal: 9,
+      borderRadius: 7,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      backgroundColor: palette.surface,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    composerEscText: {
+      color: palette.textDim,
+      fontSize: 12,
+      fontWeight: "600",
+    },
+    composerInput: {
+      flex: 1,
+      minHeight: 32,
+      maxHeight: 112,
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+      borderRadius: 7,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      backgroundColor: palette.surface,
+      color: palette.text,
+      fontSize: 13.5,
+      lineHeight: 19,
+    },
+    composerIconBtn: {
+      width: 32,
+      height: 32,
+      borderRadius: 7,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      backgroundColor: palette.surface,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    composerSecondaryBtn: {
+      minHeight: 32,
+      paddingHorizontal: 9,
+      borderRadius: 7,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      backgroundColor: palette.surface,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    composerSecondaryText: {
+      color: palette.textDim,
+      fontSize: 12,
+      fontWeight: "600",
+    },
+    composerSendBtn: {
+      minHeight: 32,
+      paddingHorizontal: 11,
+      borderRadius: 7,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      backgroundColor: palette.surfaceRaised,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    composerSendBtnActive: {
+      borderColor: palette.accent,
+      backgroundColor: palette.accent,
+    },
+    composerSendPressed: {
+      opacity: 0.84,
+    },
+    composerSendText: {
+      color: palette.text,
+      fontSize: 12.5,
+      fontWeight: "600",
+    },
+    composerSendTextActive: {
+      color: palette.onAccent,
+      fontWeight: "700",
+    },
+    primaryRow: { flexDirection: "row", alignItems: "center" },
+    content: { paddingHorizontal: 8, paddingVertical: 4, gap: 4, alignItems: "center" },
+    moreKey: {
+      width: 40,
+      minHeight: 36,
+      alignItems: "center",
+      justifyContent: "center",
+      borderLeftWidth: StyleSheet.hairlineWidth,
+      borderLeftColor: palette.border,
+    },
+    moreText: { color: palette.textDim, fontSize: 17, fontWeight: "600" },
+    key: {
+      minWidth: 34,
+      minHeight: 30,
+      backgroundColor: palette.surface,
+      borderRadius: 6,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      paddingHorizontal: 9,
+      paddingVertical: 5,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    composerToggleKey: {
+      paddingHorizontal: 9,
+      backgroundColor: palette.surfaceRaised,
+      borderColor: palette.border,
+    },
+    composerToggleText: {
+      fontWeight: "600",
+    },
+    keyPressed: { backgroundColor: palette.pressed, transform: [{ scale: 0.96 }] },
+    keyDisabled: { opacity: 0.38 },
+    modifier: { borderWidth: StyleSheet.hairlineWidth, borderColor: palette.border },
+    modifierOn: { backgroundColor: palette.accentBg, borderColor: palette.accent },
+    keyText: { color: palette.text, fontSize: 12.5, fontVariant: ["tabular-nums"] },
+    keyTextOn: { color: palette.accent, fontWeight: "700" },
+    followSystemKey: { paddingHorizontal: 10 },
+    followSystemKeyActive: { backgroundColor: palette.accentBg, borderWidth: StyleSheet.hairlineWidth, borderColor: palette.accentDim },
+    followSystemKeyText: { color: palette.accent },
+    sep: { width: 1, height: 18, alignSelf: "center", marginHorizontal: 2, backgroundColor: palette.border },
+    ctrlTray: {
+      minHeight: 36,
+      flexDirection: "row",
+      alignItems: "center",
+      paddingLeft: 10,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: palette.border,
+    },
+    ctrlLabel: { color: palette.accent, fontSize: 11.5, fontWeight: "600", marginRight: 6 },
+    ctrlContent: { gap: 4, paddingVertical: 4, paddingRight: 10 },
+    ctrlKey: {
+      width: 32,
+      height: 30,
+      borderRadius: 6,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: palette.border,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: palette.surface,
+    },
+    ctrlKeyText: { color: palette.text, fontSize: 12, fontWeight: "600" },
+    offlineNotice: {
+      minHeight: 34,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 10,
+      paddingHorizontal: 12,
+      backgroundColor: palette.warnBg,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: palette.border,
+    },
+    offlineText: { flex: 1, color: palette.warn, fontSize: 11.5, lineHeight: 16 },
+    offlineRetry: { color: palette.text, fontSize: 12, fontWeight: "700" },
+  });
+}

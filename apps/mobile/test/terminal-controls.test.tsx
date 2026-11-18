@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { KeyBar } from "../src/components/KeyBar";
 import { Terminal } from "../src/components/Terminal";
 import { Emitter } from "../src/lib/emitter";
+import { MobileThemeContext, paletteForScheme } from "../src/lib/theme";
 import type { ConnEvents, HostConnection } from "../src/lib/connection";
 
 const bridge = vi.hoisted(() => ({ post: vi.fn() }));
@@ -11,7 +12,17 @@ vi.stubGlobal("__DEV__", false);
 vi.mock("react-native", async () => {
   const { createElement: el } = await import("react");
   const component = (name: string) => (props: { children?: ReactNode }) => el(name, props, props.children);
-  return { View: component("div"), Text: component("span"), Pressable: component("button"), ScrollView: component("main"), StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1, absoluteFill: {} } };
+  return {
+    View: component("div"),
+    Text: component("span"),
+    Pressable: component("button"),
+    ScrollView: component("main"),
+    Platform: { OS: "android", select: (opts: Record<string, unknown>) => opts.android ?? opts.default },
+    PlatformColor: (name: string) => name,
+    DynamicColorIOS: () => "ios",
+    Appearance: { getColorScheme: () => "dark", setColorScheme: vi.fn() },
+    StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1, absoluteFill: {} },
+  };
 });
 vi.mock("react-native-webview", () => ({ WebView: forwardRef((_props: unknown, ref) => {
   useImperativeHandle(ref, () => ({ postMessage: bridge.post }));
@@ -23,6 +34,7 @@ vi.mock("@/components/Toast", () => ({ toast: vi.fn() }));
 vi.mock("@/lib/outbound-queue", () => import("../src/lib/outbound-queue"));
 vi.mock("@/lib/terminal-font-size", () => import("../src/lib/terminal-font-size"));
 vi.mock("@/lib/focused-session-stream", () => import("../src/lib/focused-session-stream"));
+vi.mock("@/lib/theme", () => import("../src/lib/theme"));
 vi.mock("../src/components/terminal-html", () => ({ TERMINAL_HTML: "<html></html>", TERMINAL_FONT_FAMILY: "Mono" }));
 vi.mock("@/lib/use-focused-session-effect", () => ({ useFocusedSessionEffect: (effect: () => () => void) => useEffect(effect, [effect]) }));
 
@@ -60,5 +72,52 @@ describe("mobile terminal controls", () => {
     expect(conn.resize).not.toHaveBeenCalled();
     expect(conn.inputB64).not.toHaveBeenCalled();
     expect(bridge.post.mock.calls.some(([payload]) => String(payload).includes("completed output"))).toBe(true);
+  });
+
+  it("syncs WebView theme and native container background with the active mobile theme", async () => {
+    vi.useFakeTimers();
+    const events = new Emitter<ConnEvents>();
+    const conn = { host: { id: "host" }, events, isConnected: true, attach: vi.fn(), resize: vi.fn(), detach: vi.fn(), ack: vi.fn(), inputB64: vi.fn() };
+    const light = paletteForScheme("light");
+    const dark = paletteForScheme("dark");
+    await act(async () => {
+      tree = create(
+        createElement(
+          MobileThemeContext.Provider,
+          { value: { scheme: "light", palette: light } },
+          createElement(Terminal, { conn: conn as unknown as HostConnection, sid: "themed", fontSize: 12 }),
+        ),
+      );
+    });
+    const onMessage = tree!.root.findByType("webview").props.onMessage;
+    await act(async () => {
+      onMessage({ nativeEvent: { data: JSON.stringify({ kind: "ready" }) } });
+      await vi.runAllTimersAsync();
+    });
+    expect(tree!.root.findByType("webview").props.style).toEqual(
+      expect.arrayContaining([expect.objectContaining({ backgroundColor: light.surface })]),
+    );
+    expect(
+      bridge.post.mock.calls.some(([payload]) => String(payload).includes('"kind":"theme","scheme":"light"')),
+    ).toBe(true);
+    bridge.post.mockClear();
+    await act(async () => {
+      tree!.update(
+        createElement(
+          MobileThemeContext.Provider,
+          { value: { scheme: "dark", palette: dark } },
+          createElement(Terminal, { conn: conn as unknown as HostConnection, sid: "themed", fontSize: 12 }),
+        ),
+      );
+    });
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    expect(tree!.root.findByType("webview").props.style).toEqual(
+      expect.arrayContaining([expect.objectContaining({ backgroundColor: dark.surface })]),
+    );
+    expect(
+      bridge.post.mock.calls.some(([payload]) => String(payload).includes('"kind":"theme","scheme":"dark"')),
+    ).toBe(true);
   });
 });

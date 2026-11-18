@@ -8,7 +8,7 @@ import {
 } from "react-native";
 
 /** Menlo 不随 Android 分发；monospace 会映射到设备自带的等宽字体。 */
-export const MONOSPACE_FONT = Platform.OS === "ios" ? "Menlo" : "monospace";
+export const MONOSPACE_FONT = Platform?.OS === "ios" ? "Menlo" : "monospace";
 
 /**
  * 明暗两套视觉令牌。页面通过 useMobileTheme / createThemedStyles 读取应用主题，
@@ -121,10 +121,10 @@ const androidResource: Record<keyof ThemePalette, string> = {
 };
 
 function adaptiveColor(name: keyof ThemePalette): string {
-  if (Platform.OS === "ios") {
+  if (Platform?.OS === "ios") {
     return DynamicColorIOS({ light: lightColor[name], dark: darkColor[name] }) as unknown as string;
   }
-  if (Platform.OS === "android") {
+  if (Platform?.OS === "android") {
     return PlatformColor(`@color/${androidResource[name]}`) as unknown as string;
   }
   // Web 仍有完整的深色基线；移动端的 iOS / Android 使用真正的原生动态颜色。
