@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ArrowRight, CircleAlert, Columns2, Files, Folder, FolderPlus, ListChecks, MessageSquare, Plus, WifiOff, X } from "lucide-react";
 import type { DesktopSnapshot, NativeTerminalState, SessionInfo } from "../../../shared/types";
@@ -457,7 +457,25 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onOpenSession, 
   </div>;
 }
 
-export function WorkspacePane({ active = true, snapshot, activeId, openIds, onActivate, onSwitchBotSession, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, onFocusedSessionChange, focus }: { active?: boolean; snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onFocusedSessionChange?: (id: string | undefined) => void; onActivate: (id: string) => void; onSwitchBotSession?: ((session: SessionInfo) => void) | undefined; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; onMissingSession: (id: string) => void; focus: boolean }) {
+type WorkspacePaneProps = {
+  active?: boolean;
+  snapshot: DesktopSnapshot;
+  activeId: string | undefined;
+  openIds: string[];
+  onFocusedSessionChange?: (id: string | undefined) => void;
+  onActivate: (id: string) => void;
+  onSwitchBotSession?: ((session: SessionInfo) => void) | undefined;
+  onClose: (id: string) => void;
+  onNewSession: (project?: string) => void;
+  onOpenRun: (id?: string) => void;
+  onTogglePin: (id: string) => void;
+  onToggleFocus: () => void;
+  onAddWorkspace: () => void;
+  onMissingSession: (id: string) => void;
+  focus: boolean;
+};
+
+export const WorkspacePane = memo(function WorkspacePane({ active = true, snapshot, activeId, openIds, onActivate, onSwitchBotSession, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, onFocusedSessionChange, focus }: WorkspacePaneProps) {
   const { t } = useLocale();
   const session = snapshot.daemon.sessions.find(item => item.id === activeId);
   const [splitLayout, dispatchSplitLayout] = useReducer(reduceSplitLayout, activeId, initialSplitLayoutState);
@@ -575,4 +593,21 @@ export function WorkspacePane({ active = true, snapshot, activeId, openIds, onAc
       {splitSession && splitSession.kind !== "pty" && <div key={splitSession.id} className="workspace-session-slot" data-position="secondary" data-focused={focusedId === splitSession.id || undefined} inert={!active} aria-hidden={!active} onPointerDownCapture={() => active && focusSession(splitSession.id)} onFocusCapture={() => active && focusSession(splitSession.id)}><WorkspaceSession session={splitSession} active={active} focused={focusedId === splitSession.id} primary={false} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} /></div>}
     </div>
   </div>;
-}
+}, (previous, next) => {
+  if (!previous.active && !next.active && previous.activeId === next.activeId) return true;
+  return previous.active === next.active
+    && previous.snapshot === next.snapshot
+    && previous.activeId === next.activeId
+    && previous.openIds === next.openIds
+    && previous.focus === next.focus
+    && previous.onActivate === next.onActivate
+    && previous.onSwitchBotSession === next.onSwitchBotSession
+    && previous.onClose === next.onClose
+    && previous.onNewSession === next.onNewSession
+    && previous.onOpenRun === next.onOpenRun
+    && previous.onTogglePin === next.onTogglePin
+    && previous.onToggleFocus === next.onToggleFocus
+    && previous.onAddWorkspace === next.onAddWorkspace
+    && previous.onMissingSession === next.onMissingSession
+    && previous.onFocusedSessionChange === next.onFocusedSessionChange;
+});

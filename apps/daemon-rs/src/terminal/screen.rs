@@ -140,6 +140,12 @@ impl Screen {
         self.size
     }
 
+    pub(crate) fn scrollback_len(&self) -> usize {
+        self.terminal
+            .as_ref()
+            .map_or(0, |t| t.lines().count().saturating_sub(usize::from(self.size.rows)))
+    }
+
     pub fn kitty_keyboard_flags(&self) -> u16 {
         self.kitty_keyboard[usize::from(self.alt_screen)]
             .last()
@@ -628,6 +634,14 @@ impl Screen {
         }
     }
 
+    pub(crate) fn seed_modes_from(&mut self, other: &Self) {
+        self.modes = other.modes.clone();
+        self.keypad = other.keypad;
+        self.modify_other_keys = other.modify_other_keys;
+        self.kitty_keyboard = other.kitty_keyboard.clone();
+        self.cursor_style = other.cursor_style.clone();
+    }
+
     pub fn snapshot(&self, seq: i64) -> Result<TerminalSnapshot> {
         let terminal = self
             .terminal
@@ -643,13 +657,32 @@ impl Screen {
                 ));
             }
         }
+        let mut last_error = None;
+        for limit in [None, Some(1000), Some(250), Some(0)] {
+            match self.snapshot_with_scrollback_limit(terminal, seq, limit) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| Error::Invalid("terminal checkpoint exceeds limit".into())))
+    }
+
+    fn snapshot_with_scrollback_limit(
+        &self,
+        terminal: &avt::Vt,
+        seq: i64,
+        max_scrollback: Option<usize>,
+    ) -> Result<TerminalSnapshot> {
         let mut ansi = String::new();
         if self.alt_screen
             && let Some(&primary_flags) = self.kitty_keyboard[0].last().filter(|&&f| f > 0)
         {
             ansi.push_str(&format!("\x1b[>{primary_flags}u"));
         }
-        ansi.push_str(&self.expand_dump(&normalize_xterm_dump(&terminal.dump()), None)?);
+        ansi.push_str(&self.expand_dump(
+            &normalize_xterm_dump(&terminal.dump_with_scrollback(max_scrollback)),
+            None,
+        )?);
         for mode in &self.modes {
             ansi.push_str(&format!("\x1b[?{mode}h"));
         }

@@ -96,7 +96,11 @@ impl Vt {
     }
 
     pub fn dump(&self) -> String {
-        let funs = self.terminal.dump();
+        self.dump_with_scrollback(None)
+    }
+
+    pub fn dump_with_scrollback(&self, max_scrollback: Option<usize>) -> String {
+        let funs = self.terminal.dump_with_scrollback(max_scrollback);
         let mut seq = parser::dump(&funs);
 
         seq.push_str(&self.parser.dump());
@@ -245,6 +249,27 @@ mod tests {
         vt2.feed_str(&vt1.dump());
 
         assert_vts_eq(&vt1, &vt2);
+    }
+
+    #[test]
+    fn dump_preserves_scrollback_and_ed3_clears_it() {
+        let mut vt1 = Vt::builder().size(10, 4).scrollback_limit(100).build();
+        for n in 1..=12 {
+            vt1.feed_str(&format!("line{n:02}\r\n"));
+        }
+        assert!(vt1.lines().count() > 4);
+
+        let mut vt2 = Vt::builder().size(10, 4).scrollback_limit(100).build();
+        vt2.feed_str(&vt1.dump());
+        assert_vts_eq(&vt1, &vt2);
+        assert_eq!(vt2.text(), vt1.text());
+
+        let mut vt3 = Vt::builder().size(10, 4).scrollback_limit(100).build();
+        vt3.feed_str(&vt1.dump_with_scrollback(Some(3)));
+        assert_eq!(vt3.lines().count(), 7);
+
+        vt1.feed_str("\x1b[3J");
+        assert_eq!(vt1.lines().count(), 4);
     }
 
     #[test]

@@ -45,7 +45,7 @@ impl Handle {
                     .await
                     .map_err(|_| Error::Closed)?
             }
-            Self::Hosted(h) => h.get("snapshot").await,
+            Self::Hosted(h) => h.reconstruct_scrollback_snapshot(None).await,
         }
     }
     pub async fn checkpoint(&self, after: Option<i64>) -> Result<Option<Archive>> {

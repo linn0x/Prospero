@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import { sessionTabLabels } from "../workspace/session-tab-labels";
 import { projectForSession } from "../workspace-sidebar-state";
 import "./workspace-tabs.css";
@@ -9,10 +10,91 @@ import { cn } from "../lib/utils";
 import { isProsperoBotSession, sessionLabel, sessionStatusLabel, SessionAgentIcon, StatusMark } from "../workspace/session-presentation";
 import { Spinner } from "../components/ui/spinner";
 
-export function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy = false, onSelectBot, onActivate, onClose, onTogglePin, onReorder, onNewSession }: { snapshot: DesktopSnapshot; openIds: string[]; activeId: string | undefined; botSession?: SessionInfo | undefined; botBusy?: boolean | undefined; onSelectBot?: (() => void) | undefined; onActivate: (id: string) => void; onClose: (id: string) => void; onTogglePin: (id: string) => void; onReorder: (ids: string[]) => void; onNewSession?: (project?: string) => void }) {
+type WorkspaceTabsProps = {
+  snapshot: DesktopSnapshot;
+  openIds: string[];
+  activeId: string | undefined;
+  botSession?: SessionInfo | undefined;
+  botBusy?: boolean | undefined;
+  onSelectBot?: (() => void) | undefined;
+  onActivate: (id: string) => void;
+  onClose: (id: string) => void;
+  onTogglePin: (id: string) => void;
+  onReorder: (ids: string[]) => void;
+  onNewSession?: (project?: string) => void;
+};
+
+function arraysEqual(left: readonly string[], right: readonly string[]): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function sameTabSession(left: SessionInfo | undefined, right: SessionInfo | undefined): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.id === right.id
+    && left.title === right.title
+    && left.displayTitle === right.displayTitle
+    && left.status === right.status
+    && left.kind === right.kind
+    && left.agent === right.agent
+    && left.model === right.model
+    && left.accountId === right.accountId
+    && left.cwd === right.cwd
+    && left.pendingPermissions === right.pendingPermissions
+    && left.pendingQuestions === right.pendingQuestions
+    && left.busySince === right.busySince
+    && left.archived === right.archived
+    && left.agentControls?.currentModel === right.agentControls?.currentModel;
+}
+
+function workspaceTabsEqual(previous: WorkspaceTabsProps, next: WorkspaceTabsProps): boolean {
+  if (previous === next) return true;
+  if (
+    previous.activeId !== next.activeId
+    || previous.botBusy !== next.botBusy
+    || !sameTabSession(previous.botSession, next.botSession)
+    || previous.onSelectBot !== next.onSelectBot
+    || previous.onActivate !== next.onActivate
+    || previous.onClose !== next.onClose
+    || previous.onTogglePin !== next.onTogglePin
+    || previous.onReorder !== next.onReorder
+    || previous.onNewSession !== next.onNewSession
+    || !arraysEqual(previous.openIds, next.openIds)
+    || !arraysEqual(previous.snapshot.projects, next.snapshot.projects)
+    || !arraysEqual(previous.snapshot.unreadSessionIds, next.snapshot.unreadSessionIds)
+    || !arraysEqual(previous.snapshot.pinnedSessionIds, next.snapshot.pinnedSessionIds)
+  ) {
+    return false;
+  }
+  const trackedIds = new Set(next.openIds);
+  if (next.activeId) trackedIds.add(next.activeId);
+  if (trackedIds.size === 0) return true;
+  const previousById = new Map<string, SessionInfo>();
+  for (const session of previous.snapshot.daemon.sessions) {
+    if (trackedIds.has(session.id)) previousById.set(session.id, session);
+  }
+  const nextById = new Map<string, SessionInfo>();
+  for (const session of next.snapshot.daemon.sessions) {
+    if (trackedIds.has(session.id)) nextById.set(session.id, session);
+  }
+  if (previousById.size !== nextById.size) return false;
+  for (const [id, session] of nextById) {
+    if (!sameTabSession(previousById.get(id), session)) return false;
+  }
+  return true;
+}
+
+export const WorkspaceTabs = memo(function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy = false, onSelectBot, onActivate, onClose, onTogglePin, onReorder, onNewSession }: WorkspaceTabsProps) {
   const { t } = useLocale();
-  const sessions = new Map(snapshot.daemon.sessions.map((session) => [session.id, session]));
-  const labels = sessionTabLabels(snapshot.daemon.sessions);
+  const sessions = useMemo(
+    () => new Map(snapshot.daemon.sessions.map((session) => [session.id, session])),
+    [snapshot.daemon.sessions],
+  );
   const allIds = openIds.filter((id) => {
     const candidate = sessions.get(id);
     return Boolean(candidate && id !== botSession?.id && !isProsperoBotSession(candidate));
@@ -29,6 +111,10 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy
       })
     : allIds;
   const ids = workspaceScopedIds.length > 0 ? workspaceScopedIds : allIds;
+  const labels = useMemo(
+    () => sessionTabLabels(ids.map((id) => sessions.get(id)!).filter(Boolean)),
+    [ids, sessions],
+  );
   return <TabStrip className="topbar-workspace-tabs" listClassName="workspace-tabs" label={t("打开的会话", "Open sessions")} items={ids.map(id => ({ id, label: `${labels.get(id)} · ${sessionStatusLabel(sessions.get(id)!, snapshot.unreadSessionIds.includes(id), t)} — ${sessions.get(id)!.cwd}`, onSelect: () => onActivate(id), onClose: () => onClose(id) }))} activeId={activeId} onReorder={onReorder}>
     {onSelectBot && (
       <button
@@ -81,4 +167,4 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy
       </button>
     )}
   </TabStrip>;
-}
+}, workspaceTabsEqual);

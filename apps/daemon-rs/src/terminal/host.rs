@@ -105,7 +105,18 @@ fn set_private_dir_permissions(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-async fn read_healthy_mux(mux_dir: &std::path::Path, client: &reqwest::Client) -> Option<MuxInfo> {
+fn same_executable(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+async fn read_healthy_mux(
+    mux_dir: &std::path::Path,
+    expected_executable: &std::path::Path,
+    client: &reqwest::Client,
+) -> Option<MuxInfo> {
     if !owner_alive(mux_dir).ok()? {
         return None;
     }
@@ -115,6 +126,13 @@ async fn read_healthy_mux(mux_dir: &std::path::Path, client: &reqwest::Client) -
     }
     let info: MuxInfo = serde_json::from_slice(&bytes).ok()?;
     if info.version != 1 {
+        return None;
+    }
+    if !info
+        .executable
+        .as_deref()
+        .is_some_and(|exe| same_executable(exe, expected_executable))
+    {
         return None;
     }
     let url = url::Url::parse(&info.base_url).ok()?;
@@ -197,11 +215,15 @@ pub(crate) struct Host {
     token: String,
     client: reqwest::Client,
     stream_supported: bool,
+    scrollback_supported: bool,
     fallback_stream: Arc<HostFallbackStream>,
 }
 impl Host {
     pub fn supports_stream(&self) -> bool {
         self.stream_supported
+    }
+    pub fn supports_scrollback(&self) -> bool {
+        self.scrollback_supported
     }
     pub fn stream_url(&self) -> String {
         format!("{}/stream", self.url.replacen("http://", "ws://", 1))
@@ -323,6 +345,7 @@ impl Host {
             token: connection.token,
             client,
             stream_supported: false,
+            scrollback_supported: false,
             fallback_stream: Arc::default(),
         };
         let identity: serde_json::Value = host.get("identity").await?;
@@ -334,7 +357,128 @@ impl Host {
                 .iter()
                 .any(|item| item.as_str() == Some("terminal.stream.v1"))
         });
+        host.scrollback_supported = identity["capabilities"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str() == Some("terminal.scrollback.v1"))
+        });
         Ok(host)
+    }
+
+    pub async fn reconstruct_scrollback_snapshot(
+        &self,
+        fallback: Option<TerminalSnapshot>,
+    ) -> Result<Option<TerminalSnapshot>> {
+        if self.scrollback_supported {
+            return match fallback {
+                Some(snapshot) => Ok(Some(snapshot)),
+                None => self.get("snapshot").await,
+            };
+        }
+        let Some(snap) = (match fallback {
+            Some(snapshot) => Some(snapshot),
+            None => self.get("snapshot").await?,
+        }) else {
+            return Ok(None);
+        };
+        if snap.seq <= 0 {
+            return Ok(Some(snap));
+        }
+        let Ok(first_page) = self
+            .get::<TerminalPage>("output?afterSeq=0&waitMs=0")
+            .await
+        else {
+            return Ok(Some(snap));
+        };
+        let initial_size = first_page.initial_size;
+        let resynced = first_page.resync_required;
+        let mut cursor = if resynced {
+            first_page.floor_seq
+        } else {
+            0
+        };
+        if cursor > snap.seq {
+            return Ok(Some(snap));
+        }
+        let mut collected = Vec::new();
+        let mut pending_page = if !resynced { Some(first_page) } else { None };
+        while cursor < snap.seq {
+            let page = match pending_page.take() {
+                Some(page) => page,
+                None => match self
+                    .get::<TerminalPage>(&format!("output?afterSeq={cursor}&waitMs=0"))
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(_) => return Ok(Some(snap)),
+                },
+            };
+            if page.resync_required {
+                if page.floor_seq > cursor && page.floor_seq <= snap.seq {
+                    cursor = page.floor_seq;
+                    continue;
+                }
+                return Ok(Some(snap));
+            }
+            if page.events.is_empty() || page.next_seq <= cursor {
+                break;
+            }
+            for (idx, event) in page.events.into_iter().enumerate() {
+                let event_seq = page.base_seq + idx as i64 + 1;
+                if event_seq > snap.seq {
+                    break;
+                }
+                collected.push(event);
+            }
+            cursor = page.next_seq;
+        }
+        if collected.is_empty() {
+            return Ok(Some(snap));
+        }
+        let fallback_snap = snap.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut screen = super::screen::Screen::new(if resynced {
+                fallback_snap.size
+            } else {
+                initial_size
+            });
+            let snap_screen = if resynced {
+                let mut parsed = super::screen::Screen::new(fallback_snap.size);
+                if let Ok(bytes) = STANDARD.decode(&fallback_snap.data_b64) {
+                    parsed.process(&bytes);
+                }
+                screen.seed_modes_from(&parsed);
+                Some(parsed)
+            } else {
+                None
+            };
+            for event in collected {
+                match event {
+                    TerminalEvent::Output { data_b64 } => {
+                        if let Ok(bytes) = STANDARD.decode(data_b64) {
+                            screen.process(&bytes);
+                        }
+                    }
+                    TerminalEvent::Resize { size } => screen.resize(size),
+                }
+            }
+            if screen.size() != fallback_snap.size {
+                screen.resize(fallback_snap.size);
+            }
+            if let Some(snap_screen) = snap_screen {
+                let rows = usize::from(fallback_snap.size.rows);
+                if screen.scrollback_len() == 0
+                    || screen.visible_tail_text(rows) != snap_screen.visible_tail_text(rows)
+                {
+                    return Ok(Some(fallback_snap));
+                }
+            }
+            Ok(Some(
+                screen.snapshot(fallback_snap.seq).unwrap_or(fallback_snap),
+            ))
+        })
+        .await
+        .map_err(|_| Error::Closed)?
     }
 
     /// Deliver bytes to an already-owned terminal without requiring the
@@ -383,24 +527,35 @@ impl Host {
             size,
             base_seq,
         };
-        let mux_dir = data_dir.join("terminal-mux-host");
+        let default_mux_dir = data_dir.join("terminal-mux-host");
         let pin_data_dir = data_dir.clone();
-        let lock_mux_dir = mux_dir.clone();
-        let (executable, _spawn_lock, launch) =
-            tokio::task::spawn_blocking(move || -> Result<(PathBuf, SpawnLockGuard, Launch)> {
+        let versioned_mux_dir = data_dir.join(format!("terminal-mux-host-{}", &expected_hash[..16]));
+        let (executable, mux_dir, _spawn_lock, launch) =
+            tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, SpawnLockGuard, Launch)> {
                 use fs2::FileExt;
-                set_private_dir_permissions(&lock_mux_dir)?;
+                let cache = pin_data_dir.join("terminal-host-runtime");
+                let executable = pin_executable(&exe, &cache, &expected_hash)?;
+                let mut selected_mux_dir = default_mux_dir.clone();
+                if owner_alive(&default_mux_dir).unwrap_or(false)
+                    && let Ok(bytes) = std::fs::read(default_mux_dir.join("mux.json"))
+                    && let Ok(info) = serde_json::from_slice::<MuxInfo>(&bytes)
+                    && !info
+                        .executable
+                        .as_deref()
+                        .is_some_and(|running_exe| same_executable(running_exe, &executable))
+                {
+                    selected_mux_dir = versioned_mux_dir;
+                }
+                set_private_dir_permissions(&selected_mux_dir)?;
                 let lock_file = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
                     .read(true)
                     .write(true)
-                    .open(lock_mux_dir.join("spawn.lock"))?;
+                    .open(selected_mux_dir.join("spawn.lock"))?;
                 lock_file.lock_exclusive()?;
                 let guard = SpawnLockGuard(Some(lock_file));
 
-                let cache = pin_data_dir.join("terminal-host-runtime");
-                let executable = pin_executable(&exe, &cache, &expected_hash)?;
                 if launch
                     .argv
                     .first()
@@ -412,7 +567,7 @@ impl Host {
                 if bytes.len() > 1024 * 1024 {
                     return Err(Error::Invalid("terminal environment exceeds limit".into()));
                 }
-                Ok((executable, guard, launch))
+                Ok((executable, selected_mux_dir, guard, launch))
             })
             .await
             .map_err(|_| Error::Closed)??;
@@ -457,7 +612,7 @@ impl Host {
             .build()
             .map_err(|_| Error::Closed)?;
 
-        let mux_info = match read_healthy_mux(&mux_dir, &client).await {
+        let mux_info = match read_healthy_mux(&mux_dir, &executable, &client).await {
             Some(info) => info,
             None => {
                 let _ = std::fs::remove_file(mux_dir.join("mux.json"));
@@ -470,7 +625,7 @@ impl Host {
                 );
                 let mut connected = None;
                 for _ in 0..600 {
-                    if let Some(info) = read_healthy_mux(&mux_dir, &client).await {
+                    if let Some(info) = read_healthy_mux(&mux_dir, &executable, &client).await {
                         if let Some(mut running) = child.take() {
                             std::thread::spawn(move || {
                                 let _ = running.wait();
@@ -720,7 +875,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
                 .route(
                     "/identity",
                     get(|State(o): State<Owner>| async move {
-                        Json(serde_json::json!({"id":o.id,"version":1,"capabilities":["terminal.stream.v1"]}))
+                        Json(serde_json::json!({"id":o.id,"version":1,"capabilities":["terminal.stream.v1","terminal.scrollback.v1"]}))
                     }),
                 )
                 .route("/stream", get(host_stream))
@@ -1233,7 +1388,7 @@ pub fn run_mux(directory: &std::path::Path) -> Result<()> {
                 Json(serde_json::json!({
                     "id": s.id,
                     "version": 1,
-                    "capabilities": ["terminal.stream.v1"],
+                    "capabilities": ["terminal.stream.v1", "terminal.scrollback.v1"],
                 }))
             };
             let output_handler = |Extension(s): Extension<Arc<MuxSession>>,
@@ -1896,6 +2051,7 @@ mod tests {
         });
         let host = Host {
             stream_supported: false,
+            scrollback_supported: false,
             fallback_stream: Arc::default(),
             directory: tempfile::tempdir().unwrap().path().to_owned(),
             url: format!("http://{address}"),
@@ -1940,6 +2096,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let host = Host {
             stream_supported: false,
+            scrollback_supported: false,
             fallback_stream: Arc::default(),
             directory: directory.path().to_owned(),
             url: format!("http://{address}"),
@@ -1976,6 +2133,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let host = Host {
             stream_supported: false,
+            scrollback_supported: false,
             fallback_stream: Arc::default(),
             directory: directory.path().to_owned(),
             url: format!("http://{address}"),

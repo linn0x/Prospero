@@ -1105,7 +1105,9 @@ impl Terminal {
                 self.dirty_lines.extend(0..self.rows);
             }
 
-            _ => {}
+            EdScope::SavedLines => {
+                self.buffer.clear_scrollback();
+            }
         }
     }
 
@@ -1480,6 +1482,10 @@ impl Terminal {
     }
 
     pub fn dump(&self) -> Vec<Function> {
+        self.dump_with_scrollback(None)
+    }
+
+    pub fn dump_with_scrollback(&self, max_scrollback: Option<usize>) -> Vec<Function> {
         let (primary_ctx, alternate_ctx): (&SavedCtx, &SavedCtx) = match self.active_buffer_type {
             BufferType::Primary => (&self.saved_ctx, &self.alternate_saved_ctx),
             BufferType::Alternate => (&self.alternate_saved_ctx, &self.saved_ctx),
@@ -1488,7 +1494,7 @@ impl Terminal {
         // 1. dump primary screen buffer
 
         let mut funs = Vec::new();
-        dump_buffer(self.primary_buffer(), &mut funs);
+        dump_buffer(self.primary_buffer(), max_scrollback, &mut funs);
 
         // 2. setup tab stops
 
@@ -1554,7 +1560,7 @@ impl Terminal {
             funs.push(Function::Cup(1, 1));
 
             // dump alternate buffer
-            dump_buffer(self.alternate_buffer(), &mut funs);
+            dump_buffer(self.alternate_buffer(), Some(0), &mut funs);
         }
 
         // 5. configure saved context for alternate screen
@@ -1753,11 +1759,16 @@ impl Terminal {
     }
 }
 
-fn dump_buffer(buffer: &Buffer, funs: &mut Vec<Function>) {
+fn dump_buffer(buffer: &Buffer, max_scrollback: Option<usize>, funs: &mut Vec<Function>) {
+    let scrollback_total = buffer.scrollback_len();
+    let keep_scrollback =
+        max_scrollback.map_or(scrollback_total, |limit| scrollback_total.min(limit));
+    let skip = scrollback_total - keep_scrollback;
+    let total = keep_scrollback + buffer.rows;
     let mut cutoff = 0;
     let mut wrapped = false;
 
-    for (i, line) in buffer.view().enumerate() {
+    for (i, line) in buffer.lines().skip(skip).enumerate() {
         if wrapped || line.wrapped || !line.is_blank() {
             cutoff = i + 1;
         }
@@ -1765,10 +1776,11 @@ fn dump_buffer(buffer: &Buffer, funs: &mut Vec<Function>) {
         wrapped = line.wrapped;
     }
 
-    let last = buffer.rows - 1;
+    let last = total - 1;
     let mut pen = Pen::default();
+    let mut prev_wrapped = false;
 
-    for (i, line) in buffer.view().take(cutoff).enumerate() {
+    for (i, line) in buffer.lines().skip(skip).take(cutoff).enumerate() {
         let overlaps: Vec<_> = line
             .cells
             .windows(2)
@@ -1785,7 +1797,7 @@ fn dump_buffer(buffer: &Buffer, funs: &mut Vec<Function>) {
         if overlaps.is_empty() {
             dump_styled_line(line, &mut pen, funs);
         } else {
-            if i > 0 && buffer[i - 1].wrapped {
+            if prev_wrapped {
                 funs.push(Function::Print(' '));
                 funs.push(Function::Cha(1));
             }
@@ -1820,7 +1832,26 @@ fn dump_buffer(buffer: &Buffer, funs: &mut Vec<Function>) {
         }
 
         if i < last && !line.wrapped {
+            if i + 1 >= cutoff && keep_scrollback > 0 && pen != Pen::default() {
+                if let Some(sgr) = to_sgr_diff(&pen, &Pen::default()) {
+                    funs.push(sgr);
+                }
+                pen = Pen::default();
+            }
             funs.push(Function::Cr);
+            funs.push(Function::Lf);
+        }
+
+        prev_wrapped = line.wrapped;
+    }
+
+    if keep_scrollback > 0 && cutoff < total {
+        if pen != Pen::default() {
+            if let Some(sgr) = to_sgr_diff(&pen, &Pen::default()) {
+                funs.push(sgr);
+            }
+        }
+        for _ in cutoff..last {
             funs.push(Function::Lf);
         }
     }

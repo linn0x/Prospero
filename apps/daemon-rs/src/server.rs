@@ -7459,6 +7459,7 @@ async fn proxy_hosted_terminal_stream(
     }
 
     let mut upstream_hello_seen = false;
+    let mut upstream_hello_size: Option<crate::terminal::TerminalSize> = None;
     let mut proxy_error = None;
     loop {
         tokio::select! {
@@ -7474,10 +7475,21 @@ async fn proxy_hosted_terminal_stream(
                 Some(Err(_)) => break,
             },
             remote = host_rx.next() => match remote {
-                Some(Ok(UpMessage::Binary(bytes))) => {
+                Some(Ok(UpMessage::Binary(mut bytes))) => {
                     if !upstream_hello_seen {
                         if crate::terminal::stream_session::is_hello_frame(&bytes) {
                             upstream_hello_seen = true;
+                            if is_cold_attach && !host.supports_scrollback()
+                                && let Ok(frame) = crate::terminal::stream::decode(&bytes)
+                                && let Ok(hello) = serde_json::from_slice::<JsonValue>(&frame.payload)
+                                && let (Some(cols), Some(rows)) = (hello["cols"].as_u64(), hello["rows"].as_u64())
+                                && let (Ok(cols), Ok(rows)) = (u16::try_from(cols), u16::try_from(rows))
+                            {
+                                let size = crate::terminal::TerminalSize { cols, rows };
+                                if size.is_valid() {
+                                    upstream_hello_size = Some(size);
+                                }
+                            }
                         } else if is_cold_attach
                             && crate::terminal::stream_session::is_history_gap_error(&bytes)
                         {
@@ -7489,6 +7501,32 @@ async fn proxy_hosted_terminal_stream(
                                 first_binary,
                             )
                             .await;
+                        }
+                    } else if is_cold_attach
+                        && !host.supports_scrollback()
+                        && let Some(size) = upstream_hello_size.take()
+                        && let Ok(frame) = crate::terminal::stream::decode(&bytes)
+                        && frame.kind == crate::terminal::stream::Kind::Snapshot
+                        && let Ok(seq) = i64::try_from(frame.sequence)
+                    {
+                        let fallback = crate::terminal::TerminalSnapshot {
+                            seq,
+                            size,
+                            data_b64: BASE64_STANDARD.encode(&frame.payload),
+                        };
+                        if let Ok(Some(reconstructed)) =
+                            host.reconstruct_scrollback_snapshot(Some(fallback)).await
+                            && let Ok(payload) = BASE64_STANDARD.decode(&reconstructed.data_b64)
+                            && payload.len() <= crate::terminal::stream::MAX_PAYLOAD
+                            && let Ok(encoded) = crate::terminal::stream::encode(
+                                &crate::terminal::stream::Frame {
+                                    kind: crate::terminal::stream::Kind::Snapshot,
+                                    sequence: frame.sequence,
+                                    payload,
+                                },
+                            )
+                        {
+                            bytes = encoded.into();
                         }
                     }
                     forward!(client_tx, Message::Binary(bytes));

@@ -411,6 +411,7 @@ export class RustRuntime {
   private flushingEventBatch: Promise<void> | undefined;
   private pendingSessionEvents: ChangeEvent[] = [];
   private pendingFullRefresh = false;
+  private pendingOrchestrationRefresh = false;
   private sseStreamConnection: RustConnection | undefined;
   private sseStreamController: AbortController | undefined;
   private readonly sseHealthyScopes = new Set<"sessions" | "orchestration">();
@@ -505,6 +506,7 @@ export class RustRuntime {
     this.orchestrationWindow = {};
     this.orchestrationReady = false;
     this.orchestrationRetryPending = false;
+    this.pendingOrchestrationRefresh = false;
     this.orchestrationConnection = undefined;
     this.nextDevicesPollAt = 0;
     this.slowMetadataReadAt = 0;
@@ -674,6 +676,7 @@ export class RustRuntime {
     this.eventBatchTimer = undefined;
     this.pendingSessionEvents = [];
     this.pendingFullRefresh = false;
+    this.pendingOrchestrationRefresh = false;
     this.sseHealthyScopes.clear();
     this.sseStreamConnection = undefined;
     this.sseStreamController?.abort();
@@ -734,7 +737,7 @@ export class RustRuntime {
               if (scope === "sessions") {
                 this.pendingSessionEvents.push(event);
               } else {
-                this.pendingFullRefresh = true;
+                this.pendingOrchestrationRefresh = true;
               }
               this.scheduleEventBatch();
             },
@@ -781,7 +784,7 @@ export class RustRuntime {
     this.eventBatchTimer = undefined;
     const run = this.processEventBatch().finally(() => {
       this.flushingEventBatch = undefined;
-      if ((this.pendingSessionEvents.length > 0 || this.pendingFullRefresh) && this.ready && !this.controller.signal.aborted) {
+      if ((this.pendingSessionEvents.length > 0 || this.pendingFullRefresh || this.pendingOrchestrationRefresh) && this.ready && !this.controller.signal.aborted) {
         this.scheduleEventBatch();
       }
     });
@@ -789,12 +792,59 @@ export class RustRuntime {
     return run;
   }
 
+  private async refreshOrchestrationOnly(): Promise<void> {
+    if (!this.connection || this.controller.signal.aborted) return;
+    const { client } = this.current();
+    const signal = this.controller.signal;
+    const cursor = await client.events(
+      { scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 },
+      signal,
+    ).catch(() => null);
+    if (!cursor) {
+      await this.refresh();
+      return;
+    }
+    const orchestration = await readOrchestrationWindow(client, signal, cursor.latestSeq).catch((error: unknown) => {
+      this.store.appendLog(`[rust] orchestration read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      return null;
+    });
+    signal.throwIfAborted();
+    if (orchestration) {
+      this.orchestrationWindow = orchestration;
+      this.orchestrationSequence = cursor.latestSeq;
+      this.orchestrationReadAt = Date.now();
+      this.orchestrationReady = true;
+      this.orchestrationRetryPending = false;
+      if (typeof this.store.setApiOrchestration === "function") {
+        this.store.setApiOrchestration(orchestration);
+      } else {
+        await this.refresh();
+      }
+    } else {
+      this.orchestrationRetryPending = true;
+    }
+  }
+
   private async processEventBatch(): Promise<void> {
     if (!this.ready || this.controller.signal.aborted || !this.connection) return;
     const events = this.pendingSessionEvents.splice(0);
     const fullRefresh = this.pendingFullRefresh;
+    const orchestrationRefresh = this.pendingOrchestrationRefresh;
     this.pendingFullRefresh = false;
-    if (events.length === 0 && !fullRefresh) return;
+    this.pendingOrchestrationRefresh = false;
+    if (events.length === 0 && !fullRefresh && !orchestrationRefresh) return;
+
+    if (
+      !fullRefresh
+      && !this.refreshing
+      && this.orchestrationReady
+      && !this.orchestrationRetryPending
+      && events.length === 0
+      && orchestrationRefresh
+    ) {
+      await this.refreshOrchestrationOnly();
+      return;
+    }
 
     if (
       !fullRefresh
@@ -805,6 +855,7 @@ export class RustRuntime {
       && events.every((event) => event.kind === "workspace.tabs")
     ) {
       await this.refresh(true, { tabsOnly: true });
+      if (orchestrationRefresh) await this.refreshOrchestrationOnly();
       return;
     }
 
@@ -817,7 +868,10 @@ export class RustRuntime {
       && events.every((event) => event.kind === "session.updated" && typeof event.entityId === "string" && event.entityId.length > 0)
     ) {
       const applied = await this.tryTargetedSessionPatch(events);
-      if (applied) return;
+      if (applied) {
+        if (orchestrationRefresh) await this.refreshOrchestrationOnly();
+        return;
+      }
     }
 
     await this.refresh();

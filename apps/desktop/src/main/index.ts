@@ -105,6 +105,8 @@ const sessionViewControllers = new Map<string, AbortController>();
 const sessionPageRequests = new RequestRegistry();
 let lastBroadcastSnapshot: ReturnType<StateStore["snapshot"]> | undefined;
 let lastBroadcastWindowId: number | undefined;
+let lastProgressBarKey: string | undefined;
+let lastTrayManagedState: boolean | undefined;
 let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
 let accountActionTail: Promise<void> = Promise.resolve();
 function sendToMainWindow(channel: string, payload: unknown): boolean {
@@ -408,13 +410,21 @@ function broadcastSnapshot(snapshot: ReturnType<StateStore["snapshot"]> = store.
   if (!sendToMainWindow("snapshot:changed", patch)) return;
   const pending = snapshot.daemon.sessions.reduce((total, session) => total + (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0), 0);
   const active = snapshot.daemon.sessions.some((session) => session.status === "running" || session.status === "starting");
-  mainWindow.setProgressBar(pending > 0 ? 1 : active ? 2 : -1, { mode: pending > 0 ? "paused" : active ? "indeterminate" : "none" });
+  const progressValue = pending > 0 ? 1 : active ? 2 : -1;
+  const progressMode = pending > 0 ? "paused" : active ? "indeterminate" : "none";
+  const progressBarKey = `${mainWindow.id}:${String(progressValue)}:${progressMode}`;
+  if (progressBarKey !== lastProgressBarKey) {
+    lastProgressBarKey = progressBarKey;
+    mainWindow.setProgressBar(progressValue, { mode: progressMode });
+  }
   if (pending > previousPendingInteractions) {
     mainWindow.flashFrame(true);
     if (Notification.isSupported()) new Notification({ title: "Prospero 等待你的处理", body: `${String(pending)} 个审批或问题需要处理`, silent: false }).show();
   }
   previousPendingInteractions = pending;
-  refreshTrayMenu();
+  if (runtime.managed !== lastTrayManagedState) {
+    refreshTrayMenu();
+  }
 }
 
 function createWindow(): BrowserWindow {
@@ -563,10 +573,12 @@ function createTray(): void {
 
 function refreshTrayMenu(): void {
   if (!tray) return;
+  const managed = runtime.managed;
+  lastTrayManagedState = managed;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "打开 Prospero", click: showMainWindow },
     { label: "启动 daemon", click: () => void runtime.start() },
-    { label: "重启 daemon", click: () => void runtime.restart(), enabled: runtime.managed },
+    { label: "重启 daemon", click: () => void runtime.restart(), enabled: managed },
     { type: "separator" },
     { label: "退出", click: () => { quitState = "confirming_unload"; app.quit(); } },
   ]));

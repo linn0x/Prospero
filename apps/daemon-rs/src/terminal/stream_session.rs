@@ -117,7 +117,7 @@ impl StreamTarget {
                     .await
                     .map_err(|_| Error::Closed)?
             }
-            Self::HostedFallback(h) => h.get("snapshot").await,
+            Self::HostedFallback(h) => h.reconstruct_scrollback_snapshot(None).await,
         }
     }
     fn fallback_size(&self, default: TerminalSize) -> TerminalSize {

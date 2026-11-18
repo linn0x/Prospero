@@ -951,6 +951,14 @@ export class StateStore extends EventEmitter {
     this.changed();
   }
 
+  setApiOrchestration(orchestration: JsonObject): void {
+    if (this.backend !== "api") throw new Error("API data is not enabled");
+    const next = reuseEquivalent(this.apiState.orchestration, orchestration);
+    if (next === this.apiState.orchestration) return;
+    this.apiState = enforceApiStateBudget({ ...this.apiState, orchestration: next });
+    this.changed();
+  }
+
   setStartupProgress(progress: number, stage: string, pid?: number): void {
     if (pid !== undefined) this.managedPid = pid;
     this.starting = true;

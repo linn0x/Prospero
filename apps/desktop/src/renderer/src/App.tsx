@@ -3619,6 +3619,25 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       .setSessionUnread(id, unread)
       .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : setSessionActionError(reportError(reason)));
   }, [forgetMissingSession]);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+  const activateWorkspaceTab = useCallback((id: string): void => {
+    openSession(id, undefined, { openTab: true });
+  }, [openSession]);
+  const activateWorkspaceSession = useCallback((id: string): void => {
+    openSession(id);
+  }, [openSession]);
+  const toggleWorkspaceFocus = useCallback((): void => {
+    setFocus((current) => !current);
+  }, []);
+  const reorderWorkspaceTabs = useCallback((ids: string[]): void => {
+    setOpenIds((current) => {
+      const next = [...ids, ...current.filter((id) => !ids.includes(id))];
+      const first = snapshotRef.current.daemon.sessions.find((item) => item.id === ids[0]);
+      persistWorkspaceTabs(first ? (projectForSession(snapshotRef.current.projects, first) ?? first.cwd) : undefined, next, activeIdRef.current);
+      return next;
+    });
+  }, [persistWorkspaceTabs]);
   const [focus, setFocus] = useState(() => {
     try {
       return localStorage.getItem(FOCUS_STORAGE_KEY) === "true";
@@ -3845,19 +3864,19 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <span>{t("正在加载工作区…", "Loading workspace…")}</span>
             </div>
           ) : null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
-              {!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} botSession={botSession} botBusy={botCreating} onSelectBot={openBotSession} onActivate={(id) => openSession(id, undefined, { openTab: true })} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => { const next = [...ids, ...current.filter(id => !ids.includes(id))]; const first = sessionSnapshot.daemon.sessions.find(item => item.id === ids[0]); persistWorkspaceTabs(first ? (projectForSession(snapshotRef.current.projects, first) ?? first.cwd) : undefined, next, activeId); return next; })} onNewSession={openNewSession} />}
+              {!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} botSession={botSession} botBusy={botCreating} onSelectBot={openBotSession} onActivate={activateWorkspaceTab} onClose={closeSession} onTogglePin={togglePin} onReorder={reorderWorkspaceTabs} onNewSession={openNewSession} />}
               <WorkspacePane
                 active={localWorkspaceVisible}
                 focus={focus}
                 snapshot={sessionSnapshot}
                 activeId={activeId}
                 openIds={validOpenIds}
-                onActivate={(id) => openSession(id)}
+                onActivate={activateWorkspaceSession}
                 onClose={closeSession}
                 onNewSession={openNewSession}
                 onOpenRun={openRun}
                 onTogglePin={togglePin}
-                onToggleFocus={() => setFocus((current) => !current)}
+                onToggleFocus={toggleWorkspaceFocus}
                 onAddWorkspace={openAddWorkspace}
                 onMissingSession={forgetMissingSession}
                 onFocusedSessionChange={setFocusedSessionId}

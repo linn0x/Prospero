@@ -324,6 +324,17 @@ impl Buffer {
         self.lines.iter()
     }
 
+    pub(crate) fn scrollback_len(&self) -> usize {
+        self.view_offset()
+    }
+
+    pub(crate) fn clear_scrollback(&mut self) {
+        let offset = self.view_offset();
+        if offset > 0 {
+            self.lines.drain(..offset);
+        }
+    }
+
     fn view_offset(&self) -> usize {
         self.lines.len() - self.rows
     }
