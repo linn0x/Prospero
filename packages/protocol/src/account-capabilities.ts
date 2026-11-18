@@ -24,7 +24,7 @@ export function getAgentAccountCapabilities(account: AccountMetadata): AgentAcco
   const engine = getAgentAccountEngine(account);
   return {
     sessionKinds: engine === "opencode" ? ["structured"] : ["pty", "structured"],
-    plan: engine !== "opencode" && engine !== "pi",
+    plan: engine !== "opencode" && engine !== "pi" && !(Boolean(account.apiProfile) && engine === "agy"),
     resume: engine !== "opencode",
     modelSelection: !account.apiProfile,
     reasoningEffort: !account.apiProfile,

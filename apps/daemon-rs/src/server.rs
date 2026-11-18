@@ -1986,7 +1986,7 @@ async fn remote_launch_models(
             }
             Err(error) => out["error"] = json!(error.to_string()),
         },
-        "agy" => match api.agents.agy_launch_catalog().await {
+        "agy" => match api.agents.agy_launch_catalog(account_id.as_deref()).await {
             Ok(catalog) => {
                 let catalog = serde_json::to_value(catalog)?;
                 out["models"] = catalog["models"].clone();
@@ -6548,7 +6548,11 @@ async fn launch_models(
         ));
     }
     if query.agent == "agy" {
-        return Ok(Json(api.agents.agy_launch_catalog().await?));
+        return Ok(Json(
+            api.agents
+                .agy_launch_catalog(query.account_id.as_deref())
+                .await?,
+        ));
     }
     if query.agent != "claude" {
         return Err(ApiError(Error::Invalid(

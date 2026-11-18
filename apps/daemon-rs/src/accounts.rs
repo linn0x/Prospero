@@ -814,6 +814,19 @@ fn pi_profile_capabilities() -> AccountCapabilities {
     }
 }
 
+fn agy_profile_capabilities() -> AccountCapabilities {
+    AccountCapabilities {
+        session_kinds: vec![
+            crate::protocol::SessionKind::Pty,
+            crate::protocol::SessionKind::Structured,
+        ],
+        plan: false,
+        resume: true,
+        model_selection: false,
+        reasoning_effort: false,
+    }
+}
+
 /// Builds one account row for a managed subscription (OAuth/imported-key) account.
 async fn managed_row(
     database: &Database,
@@ -896,6 +909,7 @@ async fn profile_row(
     codex_runtime_ok: bool,
     opencode_runtime_ok: bool,
     pi_runtime_ok: bool,
+    agy_runtime_ok: bool,
     model_source: Option<sources::SourceBindingView>,
 ) -> Result<NativeAccount> {
     let profile = record
@@ -913,6 +927,8 @@ async fn profile_row(
     .map_err(|_| crate::error::Error::Closed)??;
     let engine_agent = if record.agent == crate::protocol::AgentKind::Pi {
         crate::protocol::AgentKind::Pi
+    } else if record.agent == crate::protocol::AgentKind::Agy {
+        crate::protocol::AgentKind::Agy
     } else {
         profile::agent_kind(profile)
     };
@@ -920,6 +936,7 @@ async fn profile_row(
         crate::protocol::AgentKind::Opencode => opencode_runtime_ok,
         crate::protocol::AgentKind::Codex => codex_runtime_ok,
         crate::protocol::AgentKind::Pi => pi_runtime_ok,
+        crate::protocol::AgentKind::Agy => agy_runtime_ok,
         _ => claude_runtime_ok,
     };
     let (status, auth_method, detail) = if !runtime_ok {
@@ -932,6 +949,7 @@ async fn profile_row(
                     crate::protocol::AgentKind::Opencode => "opencode",
                     crate::protocol::AgentKind::Codex => "codex",
                     crate::protocol::AgentKind::Pi => "pi",
+                    crate::protocol::AgentKind::Agy => "agy",
                     _ => "claude",
                 }
             )),
@@ -971,11 +989,13 @@ async fn profile_row(
         crate::protocol::AgentKind::Codex => "codex",
         crate::protocol::AgentKind::Opencode => "opencode",
         crate::protocol::AgentKind::Pi => "pi",
+        crate::protocol::AgentKind::Agy => "agy",
         _ => "claude",
     };
     let capabilities = match engine_agent {
         crate::protocol::AgentKind::Opencode => opencode_profile_capabilities(),
         crate::protocol::AgentKind::Pi => pi_profile_capabilities(),
+        crate::protocol::AgentKind::Agy => agy_profile_capabilities(),
         _ => profile_capabilities(),
     };
     Ok(NativeAccount {
@@ -1185,6 +1205,7 @@ async fn snapshot_with(
                     codex_runtime_ok,
                     opencode_runtime_ok,
                     pi_runtime_ok,
+                    agy_runtime_ok,
                     binding,
                 )
                 .await

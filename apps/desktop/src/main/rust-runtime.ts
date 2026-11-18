@@ -219,7 +219,7 @@ function requireProfileKey(raw: unknown, { allowBlank }: { allowBlank: boolean }
 function profileDefaultsForAgent(agent: unknown): { provider: "anthropic_compatible" | "openai_compatible"; protocol: "anthropic" | "openai_responses" | "openai_chat_completions" } {
   if (agent === "claude") return { provider: "anthropic_compatible", protocol: "anthropic" };
   if (agent === "codex") return { provider: "openai_compatible", protocol: "openai_responses" };
-  if (agent === "opencode") return { provider: "openai_compatible", protocol: "openai_chat_completions" };
+  if (agent === "opencode" || agent === "agy") return { provider: "openai_compatible", protocol: "openai_chat_completions" };
   if (agent === "pi") return { provider: "anthropic_compatible", protocol: "anthropic" };
   throw new Error("Agent 不支持 API Profile");
 }
@@ -238,7 +238,7 @@ function requireProfileProtocol(agent: unknown, input: Record<string, unknown>, 
   const valid =
     agent === "claude"
       ? provider === "anthropic_compatible" && protocol === "anthropic"
-      : agent === "opencode"
+      : agent === "opencode" || agent === "agy"
         ? provider === "openai_compatible" && protocol === "openai_chat_completions"
         : agent === "pi"
           ? (provider === "anthropic_compatible" && protocol === "anthropic") ||
@@ -1630,8 +1630,7 @@ export class RustRuntime {
           } else if (agent === "pi") {
             accountId = rawAccountId === NATIVE_PI_ACCOUNT ? NATIVE_PI_ACCOUNT : requireManagedAccountId(rawAccountId);
           } else if (agent === "agy") {
-            if (rawAccountId !== NATIVE_AGY_ACCOUNT) throw new Error("Antigravity (agy) 仅支持本机 Antigravity 订阅账号");
-            accountId = NATIVE_AGY_ACCOUNT;
+            accountId = rawAccountId === NATIVE_AGY_ACCOUNT ? NATIVE_AGY_ACCOUNT : requireManagedAccountId(rawAccountId);
           } else throw new Error("此 Agent 的账号选择尚未接入 Rust daemon");
         }
         if ((model || effort) && agent !== "claude" && agent !== "codex" && agent !== "pi" && agent !== "agy") throw new Error("此 Agent 的模型参数尚未接入 Rust daemon");
@@ -1642,10 +1641,8 @@ export class RustRuntime {
       const agent = input["agent"];
       if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode" && agent !== "pi" && agent !== "agy") throw new Error("Rust Agent 当前仅接入 Claude/Codex/DeepSeek/OpenCode/Pi/Antigravity");
       if (agent === "opencode" && input["accountId"] === undefined) throw new Error("OpenCode 需要 API Profile");
-      if (agent === "agy" && input["accountId"] !== undefined && input["accountId"] !== NATIVE_AGY_ACCOUNT) throw new Error("Antigravity (agy) 仅支持本机 Antigravity 订阅账号");
       const accountId =
         agent === "deepseek" ||
-        agent === "agy" ||
         input["accountId"] === undefined ||
         input["accountId"] === NATIVE_CLAUDE_ACCOUNT ||
         input["accountId"] === NATIVE_CODEX_ACCOUNT ||

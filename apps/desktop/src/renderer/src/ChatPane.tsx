@@ -156,7 +156,7 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
   const sourceState = useModelSources(supported && open && useSource);
   const [agent, setAgent] = useState<ChildDispatchAgent>("codex");
   const sourceAgent: SourceRuntimeAgent =
-    agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi" ? agent : "codex";
+    agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi" || agent === "agy" ? agent : "codex";
   const [workspace, setWorkspace] = useState(session.cwd);
   const [accountId, setAccountId] = useState<string | undefined>(() =>
     defaultSessionLaunchAccountId(independentAccounts, "codex"),
@@ -338,7 +338,7 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
                 aria-pressed={useSource}
                 disabled={busy}
                 onClick={() => {
-                  if (agent === "deepseek" || agent === "agy") setAgent("codex");
+                  if (agent === "deepseek") setAgent("codex");
                   setUseSource(true);
                 }}
               >
@@ -369,7 +369,7 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
                 <NativeSelectOption value="claude">Claude Code</NativeSelectOption>
                 <NativeSelectOption value="opencode">OpenCode</NativeSelectOption>
                 <NativeSelectOption value="pi">Pi</NativeSelectOption>
-                {!useSource && <NativeSelectOption value="agy">Antigravity (agy)</NativeSelectOption>}
+                <NativeSelectOption value="agy">Antigravity (agy)</NativeSelectOption>
                 {!useSource && <NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption>}
               </NativeSelect>
             </div>
@@ -519,7 +519,7 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
       : "codex";
   const [agent, setAgent] = useState<ChildDispatchAgent>(initialAgent);
   const sourceAgent: SourceRuntimeAgent =
-    agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi" ? agent : "codex";
+    agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi" || agent === "agy" ? agent : "codex";
   const [workspace, setWorkspace] = useState(session.cwd);
   const [accountId, setAccountId] = useState<string | undefined>(
     session.accountId ?? defaultSessionLaunchAccountId(independentAccounts, initialAgent),
@@ -807,8 +807,8 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
                 <NativeSelectOption value="claude">Claude Code</NativeSelectOption>
                 <NativeSelectOption value="opencode">OpenCode</NativeSelectOption>
                 <NativeSelectOption value="pi">Pi</NativeSelectOption>
+                <NativeSelectOption value="agy">AGY</NativeSelectOption>
                 {!useSource && <NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption>}
-                {!useSource && <NativeSelectOption value="agy">AGY</NativeSelectOption>}
               </NativeSelect>
             </div>
             {!useSource && launchAccounts.length > 0 && (

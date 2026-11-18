@@ -126,6 +126,7 @@ pub(crate) fn profile_account_root_for_agent(
         AgentKind::Codex => "codex",
         AgentKind::Opencode => "opencode",
         AgentKind::Pi => "pi",
+        AgentKind::Agy => "agy",
         _ => "claude",
     };
     account_root_for_agent(data, agent, id)
@@ -332,10 +333,45 @@ pub(crate) fn profile_account_environment(
     if agent == AgentKind::Pi {
         return pi_environment(&root, profile, &secret);
     }
+    if agent == AgentKind::Agy {
+        return agy_environment(&root, profile, &secret);
+    }
     if profile.protocol() == "openai_chat_completions" {
         return opencode_environment(&root, profile, &secret);
     }
     Ok(session_environment(&root, profile, &secret))
+}
+
+fn agy_environment(
+    root: &Path,
+    profile: &ApiProfile,
+    secret: &str,
+) -> Result<Vec<(String, String)>> {
+    ensure_private_dir(root)?;
+    let gateway_models = if profile.model == "gemini-3.1-flash-lite-preview" {
+        profile.model.clone()
+    } else {
+        format!("{},gemini-3.1-flash-lite-preview", profile.model)
+    };
+    let mut env = vec![
+        ("AGY_LLM_GATEWAY_URL".into(), profile.base_url.clone()),
+        ("AGY_LLM_GATEWAY_WIRE_PROTOCOL".into(), "openai".into()),
+        ("AGY_LLM_GATEWAY_API_KEY".into(), secret.to_owned()),
+        ("AGY_LLM_GATEWAY_MODELS".into(), gateway_models),
+        ("AGY_LLM_GATEWAY_TIER_PRO".into(), profile.model.clone()),
+        ("AGY_LLM_GATEWAY_TIER_FLASH".into(), profile.model.clone()),
+        (
+            "AGY_LLM_GATEWAY_TIER_FLASH_LITE".into(),
+            profile.model.clone(),
+        ),
+    ];
+    if let Some(headers) = profile.headers.as_ref().filter(|map| !map.is_empty()) {
+        env.push((
+            "AGY_LLM_GATEWAY_HEADERS".into(),
+            serde_json::to_string(headers)?,
+        ));
+    }
+    Ok(env)
 }
 
 fn pi_environment(
@@ -587,6 +623,7 @@ fn agent_from_storage(raw: Option<&str>, profile: Option<&ApiProfile>) -> AgentK
         Some("codex") => AgentKind::Codex,
         Some("opencode") => AgentKind::Opencode,
         Some("pi") => AgentKind::Pi,
+        Some("agy") => AgentKind::Agy,
         Some("claude") => AgentKind::Claude,
         _ => profile
             .map(super::profile::agent_kind)
@@ -599,6 +636,7 @@ fn agent_label_value(agent: AgentKind) -> &'static str {
         AgentKind::Codex => "codex",
         AgentKind::Opencode => "opencode",
         AgentKind::Pi => "pi",
+        AgentKind::Agy => "agy",
         _ => "claude",
     }
 }
@@ -606,6 +644,9 @@ fn agent_label_value(agent: AgentKind) -> &'static str {
 fn profile_engine_label(agent: AgentKind, profile: Option<&ApiProfile>) -> &'static str {
     if agent == AgentKind::Pi {
         return "pi";
+    }
+    if agent == AgentKind::Agy {
+        return "agy";
     }
     agent_label_value(profile.map(super::profile::agent_kind).unwrap_or(agent))
 }
@@ -616,6 +657,7 @@ fn agent_label(agent: AgentKind) -> Result<&'static str> {
         AgentKind::Codex => Ok("codex"),
         AgentKind::Opencode => Ok("opencode"),
         AgentKind::Pi => Ok("pi"),
+        AgentKind::Agy => Ok("agy"),
         _ => Err(Error::Invalid("Agent 不支持 API Profile".into())),
     }
 }
@@ -627,7 +669,7 @@ pub(crate) fn validate_profile_agent(agent: AgentKind, profile: &ApiProfile) -> 
             profile.protocol(),
             "openai_responses" | "openai_chat_completions"
         ),
-        AgentKind::Opencode => profile.protocol() == "openai_chat_completions",
+        AgentKind::Opencode | AgentKind::Agy => profile.protocol() == "openai_chat_completions",
         AgentKind::Pi => matches!(
             profile.protocol(),
             "anthropic" | "openai_responses" | "openai_chat_completions"
@@ -721,6 +763,7 @@ impl crate::database::Store {
                 "codex" => AgentKind::Codex,
                 "opencode" => AgentKind::Opencode,
                 "pi" => AgentKind::Pi,
+                "agy" => AgentKind::Agy,
                 _ => continue,
             };
             if validate_profile_agent(agent, &profile).is_err() {
@@ -1520,5 +1563,61 @@ mod tests {
                 .iter()
                 .all(|(key, _)| key != "ANTHROPIC_API_KEY")
         );
+    }
+
+    #[test]
+    fn agy_profile_generates_llm_gateway_environment() {
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("X-Tenant".into(), "prospero".into());
+        let profile = ApiProfile {
+            provider: "openai_compatible".into(),
+            protocol: Some("openai_chat_completions".into()),
+            base_url: "https://gateway.example/v1".into(),
+            model: "gpt-5.4".into(),
+            model_capabilities: None,
+            headers: Some(headers),
+        };
+        let record = store
+            .create_api_profile_account(
+                directory.path(),
+                "AGY Gateway",
+                AgentKind::Agy,
+                &profile,
+                "agy-secret-key",
+            )
+            .unwrap();
+        assert_eq!(record.agent, AgentKind::Agy);
+        let environment = profile_account_environment(
+            directory.path(),
+            &record.id,
+            record.agent,
+            record.api_profile.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(environment.contains(&(
+            "AGY_LLM_GATEWAY_URL".into(),
+            "https://gateway.example/v1".into()
+        )));
+        assert!(environment.contains(&("AGY_LLM_GATEWAY_WIRE_PROTOCOL".into(), "openai".into())));
+        assert!(environment.contains(&("AGY_LLM_GATEWAY_API_KEY".into(), "agy-secret-key".into())));
+        assert!(environment.contains(&(
+            "AGY_LLM_GATEWAY_MODELS".into(),
+            "gpt-5.4,gemini-3.1-flash-lite-preview".into()
+        )));
+        assert!(environment.contains(&("AGY_LLM_GATEWAY_TIER_PRO".into(), "gpt-5.4".into())));
+        assert!(environment.contains(&("AGY_LLM_GATEWAY_TIER_FLASH".into(), "gpt-5.4".into())));
+        assert!(environment.contains(&("AGY_LLM_GATEWAY_TIER_FLASH_LITE".into(), "gpt-5.4".into())));
+        assert!(environment.contains(&(
+            "AGY_LLM_GATEWAY_HEADERS".into(),
+            r#"{"X-Tenant":"prospero"}"#.into()
+        )));
+
+        let invalid = ApiProfile {
+            protocol: Some("openai_responses".into()),
+            ..profile
+        };
+        assert!(validate_profile_agent(AgentKind::Agy, &invalid).is_err());
     }
 }

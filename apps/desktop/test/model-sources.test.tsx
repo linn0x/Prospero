@@ -83,10 +83,14 @@ describe("model source selection and IPC", () => {
     expect(sourceRouteSupportsAgent(mixed.routes[2]!, "claude")).toBe(true);
     expect(sourceRouteSupportsAgent(mixed.routes[0]!, "opencode")).toBe(false);
     expect(sourceRouteSupportsAgent(mixed.routes[3]!, "opencode")).toBe(true);
+    expect(sourceRouteSupportsAgent(mixed.routes[0]!, "agy")).toBe(false);
+    expect(sourceRouteSupportsAgent(mixed.routes[3]!, "agy")).toBe(true);
     expect(defaultSourceSelection([mixed], undefined, "claude")).toMatchObject({ routeId: "route-c", agent: "claude" });
     expect(defaultSourceSelection([mixed], undefined, "opencode")).toMatchObject({ routeId: "route-d", agent: "opencode" });
+    expect(defaultSourceSelection([mixed], undefined, "agy")).toMatchObject({ routeId: "route-d", agent: "agy" });
     expect(selectedSourceRoute([mixed], { sourceId: mixed.id, routeId: "route-c", revision: mixed.revision }, "codex")).toBeUndefined();
     expect(selectedSourceRoute([mixed], { sourceId: mixed.id, routeId: "route-a", revision: mixed.revision }, "opencode")).toBeUndefined();
+    expect(selectedSourceRoute([mixed], { sourceId: mixed.id, routeId: "route-a", revision: mixed.revision }, "agy")).toBeUndefined();
   });
 
   it("preserves configured model capabilities when enabling an existing catalog model", () => {
@@ -163,11 +167,12 @@ describe("model source selection and IPC", () => {
     expect(effortHtml).toContain("ultra");
   });
 
-  it("keeps OpenCode and Pi available in the shared model source session runtime selector", () => {
+  it("keeps OpenCode, Pi, and Antigravity available in the shared model source session runtime selector", () => {
     const app = readFileSync(new URL("../src/renderer/src/App.tsx", import.meta.url), "utf8");
     expect(app).toContain('<NativeSelectOption value="opencode">OpenCode</NativeSelectOption>');
     expect(app).toContain('<NativeSelectOption value="pi">Pi</NativeSelectOption>');
-    expect(app).toContain('input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" ? input.agent : "codex"');
+    expect(app).toContain('<NativeSelectOption value="agy">Antigravity (agy)</NativeSelectOption>');
+    expect(app).toContain('input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" || input.agent === "agy" ? input.agent : "codex"');
   });
 
   it("keeps sources and native accounts on the same page, without a new navigation tab", () => {

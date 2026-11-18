@@ -291,7 +291,7 @@ export default function OrchestrationScreen() {
     accountsFor(agent).find((account) => account.isDefault)?.id ?? accountsFor(agent)[0]?.id;
 
   const sourceRoutesFor = (agent: AgentKind) => {
-    if (agent !== "claude" && agent !== "codex" && agent !== "opencode" && agent !== "pi") return [];
+    if (agent !== "claude" && agent !== "codex" && agent !== "agy" && agent !== "opencode" && agent !== "pi") return [];
     const codeAgent = agent as CodeAgentKind;
     return modelSources.flatMap((source) =>
       availableSourceRoutes(source, codeAgent).map((route) => ({ source, route })),
@@ -1820,6 +1820,7 @@ export default function OrchestrationScreen() {
                                 if (
                                   automationAgent === "claude" ||
                                   automationAgent === "codex" ||
+                                  automationAgent === "agy" ||
                                   automationAgent === "opencode" ||
                                   automationAgent === "pi"
                                 ) {
@@ -1968,6 +1969,7 @@ export default function OrchestrationScreen() {
                                 if (
                                   workerAgent === "claude" ||
                                   workerAgent === "codex" ||
+                                  workerAgent === "agy" ||
                                   workerAgent === "opencode" ||
                                   workerAgent === "pi"
                                 ) {

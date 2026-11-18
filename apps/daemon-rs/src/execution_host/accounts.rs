@@ -105,7 +105,7 @@ fn validate_reference(reference: &AccountSnapshotRef) -> Result<()> {
             .all(|byte| byte.is_ascii_hexdigit())
         || !matches!(
             reference.engine,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi | AgentKind::Agy
         )
     {
         return Err(invalid_snapshot());
@@ -293,7 +293,7 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
         || snapshot.credential.secret.contains(['\r', '\n', '\0'])
         || !matches!(
             snapshot.account_agent,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi | AgentKind::Agy
         )
     {
         return Err(invalid_snapshot());
@@ -315,6 +315,8 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
         Some(profile) => {
             let engine = if snapshot.account_agent == AgentKind::Pi {
                 AgentKind::Pi
+            } else if snapshot.account_agent == AgentKind::Agy {
+                AgentKind::Agy
             } else {
                 profile::agent_kind(profile)
             };
@@ -332,6 +334,7 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
                 AgentKind::Codex => "codex",
                 AgentKind::Opencode => "opencode",
                 AgentKind::Pi => "pi",
+                AgentKind::Agy => "agy",
                 _ => return Err(invalid_snapshot()),
             };
             profile::clean_profile(
@@ -419,7 +422,7 @@ pub(crate) async fn capture(
     validate_account_id(account_id)?;
     if !matches!(
         agent,
-        AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi | AgentKind::Agy
     ) {
         return Err(invalid_snapshot());
     }
@@ -479,6 +482,8 @@ pub(crate) async fn capture(
                 crate::accounts::config::read_defaults(&data, &target)?;
             let engine = if record.agent == AgentKind::Pi {
                 AgentKind::Pi
+            } else if record.agent == AgentKind::Agy {
+                AgentKind::Agy
             } else {
                 record
                     .api_profile

@@ -1952,21 +1952,23 @@ impl Terminals {
                 }))
             }
             (crate::protocol::AgentKind::Agy, None) => {
-                match input.account_id.as_deref() {
-                    None | Some(crate::accounts::NATIVE_AGY_ID) => {}
-                    Some(_) => {
-                        return Err(Error::Invalid(
-                            "Antigravity (agy) 仅支持本机 Antigravity 订阅账号".into(),
-                        ));
-                    }
-                }
-                let (resolved_model, resolved_effort, model_effort_args) =
-                    crate::agent::agy::resolve_cli_model_and_effort(
-                        model.as_deref(),
-                        effort.as_deref(),
-                    );
-                input.model = resolved_model;
-                input.effort = resolved_effort;
+                let (environment, account_id, profile) = self
+                    .resolve_agy_terminal_account(input.account_id.clone())
+                    .await?;
+                let model_effort_args = if let Some(profile) = profile.as_ref() {
+                    input.model = Some(profile.model.clone());
+                    input.effort = None;
+                    vec!["--model".into(), profile.model.clone()]
+                } else {
+                    let (resolved_model, resolved_effort, args) =
+                        crate::agent::agy::resolve_cli_model_and_effort(
+                            model.as_deref(),
+                            effort.as_deref(),
+                        );
+                    input.model = resolved_model;
+                    input.effort = resolved_effort;
+                    args
+                };
                 let mut args = match policy {
                     crate::protocol::TerminalApprovalPolicy::Strict => Vec::new(),
                     crate::protocol::TerminalApprovalPolicy::Standard => {
@@ -1980,8 +1982,8 @@ impl Terminals {
                 Ok(Some(ProgramSpec {
                     program: crate::agent::agy::binary(),
                     args,
-                    environment: Vec::new(),
-                    account_id: Some(crate::accounts::NATIVE_AGY_ID.into()),
+                    environment,
+                    account_id,
                 }))
             }
             (crate::protocol::AgentKind::Grok, None) => {
@@ -2224,6 +2226,64 @@ impl Terminals {
                     .api_profile
                     .ok_or_else(|| Error::Invalid("所选账号不支持 Pi PTY".into()))?;
                 if record.agent != crate::protocol::AgentKind::Pi {
+                    return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                }
+                let env_id = record.id.clone();
+                let env_profile = profile.clone();
+                let agent = record.agent;
+                let env = tokio::task::spawn_blocking(move || {
+                    crate::accounts::managed::profile_account_environment(
+                        &data,
+                        &env_id,
+                        agent,
+                        &env_profile,
+                    )
+                })
+                .await
+                .map_err(|_| Error::Closed)??;
+                Ok((env, Some(record.id), Some(profile)))
+            }
+        }
+    }
+
+    async fn resolve_agy_terminal_account(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<(
+        Vec<(String, String)>,
+        Option<String>,
+        Option<crate::accounts::ApiProfile>,
+    )> {
+        match account_id.as_deref() {
+            None | Some(crate::accounts::NATIVE_AGY_ID) => {
+                Ok((Vec::new(), Some(crate::accounts::NATIVE_AGY_ID.into()), None))
+            }
+            Some(account_id) => {
+                let data = self.0.database.directory().to_owned();
+                let id = account_id.to_owned();
+                let record = self
+                    .0
+                    .database
+                    .call({
+                        let database = self.0.database.clone();
+                        let data = data.clone();
+                        let id = id.clone();
+                        move |store| {
+                            if let Some(message) =
+                                crate::accounts::source_bound_launch_error(&database, &id)?
+                            {
+                                return Err(Error::Invalid(message));
+                            }
+                            store.managed_snapshot_row(&data, &id)
+                        }
+                    })
+                    .await?;
+                let profile = record
+                    .api_profile
+                    .ok_or_else(|| Error::Invalid("所选账号不支持 Antigravity (agy) PTY".into()))?;
+                if record.agent != crate::protocol::AgentKind::Agy
+                    || profile.protocol() != "openai_chat_completions"
+                {
                     return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
                 }
                 let env_id = record.id.clone();

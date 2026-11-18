@@ -1484,19 +1484,40 @@ impl Agents {
             match input.account_id.as_deref() {
                 None | Some(crate::accounts::NATIVE_AGY_ID) => {
                     input.account_id = None;
+                    let (normalized_model, normalized_effort, _) =
+                        super::agy::resolve_cli_model_and_effort(
+                            input.model.as_deref(),
+                            input.effort.as_deref(),
+                        );
+                    input.model = normalized_model;
+                    input.effort = normalized_effort;
                 }
-                Some(_) => {
-                    return Err(Error::Invalid(
-                        "Antigravity (agy) 仅支持使用本机 Antigravity 订阅账号".into(),
-                    ));
+                Some(account_id) => {
+                    let data = self.0.database.directory().to_owned();
+                    let account_id = account_id.to_owned();
+                    let record = self
+                        .0
+                        .database
+                        .call_control("agent.create", move |store| {
+                            store.managed_snapshot_row(&data, &account_id)
+                        })
+                        .await?;
+                    let valid_profile = record.agent == crate::protocol::AgentKind::Agy
+                        && record
+                            .api_profile
+                            .as_ref()
+                            .is_some_and(|profile| profile.protocol() == "openai_chat_completions");
+                    if !valid_profile {
+                        return Err(Error::Invalid(
+                            "所选账号不支持 Antigravity (agy) structured runtime".into(),
+                        ));
+                    }
+                    if let Some(profile) = record.api_profile.as_ref() {
+                        input.model = Some(profile.model.clone());
+                    }
+                    input.effort = None;
                 }
             }
-            let (normalized_model, normalized_effort, _) = super::agy::resolve_cli_model_and_effort(
-                input.model.as_deref(),
-                input.effort.as_deref(),
-            );
-            input.model = normalized_model;
-            input.effort = normalized_effort;
         }
         if input.agent == crate::protocol::AgentKind::Pi && input.mode.as_deref() == Some("plan") {
             return Err(Error::Invalid("Pi Agent 不支持 Plan 模式".into()));
@@ -1863,10 +1884,14 @@ impl Agents {
             crate::accounts::sources::validate_source_id(&input.route_id)?;
             if !matches!(
                 input.agent,
-                AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi
+                AgentKind::Claude
+                    | AgentKind::Codex
+                    | AgentKind::Opencode
+                    | AgentKind::Pi
+                    | AgentKind::Agy
             ) {
                 return Err(Error::Invalid(
-                    "跨模型子任务仅支持 Claude、Codex、OpenCode 或 Pi".into(),
+                    "跨模型子任务仅支持 Claude、Codex、OpenCode、Pi 或 Antigravity".into(),
                 ));
             }
         } else if !matches!(
@@ -2007,7 +2032,13 @@ impl Agents {
                         _ => None,
                     };
                     let chosen_account_id = requested_account.or(default_native_id);
-                    let (requested_model, requested_effort) = if agent == AgentKind::Agy {
+                    let (requested_model, requested_effort) = if agent == AgentKind::Agy
+                        && accounts
+                            .iter()
+                            .find(|a| Some(&a.id) == chosen_account_id.as_ref())
+                            .and_then(|a| a.api_profile.as_ref())
+                            .is_none()
+                    {
                         let (m, e, _) = super::agy::resolve_cli_model_and_effort(
                             requested_model.as_deref(),
                             requested_effort.as_deref(),
@@ -4623,7 +4654,48 @@ impl Agents {
         super::pi::launch_catalog(Path::new(&home), &environment).await
     }
 
-    pub async fn agy_launch_catalog(&self) -> Result<LaunchModelCatalog> {
+    pub async fn agy_launch_catalog(
+        &self,
+        account_id: Option<&str>,
+    ) -> Result<LaunchModelCatalog> {
+        let account_id = match account_id {
+            None | Some(crate::accounts::NATIVE_AGY_ID) => None,
+            Some(id) => {
+                crate::database::validate_id(id)?;
+                let id_owned = id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.managed_account(&id_owned)?.id))
+                    .await?;
+                Some(id.to_owned())
+            }
+        };
+        if let Some(id) = account_id.as_deref() {
+            let data = self.0.database.directory().to_owned();
+            let id = id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if let Some(profile) = profile {
+                let model = profile.model.clone();
+                return Ok(LaunchModelCatalog {
+                    models: vec![LaunchModelInfo {
+                        id: model,
+                        label: profile.model.clone(),
+                        description: None,
+                        supported_efforts: Vec::new(),
+                        default_effort: None,
+                        is_default: true,
+                    }],
+                    current_model: Some(profile.model),
+                    current_effort: None,
+                    presets: Vec::new(),
+                    current_preset: None,
+                });
+            }
+        }
         super::agy::launch_catalog().await
     }
 

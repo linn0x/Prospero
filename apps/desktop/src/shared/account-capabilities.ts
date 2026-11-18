@@ -26,6 +26,7 @@ export function accountCapabilities(account?: JsonObject): AccountCapabilities {
   const engine = accountEngine(account ?? {});
   const chat = engine === "opencode";
   const isPi = engine === "pi";
+  const isAgy = engine === "agy";
   const disabled = typeof account?.["apiProfileError"] === "string" || record(profile["modelCapabilities"])["tools"] === false;
   const supplied = record(account?.["capabilities"]);
   const kinds = supplied["sessionKinds"];
@@ -39,7 +40,7 @@ export function accountCapabilities(account?: JsonObject): AccountCapabilities {
         typeof supplied[key] === "boolean"
           ? supplied[key]
           : key === "plan"
-            ? (!chat && !isPi)
+            ? (!chat && !isPi && !(isApi && isAgy))
             : key === "resume"
               ? !chat
               : (!isApi || isPi)

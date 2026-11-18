@@ -30,10 +30,11 @@ export function sourceRouteMatchesAgent(
   route: Pick<ModelSourceRoute, "protocol">,
   preferred: CodeAgentKind,
 ): boolean {
-  if (preferred === "agy") return false;
   if (preferred === "pi") return true;
   if (preferred === "claude") return route.protocol === "anthropic";
-  if (preferred === "opencode") return route.protocol === "openai_chat_completions";
+  if (preferred === "opencode" || preferred === "agy") {
+    return route.protocol === "openai_chat_completions";
+  }
   return route.protocol === "openai_responses" || route.protocol === "openai_chat_completions";
 }
 
@@ -41,7 +42,7 @@ export function sourceCatalogTarget(
   source: ModelSource,
   preferred: CodeAgentKind,
 ): { protocol: ModelSourceRoute["protocol"]; credentialId: string } | null {
-  if (!source.enabled || preferred === "agy") return null;
+  if (!source.enabled) return null;
   const route =
     source.routes.find(
       (item) =>
@@ -99,7 +100,12 @@ export function agentForSourceRoute(
 ): CodeAgentKind {
   if (preferred === "pi") return "pi";
   if (route.protocol === "anthropic") return "claude";
-  if (route.protocol === "openai_chat_completions" && preferred === "opencode") return "opencode";
+  if (
+    route.protocol === "openai_chat_completions" &&
+    (preferred === "opencode" || preferred === "agy")
+  ) {
+    return preferred;
+  }
   return "codex";
 }
 
@@ -108,7 +114,7 @@ export function availableSourceRoutes(
   source: ModelSource,
   preferred: CodeAgentKind,
 ): ModelSourceRoute[] {
-  if (!source.enabled || preferred === "agy") return [];
+  if (!source.enabled) return [];
   const routes = source.routes.filter(
     (route) =>
       route.enabled &&
@@ -155,7 +161,6 @@ export function defaultModelSourceRoute(
   sources: readonly ModelSource[],
   preferred: CodeAgentKind,
 ): ActiveModelSourceSelection | null {
-  if (preferred === "agy") return null;
   for (const source of sources) {
     if (!source.enabled) continue;
     const routes = availableSourceRoutes(source, preferred);

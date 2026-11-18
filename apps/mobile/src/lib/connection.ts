@@ -2012,7 +2012,7 @@ export class HostConnection {
   }
 
   launchModels(
-    agent: "claude" | "codex" | "deepseek" | "opencode" | "pi",
+    agent: "claude" | "codex" | "deepseek" | "opencode" | "pi" | "agy",
     accountId?: string,
   ): Promise<Extract<S2CMessage, { type: "launch.models" }>> {
     if (!this.supportsSessionCreateModel) {

@@ -297,7 +297,7 @@ export default function HostScreen() {
       ? agent
       : null;
   const launchCatalogAgent =
-    codeAgent && codeAgent !== "agy"
+    codeAgent
       ? codeAgent
       : agent === "deepseek"
         ? "deepseek"
@@ -322,7 +322,7 @@ export default function HostScreen() {
         : [],
     [agentAccounts, codeAgent],
   );
-  const sourceSupported = Boolean(codeAgent && codeAgent !== "agy" && conn?.supportsModelSources);
+  const sourceSupported = Boolean(codeAgent && conn?.supportsModelSources);
   const effectiveAuthMode: "subscription" | "source" =
     sourceSupported && authSourceMode === "source" ? "source" : "subscription";
   const selectedAccount = codeAgent
@@ -346,13 +346,14 @@ export default function HostScreen() {
     effectiveAuthMode === "source" &&
     !selectedAccount &&
     defaultSourcePair?.route.protocol === "openai_chat_completions" &&
-    codeAgent !== "pi";
+    codeAgent !== "pi" &&
+    codeAgent !== "agy";
   const accountRequiresStructured =
     sourceRequiresStructured ||
     (selectedAccountCapabilities?.sessionKinds.length === 1 &&
       selectedAccountCapabilities.sessionKinds[0] === "structured");
   const effectiveSessionKind: SessionKind = accountRequiresStructured ? "structured" : sessionKind;
-  const managedAgentTerminal = effectiveSessionKind === "pty" && (agent === "claude" || agent === "codex" || agent === "pi");
+  const managedAgentTerminal = effectiveSessionKind === "pty" && (agent === "claude" || agent === "codex" || agent === "pi" || agent === "agy");
   const displayedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : approvalPolicy;
   const accountCanPlan = selectedAccountCapabilities?.plan ?? true;
   const accountCanResume = effectiveAuthMode === "subscription" && (selectedAccountCapabilities?.resume ?? true);
@@ -501,7 +502,7 @@ export default function HostScreen() {
           });
           setSelectedSourceAccountIds((current) => {
             const updated = { ...current };
-            for (const kind of ["claude", "codex", "opencode", "pi"] as const) {
+            for (const kind of ["claude", "codex", "agy", "opencode", "pi"] as const) {
               const available = next.filter(
                 (account) => Boolean(account.modelSource) && getAgentAccountEngine(account) === kind,
               );
@@ -970,7 +971,7 @@ export default function HostScreen() {
             : {};
       const managedTerminal =
         resolvedKind === "pty" &&
-        (agent === "claude" || agent === "codex" || agent === "pi");
+        (agent === "claude" || agent === "codex" || agent === "pi" || agent === "agy");
       const sessionOptions:
         | {
             mode?: "default" | "plan";
@@ -1390,7 +1391,7 @@ export default function HostScreen() {
                   setAgent(a);
                   setSessionKind(STRUCTURED.includes(a) ? "structured" : "pty");
                   if (!STRUCTURED.includes(a)) setApprovalPolicy("strict");
-                  if (a === "agy" || !["claude", "codex", "opencode", "pi"].includes(a)) {
+                  if (!["claude", "codex", "agy", "opencode", "pi"].includes(a)) {
                     setAuthSourceMode("subscription");
                   } else if (
                     a === "pi" &&
@@ -1435,7 +1436,7 @@ export default function HostScreen() {
                   )}
                 </View>
 
-                {codeAgent && codeAgent !== "agy" && (
+                {codeAgent && (
                   <View
                     style={styles.kindSwitch}
                     accessibilityRole="tablist"

@@ -8,7 +8,7 @@ export type AccountApiProtocol =
 export type AccountApiProvider = "openai_compatible" | "anthropic_compatible";
 
 export type AccountApiDefaults = {
-  agent: "codex" | "claude" | "opencode" | "pi";
+  agent: "codex" | "claude" | "opencode" | "pi" | "agy";
   baseUrl: string;
   model: string;
 };
@@ -179,7 +179,7 @@ export function accountApiProvider(protocol: AccountApiProtocol): AccountApiProv
 
 export function accountApiProtocolsForAgent(agent: string): AccountApiProtocol[] {
   if (agent === "claude") return ["anthropic"];
-  if (agent === "opencode") return ["openai_chat_completions"];
+  if (agent === "opencode" || agent === "agy") return ["openai_chat_completions"];
   if (agent === "pi") return ["anthropic", "openai_responses", "openai_chat_completions"];
   return ["openai_responses", "openai_chat_completions"];
 }
@@ -188,7 +188,7 @@ export function accountApiProtocolFromProfile(profile: JsonObject, agent: string
   const protocol = profile["protocol"];
   if (accountApiProtocols.includes(protocol as AccountApiProtocol)) return protocol as AccountApiProtocol;
   if (profile["provider"] === "anthropic_compatible" || agent === "claude") return "anthropic";
-  if (agent === "opencode") return "openai_chat_completions";
+  if (agent === "opencode" || agent === "agy") return "openai_chat_completions";
   return "openai_responses";
 }
 

@@ -606,3 +606,67 @@ async fn source_enriches_glm_routes_with_published_effort_levels() {
         1_048_576
     );
 }
+
+#[tokio::test]
+async fn source_binds_agy_for_openai_chat_completions_only() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = spawn_server();
+
+    let (status, created) = harness
+        .post(envelope(json!({
+            "kind":"create",
+            "operationId":"op-agy-source-create",
+            "name":"OpenAI Gateway",
+            "endpoints":[
+                {"protocol":"openai_responses","baseUrl":format!("{}/responses", server.base_url)},
+                {"protocol":"openai_chat_completions","baseUrl":format!("{}/v1", server.base_url)}
+            ],
+            "credential":{"name":"Gateway Key","apiKey":SECRET},
+            "routes":[
+                {"name":"deepseek-chat","model":"deepseek-chat","protocol":"openai_chat_completions","enabled":true},
+                {"name":"gpt-5-responses","model":"gpt-5","protocol":"openai_responses","enabled":true}
+            ]
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let source = &created["sources"][0];
+    let source_id = source["id"].as_str().unwrap();
+    let revision = source["revision"].as_i64().unwrap();
+    let routes = source["routes"].as_array().unwrap();
+
+    let (status, bound) = harness
+        .post(envelope(json!({
+            "kind":"bind",
+            "sourceId":source_id,
+            "routeId":routes[0]["id"],
+            "revision":revision,
+            "agent":"agy"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{bound}");
+    assert_eq!(bound["ok"], true, "{bound}");
+    let account_id = bound["accountId"].as_str().unwrap();
+    let account = bound["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == account_id)
+        .unwrap();
+    assert_eq!(account["agent"], "agy");
+    assert_eq!(account["engine"], "agy");
+    assert_eq!(account["apiProfile"]["model"], "deepseek-chat");
+    assert_eq!(account["capabilities"]["plan"], false);
+
+    // Non-chat-completions route cannot be bound to agy.
+    let (status, rejected) = harness
+        .post(envelope(json!({
+            "kind":"bind",
+            "sourceId":source_id,
+            "routeId":routes[1]["id"],
+            "revision":revision,
+            "agent":"agy"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+}

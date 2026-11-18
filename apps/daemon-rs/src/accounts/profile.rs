@@ -268,7 +268,7 @@ pub(crate) fn clean_profile(
     let (default_provider, default_protocol) = match agent {
         "claude" => ("anthropic_compatible", "anthropic"),
         "codex" => ("openai_compatible", "openai_responses"),
-        "opencode" | "pi" => ("openai_compatible", "openai_chat_completions"),
+        "opencode" | "pi" | "agy" => ("openai_compatible", "openai_chat_completions"),
         _ => return Err(Error::Invalid("Agent 不支持 API Profile".into())),
     };
     let base_url = raw_base_url.trim();
@@ -290,7 +290,7 @@ pub(crate) fn clean_profile(
                     "openai_responses" | "openai_chat_completions"
                 )
         }
-        "opencode" => {
+        "opencode" | "agy" => {
             parsed_provider == "openai_compatible" && parsed_protocol == "openai_chat_completions"
         }
         "claude" => parsed_provider == "anthropic_compatible" && parsed_protocol == "anthropic",

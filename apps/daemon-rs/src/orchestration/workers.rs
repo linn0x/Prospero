@@ -129,11 +129,6 @@ pub(super) async fn launch_worker_start(
         Some(crate::accounts::NATIVE_AGY_ID) if input.agent == crate::protocol::AgentKind::Agy => {
             None
         }
-        Some(_) if input.agent == crate::protocol::AgentKind::Agy => {
-            return Err(Error::Invalid(
-                "Antigravity worker 使用本机 Antigravity 订阅账号".into(),
-            ));
-        }
         Some(_) if input.agent == crate::protocol::AgentKind::Deepseek => {
             return Err(Error::Invalid(
                 "DeepSeek worker 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
@@ -160,6 +155,19 @@ pub(super) async fn launch_worker_start(
                             "OpenCode worker 需要 OpenAI Chat Completions API Profile".into(),
                         ));
                     }
+                }
+            } else if input.agent == crate::protocol::AgentKind::Agy {
+                if record.agent != crate::protocol::AgentKind::Agy
+                    || record
+                        .api_profile
+                        .as_ref()
+                        .map(|profile| profile.protocol())
+                        != Some("openai_chat_completions")
+                {
+                    return Err(Error::Invalid(
+                        "Antigravity worker 仅支持 OpenAI Chat Completions API Profile 或本机订阅"
+                            .into(),
+                    ));
                 }
             }
             Some(record.id)

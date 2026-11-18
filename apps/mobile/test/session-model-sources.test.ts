@@ -32,12 +32,16 @@ describe("model source selection", () => {
     expect(availableSourceRoutes(source([anthropic, responses, chat, disabled, noTools]), "claude")).toEqual([anthropic]);
     expect(availableSourceRoutes(source([anthropic, responses, chat, disabled, noTools]), "codex")).toEqual([responses, chat]);
     expect(availableSourceRoutes(source([anthropic, responses, chat, disabled, noTools]), "opencode")).toEqual([chat]);
+    expect(availableSourceRoutes(source([anthropic, responses, chat, disabled, noTools]), "agy")).toEqual([chat]);
     expect(agentForSourceRoute(anthropic, "codex")).toBe("claude");
     expect(agentForSourceRoute(responses, "claude")).toBe("codex");
     expect(agentForSourceRoute(chat, "opencode")).toBe("opencode");
+    expect(agentForSourceRoute(chat, "agy")).toBe("agy");
     expect(agentForSourceRoute(chat, "claude")).toBe("codex");
     expect(sourceRouteMatchesAgent(anthropic, "claude")).toBe(true);
     expect(sourceRouteMatchesAgent(responses, "claude")).toBe(false);
+    expect(sourceRouteMatchesAgent(chat, "agy")).toBe(true);
+    expect(sourceRouteMatchesAgent(responses, "agy")).toBe(false);
   });
   it("loads catalogs only through the selected agent protocol", () => {
     const openAiOnly = { ...source([route("responses", "m1")]), endpoints: [{ protocol: "openai_responses" as const, baseUrl: "https://example.test/v1" }] };
@@ -45,6 +49,7 @@ describe("model source selection", () => {
     expect(sourceCatalogTarget(source([route("responses", "m1")]), "claude")).toEqual({ protocol: "anthropic", credentialId: "key" });
     expect(sourceCatalogTarget(source([route("claude", "m1", "anthropic")], "claude"), "claude")).toEqual({ protocol: "anthropic", credentialId: "key" });
     expect(sourceCatalogTarget(source([route("chat", "m1", "openai_chat_completions")], "chat"), "opencode")).toEqual({ protocol: "openai_chat_completions", credentialId: "key" });
+    expect(sourceCatalogTarget(source([route("chat", "m1", "openai_chat_completions")], "chat"), "agy")).toEqual({ protocol: "openai_chat_completions", credentialId: "key" });
     expect(sourceCatalogTarget(source([route("responses", "m1")]), "codex")).toEqual({ protocol: "openai_responses", credentialId: "key" });
   });
 });

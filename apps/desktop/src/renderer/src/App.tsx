@@ -2202,7 +2202,7 @@ function NewSessionDialog({
   const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
   const rememberedSource = useMemo(() => rememberedSourceSelection(), []);
   const initialAgent = initialDraft?.input.agent ?? initialSource?.agent ?? rememberedSource?.agent ?? rememberedLaunchAgent();
-  const supportsInitialModelSource = initialAgent === "codex" || initialAgent === "claude" || initialAgent === "opencode" || initialAgent === "pi";
+  const supportsInitialModelSource = initialAgent === "codex" || initialAgent === "claude" || initialAgent === "opencode" || initialAgent === "pi" || initialAgent === "agy";
   const [useSource, setUseSource] = useState(() => supportsInitialModelSource && (initialDraft?.useSource ?? (sourceSupported && Boolean(initialSource || rememberedSource))));
   const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialDraft?.sourceSelection ?? initialSource ?? (rememberedSource ? { ...rememberedSource, revision: 0 } : undefined));
   const sourceState = useModelSources(sourceSupported && useSource);
@@ -2218,7 +2218,7 @@ function NewSessionDialog({
       ? initialDraft.input.approvalPolicy
       : "yolo",
   );
-  const sourceRuntimeAgent: SourceRuntimeAgent = input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" ? input.agent : "codex";
+  const sourceRuntimeAgent: SourceRuntimeAgent = input.agent === "claude" || input.agent === "opencode" || input.agent === "pi" || input.agent === "agy" ? input.agent : "codex";
   const sourceChoice = selectedSourceRoute(sourceState.sources, sourceSelection, sourceRuntimeAgent);
   const setSourceRuntimeAgent = (agent: SourceRuntimeAgent): void => {
     setInput((current) => ({
@@ -2254,7 +2254,7 @@ function NewSessionDialog({
     (account) => account.id === input.accountId,
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
-  const selectedKind: SessionCreateInput["kind"] = botMode ? "structured" : useSource ? (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi" ? "structured" : input.kind) : requiresStructured ? "structured" : input.kind;
+  const selectedKind: SessionCreateInput["kind"] = botMode ? "structured" : useSource ? (sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi" && sourceRuntimeAgent !== "agy" ? "structured" : input.kind) : requiresStructured ? "structured" : input.kind;
   const managedAgentTerminal = selectedKind === "pty" && (input.agent === "codex" || input.agent === "claude" || input.agent === "agy");
   const selectedApprovalPolicy = managedAgentTerminal ? terminalApprovalPolicy : input.approvalPolicy;
   const supportsApprovalPolicy = selectedKind === "structured" || input.agent === "codex" || input.agent === "claude" || input.agent === "agy";
@@ -2527,7 +2527,7 @@ function NewSessionDialog({
                   const agent = event.target
                     .value as SessionCreateInput["agent"];
                   const nextAccounts = sessionLaunchAccounts(independentAccounts, agent);
-                  const supportsModelSource = agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi";
+                  const supportsModelSource = agent === "codex" || agent === "claude" || agent === "opencode" || agent === "pi" || agent === "agy";
                   if (!supportsModelSource) {
                     setUseSource(false);
                   } else if (agent === "pi" && nextAccounts.length === 0 && sourceSupported) {
@@ -2566,7 +2566,7 @@ function NewSessionDialog({
               <NativeSelect
                 id="session-kind"
                 value={selectedKind}
-                disabled={busy || (useSource && sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi")}
+                disabled={busy || (useSource && sourceChoice?.route.protocol === "openai_chat_completions" && sourceRuntimeAgent !== "pi" && sourceRuntimeAgent !== "agy")}
                 onChange={(event) => {
                   const kind = event.target.value as SessionCreateInput["kind"];
                   setInput({
@@ -2599,7 +2599,7 @@ function NewSessionDialog({
                   <Settings />{t("管理订阅与模型源", "Manage subscriptions & model sources")}
                 </Button>
               </div>
-              {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode" || input.agent === "pi") && (
+              {(input.agent === "codex" || input.agent === "claude" || input.agent === "agy" || input.agent === "opencode" || input.agent === "pi") && (
                 <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}>
                   <Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>
                     {t("订阅登录态", "Subscription login")}{launchAccounts.length > 0 ? ` (${launchAccounts.length})` : ""}
