@@ -29,14 +29,19 @@ describe("desktop shell structure", () => {
     expect(app).toMatch(/<ShellSidebar\s+snapshot=\{sessionSnapshot\}/);
     expect(app).not.toContain("{shellChromeVisible && <ShellSidebar");
     expect(app).toContain('!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs');
+    expect(app).toContain('actionsContainer={topbarActionsContainer}');
+    expect(app).toContain('topbarActionsHost={topbarActionsContainer}');
     expect(app).toContain('className="local-workspace-container"');
     expect(app).toContain('{focus && <Button className="sidebar-exit-focus"');
-    expect(workspace).toContain('{chromeVisible && session && <SessionToolbar');
+    expect(workspace).toContain('const mergedTopbar = Boolean(!split && topbarActionsHost);');
+    expect(workspace).toContain('actionsHost={mergedTopbar ? topbarActionsHost : undefined}');
     expect(workspace).not.toContain('pane-tabbar-static');
     expect(workspace).not.toContain('workspace-tabbar');
     expect(workspace).toContain('const visible = active && focused && chromeVisible && dock.visible && available > 0;');
     expect(workspace).toContain('<Sheet open={visible && overlay}');
+    expect(tabs).toContain('<div className="workspace-topbar">');
     expect(tabs).toContain('<TabStrip');
+    expect(tabs).toContain('<TopbarActionsSlot');
   });
 
   it("keeps the sidebar collapsible and able to switch sessions", () => {

@@ -113,23 +113,25 @@ export function RemoteWorkspacePane({ workspace, settings, focus, onToggleFocus,
     : [{ id: sid, title: "Shell", cwd: active.cwd }, ...sessions.map(session => ({ id: session.id, title: session.title || session.agent, cwd: session.cwd }))];
   const activeIndex = tabs.findIndex(tab => tab.id === sid);
   return <section className="remote-workspace-pane" aria-label={t(`远程工作区：${active.hostName} · ${active.cwd}`, `Remote workspace: ${active.hostName} · ${active.cwd}`)}>
-    {!focus && <>
-      <header className="remote-workspace-toolbar">
-        <div className="remote-workspace-title"><DesktopIcon name="server" /><strong>{t("远程", "Remote")} · {active.hostName}</strong><span title={active.cwd}>{active.cwd}</span></div>
-        <button type="button" disabled={Boolean(busy) || !supported} aria-busy={busy === "new"} aria-label={t("新建远程 Shell", "New remote Shell")} onClick={() => void open(true)}><DesktopIcon name="add" />Shell</button>
-        <button type="button" disabled={Boolean(busy) || !supported} aria-label={t("刷新远程会话", "Refresh remote sessions")} onClick={() => void refresh()}><DesktopIcon name="refresh" className={busy ? "daemon-spinner" : undefined} /></button>
-        <button type="button" aria-label={t("进入专注模式", "Enter focus mode")} onClick={onToggleFocus}><DesktopIcon name="expand" /></button>
-      </header>
-      {tabs.length > 0 && <div className="remote-workspace-tabs" role="tablist" aria-label={t("此目录的远程 Shell", "Remote Shells in this directory")}>
-        {tabs.map((tab, index) => <button type="button" role="tab" data-liquid-glass="tab" id={`remote-shell-tab-${tab.id}`} key={tab.id} aria-selected={tab.id === sid} aria-controls="remote-workspace-terminal" tabIndex={tab.id === sid || activeIndex < 0 && index === 0 ? 0 : -1} title={tab.cwd} onClick={() => select(tab.id)} onKeyDown={event => {
-          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-          event.preventDefault();
-          const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
-          const item = tabs[next];
-          if (item) { select(item.id); document.getElementById(`remote-shell-tab-${item.id}`)?.focus(); }
-        }}><DesktopIcon name="terminal" size={14} /><span>{tab.title}</span></button>)}
-      </div>}
-    </>}
+    {!focus && <header className="remote-workspace-toolbar remote-workspace-topbar">
+      <div className="remote-workspace-title" title={`${t("远程", "Remote")} · ${active.hostName}\n${active.cwd}`}><DesktopIcon name="server" size={13} /><strong>{active.hostName}</strong></div>
+      <div className="remote-workspace-tabs-wrap">
+        {tabs.length > 0 && <div className="remote-workspace-tabs" role="tablist" aria-label={t("此目录的远程 Shell", "Remote Shells in this directory")}>
+          {tabs.map((tab, index) => <button type="button" role="tab" data-liquid-glass="tab" id={`remote-shell-tab-${tab.id}`} key={tab.id} aria-selected={tab.id === sid} aria-controls="remote-workspace-terminal" tabIndex={tab.id === sid || activeIndex < 0 && index === 0 ? 0 : -1} title={tab.cwd} onClick={() => select(tab.id)} onKeyDown={event => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+            const item = tabs[next];
+            if (item) { select(item.id); document.getElementById(`remote-shell-tab-${item.id}`)?.focus(); }
+          }}><DesktopIcon name="terminal" size={13} /><span>{tab.title}</span></button>)}
+        </div>}
+        <button type="button" className="remote-workspace-tab-new" disabled={Boolean(busy) || !supported} aria-busy={busy === "new"} aria-label={t("新建远程 Shell", "New remote Shell")} title={t("新建远程 Shell", "New remote Shell")} onClick={() => void open(true)}><DesktopIcon name="add" size={13} /></button>
+      </div>
+      <div className="remote-workspace-actions">
+        <button type="button" disabled={Boolean(busy) || !supported} aria-label={t("刷新远程会话", "Refresh remote sessions")} title={t("刷新远程会话", "Refresh remote sessions")} onClick={() => void refresh()}><DesktopIcon name="refresh" size={13} className={busy ? "daemon-spinner" : undefined} /></button>
+        <button type="button" aria-label={t("进入专注模式", "Enter focus mode")} title={t("进入专注模式", "Enter focus mode")} onClick={onToggleFocus}><DesktopIcon name="expand" size={13} /></button>
+      </div>
+    </header>}
     {focus && <button type="button" className="remote-workspace-focus-exit" aria-label={t("退出专注模式", "Exit focus mode")} onClick={onToggleFocus}><DesktopIcon name="collapse" /></button>}
     {(!connected || error || !supported) && <div className={`remote-workspace-status${error || !supported ? " is-error" : ""}`} role={error || !supported ? "alert" : "status"} tabIndex={error ? 0 : undefined}>
       <DesktopIcon name={error || !supported ? "alert" : "relay"} size={14} />

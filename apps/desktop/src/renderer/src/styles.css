@@ -1372,7 +1372,7 @@ label.check-row { display: flex; }
 .workspace-tab-action { opacity: 0; pointer-events: none; }
 .workspace-tab:hover .workspace-tab-action, .workspace-tab:focus-within .workspace-tab-action { opacity: 1; pointer-events: auto; }
 @media (hover: none) { .workspace-tab-action { opacity: 1; pointer-events: auto; } }
-.topbar-workspace-tabs { background: color-mix(in srgb, var(--surface-0) 88%, var(--background)); border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent); }
+.workspace-topbar { background: color-mix(in srgb, var(--surface-0) 88%, var(--background)); border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent); }
 .workspace-tab .workspace-tab-action { width: 22px; height: 24px; }
 .workspace-tab [data-slot="workspace-tab-pin"] { position: absolute; left: 5px; z-index: 1; }
 .workspace-tab:is(:hover, :focus-within, :has(.is-pinned)) .session-agent-icon { opacity: 0; }

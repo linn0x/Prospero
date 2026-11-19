@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { memo, useLayoutEffect, useMemo, useRef } from "react";
 import { sessionTabLabels } from "../workspace/session-tab-labels";
 import { projectForSession } from "../workspace-sidebar-state";
 import "./workspace-tabs.css";
@@ -16,6 +16,7 @@ type WorkspaceTabsProps = {
   activeId: string | undefined;
   botSession?: SessionInfo | undefined;
   botBusy?: boolean | undefined;
+  actionsContainer?: HTMLDivElement | null | undefined;
   onSelectBot?: (() => void) | undefined;
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
@@ -23,6 +24,19 @@ type WorkspaceTabsProps = {
   onReorder: (ids: string[]) => void;
   onNewSession?: (project?: string) => void;
 };
+
+function TopbarActionsSlot({ container }: { container: HTMLDivElement | null | undefined }) {
+  const slot = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const host = slot.current;
+    if (!host || !container) return;
+    host.appendChild(container);
+    return () => {
+      if (container.parentNode === host) container.remove();
+    };
+  }, [container]);
+  return <div className="workspace-topbar-actions-slot" ref={slot} />;
+}
 
 function arraysEqual(left: readonly string[], right: readonly string[]): boolean {
   if (left === right) return true;
@@ -57,6 +71,7 @@ function workspaceTabsEqual(previous: WorkspaceTabsProps, next: WorkspaceTabsPro
   if (
     previous.activeId !== next.activeId
     || previous.botBusy !== next.botBusy
+    || previous.actionsContainer !== next.actionsContainer
     || !sameTabSession(previous.botSession, next.botSession)
     || previous.onSelectBot !== next.onSelectBot
     || previous.onActivate !== next.onActivate
@@ -89,7 +104,7 @@ function workspaceTabsEqual(previous: WorkspaceTabsProps, next: WorkspaceTabsPro
   return true;
 }
 
-export const WorkspaceTabs = memo(function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy = false, onSelectBot, onActivate, onClose, onTogglePin, onReorder, onNewSession }: WorkspaceTabsProps) {
+export const WorkspaceTabs = memo(function WorkspaceTabs({ snapshot, openIds, activeId, botSession, botBusy = false, actionsContainer, onSelectBot, onActivate, onClose, onTogglePin, onReorder, onNewSession }: WorkspaceTabsProps) {
   const { t } = useLocale();
   const sessions = useMemo(
     () => new Map(snapshot.daemon.sessions.map((session) => [session.id, session])),
@@ -115,7 +130,8 @@ export const WorkspaceTabs = memo(function WorkspaceTabs({ snapshot, openIds, ac
     () => sessionTabLabels(ids.map((id) => sessions.get(id)!).filter(Boolean)),
     [ids, sessions],
   );
-  return <TabStrip className="topbar-workspace-tabs" listClassName="workspace-tabs" label={t("打开的会话", "Open sessions")} items={ids.map(id => ({ id, label: `${labels.get(id)} · ${sessionStatusLabel(sessions.get(id)!, snapshot.unreadSessionIds.includes(id), t)} — ${sessions.get(id)!.cwd}`, onSelect: () => onActivate(id), onClose: () => onClose(id) }))} activeId={activeId} onReorder={onReorder}>
+  return <div className="workspace-topbar">
+    <TabStrip className="topbar-workspace-tabs" listClassName="workspace-tabs" label={t("打开的会话", "Open sessions")} items={ids.map(id => ({ id, label: `${labels.get(id)} · ${sessionStatusLabel(sessions.get(id)!, snapshot.unreadSessionIds.includes(id), t)} — ${sessions.get(id)!.cwd}`, onSelect: () => onActivate(id), onClose: () => onClose(id) }))} activeId={activeId} onReorder={onReorder}>
     {onSelectBot && (
       <button
         type="button"
@@ -166,5 +182,7 @@ export const WorkspaceTabs = memo(function WorkspaceTabs({ snapshot, openIds, ac
         <Plus aria-hidden="true" />
       </button>
     )}
-  </TabStrip>;
+    </TabStrip>
+    {actionsContainer && <TopbarActionsSlot container={actionsContainer} />}
+  </div>;
 }, workspaceTabsEqual);

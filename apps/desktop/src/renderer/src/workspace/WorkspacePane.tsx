@@ -245,7 +245,7 @@ function WorkspaceEmptyWorkbench({
   );
 }
 
-function WorkspaceSession({ session, snapshot, focus, onOpenRun, onOpenSession, onSwitchBotSession, onToggleFocus, onMissingSession, onNativeFocus, empty, onSplit, active = true, focused = true, primary = true }: { onSplit?: (() => void) | undefined; active?: boolean; focused?: boolean; primary?: boolean; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onOpenSession?: (id: string) => void; onSwitchBotSession?: ((session: SessionInfo) => void) | undefined; onToggleFocus: () => void; onMissingSession: (id: string) => void; onNativeFocus?: (id: string) => void }) {
+function WorkspaceSession({ session, snapshot, focus, onOpenRun, onOpenSession, onSwitchBotSession, onToggleFocus, onMissingSession, onNativeFocus, empty, onSplit, active = true, focused = true, primary = true, split = false, topbarActionsHost }: { onSplit?: (() => void) | undefined; active?: boolean; focused?: boolean; primary?: boolean; split?: boolean; topbarActionsHost?: HTMLDivElement | null | undefined; session: SessionInfo | undefined; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onOpenSession?: (id: string) => void; onSwitchBotSession?: ((session: SessionInfo) => void) | undefined; onToggleFocus: () => void; onMissingSession: (id: string) => void; onNativeFocus?: (id: string) => void }) {
   const { t } = useLocale();
   const host = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(0);
@@ -381,17 +381,49 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onOpenSession, 
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
   const account = snapshot.accounts.find((item) => text(item["id"]) === session?.accountId);
+  const mergedTopbar = Boolean(!split && topbarActionsHost);
+  const projectOptions = [...new Set([root, ...snapshot.projects].filter(Boolean))];
   const toolbar = <>
-    {chromeVisible && session && <SessionToolbar onSplit={onSplit} localSelection={localSelection} onLocalSelectionChange={setLocalSelection} nativeTerminal={nativeAvailable} nativeTerminalState={nativeState} onNativeTerminalAction={nativeAction} session={session} account={account} unread={snapshot.unreadSessionIds.includes(session.id)} contextVisible={dock.visible} onToggleContext={() => setState({ ...dock, visible: !dock.visible })} onToggleFocus={onToggleFocus} />}
-    {chromeVisible && !session && <header className="pane-toolbar project-workspace-toolbar">
-      <NativeSelect size="sm" aria-label={t("当前项目", "Current project")} value={root} onChange={event => setSelectedRoot(event.target.value)}>
-        {!root && <NativeSelectOption value="">{t("选择项目", "Select project")}</NativeSelectOption>}
-        {[...new Set([root, ...snapshot.projects].filter(Boolean))].map(project => <NativeSelectOption key={project} value={project}>{snapshot.projectAliases[project.toLowerCase()] || fileName(project)}</NativeSelectOption>)}
-      </NativeSelect>
-      <div className="pane-toolbar-actions">
-        <Button variant="ghost" size="sm" disabled={!root} aria-label={t("切换工具栏", "Toggle tools")} aria-pressed={dock.visible} onClick={() => setState({ ...dock, visible: !dock.visible })}><Files />{t("工具", "Tools")}</Button>
-      </div>
-    </header>}
+    {chromeVisible && session && (mergedTopbar ? active && focused : active) && (
+      <SessionToolbar
+        actionsHost={mergedTopbar ? topbarActionsHost : undefined}
+        onSplit={onSplit}
+        localSelection={localSelection}
+        onLocalSelectionChange={setLocalSelection}
+        nativeTerminal={nativeAvailable}
+        nativeTerminalState={nativeState}
+        onNativeTerminalAction={nativeAction}
+        session={session}
+        account={account}
+        unread={snapshot.unreadSessionIds.includes(session.id)}
+        contextVisible={dock.visible}
+        onToggleContext={() => setState({ ...dock, visible: !dock.visible })}
+        onToggleFocus={onToggleFocus}
+      />
+    )}
+    {chromeVisible && !session && active && (mergedTopbar ? (
+      focused && root && topbarActionsHost ? createPortal(
+        <div className="project-workspace-topbar-actions">
+          {projectOptions.length > 1 && (
+            <NativeSelect size="sm" aria-label={t("当前项目", "Current project")} value={root} onChange={event => setSelectedRoot(event.target.value)}>
+              {projectOptions.map(project => <NativeSelectOption key={project} value={project}>{snapshot.projectAliases[project.toLowerCase()] || fileName(project)}</NativeSelectOption>)}
+            </NativeSelect>
+          )}
+          <Button variant="ghost" size="xs" aria-label={t("切换工具栏", "Toggle tools")} title={snapshot.projectAliases[root.toLowerCase()] || fileName(root)} aria-pressed={dock.visible} onClick={() => setState({ ...dock, visible: !dock.visible })}><Files /><span className="session-toolbar-action-label">{t("工具", "Tools")}</span></Button>
+        </div>,
+        topbarActionsHost,
+      ) : null
+    ) : (
+      <header className="pane-toolbar project-workspace-toolbar">
+        <NativeSelect size="sm" aria-label={t("当前项目", "Current project")} value={root} onChange={event => setSelectedRoot(event.target.value)}>
+          {!root && <NativeSelectOption value="">{t("选择项目", "Select project")}</NativeSelectOption>}
+          {projectOptions.map(project => <NativeSelectOption key={project} value={project}>{snapshot.projectAliases[project.toLowerCase()] || fileName(project)}</NativeSelectOption>)}
+        </NativeSelect>
+        <div className="pane-toolbar-actions">
+          <Button variant="ghost" size="sm" disabled={!root} aria-label={t("切换工具栏", "Toggle tools")} aria-pressed={dock.visible} onClick={() => setState({ ...dock, visible: !dock.visible })}><Files />{t("工具", "Tools")}</Button>
+        </div>
+      </header>
+    ))}
   </>;
   return <div ref={host} className={cn("pane-workspace workspace-session-layout", focus && "is-focus")} data-dock-resizing={resizing || undefined}>
     <div ref={gridRef} className={cn("workspace-grid", visible && !overlay && "has-dock")} style={{ "--context-dock-width": `${effectiveWidth}px` } as CSSProperties}>
@@ -462,6 +494,7 @@ type WorkspacePaneProps = {
   snapshot: DesktopSnapshot;
   activeId: string | undefined;
   openIds: string[];
+  topbarActionsHost?: HTMLDivElement | null | undefined;
   onFocusedSessionChange?: (id: string | undefined) => void;
   onActivate: (id: string) => void;
   onSwitchBotSession?: ((session: SessionInfo) => void) | undefined;
@@ -475,7 +508,7 @@ type WorkspacePaneProps = {
   focus: boolean;
 };
 
-export const WorkspacePane = memo(function WorkspacePane({ active = true, snapshot, activeId, openIds, onActivate, onSwitchBotSession, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, onFocusedSessionChange, focus }: WorkspacePaneProps) {
+export const WorkspacePane = memo(function WorkspacePane({ active = true, snapshot, activeId, openIds, topbarActionsHost, onActivate, onSwitchBotSession, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, onFocusedSessionChange, focus }: WorkspacePaneProps) {
   const { t } = useLocale();
   const session = snapshot.daemon.sessions.find(item => item.id === activeId);
   const [splitLayout, dispatchSplitLayout] = useReducer(reduceSplitLayout, activeId, initialSplitLayoutState);
@@ -538,18 +571,24 @@ export const WorkspacePane = memo(function WorkspacePane({ active = true, snapsh
     setSplitResizing(false);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
+  const chromeVisible = workspaceChromeVisible(focus);
   const primaryNonPtyFocused = splitSession ? focusedId === session?.id : true;
+  const splitControls = active && chromeVisible && session && splitSession ? (
+    <div className={cn("workspace-split-controls", topbarActionsHost && "is-topbar")}>
+      <span className="workspace-split-label"><Columns2 /><span>{t("分屏", "Split view")}</span></span>
+      <NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => dispatchSplitLayout({ type: "open_split", splitId: event.target.value })}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect>
+      <Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} title={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button>
+    </div>
+  ) : null;
   return <div className="workspace-view workspace-view-single workspace-multipane" data-split-resizing={splitResizing || undefined}>
-    {session && splitSession && <div className="workspace-split-controls">
-      <span className="workspace-split-label"><Columns2 />{t("分屏", "Split view")}</span>
-      {splitSession && <><NativeSelect size="sm" aria-label={t("分屏会话", "Split session")} value={splitSession.id} onChange={event => dispatchSplitLayout({ type: "open_split", splitId: event.target.value })}>{candidates.map(item => <NativeSelectOption key={item.id} value={item.id}>{sessionLabel(item)}</NativeSelectOption>)}</NativeSelect><Button size="icon-xs" variant="ghost" aria-label={t("关闭分屏", "Close split view")} onClick={closeSplit}><X /></Button></>}
-    </div>}
+    {splitControls && (topbarActionsHost ? createPortal(splitControls, topbarActionsHost) : splitControls)}
     <div ref={stack} className={cn("workspace-session-stack", splitSession && "is-split", stacked && "is-stacked")} style={splitSession ? { [stacked ? "gridTemplateRows" : "gridTemplateColumns"]: `${ratio}fr 6px ${100 - ratio}fr` } : undefined}>
       {terminalSessions.map(item => {
         const primary = item.id === activeId;
         const visible = active && (primary || item.id === splitSession?.id);
-        return <div key={item.id} className="workspace-session-slot" data-position={primary ? "primary" : "secondary"} data-focused={focusedId === item.id || undefined} inert={!visible} aria-hidden={!visible} style={visible ? undefined : { position: "absolute", inset: 0, visibility: "hidden", pointerEvents: "none" }} onPointerDownCapture={() => visible && focusSession(item.id)} onFocusCapture={() => visible && focusSession(item.id)}>
-          <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} session={item} active={visible} focused={focusedId === item.id} primary={primary} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
+        const isFocused = splitSession ? focusedId === item.id : primary;
+        return <div key={item.id} className="workspace-session-slot" data-position={primary ? "primary" : "secondary"} data-focused={isFocused || undefined} inert={!visible} aria-hidden={!visible} style={visible ? undefined : { position: "absolute", inset: 0, visibility: "hidden", pointerEvents: "none" }} onPointerDownCapture={() => visible && focusSession(item.id)} onFocusCapture={() => visible && focusSession(item.id)}>
+          <WorkspaceSession onSplit={primary && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} session={item} active={visible} focused={isFocused} primary={primary} split={Boolean(splitSession)} topbarActionsHost={topbarActionsHost} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} onNativeFocus={focusSession} />
         </div>;
       })}
       {splitSession && <div ref={splitResizerRef} className="workspace-split-resizer" role="separator" aria-orientation={stacked ? "horizontal" : "vertical"} aria-label={t("调整分屏大小", "Resize split view")} aria-valuemin={SPLIT_RATIO_MIN} aria-valuemax={SPLIT_RATIO_MAX} aria-valuenow={Math.round(ratio)} tabIndex={0} onDoubleClick={() => dispatchSplitLayout({ type: "set_ratio", ratio: SPLIT_RATIO_DEFAULT })} onPointerDown={event => {
@@ -589,8 +628,8 @@ export const WorkspacePane = memo(function WorkspacePane({ active = true, snapsh
         const next = event.key === "Home" ? SPLIT_RATIO_MIN : event.key === "End" ? SPLIT_RATIO_MAX : ["ArrowLeft", "ArrowUp"].includes(event.key) ? ratio - 5 : ["ArrowRight", "ArrowDown"].includes(event.key) ? ratio + 5 : undefined;
         if (next !== undefined) { event.preventDefault(); dispatchSplitLayout({ type: "set_ratio", ratio: next }); }
       }} />}
-      {session?.kind !== "pty" && <div className="workspace-session-slot" data-position="primary" data-focused={primaryNonPtyFocused || undefined} onPointerDownCapture={() => active && session && focusSession(session.id)} onFocusCapture={() => active && session && focusSession(session.id)}><WorkspaceSession key={session?.id ?? "empty"} onSplit={session && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} active={active} focused={primaryNonPtyFocused} primary={true} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<WorkspaceEmptyWorkbench snapshot={snapshot} onActivate={onActivate} onNewSession={onNewSession} onOpenRun={onOpenRun} onAddWorkspace={onAddWorkspace} />} /></div>}
-      {splitSession && splitSession.kind !== "pty" && <div key={splitSession.id} className="workspace-session-slot" data-position="secondary" data-focused={focusedId === splitSession.id || undefined} inert={!active} aria-hidden={!active} onPointerDownCapture={() => active && focusSession(splitSession.id)} onFocusCapture={() => active && focusSession(splitSession.id)}><WorkspaceSession session={splitSession} active={active} focused={focusedId === splitSession.id} primary={false} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} /></div>}
+      {session?.kind !== "pty" && <div className="workspace-session-slot" data-position="primary" data-focused={primaryNonPtyFocused || undefined} onPointerDownCapture={() => active && session && focusSession(session.id)} onFocusCapture={() => active && session && focusSession(session.id)}><WorkspaceSession key={session?.id ?? "empty"} onSplit={session && !splitSession && candidates.length > 0 ? () => dispatchSplitLayout({ type: "open_split", splitId: candidates[0]?.id }) : undefined} active={active} focused={primaryNonPtyFocused} primary={true} split={Boolean(splitSession)} topbarActionsHost={topbarActionsHost} snapshot={snapshot} session={session} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<WorkspaceEmptyWorkbench snapshot={snapshot} onActivate={onActivate} onNewSession={onNewSession} onOpenRun={onOpenRun} onAddWorkspace={onAddWorkspace} />} /></div>}
+      {splitSession && splitSession.kind !== "pty" && <div key={splitSession.id} className="workspace-session-slot" data-position="secondary" data-focused={focusedId === splitSession.id || undefined} inert={!active} aria-hidden={!active} onPointerDownCapture={() => active && focusSession(splitSession.id)} onFocusCapture={() => active && focusSession(splitSession.id)}><WorkspaceSession session={splitSession} active={active} focused={focusedId === splitSession.id} primary={false} split={Boolean(splitSession)} topbarActionsHost={topbarActionsHost} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onOpenSession={onActivate} onSwitchBotSession={onSwitchBotSession} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} /></div>}
     </div>
   </div>;
 }, (previous, next) => {
@@ -599,6 +638,7 @@ export const WorkspacePane = memo(function WorkspacePane({ active = true, snapsh
     && previous.snapshot === next.snapshot
     && previous.activeId === next.activeId
     && previous.openIds === next.openIds
+    && previous.topbarActionsHost === next.topbarActionsHost
     && previous.focus === next.focus
     && previous.onActivate === next.onActivate
     && previous.onSwitchBotSession === next.onSwitchBotSession

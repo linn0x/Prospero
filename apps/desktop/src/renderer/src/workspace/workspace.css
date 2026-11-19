@@ -1,5 +1,19 @@
 .local-workspace-container { display: flex; height: 100%; min-width: 0; min-height: 0; flex-direction: column; }
 .local-workspace-container > .workspace-view { flex: 1; min-height: 0; height: auto; }
+.workspace-topbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  height: 34px;
+  padding: 3px 8px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--surface-0) 88%, var(--background));
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  -webkit-app-region: drag;
+  container: workspace-topbar / inline-size;
+}
 .topbar-workspace-tabs {
   display: flex;
   flex: none;
@@ -12,15 +26,40 @@
   padding: 3px 8px;
   -webkit-app-region: drag;
 }
+.workspace-topbar > .topbar-workspace-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 0;
+  background: transparent;
+  border-bottom: 0;
+}
 .topbar-workspace-tabs .workspace-tab { flex: 1 1 184px; height: 26px; min-width: 112px; max-width: 220px; border-radius: var(--ui-radius-control); }
 .topbar-workspace-tabs .workspace-tabs { padding: 0; gap: 3px; }
 .topbar-workspace-tabs .workspace-tab-main { min-width: 0; }
 .topbar-workspace-tabs .workspace-tab-main span { color: inherit; }
 .topbar-workspace-tabs button { -webkit-app-region: no-drag; }
+.workspace-topbar-actions-slot { display: contents; }
+.workspace-topbar-actions-host {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  padding-left: 6px;
+  border-left: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  -webkit-app-region: no-drag;
+}
+.workspace-topbar-actions-host:empty { display: none; }
+.workspace-topbar-actions-host button,
+.workspace-topbar-actions-host select { -webkit-app-region: no-drag; }
 .workspace-session-layout { height: 100%; }
 .workspace-multipane { display: flex; flex-direction: column; }
 .workspace-split-controls { display: flex; flex: none; align-items: center; gap: 6px; min-height: 32px; padding: 3px 10px; border-bottom: 1px solid var(--border); }
 .workspace-split-controls [data-slot="native-select-wrapper"] { width: min(280px, 60%); }
+.workspace-split-controls.is-topbar { min-height: 26px; height: 26px; padding: 0; gap: 4px; border-bottom: 0; }
+.workspace-split-controls.is-topbar [data-slot="native-select-wrapper"] { width: auto; max-width: 170px; }
+.workspace-split-controls.is-topbar [data-slot="native-select"] { height: 24px; font-size: var(--ui-text-caption); }
 .workspace-session-stack { display: grid; position: relative; flex: 1; min-width: 0; min-height: 0; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); overflow: hidden; }
 .workspace-session-slot { position: relative; min-width: 0; min-height: 0; grid-row: 1; grid-column: 1; overflow: hidden; transition: opacity 150ms cubic-bezier(0.22, 1, 0.36, 1); }
 .workspace-session-stack.is-split > [data-position="secondary"] { grid-column: 3; }
@@ -43,6 +82,71 @@
 .session-toolbar-model { max-width: 160px; overflow: hidden; text-overflow: ellipsis; color: var(--foreground); }
 .session-toolbar .pane-toolbar-actions { gap: 2px; }
 .session-toolbar .pane-toolbar-actions > [data-slot="button"] { min-width: 24px; height: 24px; flex: none; padding-inline: 6px; font-size: var(--ui-text-caption); }
+.session-toolbar .pane-toolbar-actions > [data-slot="button"][aria-pressed="true"] {
+  color: var(--foreground);
+  background: var(--surface-raised);
+  border-color: color-mix(in srgb, var(--foreground) 10%, var(--border));
+}
+.session-toolbar.is-topbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  min-height: 26px;
+  height: 26px;
+  padding: 0;
+  gap: 2px;
+  border: 0;
+  background: transparent;
+}
+.session-toolbar.is-topbar .pane-toolbar-actions > [data-slot="button"] {
+  min-width: 26px;
+  height: 26px;
+  padding-inline: 7px;
+  border-radius: var(--ui-radius-control, 6px);
+  color: var(--muted-foreground);
+  font-weight: 400;
+}
+.session-toolbar.is-topbar .pane-toolbar-actions > [data-slot="button"].size-6 {
+  width: 26px;
+  padding-inline: 0;
+}
+.session-toolbar.is-topbar .pane-toolbar-actions > [data-slot="button"]:hover,
+.session-toolbar.is-topbar .pane-toolbar-actions > [data-slot="button"][aria-expanded="true"] {
+  color: var(--foreground);
+}
+.session-toolbar-menu-meta {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--ui-font-mono);
+  font-size: 11px;
+  font-weight: 400;
+}
+.project-workspace-topbar-actions { display: flex; flex: none; align-items: center; gap: 4px; }
+.project-workspace-topbar-actions [data-slot="native-select-wrapper"] { width: auto; max-width: 170px; }
+.project-workspace-topbar-actions [data-slot="native-select"] { height: 24px; font-size: var(--ui-text-caption); }
+.project-workspace-topbar-actions > [data-slot="button"] {
+  min-width: 26px;
+  height: 26px;
+  padding-inline: 7px;
+  border-radius: var(--ui-radius-control, 6px);
+  color: var(--muted-foreground);
+  font-size: var(--ui-text-caption);
+  font-weight: 400;
+}
+.project-workspace-topbar-actions > [data-slot="button"]:hover { color: var(--foreground); }
+.project-workspace-topbar-actions > [data-slot="button"][aria-pressed="true"] {
+  color: var(--foreground);
+  background: var(--surface-raised);
+  border-color: color-mix(in srgb, var(--foreground) 10%, var(--border));
+}
+@container workspace-topbar (max-width: 680px) {
+  .session-toolbar-action-label,
+  .workspace-split-controls.is-topbar .workspace-split-label > span { display: none; }
+  .session-toolbar.is-topbar .pane-toolbar-actions > [data-slot="button"],
+  .project-workspace-topbar-actions > [data-slot="button"] { width: 26px; padding-inline: 0; }
+}
 .session-toolbar .pane-toolbar-actions > .terminal-mouse-toggle { width: auto; flex: none; }
 @container workspace-primary (max-width: 480px) { .session-toolbar { flex-wrap: wrap; height: auto; } .session-toolbar-identity { flex: 1 1 100%; } .session-toolbar .pane-toolbar-actions { flex-wrap: wrap; } }
 .session-toolbar .session-model-chip { width: auto !important; max-width: 190px; height: 24px; min-height: 24px; padding-inline: 8px; gap: 4px; font-size: var(--ui-text-caption); }

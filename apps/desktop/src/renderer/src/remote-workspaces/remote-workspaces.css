@@ -1,15 +1,21 @@
 .remote-workspace-pane { display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; position: relative; background: var(--surface-sunken); }
-.remote-workspace-toolbar { display: flex; align-items: center; gap: 8px; height: 38px; min-height: 38px; padding: 0 10px; border-bottom: 1px solid var(--border); background: var(--surface); }
-.remote-workspace-title { display: flex; flex: 1; align-items: center; gap: 7px; min-width: 0; font-size: var(--ui-text-small); }
-.remote-workspace-title > svg { flex: none; color: var(--muted); }
-.remote-workspace-title strong, .remote-workspace-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.remote-workspace-title strong { flex: none; max-width: 180px; font-weight: 600; }
-.remote-workspace-title span { color: var(--muted); font-size: var(--ui-text-caption); }
-.remote-workspace-toolbar button { flex: none; min-height: 28px; padding: 4px 7px; }
-.remote-workspace-tabs { display: flex; align-items: center; flex: none; gap: 3px; min-height: 32px; max-height: 38px; padding: 3px 8px; overflow-x: auto; border-bottom: 1px solid var(--border); background: var(--surface); }
-.remote-workspace-tabs button { min-width: 84px; max-width: 210px; min-height: 26px; padding: 4px 8px; border-color: transparent; background: transparent; }
+.remote-workspace-toolbar { display: flex; align-items: center; gap: 6px; height: 34px; min-height: 34px; padding: 3px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent); background: color-mix(in srgb, var(--surface-0) 88%, var(--background)); -webkit-app-region: drag; }
+.remote-workspace-toolbar button { -webkit-app-region: no-drag; }
+.remote-workspace-title { display: flex; flex: none; align-items: center; gap: 5px; max-width: 160px; padding-right: 6px; border-right: 1px solid color-mix(in srgb, var(--border) 72%, transparent); color: var(--muted-foreground); font-size: var(--ui-text-caption); }
+.remote-workspace-title > svg { flex: none; color: var(--muted-foreground); }
+.remote-workspace-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: var(--foreground); }
+.remote-workspace-tabs-wrap { display: flex; flex: 1; min-width: 0; align-items: center; gap: 3px; -webkit-app-region: no-drag; }
+.remote-workspace-tabs { display: flex; align-items: center; min-width: 0; gap: 3px; overflow-x: auto; scrollbar-width: none; }
+.remote-workspace-tabs::-webkit-scrollbar { display: none; }
+.remote-workspace-tabs button { flex: none; min-width: 72px; max-width: 180px; height: 26px; min-height: 26px; padding: 0 8px; border-color: transparent; border-radius: var(--ui-radius-control, 6px); background: transparent; color: var(--muted-foreground); font-size: var(--ui-text-caption); }
+.remote-workspace-tabs button:hover { color: var(--foreground); background: color-mix(in srgb, var(--foreground) 6%, transparent); }
 .remote-workspace-tabs button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.remote-workspace-tabs button[aria-selected="true"] { background: var(--surface-3); border-color: var(--border); }
+.remote-workspace-tabs button[aria-selected="true"] { color: var(--foreground); background: var(--surface-raised); border-color: color-mix(in srgb, var(--foreground) 10%, var(--border)); }
+.remote-workspace-tab-new { display: inline-grid; flex: none; width: 24px; height: 24px; place-items: center; padding: 0; border-color: transparent; border-radius: var(--ui-radius-control, 6px); background: transparent; color: var(--muted-foreground); }
+.remote-workspace-tab-new:hover:not(:disabled) { color: var(--foreground); background: color-mix(in srgb, var(--foreground) 8%, transparent); border-color: transparent; }
+.remote-workspace-actions { display: flex; flex: none; align-items: center; gap: 2px; padding-left: 6px; border-left: 1px solid color-mix(in srgb, var(--border) 72%, transparent); -webkit-app-region: no-drag; }
+.remote-workspace-actions button { display: inline-grid; flex: none; width: 26px; height: 26px; place-items: center; padding: 0; border-color: transparent; border-radius: var(--ui-radius-control, 6px); background: transparent; color: var(--muted-foreground); }
+.remote-workspace-actions button:hover:not(:disabled) { color: var(--foreground); background: color-mix(in srgb, var(--foreground) 8%, transparent); border-color: transparent; }
 .remote-workspace-status { display: flex; align-items: center; flex: none; gap: 7px; min-height: 28px; padding: 5px 12px; color: var(--muted); font-size: var(--ui-text-caption); background: var(--surface); }
 .remote-workspace-status.is-error { color: var(--danger); }
 .remote-workspace-status button { margin-left: auto; padding: 2px 6px; font-size: var(--ui-text-caption); }

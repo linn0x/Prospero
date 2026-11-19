@@ -4,9 +4,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SessionToolbar } from '../src/renderer/src/workspace/SessionToolbar';
 vi.mock('../src/renderer/src/locale', () => ({ useLocale: () => ({ t: (_zh: string, en: string) => en }) }));
 afterEach(() => vi.unstubAllGlobals());
-function toolbar(status: 'idle' | 'running') {
+function toolbar(status: 'idle' | 'running', variant?: 'pane' | 'topbar') {
   vi.stubGlobal('window', { prospero: { platform: 'darwin' } });
-  return renderToStaticMarkup(<SessionToolbar session={{ id: 'one', cwd: '/repo', agent: 'codex', kind: 'pty', status }} account={undefined} contextVisible={false} onToggleContext={() => {}} onToggleFocus={() => {}} localSelection onLocalSelectionChange={() => {}} />);
+  return renderToStaticMarkup(<SessionToolbar variant={variant} session={{ id: 'one', cwd: '/repo', agent: 'codex', kind: 'pty', status }} account={undefined} contextVisible={false} onToggleContext={() => {}} onToggleFocus={() => {}} localSelection onLocalSelectionChange={() => {}} />);
 }
 describe('session toolbar priorities', () => {
   it('exposes tools, focus and session actions without duplicate project shortcuts', () => {
@@ -16,5 +16,11 @@ describe('session toolbar priorities', () => {
   });
   it('keeps stop immediately accessible while a session runs', () => {
     expect(toolbar('running')).toContain('aria-label="Stop current turn"');
+  });
+  it('omits the redundant identity header row when merged into the top bar', () => {
+    const html = toolbar('running', 'topbar');
+    expect(html).toContain('session-toolbar is-topbar');
+    expect(html).not.toContain('session-toolbar-identity');
+    for (const name of ['Stop current turn', 'Toggle tools', 'Enter focus mode', 'Session actions']) expect(html).toContain(`aria-label="${name}"`);
   });
 });

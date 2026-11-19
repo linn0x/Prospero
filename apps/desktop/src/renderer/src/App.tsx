@@ -3766,6 +3766,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const localWorkspaceVisible = view === "workspaces" && !activeRemote && !(activeRemoteId && !remote.ready);
   const [localWorkspaceVisited, setLocalWorkspaceVisited] = useState(false);
   if (localWorkspaceVisible && !localWorkspaceVisited) setLocalWorkspaceVisited(true);
+  const [topbarActionsContainer] = useState<HTMLDivElement | null>(() => {
+    if (typeof document === "undefined") return null;
+    const element = document.createElement("div");
+    element.className = "workspace-topbar-actions-host";
+    return element;
+  });
   return (
     <TooltipProvider>
     <ProjectToolsProvider>
@@ -3864,13 +3870,14 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <span>{t("正在加载工作区…", "Loading workspace…")}</span>
             </div>
           ) : null}><div className="local-workspace-container" inert={!localWorkspaceVisible} aria-hidden={!localWorkspaceVisible} style={{ position: "absolute", inset: 0, visibility: localWorkspaceVisible ? "visible" : "hidden" }}>
-              {!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} botSession={botSession} botBusy={botCreating} onSelectBot={openBotSession} onActivate={activateWorkspaceTab} onClose={closeSession} onTogglePin={togglePin} onReorder={reorderWorkspaceTabs} onNewSession={openNewSession} />}
+              {!workspaceFocus && (validOpenIds.length > 0 || Boolean(botSession) || localWorkspaceVisible) && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} botSession={botSession} botBusy={botCreating} actionsContainer={topbarActionsContainer} onSelectBot={openBotSession} onActivate={activateWorkspaceTab} onClose={closeSession} onTogglePin={togglePin} onReorder={reorderWorkspaceTabs} onNewSession={openNewSession} />}
               <WorkspacePane
                 active={localWorkspaceVisible}
                 focus={focus}
                 snapshot={sessionSnapshot}
                 activeId={activeId}
                 openIds={validOpenIds}
+                topbarActionsHost={topbarActionsContainer}
                 onActivate={activateWorkspaceSession}
                 onClose={closeSession}
                 onNewSession={openNewSession}
