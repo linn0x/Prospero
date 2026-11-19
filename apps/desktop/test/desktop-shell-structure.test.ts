@@ -53,6 +53,10 @@ describe("desktop shell structure", () => {
     expect(app).toContain('className="sidebar-header-toggle"');
     expect(app).toContain("onOpenSession(id, session);");
     expect(app).toContain("onOpenSession={openSession}");
+    expect(styles).not.toContain('.prospero-sidebar:not([data-collapsible="icon"])');
+    expect(styles).toContain('[data-slot="sidebar"]:not([data-collapsible="icon"]) .sidebar-primary-grid');
+    expect(styles).toContain('[data-slot="sidebar"]:not([data-collapsible="icon"]) .sidebar-resource-dock');
+    expect(styles).toContain('[data-collapsible="icon"] .prospero-sidebar .sidebar-resource-dock');
   });
 
   it("fills the space beside the sidebar with workspace content", () => {

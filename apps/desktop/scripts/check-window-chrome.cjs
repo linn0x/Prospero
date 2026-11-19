@@ -34,6 +34,8 @@ app.on("browser-window-created", (_event, window) => {
         headerButtons: [...document.querySelectorAll('.sidebar-shell-header button')].map(element => ({ label: element.getAttribute('aria-label'), region: getComputedStyle(element).webkitAppRegion, x: element.getBoundingClientRect().x, y: element.getBoundingClientRect().y })),
         expanded: document.querySelector('[data-slot="sidebar"][data-state]')?.dataset.state === 'expanded',
         navHeights: [...document.querySelectorAll('.sidebar-nav-fixed [data-sidebar="menu-button"]')].map(e=>e.getBoundingClientRect().height),
+        resourceButtons: [...document.querySelectorAll('.sidebar-resource-dock [data-sidebar="menu-button"]')].map(e => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right, bottom: r.bottom }; }),
+        footerButtons: [...document.querySelectorAll('.sidebar-footer-actions [data-sidebar="menu-button"]')].map(e => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right, bottom: r.bottom }; }),
         resizing: document.documentElement.dataset.sidebarResizing,
         savedWidth: Number(localStorage.getItem('prospero.sidebarWidth')), saves: window.widthSaves || 0 };
     })()`);
@@ -97,7 +99,9 @@ app.on("browser-window-created", (_event, window) => {
       assert.equal(initial.main.y, isMac ? 0 : initial.toolbar.height);
       assert.equal(initial.viewport.y, isMac ? 0 : initial.toolbar.height);
       if (isMac) assert(initial.header.width <= initial.sidebar.width);
-      assert(initial.navHeights.every(h => h === 28));
+      assert(initial.navHeights.every(h => h === 26));
+      assert.equal(initial.resourceButtons.length, 5);
+      assert(initial.resourceButtons.every((btn, i) => Math.abs(btn.y - initial.resourceButtons[0].y) < 1 && (i === 0 || btn.x >= initial.resourceButtons[i - 1].right - 0.5)));
       if (isMac) {
         assert.deepEqual(window.getWindowButtonPosition(), { x: 14, y: 16 });
         assert(initial.trigger.x >= 88);
@@ -131,6 +135,10 @@ app.on("browser-window-created", (_event, window) => {
       assert.equal(collapsed.sidebar.width, collapsedWidth);
       assert.equal(collapsed.sidebar.y, isMac ? 0 : collapsed.toolbar.height);
       assert(collapsed.navHeights.every(h => h === 28));
+      assert.equal(collapsed.resourceButtons.length, 5);
+      assert.equal(collapsed.footerButtons.length, 2);
+      const bottomButtons = [...collapsed.resourceButtons, ...collapsed.footerButtons];
+      assert(bottomButtons.every((btn, i) => btn.width === 28 && btn.height === 28 && btn.x >= 0 && btn.right <= collapsed.sidebar.width && (i === 0 || btn.y >= bottomButtons[i - 1].bottom)));
       await screenshot("collapsed");
       await toggle();
       assert.equal((await measure()).sidebar.width, resized.sidebar.width);
@@ -166,7 +174,7 @@ app.on("browser-window-created", (_event, window) => {
       await toggle();
       await run(`Array.from(document.querySelectorAll('.sidebar-nav-fixed button')).find(e=>['工作台','Workspaces'].includes(e.textContent.trim()))?.click()`);
       await delay(300);
-      const focusShortcut = isMac ? ["meta", "shift"] : ["control", "alt"];
+      const focusShortcut = isMac ? ["meta", "alt"] : ["control", "alt"];
       await key("F", focusShortcut);
       assert(await run(`Boolean(document.querySelector('.sidebar-exit-focus'))`), "Focus mode keeps its exit in the sidebar");
       await assertHeader();
