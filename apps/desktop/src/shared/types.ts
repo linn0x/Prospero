@@ -194,6 +194,7 @@ export type DesktopSettings = {
   workspaceSort: "recent" | "name";
   terminalFontFamily: string;
   terminalFontSize: number;
+  uiFontFamily?: string;
   /** daemon 的监听地址;0.0.0.0 表示全部网卡。下次启动 daemon 时生效。 */
   daemonBind: string;
 };

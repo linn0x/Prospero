@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Terminal } from "@xterm/xterm";
 import { configureRustTerminalUnicode } from "../src/renderer/src/terminal-unicode";
-import { terminalFontFamilyWithFallbacks } from "../src/shared/terminal-typography";
+import { terminalFontFamilyWithFallbacks, uiFontFamilyWithFallbacks } from "../src/shared/terminal-typography";
 
 describe("terminal font fallbacks", () => {
   it("adds Chinese fallbacks after the generic font", () => {
@@ -27,6 +27,33 @@ describe("terminal font fallbacks", () => {
     const family = terminalFontFamilyWithFallbacks("ui-monospace, monospace");
     expect(family.startsWith("Cascadia Mono, Consolas, ")).toBe(true);
     expect(family).toContain(", ui-monospace, monospace, \"PingFang SC\"");
+  });
+});
+
+describe("ui font fallbacks", () => {
+  it("returns undefined when unset or blank so system defaults remain untouched", () => {
+    expect(uiFontFamilyWithFallbacks(undefined, "darwin")).toBeUndefined();
+    expect(uiFontFamilyWithFallbacks("", "darwin")).toBeUndefined();
+    expect(uiFontFamilyWithFallbacks("   ", "linux")).toBeUndefined();
+    expect(uiFontFamilyWithFallbacks("inherit", "darwin")).toBeUndefined();
+    expect(uiFontFamilyWithFallbacks(";{}", "darwin")).toBeUndefined();
+  });
+
+  it("prepends custom UI fonts before platform and CJK fallbacks", () => {
+    expect(uiFontFamilyWithFallbacks("Allo Variable, Allo", "darwin")).toBe(
+      '"Allo Variable", "Allo", -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif',
+    );
+    expect(uiFontFamilyWithFallbacks("Allo Variable, Allo", "win32")).toBe(
+      '"Allo Variable", "Allo", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", system-ui, sans-serif',
+    );
+  });
+
+  it("deduplicates families, handles quoted names with commas, and strips unsafe characters", () => {
+    const family = uiFontFamilyWithFallbacks('"Custom, Sans", PingFang SC, sans-serif, Inter;color:red', "darwin");
+    expect(family).toBe(
+      '"Custom, Sans", "PingFang SC", "Intercolorred", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Noto Sans CJK SC", sans-serif, system-ui',
+    );
+    expect(uiFontFamilyWithFallbacks(family, "darwin")).toBe(family);
   });
 });
 

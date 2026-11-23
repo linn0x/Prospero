@@ -31,6 +31,27 @@ describe("Electron state snapshot caching", () => {
     expect(new StateStore(home).settingsSnapshot()).toMatchObject({ terminalFontFamily: "My Mono, monospace", terminalFontSize: 18 });
   });
 
+  it("leaves uiFontFamily unset by default and persists or clears custom values cleanly", () => {
+    const home = testHome();
+    const initial = new StateStore(home);
+    expect(initial.settingsSnapshot().uiFontFamily).toBeUndefined();
+    expect("uiFontFamily" in initial.settingsSnapshot()).toBe(false);
+
+    initial.updateSettings({ uiFontFamily: "  Allo Variable, Allo  " });
+    initial.updateSettings({ theme: "dark" });
+    expect(new StateStore(home).settingsSnapshot()).toMatchObject({ uiFontFamily: "Allo Variable, Allo", theme: "dark" });
+
+    initial.updateSettings({ uiFontFamily: "" });
+    const cleared = new StateStore(home).settingsSnapshot();
+    expect(cleared.uiFontFamily).toBeUndefined();
+    expect("uiFontFamily" in cleared).toBe(false);
+
+    writeJson(home, "desktop.json", { settings: { uiFontFamily: "   " } });
+    expect(new StateStore(home).settingsSnapshot().uiFontFamily).toBeUndefined();
+    writeJson(home, "desktop.json", { settings: { uiFontFamily: 123 as unknown as string } });
+    expect(new StateStore(home).settingsSnapshot().uiFontFamily).toBeUndefined();
+  });
+
   it("retains live session model controls without granting missing capabilities", () => {
     const home = testHome();
     const agentControls = { compact: false, model: true, mode: false, currentModel: "provider/model", currentEffort: "high" };

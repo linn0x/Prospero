@@ -1,4 +1,4 @@
-import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../../shared/terminal-typography";
+import { terminalFontFamilyWithFallbacks, uiFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../../shared/terminal-typography";
 import { useConversationFont } from "../chat/use-conversation-font";
 import { DEFAULT_CONVERSATION_FONT_SIZE } from "../chat/display";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -32,8 +32,10 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot; onOpenAc
   const isWindows = window.prospero.platform === "win32";
   const [interfaces, setInterfaces] = useState<Array<{ label: string; address: string }>>([]);
   const interfacesLoaded = useRef(false);
+  const [uiFontFamily, setUiFontFamily] = useState(settings.uiFontFamily ?? "");
   const [fontFamily, setFontFamily] = useState(settings.terminalFontFamily);
   const [fontSize, setFontSize] = useState(String(settings.terminalFontSize));
+  const uiFontFamilyDirty = useRef(false);
   const fontFamilyDirty = useRef(false);
   const fontSizeDirty = useRef(false);
   const [relay, setRelay] = useState<Record<string, unknown>>(snapshot.daemon.relay);
@@ -51,6 +53,9 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot; onOpenAc
     mounted.current = true;
     return () => { mounted.current = false; actions.dispose(); };
   }, [actions]);
+  useEffect(() => {
+    if (!uiFontFamilyDirty.current) setUiFontFamily(settings.uiFontFamily ?? "");
+  }, [settings.uiFontFamily]);
   useEffect(() => {
     if (!fontFamilyDirty.current) setFontFamily(settings.terminalFontFamily);
   }, [settings.terminalFontFamily]);
@@ -76,6 +81,17 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot; onOpenAc
     if (active === "runtime" && !interfacesLoaded.current && !feedback["daemon-bind"]) void loadInterfaces();
   }, [active, feedback, loadInterfaces]);
 
+  const previewUiFont = uiFontFamilyWithFallbacks(uiFontFamily, window.prospero.platform);
+  const saveUiFontFamily = () => {
+    if (!uiFontFamilyDirty.current) return;
+    void actions.run("ui-font-family", async () => {
+      const value = uiFontFamily.trim();
+      const next = await window.prospero.updateSettings({ uiFontFamily: value });
+      if (mounted.current) setUiFontFamily(next.settings.uiFontFamily ?? "");
+      uiFontFamilyDirty.current = false;
+      return value ? t("已保存", "Saved") : t("已恢复系统默认", "Reset to system default");
+    }, "settings");
+  };
   const saveFontFamily = () => {
     if (!fontFamilyDirty.current) return;
     void actions.run("terminal-font-family", async () => {
@@ -144,6 +160,9 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot; onOpenAc
         <SettingRow id="desktop-theme" title={t("主题", "Theme")} description={t("立即应用于侧栏、面板和窗口。", "Applies immediately to the sidebar, panels, and window.")} {...rowFeedback("desktop-theme")}>
           <select id="desktop-theme" value={settings.theme} disabled={busy("desktop-theme")} aria-describedby={description("desktop-theme")} onChange={(event) => { void update("desktop-theme", { theme: event.target.value as DesktopSettings["theme"] }); }}><option value="system">{t("跟随系统", "System")}</option><option value="light">{t("浅色", "Light")}</option><option value="dark">{t("深色", "Dark")}</option></select>
         </SettingRow>
+        <SettingRow id="ui-font-family" title={t("界面字体", "Interface font")} description={t("留空使用系统默认，回车或失焦后保存。", "Leave empty for system default. Saves on Enter or blur.")} {...rowFeedback("ui-font-family")}>
+          <input id="ui-font-family" type="text" value={uiFontFamily} placeholder={t("系统默认", "System default")} disabled={busy("ui-font-family")} aria-describedby={description("ui-font-family")} onChange={(event) => { uiFontFamilyDirty.current = true; setUiFontFamily(event.target.value); }} onBlur={saveUiFontFamily} onKeyDown={(event) => { if (event.key === "Enter") saveUiFontFamily(); }} />
+        </SettingRow>
         <SettingRow id="conversation-font-size" title={t("对话字号", "Conversation text size")} description={t("应用到所有会话，即时保存。", "Applies to all conversations and saves immediately.")}>
           <div className="settings-font-control">
             <input id="conversation-font-size" type="range" min={13} max={24} step={1} value={conversationSize} aria-describedby="conversation-font-size-description" aria-valuetext={`${conversationSize} px`} onChange={(event) => setConversationSize(Number(event.target.value))} />
@@ -151,7 +170,7 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot; onOpenAc
             <button type="button" data-slot="conversation-font-reset" className="settings-font-reset" disabled={conversationSize === DEFAULT_CONVERSATION_FONT_SIZE} onClick={() => setConversationSize(DEFAULT_CONVERSATION_FONT_SIZE)}>{t("恢复默认", "Reset")}</button>
           </div>
         </SettingRow>
-        <div className="settings-conversation-preview" style={{ fontSize: conversationSize }} aria-label={t("对话字号预览", "Conversation text preview")}>
+        <div className="settings-conversation-preview" style={{ fontSize: conversationSize, ...(previewUiFont ? { fontFamily: previewUiFont } : {}) }} aria-label={t("对话字号预览", "Conversation text preview")}>
           <p>{t("让文字清晰，让阅读自然。", "Clear text, comfortable reading.")}</p>
           <p>Prospero · Aa Bb 0123456789</p>
         </div>

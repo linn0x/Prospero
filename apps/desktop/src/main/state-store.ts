@@ -1177,6 +1177,11 @@ export class StateStore extends EventEmitter {
     if (patch.workspaceSort === "recent" || patch.workspaceSort === "name") next.workspaceSort = patch.workspaceSort;
     if (typeof patch.terminalFontFamily === "string" && patch.terminalFontFamily.trim()) next.terminalFontFamily = patch.terminalFontFamily.trim().slice(0, 200);
     if (typeof patch.terminalFontSize === "number" && patch.terminalFontSize >= 8 && patch.terminalFontSize <= 48) next.terminalFontSize = patch.terminalFontSize;
+    if (typeof patch.uiFontFamily === "string") {
+      const uiFontFamily = patch.uiFontFamily.trim().slice(0, 200);
+      if (uiFontFamily) next.uiFontFamily = uiFontFamily;
+      else delete next.uiFontFamily;
+    }
     // 只接受点分四段的 IPv4:这个值会直接变成 daemon 的 --bind 参数,
     // 而 daemon 拿到一个不在本机的地址会启动失败,错误只出现在日志里。
     if (typeof patch.daemonBind === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(patch.daemonBind.trim())) next.daemonBind = patch.daemonBind.trim();
@@ -1376,6 +1381,8 @@ export class StateStore extends EventEmitter {
         updatedAt: numberValue(value["updatedAt"], Date.now()),
       }];
     }).filter((template) => template.nodes.length > 0);
+    const rawUiFont = typeof stored["uiFontFamily"] === "string" ? stored["uiFontFamily"] : this.defaultSettings.uiFontFamily;
+    const uiFontFamily = typeof rawUiFont === "string" ? rawUiFont.trim().slice(0, 200) : "";
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...stored,
@@ -1384,6 +1391,8 @@ export class StateStore extends EventEmitter {
       theme: stored["theme"] === "dark" || stored["theme"] === "light" ? stored["theme"] : "system",
       workspaceSort: stored["workspaceSort"] === "name" ? "name" : "recent",
     } as DesktopSettings;
+    if (uiFontFamily) this.settings.uiFontFamily = uiFontFamily;
+    else delete this.settings.uiFontFamily;
   }
 
   private saveDesktopState(): void {

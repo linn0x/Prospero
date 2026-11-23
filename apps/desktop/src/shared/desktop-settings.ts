@@ -10,6 +10,7 @@ const SETTING_KEYS = new Set<keyof DesktopSettings>([
   "workspaceSort",
   "terminalFontFamily",
   "terminalFontSize",
+  "uiFontFamily",
   "daemonBind",
 ]);
 
@@ -58,6 +59,10 @@ export function desktopSettingsPatch(input: JsonObject, platform: NodeJS.Platfor
   if (Object.hasOwn(input, "terminalFontSize")) {
     if (typeof input["terminalFontSize"] !== "number" || !Number.isInteger(input["terminalFontSize"]) || input["terminalFontSize"] < 8 || input["terminalFontSize"] > 48) throw new Error("终端字号设置无效");
     patch.terminalFontSize = input["terminalFontSize"];
+  }
+  if (Object.hasOwn(input, "uiFontFamily")) {
+    if (typeof input["uiFontFamily"] !== "string" || input["uiFontFamily"].trim().length > 200) throw new Error("界面字体设置无效");
+    patch.uiFontFamily = input["uiFontFamily"].trim();
   }
   if (Object.hasOwn(input, "daemonBind")) {
     if (typeof input["daemonBind"] !== "string" || !validIpv4(input["daemonBind"].trim())) throw new Error("监听地址无效");

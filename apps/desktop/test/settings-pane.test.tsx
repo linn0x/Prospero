@@ -16,10 +16,22 @@ const snapshot = {
 } as DesktopSnapshot;
 
 describe("settings pane", () => {
+  it("applies custom UI font only when configured", () => {
+    vi.stubGlobal("window", { prospero: { platform: "darwin" } });
+    const defaultHtml = renderToStaticMarkup(<SettingsPane snapshot={snapshot} />);
+    expect(defaultHtml).toContain('id="ui-font-family"');
+    expect(defaultHtml).not.toContain("Allo Variable");
+
+    const customSnapshot = { ...snapshot, settings: { ...snapshot.settings, uiFontFamily: "Allo Variable, Allo" } };
+    const customHtml = renderToStaticMarkup(<SettingsPane snapshot={customSnapshot} />);
+    expect(customHtml).toContain('value="Allo Variable, Allo"');
+    expect(customHtml).toContain('&quot;Allo Variable&quot;, &quot;Allo&quot;');
+  });
+
   it("retains all desktop controls across five accessible categories", () => {
     vi.stubGlobal("window", { prospero: { platform: "darwin" } });
     const html = renderToStaticMarkup(<SettingsPane snapshot={snapshot} />);
-    for (const id of ["start-daemon-on-launch", "minimize-to-tray", "launch-at-login", "interface-language", "desktop-theme", "terminal-font-family", "terminal-font-size", "daemon-bind", "relay-url"]) expect(html).toContain(`id="${id}"`);
+    for (const id of ["start-daemon-on-launch", "minimize-to-tray", "launch-at-login", "interface-language", "desktop-theme", "ui-font-family", "terminal-font-family", "terminal-font-size", "daemon-bind", "relay-url"]) expect(html).toContain(`id="${id}"`);
     expect(html.match(/role="tab"/g)).toHaveLength(5);
     expect(html.match(/role="tabpanel"/g)).toHaveLength(5);
     expect(html.match(/hidden=""/g)).toHaveLength(4);

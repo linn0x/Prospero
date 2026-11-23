@@ -75,6 +75,7 @@ import {
 } from "./account-usage-cache";
 import { isMissingSessionError, reportError, shortPath, text } from "./state";
 import { useLocale } from "./locale";
+import { uiFontFamilyWithFallbacks } from "../../shared/terminal-typography";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   SIDEBAR_COLLAPSE_WIDTH,
@@ -3385,6 +3386,15 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     systemTheme.addEventListener("change", apply);
     return () => systemTheme.removeEventListener("change", apply);
   }, [snapshot.settings.theme]);
+
+  useLayoutEffect(() => {
+    const resolved = uiFontFamilyWithFallbacks(snapshot.settings.uiFontFamily, window.prospero.platform);
+    if (resolved) document.documentElement.style.setProperty("--ui-font", resolved);
+    else document.documentElement.style.removeProperty("--ui-font");
+    return () => {
+      document.documentElement.style.removeProperty("--ui-font");
+    };
+  }, [snapshot.settings.uiFontFamily]);
   useEffect(() => {
     if (snapshot.daemon.running && accountUsageKey) prefetchAccountUsage();
   }, [snapshot.daemon.running, accountUsageKey]);
