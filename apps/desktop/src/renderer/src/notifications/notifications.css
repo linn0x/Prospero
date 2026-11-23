@@ -1,6 +1,6 @@
 .desktop-toast-viewport { position: fixed; z-index: 200; top: calc(var(--window-titlebar-height, 44px) + 12px); right: 16px; display: flex; flex-direction: column; align-items: stretch; gap: 8px; width: min(360px, calc(100vw - 32px)); max-height: calc(100vh - 80px); overflow-y: auto; pointer-events: none; -webkit-app-region: no-drag; }
-.desktop-toast { display: flex; flex: none; align-items: flex-start; gap: 10px; padding: 14px; border: 1px solid var(--border-strong); border-radius: var(--ui-radius-window, 8px); background: var(--popover); color: var(--foreground); box-shadow: 0 6px 24px #0000001a; pointer-events: auto; transition: opacity 160ms ease, transform 160ms ease; }
-.desktop-toast[data-starting-style], .desktop-toast[data-ending-style] { opacity: 0; transform: translateX(24px); }
+.desktop-toast { display: flex; flex: none; align-items: flex-start; gap: 10px; padding: 14px; border: 1px solid var(--border-strong); border-radius: var(--ui-radius-window, 8px); background: var(--popover); color: var(--foreground); box-shadow: 0 6px 24px #0000001a; pointer-events: auto; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-base) var(--ease-out); }
+.desktop-toast[data-starting-style], .desktop-toast[data-ending-style] { opacity: 0; transform: translateX(16px); }
 .desktop-toast[data-limited] { display: none; }
 .desktop-toast-icon { flex: none; width: 17px; height: 17px; margin-top: 2px; color: var(--destructive); }
 .desktop-toast[data-type="warning"] .desktop-toast-icon { color: var(--warning); }

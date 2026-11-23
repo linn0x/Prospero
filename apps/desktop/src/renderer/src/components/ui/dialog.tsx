@@ -31,7 +31,7 @@ function DialogOverlay({
     <DialogPrimitive.Backdrop
       data-slot="dialog-overlay"
       className={cn(
-        "glass-scrim fixed inset-0 isolate z-50 duration-100 supports-backdrop-filter:backdrop-blur-xs data-open:animate-in data-open:fade-in-0 data-closed:pointer-events-none data-closed:animate-out data-closed:fade-out-0 motion-reduce:animate-none motion-reduce:transition-none",
+        "glass-scrim fixed inset-0 isolate z-50 transition-opacity duration-(--motion-base) ease-(--ease-out) data-ending-style:duration-(--motion-exit) data-ending-style:ease-(--ease-in) data-starting-style:opacity-0 data-ending-style:opacity-0 data-closed:pointer-events-none supports-backdrop-filter:backdrop-blur-xs",
         className
       )}
       {...props}
@@ -56,7 +56,7 @@ function DialogContent({
         data-slot="dialog-content"
         data-liquid-glass="panel"
         className={cn(
-          "overlay-glass fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100svh-2rem)] w-full max-w-[calc(100%-2rem)] min-w-0 -translate-x-1/2 -translate-y-1/2 gap-4 overflow-x-hidden overflow-y-auto overscroll-contain rounded-xl p-4 text-sm text-popover-foreground duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:pointer-events-none data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 motion-reduce:animate-none motion-reduce:transition-none",
+          "overlay-glass fixed top-1/2 left-1/2 z-50 grid max-h-[calc(100svh-2rem)] w-full max-w-[calc(100%-2rem)] min-w-0 -translate-x-1/2 -translate-y-1/2 gap-4 overflow-x-hidden overflow-y-auto overscroll-contain rounded-xl p-4 text-sm text-popover-foreground outline-none sm:max-w-sm transition-[opacity,scale] duration-(--motion-base) ease-(--ease-out) data-ending-style:duration-(--motion-exit) data-ending-style:ease-(--ease-in) data-starting-style:opacity-0 data-starting-style:scale-[0.97] data-ending-style:opacity-0 data-ending-style:scale-[0.97] data-closed:pointer-events-none",
           className
         )}
         {...props}

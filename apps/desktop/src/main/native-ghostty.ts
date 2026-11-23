@@ -785,7 +785,7 @@ export class NativeGhosttyManager {
 
   update(id: number, bounds: GhosttySurfaceUpdate): void {
     const session = this.requireSession(id);
-    if (![bounds.x, bounds.y, bounds.width, bounds.height].every(value => Number.isFinite(value) && Math.abs(value) <= 100_000) || bounds.width < 0 || bounds.height < 0 || typeof bounds.visible !== "boolean" || (bounds.focus !== undefined && typeof bounds.focus !== "boolean")) throw new Error("Invalid native terminal bounds");
+    if (![bounds.x, bounds.y, bounds.width, bounds.height].every(value => Number.isFinite(value) && Math.abs(value) <= 100_000) || bounds.width < 0 || bounds.height < 0 || typeof bounds.visible !== "boolean" || (bounds.focus !== undefined && typeof bounds.focus !== "boolean") || (bounds.preserveGrid !== undefined && typeof bounds.preserveGrid !== "boolean")) throw new Error("Invalid native terminal bounds");
     if (process.env["PROSPERO_NATIVE_GHOSTTY_DEBUG"] === "1" && bounds.focus !== undefined) {
       process.stderr.write(`[native-ghostty] explicit focus update id=${id} focus=${bounds.focus} visible=${bounds.visible} bounds=${bounds.x},${bounds.y},${bounds.height ? bounds.height : 0} syncing=${session.controllerState.syncing}\n${new Error().stack ?? ""}\n`);
     }
@@ -808,7 +808,7 @@ export class NativeGhosttyManager {
       }
     }
 
-    this.loadAddon().update(id, { ...bounds, ...(session.controllerState.syncing ? { preserveGrid: true } : {}) });
+    this.loadAddon().update(id, { ...bounds, ...((bounds.preserveGrid || session.controllerState.syncing) ? { preserveGrid: true } : {}) });
 
     if (shouldResumeStream) {
       this.publishState(session);

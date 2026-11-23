@@ -372,7 +372,8 @@ describe("NativeGhosttyManager optimizations & URL handling", () => {
       await vi.advanceTimersByTimeAsync(HIDDEN_STREAM_SUSPEND_DELAY_MS - 200);
       await flushIo();
       expect(sockets[0]!.closed).toBe(false);
-      manager.update(id, { x: 0, y: 0, width: 800, height: 600, visible: true });
+      manager.update(id, { x: 0, y: 0, width: 800, height: 600, visible: true, preserveGrid: true });
+      expect(addon.update).toHaveBeenLastCalledWith(id, expect.objectContaining({ x: 0, y: 0, width: 800, height: 600, visible: true, preserveGrid: true }));
       await vi.advanceTimersByTimeAsync(500);
       await flushIo();
       expect(sockets).toHaveLength(1);

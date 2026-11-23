@@ -21,7 +21,7 @@ export type NativeTerminalState = {
   error?: string;
 };
 
-export type NativeTerminalBounds = { x: number; y: number; width: number; height: number; visible: boolean; focus?: boolean };
+export type NativeTerminalBounds = { x: number; y: number; width: number; height: number; visible: boolean; focus?: boolean; preserveGrid?: boolean };
 export type NativeTerminalShortcut = { id: number; action: "toggle-focus" | "project-search" | "terminal-search" | "paste-image" };
 
 export type QueuedChatMessage = {

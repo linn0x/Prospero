@@ -42,28 +42,65 @@ export const OVERLAY_SELECTORS = [
   '[data-radix-popper-content-wrapper]',
 ].join(",");
 
-const CLOSING_OR_HIDDEN_OVERLAY_SELECTOR = '[data-closed], [data-ending-style], [data-state="closed"], [aria-hidden="true"], [hidden], [inert]';
+const HIDDEN_OVERLAY_SELECTOR = '[aria-hidden="true"], [hidden], [inert]';
+const CLOSING_OVERLAY_SELECTOR = '[data-closed], [data-ending-style], [data-state="closed"]';
+
+function parseMaxCssDurationMs(value: string | undefined): number {
+  if (!value) return 0;
+  let max = 0;
+  for (const part of value.split(",")) {
+    const token = part.trim().toLowerCase();
+    if (!token) continue;
+    if (token.endsWith("ms")) {
+      const n = Number.parseFloat(token.slice(0, -2));
+      if (Number.isFinite(n) && n > max) max = n;
+    } else if (token.endsWith("s")) {
+      const n = Number.parseFloat(token.slice(0, -1)) * 1000;
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return max;
+}
+
+function hasActiveExitMotion(style: CSSStyleDeclaration): boolean {
+  const transitionMs = parseMaxCssDurationMs(style.transitionDuration);
+  const animationMs =
+    style.animationName && style.animationName !== "none"
+      ? parseMaxCssDurationMs(style.animationDuration)
+      : 0;
+  return transitionMs > 1 || animationMs > 1;
+}
 
 function nodeIntersectsOverlay(node: Node): boolean {
   if (!(node instanceof Element)) return false;
   return node.matches(OVERLAY_SELECTORS) || Boolean(node.closest(OVERLAY_SELECTORS) || node.querySelector(OVERLAY_SELECTORS));
 }
 
-export function overlayCovers(rect: DOMRect, hostElement?: HTMLElement | null): boolean {
-  if (rect.width <= 0 || rect.height <= 0) return false;
+function inspectOverlayCoverage(rect: DOMRect, hostElement?: HTMLElement | null): { covered: boolean; closing: boolean } {
+  if (rect.width <= 0 || rect.height <= 0) return { covered: false, closing: false };
   for (const element of document.querySelectorAll<HTMLElement>(OVERLAY_SELECTORS)) {
     if (!element.isConnected) continue;
     if (hostElement && (element === hostElement || hostElement.contains(element))) continue;
-    if (element.matches(CLOSING_OR_HIDDEN_OVERLAY_SELECTOR) || element.closest(CLOSING_OR_HIDDEN_OVERLAY_SELECTOR)) continue;
+    if (element.matches(HIDDEN_OVERLAY_SELECTOR) || element.closest(HIDDEN_OVERLAY_SELECTOR)) continue;
+    const isClosing = element.matches(CLOSING_OVERLAY_SELECTOR) || Boolean(element.closest(CLOSING_OVERLAY_SELECTOR));
     const box = element.getBoundingClientRect();
     if (box.width <= 0 || box.height <= 0 || box.left >= rect.right || box.right <= rect.left || box.top >= rect.bottom || box.bottom <= rect.top) continue;
     const style = getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") continue;
+    if (style.display === "none" || style.visibility === "hidden") continue;
     const opacity = Number.parseFloat(style.opacity);
-    if (style.opacity === "0" || (Number.isFinite(opacity) && opacity <= 0)) continue;
-    return true;
+    if (style.opacity === "0" || (Number.isFinite(opacity) && opacity <= 0.02)) continue;
+    if (isClosing) {
+      if (!hasActiveExitMotion(style)) continue;
+      return { covered: true, closing: true };
+    }
+    if (style.pointerEvents === "none") continue;
+    return { covered: true, closing: false };
   }
-  return false;
+  return { covered: false, closing: false };
+}
+
+export function overlayCovers(rect: DOMRect, hostElement?: HTMLElement | null): boolean {
+  return inspectOverlayCoverage(rect, hostElement).covered;
 }
 
 type TerminalLayoutSubscriber = {
@@ -236,6 +273,10 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
   const notifiedClosedIds = useRef(new Set<number>());
   const lastNativeError = useRef<string | undefined>(undefined);
   const boundsFrame = useRef<number | undefined>(undefined);
+  const sidebarTransitioning = useRef(false);
+  const sidebarTransitionTimer = useRef<number | undefined>(undefined);
+  const closingOverlayTimer = useRef<number | undefined>(undefined);
+  const flushBoundsRef = useRef<() => void>(() => undefined);
   const sessionRef = useRef(session);
   sessionRef.current = session;
   const autoRetryCount = useRef(0);
@@ -458,6 +499,10 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     const element = host.current;
     if (id === undefined || !element?.isConnected) return;
     if (!activeRef.current || document.visibilityState !== "visible") {
+      if (closingOverlayTimer.current !== undefined) {
+        window.clearTimeout(closingOverlayTimer.current);
+        closingOverlayTimer.current = undefined;
+      }
       if (occludedRef.current) {
         occludedRef.current = false;
         setOccluded(false);
@@ -476,15 +521,36 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     }
     const rect = element.getBoundingClientRect();
     const hasArea = rect.width > 0 && rect.height > 0;
-    const isOccluded = hasArea && overlayCovers(rect, element);
+    const coverage = hasArea ? inspectOverlayCoverage(rect, element) : { covered: false, closing: false };
+    const isOccluded = coverage.covered;
+    if (coverage.closing) {
+      if (closingOverlayTimer.current === undefined) {
+        closingOverlayTimer.current = window.setTimeout(() => {
+          closingOverlayTimer.current = undefined;
+          requestAnimationFrame(() => flushBoundsRef.current());
+        }, 240);
+      }
+    } else if (closingOverlayTimer.current !== undefined) {
+      window.clearTimeout(closingOverlayTimer.current);
+      closingOverlayTimer.current = undefined;
+    }
     if (occludedRef.current !== isOccluded) {
       occludedRef.current = isOccluded;
       setOccluded(isOccluded);
     }
     const visible = hasArea && !isOccluded;
+    const preserveGrid = visible && sidebarTransitioning.current;
     const focus = pendingFocus.current;
     pendingFocus.current = undefined;
-    const bounds = { x: rect.left, y: rect.top, width: rect.width, height: rect.height, visible, ...(focus !== undefined ? { focus: visible && focus } : !visible ? { focus: false } : {}) };
+    const bounds = {
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+      visible,
+      ...(preserveGrid ? { preserveGrid: true } : {}),
+      ...(focus !== undefined ? { focus: visible && focus } : !visible ? { focus: false } : {}),
+    };
     const key = JSON.stringify(bounds);
     if (lastBounds.current === key) return;
     lastBounds.current = key;
@@ -494,6 +560,7 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
         if (nativeId.current === id && !closedNativeIds.current.has(id) && !message.toLowerCase().includes("no longer open")) lastNativeError.current = message;
       });
   }, []);
+  flushBoundsRef.current = flushBounds;
 
   const scheduleBounds = useCallback((): void => {
     if (boundsFrame.current !== undefined) return;
@@ -519,6 +586,34 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     const stackContainer = element.closest(".workspace-session-stack");
     if (mainContainer) resizeObserver.observe(mainContainer);
     if (stackContainer && stackContainer !== mainContainer) resizeObserver.observe(stackContainer);
+    const isSidebarWidthEvent = (event: TransitionEvent): boolean =>
+      event.propertyName === "width" &&
+      event.target instanceof Element &&
+      event.target.matches('[data-slot="sidebar-gap"], [data-slot="sidebar-container"]');
+    const clearSidebarTimer = (): void => {
+      if (sidebarTransitionTimer.current !== undefined) {
+        window.clearTimeout(sidebarTransitionTimer.current);
+        sidebarTransitionTimer.current = undefined;
+      }
+    };
+    const finishSidebarTransition = (): void => {
+      clearSidebarTimer();
+      if (!sidebarTransitioning.current) return;
+      sidebarTransitioning.current = false;
+      scheduleBounds();
+    };
+    const handleSidebarTransitionRun = (event: TransitionEvent): void => {
+      if (!isSidebarWidthEvent(event)) return;
+      sidebarTransitioning.current = true;
+      clearSidebarTimer();
+      sidebarTransitionTimer.current = window.setTimeout(finishSidebarTransition, 260);
+    };
+    const handleSidebarTransitionEnd = (event: TransitionEvent): void => {
+      if (isSidebarWidthEvent(event)) finishSidebarTransition();
+    };
+    document.documentElement.addEventListener("transitionrun", handleSidebarTransitionRun, true);
+    document.documentElement.addEventListener("transitionend", handleSidebarTransitionEnd, true);
+    document.documentElement.addEventListener("transitioncancel", handleSidebarTransitionEnd, true);
     const unsubscribeLayout = subscribeTerminalLayoutChanges({
       getElement: () => host.current,
       onFlush: flushBounds,
@@ -527,6 +622,15 @@ export function NativeTerminalPane({ session, fontFamily, fontSize, active = tru
     return () => {
       resizeObserver.disconnect();
       unsubscribeLayout();
+      document.documentElement.removeEventListener("transitionrun", handleSidebarTransitionRun, true);
+      document.documentElement.removeEventListener("transitionend", handleSidebarTransitionEnd, true);
+      document.documentElement.removeEventListener("transitioncancel", handleSidebarTransitionEnd, true);
+      clearSidebarTimer();
+      sidebarTransitioning.current = false;
+      if (closingOverlayTimer.current !== undefined) {
+        window.clearTimeout(closingOverlayTimer.current);
+        closingOverlayTimer.current = undefined;
+      }
       if (boundsFrame.current !== undefined) cancelAnimationFrame(boundsFrame.current);
       boundsFrame.current = undefined;
     };

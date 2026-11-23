@@ -25,11 +25,23 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
   const latest = useRef({ items, onReorder }); latest.current = { items, onReorder };
   const drag = useRef<Drag | undefined>(undefined);
   const suppressClick = useRef(0);
+  const pendingFlip = useRef<Map<string, number> | undefined>(undefined);
   const [edges, setEdges] = useState({ overflow: false, left: false, right: false });
   const [announcement, setAnnouncement] = useState("");
   const keys = JSON.stringify(items.map(item => item.id));
   const tabElements = () => [...viewport.current?.querySelectorAll<HTMLElement>("[data-tab-id]") ?? []];
   const elementFor = (id: string) => tabElements().find(element => element.dataset.tabId === id);
+  const captureTabPositions = (): Map<string, number> => {
+    const positions = new Map<string, number>();
+    const host = viewport.current;
+    if (!host) return positions;
+    for (const element of tabElements()) {
+      const id = element.dataset.tabId;
+      if (!id) continue;
+      positions.set(id, element.getBoundingClientRect().left + host.scrollLeft);
+    }
+    return positions;
+  };
   const reveal = (id: string) => {
     const host = viewport.current, element = elementFor(id);
     if (!host || !element || !host.getClientRects().length || drag.current?.started) return;
@@ -44,9 +56,25 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
   useLayoutEffect(() => {
     const host = viewport.current;
     if (!host) return;
+    const flipSnapshot = pendingFlip.current;
+    pendingFlip.current = undefined;
     // Documents are portaled into this rail. CSS order also allows a terminal
     // to move between documents without changing either React component tree.
     for (const element of tabElements()) element.style.order = String(items.findIndex(item => item.id === element.dataset.tabId));
+    if (flipSnapshot?.size && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      for (const element of tabElements()) {
+        const id = element.dataset.tabId;
+        const beforeLeft = id ? flipSnapshot.get(id) : undefined;
+        if (beforeLeft === undefined || typeof element.animate !== "function") continue;
+        const dx = beforeLeft - (element.getBoundingClientRect().left + host.scrollLeft);
+        if (Math.abs(dx) >= 1 && Math.abs(dx) < Math.max(host.clientWidth, 400) * 2) {
+          element.animate(
+            [{ transform: `translateX(${dx}px)` }, { transform: "translateX(0)" }],
+            { duration: 160, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+          );
+        }
+      }
+    }
     const measure = () => {
       const next = { overflow: host.scrollWidth > host.clientWidth + 1, left: host.scrollLeft > 1, right: host.scrollLeft + host.clientWidth < host.scrollWidth - 1 };
       setEdges(current => Object.keys(next).every(key => current[key as keyof typeof next] === next[key as keyof typeof next]) ? current : next);
@@ -75,20 +103,29 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
       drag.current = undefined;
       cancelAnimationFrame(frame);
       if (!current) return;
+      const ids = latest.current.items.map(item => item.id);
+      let nextIds: string[] | undefined;
+      if (current.started && !cancel && JSON.stringify(ids) === current.keys) {
+        const target = tabElements().filter(element => element !== current.element).sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left).find(element => { const rect = element.getBoundingClientRect(); return current.x < rect.left + rect.width / 2; });
+        current.before = target?.dataset.tabId ?? null;
+        const candidate = moveTabBefore(ids, current.id, current.before);
+        if (JSON.stringify(candidate) !== current.keys) {
+          pendingFlip.current = captureTabPositions();
+          nextIds = candidate;
+        }
+      }
       current.element.style.removeProperty("transform");
       delete current.element.dataset.dragging;
       delete host.dataset.sorting;
       if (host.hasPointerCapture(current.pointer)) host.releasePointerCapture(current.pointer);
       if (!current.started) return;
       suppressClick.current = performance.now() + 250;
-      const ids = latest.current.items.map(item => item.id);
-      if (!cancel && JSON.stringify(ids) === current.keys) {
-        const target = tabElements().filter(element => element !== current.element).sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left).find(element => { const rect = element.getBoundingClientRect(); return current.x < rect.left + rect.width / 2; });
-        current.before = target?.dataset.tabId ?? null;
-        const next = moveTabBefore(ids, current.id, current.before);
-        latest.current.onReorder(next);
+      if (nextIds) {
+        latest.current.onReorder(nextIds);
         const item = latest.current.items.find(item => item.id === current.id);
-        setAnnouncement(t(`${item?.label}，第 ${next.indexOf(current.id) + 1} 个，共 ${next.length} 个`, `${item?.label}, position ${next.indexOf(current.id) + 1} of ${next.length}`));
+        setAnnouncement(t(`${item?.label}，第 ${nextIds.indexOf(current.id) + 1} 个，共 ${nextIds.length} 个`, `${item?.label}, position ${nextIds.indexOf(current.id) + 1} of ${nextIds.length}`));
+        focus(current.id);
+      } else if (!cancel && JSON.stringify(ids) === current.keys) {
         focus(current.id);
       }
     };
@@ -165,7 +202,10 @@ export function TabStrip({ items, activeId, onReorder, label, className, listCla
           event.preventDefault(); event.stopPropagation();
           const to = Math.max(0, Math.min(items.length - 1, index + (event.key === "ArrowLeft" ? -1 : 1)));
           const ids = items.map(item => item.id);
-          if (to !== index) onReorder(moveTabBefore(ids, id, to < index ? ids[to]! : ids[to + 1] ?? null));
+          if (to !== index) {
+            pendingFlip.current = captureTabPositions();
+            onReorder(moveTabBefore(ids, id, to < index ? ids[to]! : ids[to + 1] ?? null));
+          }
           focus(id); return;
         }
         if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;

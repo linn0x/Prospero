@@ -9,6 +9,13 @@
   --ui-text-chat: 16px;
   --ui-leading-body: 1.6;
   --ui-leading-chat: 1.75;
+  --motion-fast: 120ms;
+  --motion-base: 160ms;
+  --motion-panel: 180ms;
+  --motion-exit: 110ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
   font-family: var(--ui-font);
   --bg: #ffffff;
   --surface-0: #f3f3f5;

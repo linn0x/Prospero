@@ -1218,13 +1218,20 @@ function installIpc(): void {
     const value = requireObject(rawBounds);
     const bounds = {
       x: value["x"], y: value["y"], width: value["width"], height: value["height"],
-      visible: value["visible"], ...(value["focus"] === undefined ? {} : { focus: value["focus"] }),
+      visible: value["visible"],
+      ...(value["focus"] === undefined ? {} : { focus: value["focus"] }),
+      ...(value["preserveGrid"] === undefined ? {} : { preserveGrid: value["preserveGrid"] }),
     };
-    if (![bounds.x, bounds.y, bounds.width, bounds.height].every(item => typeof item === "number" && Number.isFinite(item)) || typeof bounds.visible !== "boolean" || (bounds.focus !== undefined && typeof bounds.focus !== "boolean")) throw new Error("Native terminal bounds are invalid");
+    if (
+      ![bounds.x, bounds.y, bounds.width, bounds.height].every(item => typeof item === "number" && Number.isFinite(item))
+      || typeof bounds.visible !== "boolean"
+      || (bounds.focus !== undefined && typeof bounds.focus !== "boolean")
+      || (bounds.preserveGrid !== undefined && typeof bounds.preserveGrid !== "boolean")
+    ) throw new Error("Native terminal bounds are invalid");
     // DOM rectangles are CSS pixels; AppKit frames use unzoomed window points.
     const zoom = event.sender.getZoomFactor();
     nativeGhosttyManager.update(rawId, {
-      ...(bounds as { x: number; y: number; width: number; height: number; visible: boolean; focus?: boolean }),
+      ...(bounds as { x: number; y: number; width: number; height: number; visible: boolean; focus?: boolean; preserveGrid?: boolean }),
       x: (bounds.x as number) * zoom, y: (bounds.y as number) * zoom,
       width: (bounds.width as number) * zoom, height: (bounds.height as number) * zoom,
     });
