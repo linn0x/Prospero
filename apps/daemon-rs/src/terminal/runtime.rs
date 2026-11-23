@@ -345,8 +345,10 @@ impl Terminals {
             }
         });
         let persistence = runtime.persist_live(&head.id, &terminal).await;
+        let _ = runtime.sync_native_binding(&head.id).await;
         if terminal.lost() {
             activity_task.abort();
+            runtime.cleanup_agy_log(&head);
             match runtime.fail(&head.id).await {
                 Ok(()) => {
                     if let Ok(mut entries) = runtime.0.entries.lock() {
@@ -393,6 +395,7 @@ impl Terminals {
             let _ = runtime.sync_native_binding(&head.id).await;
             let _ = terminal.release().await;
         }
+        runtime.cleanup_agy_log(&head);
         if finalized.is_err() {
             runtime.0.failed.store(true, Ordering::Release);
             runtime.0.closed.store(true, Ordering::Release);
@@ -891,7 +894,11 @@ impl Terminals {
             && input.command.is_none()
             && matches!(
                 input.agent,
-                Some(crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex)
+                Some(
+                    crate::protocol::AgentKind::Claude
+                        | crate::protocol::AgentKind::Codex
+                        | crate::protocol::AgentKind::Agy
+                )
             )
             && spec.as_ref().is_some_and(|spec| {
                 !spec
@@ -1079,6 +1086,7 @@ impl Terminals {
         let terminal = match child {
             Ok(terminal) => terminal,
             Err(error) => {
+                self.cleanup_agy_log(&head);
                 let id = head.id;
                 self.finish(
                     &id,
@@ -1211,6 +1219,16 @@ impl Terminals {
     pub(crate) fn local(&self, id: &str) -> Result<Option<Terminal>> {
         Ok(self.terminal(id)?.local())
     }
+    fn cleanup_agy_log(&self, head: &SessionHead) {
+        if head.agent == crate::protocol::AgentKind::Agy
+            && let Some(native) = head.native_session.as_ref()
+        {
+            let path =
+                super::session::agy_log_path(self.0.database.directory(), &native.runtime_id);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     pub async fn sync_native_binding(&self, id: &str) -> Result<SessionHead> {
         let sid = id.to_owned();
         let head = self
@@ -1342,7 +1360,18 @@ impl Terminals {
 
     pub async fn archive(&self, id: &str, native_id: Option<String>) -> Result<SessionHead> {
         let _guard = self.0.lifecycle.try_lock().map_err(|_| Error::Busy)?;
-        let head = self.sync_native_binding(id).await?;
+        let mut head = self.sync_native_binding(id).await?;
+        if head.agent == crate::protocol::AgentKind::Agy
+            && let Some(native) = head
+                .native_session
+                .as_ref()
+                .filter(|n| n.managed && n.native_id.is_none())
+            && super::session::agy_log_path(self.0.database.directory(), &native.runtime_id)
+                .exists()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            head = self.sync_native_binding(id).await?;
+        }
         if let Some(native_id) = native_id.filter(|value| !value.trim().is_empty()) {
             self.validate_binding(id, &native_id).await?;
             if head.native_session.as_ref().is_some_and(|n| n.managed) {
@@ -1961,10 +1990,11 @@ impl Terminals {
                     vec!["--model".into(), profile.model.clone()]
                 } else {
                     let (resolved_model, resolved_effort, args) =
-                        crate::agent::agy::resolve_cli_model_and_effort(
+                        crate::agent::agy::resolve_cli_model_and_effort_async(
                             model.as_deref(),
                             effort.as_deref(),
-                        );
+                        )
+                        .await;
                     input.model = resolved_model;
                     input.effort = resolved_effort;
                     args
@@ -2255,9 +2285,11 @@ impl Terminals {
         Option<crate::accounts::ApiProfile>,
     )> {
         match account_id.as_deref() {
-            None | Some(crate::accounts::NATIVE_AGY_ID) => {
-                Ok((Vec::new(), Some(crate::accounts::NATIVE_AGY_ID.into()), None))
-            }
+            None | Some(crate::accounts::NATIVE_AGY_ID) => Ok((
+                Vec::new(),
+                Some(crate::accounts::NATIVE_AGY_ID.into()),
+                None,
+            )),
             Some(account_id) => {
                 let data = self.0.database.directory().to_owned();
                 let id = account_id.to_owned();

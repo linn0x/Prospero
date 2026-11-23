@@ -19,6 +19,14 @@ pub fn binding_path(home: &Path, runtime_id: &str) -> PathBuf {
         .join(format!("{runtime_id}.json"))
 }
 
+pub fn agy_log_path_for_binding(binding: &Path) -> PathBuf {
+    binding.with_extension("agy.log")
+}
+
+pub fn agy_log_path(home: &Path, runtime_id: &str) -> PathBuf {
+    agy_log_path_for_binding(&binding_path(home, runtime_id))
+}
+
 pub fn read_binding(path: &Path) -> Result<Option<Binding>> {
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -216,5 +224,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn agy_log_path_derives_from_binding_path() {
+        let home = Path::new("/tmp/prospero-home");
+        let runtime_id = "11111111-2222-4333-8444-555555555555";
+        let binding = binding_path(home, runtime_id);
+        let log_path = agy_log_path(home, runtime_id);
+        assert_eq!(log_path, agy_log_path_for_binding(&binding));
+        assert!(
+            log_path
+                .to_string_lossy()
+                .ends_with(&format!("{runtime_id}.agy.log"))
+        );
     }
 }

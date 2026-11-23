@@ -612,6 +612,7 @@ function sidebarSessionRowEqual(
     left.archived !== right.archived ||
     left.nativeSession?.state !== right.nativeSession?.state ||
     left.nativeSession?.nativeId !== right.nativeSession?.nativeId ||
+    left.nativeSession?.managed !== right.nativeSession?.managed ||
     left.title !== right.title ||
     left.displayTitle !== right.displayTitle ||
     sessionLabel(left) !== sessionLabel(right) ||

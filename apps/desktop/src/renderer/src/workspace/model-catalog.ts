@@ -10,7 +10,7 @@ const LIMIT = 40;
 export function modelSwitchSupported(session: SessionInfo, _account?: JsonObject): boolean {
   if (session.kind !== "structured") return false;
   if (session.agentControls) return session.agentControls.model === true;
-  return ["claude", "codex", "deepseek", "opencode", "pi"].includes(session.agent);
+  return ["claude", "codex", "deepseek", "opencode", "pi", "agy"].includes(session.agent);
 }
 
 export function supportedModelEffort(model: AgentModel | undefined, effort: string): string | undefined {

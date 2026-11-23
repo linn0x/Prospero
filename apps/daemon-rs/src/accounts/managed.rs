@@ -1608,7 +1608,9 @@ mod tests {
         )));
         assert!(environment.contains(&("AGY_LLM_GATEWAY_TIER_PRO".into(), "gpt-5.4".into())));
         assert!(environment.contains(&("AGY_LLM_GATEWAY_TIER_FLASH".into(), "gpt-5.4".into())));
-        assert!(environment.contains(&("AGY_LLM_GATEWAY_TIER_FLASH_LITE".into(), "gpt-5.4".into())));
+        assert!(
+            environment.contains(&("AGY_LLM_GATEWAY_TIER_FLASH_LITE".into(), "gpt-5.4".into()))
+        );
         assert!(environment.contains(&(
             "AGY_LLM_GATEWAY_HEADERS".into(),
             r#"{"X-Tenant":"prospero"}"#.into()

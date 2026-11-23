@@ -439,21 +439,22 @@ pub async fn run(
 ) -> Result<i32> {
     #[cfg(windows)]
     retain_process_job()?;
-    if !matches!(agent.as_str(), "codex" | "claude") {
+    if !matches!(agent.as_str(), "codex" | "claude" | "agy") {
         return Err(Error::Invalid("不支持的原生终端".into()));
     }
     if let Some(id) = &native_id {
         validate_native_id(id)?;
     }
-    if let Ok(Ok(output)) = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        command(&cli)
-            .arg("--help")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await
+    if matches!(agent.as_str(), "codex" | "claude")
+        && let Ok(Ok(output)) = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            command(&cli)
+                .arg("--help")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output(),
+        )
+        .await
     {
         compatible_args(&agent, &mut args, &String::from_utf8_lossy(&output.stdout));
     }
@@ -467,21 +468,25 @@ pub async fn run(
         uuid::Uuid::new_v4().simple()
     ))?;
     let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-    let scope = (if agent == "codex" {
-        std::env::var("CODEX_SQLITE_HOME").or_else(|_| std::env::var("CODEX_HOME"))
-    } else {
-        std::env::var("CLAUDE_CONFIG_DIR")
-    })
-    .unwrap_or_else(|_| {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-            .join(if agent == "codex" {
-                ".codex"
-            } else {
-                ".claude"
-            })
+    let home_dir = || {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .unwrap_or_default(),
+        )
+    };
+    let scope = match agent.as_str() {
+        "codex" => std::env::var("CODEX_SQLITE_HOME")
+            .or_else(|_| std::env::var("CODEX_HOME"))
+            .unwrap_or_else(|_| home_dir().join(".codex").to_string_lossy().into_owned()),
+        "claude" => std::env::var("CLAUDE_CONFIG_DIR")
+            .unwrap_or_else(|_| home_dir().join(".claude").to_string_lossy().into_owned()),
+        _ => home_dir()
+            .join(".gemini")
+            .join("antigravity-cli")
             .to_string_lossy()
-            .into_owned()
-    });
+            .into_owned(),
+    };
     let scope = std::fs::canonicalize(&scope)
         .unwrap_or_else(|_| PathBuf::from(scope))
         .to_string_lossy()
@@ -509,6 +514,9 @@ pub async fn run(
         failed,
         lock_directory,
     };
+    if agent == "agy" {
+        return run_agy(cli, native_id, args, state, failure).await;
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let router = Router::new()
@@ -585,6 +593,236 @@ pub async fn run(
         _ = failure.changed() => { let _ = child.kill().await; let _ = child.wait().await; 1 }
     };
     http.abort();
+    Ok(code)
+}
+
+const MAX_AGY_CARRY_BYTES: usize = 64 * 1024;
+
+fn extract_agy_uuid(body: &str, prefix: &str) -> Option<String> {
+    let rest = body.strip_prefix(prefix)?;
+    let token = rest.split_whitespace().next()?;
+    validate_native_id(token).ok()?;
+    Some(token.to_owned())
+}
+
+#[derive(Default)]
+struct AgyLogTracker {
+    pending_stream: Option<String>,
+    claimed: Option<String>,
+}
+
+impl AgyLogTracker {
+    fn observe_line(&mut self, line: &str) -> Option<String> {
+        let body = line
+            .split_once("] ")
+            .map(|(_, rest)| rest)
+            .unwrap_or(line)
+            .trim();
+        if let Some(id) = extract_agy_uuid(body, "Streaming conversation ")
+            .or_else(|| extract_agy_uuid(body, "Resuming conversation "))
+        {
+            self.pending_stream = Some(id);
+            return None;
+        }
+        if let Some(id) = extract_agy_uuid(body, "GetConversationDetail: found conversation ")
+            .or_else(|| extract_agy_uuid(body, "Starting conversation update stream for "))
+        {
+            if self.pending_stream.as_deref() == Some(id.as_str())
+                && self.claimed.as_deref() != Some(id.as_str())
+            {
+                self.claimed = Some(id.clone());
+                return Some(id);
+            }
+            return None;
+        }
+        if let Some(id) = extract_agy_uuid(body, "Forwarding user message to conversation ") {
+            self.pending_stream = Some(id.clone());
+            if self.claimed.as_deref() != Some(id.as_str()) {
+                self.claimed = Some(id.clone());
+                return Some(id);
+            }
+        }
+        None
+    }
+}
+
+struct AgyLogReader {
+    path: PathBuf,
+    offset: u64,
+    carry: Vec<u8>,
+    tracker: AgyLogTracker,
+}
+
+impl AgyLogReader {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            carry: Vec::new(),
+            tracker: AgyLogTracker::default(),
+        }
+    }
+
+    fn process_line(&mut self, bytes: &[u8], state: &LaunchState) -> bool {
+        let line = String::from_utf8_lossy(bytes);
+        if let Some(id) = self.tracker.observe_line(&line)
+            && let Err(error) = state.claim(&id, &state.cwd)
+        {
+            eprintln!("native session bind: {error}");
+            state.failed.send_replace(true);
+            return false;
+        }
+        true
+    }
+
+    fn drain(&mut self, state: &LaunchState) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(error) => {
+                eprintln!("agy log open failed: {error}");
+                return true;
+            }
+        };
+        let Ok(metadata) = file.metadata() else {
+            return true;
+        };
+        let len = metadata.len();
+        if len < self.offset {
+            self.offset = 0;
+            self.carry.clear();
+        }
+        if len == self.offset {
+            return true;
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return true;
+        }
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    self.offset += read as u64;
+                    self.carry.extend_from_slice(&buffer[..read]);
+                    while let Some(pos) = self.carry.iter().position(|byte| *byte == b'\n') {
+                        let line = self.carry.drain(..=pos).collect::<Vec<u8>>();
+                        if !self.process_line(&line, state) {
+                            return false;
+                        }
+                    }
+                    if self.carry.len() > MAX_AGY_CARRY_BYTES {
+                        self.carry.clear();
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        true
+    }
+
+    fn drain_final(&mut self, state: &LaunchState) {
+        if !self.drain(state) {
+            return;
+        }
+        if !self.carry.is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            let _ = self.process_line(&line, state);
+        }
+    }
+}
+
+fn existing_agy_log_file(args: &[String]) -> Option<PathBuf> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--log-file" {
+            return iter
+                .next()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from);
+        }
+        if let Some(path) = arg.strip_prefix("--log-file=")
+            && !path.trim().is_empty()
+        {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+fn has_agy_conversation_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--conversation" || arg.starts_with("--conversation="))
+}
+
+async fn run_agy(
+    cli: String,
+    native_id: Option<String>,
+    mut args: Vec<String>,
+    state: LaunchState,
+    mut failure: watch::Receiver<bool>,
+) -> Result<i32> {
+    if let Some(id) = &native_id
+        && !has_agy_conversation_arg(&args)
+    {
+        args.extend(["--conversation".into(), id.clone()]);
+    }
+    let (log_path, owns_log_file) = match existing_agy_log_file(&args) {
+        Some(path) => (path, false),
+        None => {
+            let path = super::session::agy_log_path_for_binding(&state.binding);
+            if let Some(parent) = path.parent() {
+                private_directory(parent)?;
+            }
+            let _ = std::fs::remove_file(&path);
+            args.extend(["--log-file".into(), path.to_string_lossy().into_owned()]);
+            (path, true)
+        }
+    };
+    let mut child = command(&cli)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let reader = Arc::new(Mutex::new(AgyLogReader::new(log_path.clone())));
+    let watch_reader = reader.clone();
+    let watch_state = state.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            let keep_going = match watch_reader.lock() {
+                Ok(mut guard) => guard.drain(&watch_state),
+                Err(_) => false,
+            };
+            if !keep_going {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+    let (code, aborted_on_failure) = tokio::select! {
+        result = child.wait() => (result?.code().unwrap_or(1), false),
+        _ = failure.changed() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (1, true)
+        }
+    };
+    watcher.abort();
+    let _ = watcher.await;
+    if !aborted_on_failure && let Ok(mut guard) = reader.lock() {
+        guard.drain_final(&state);
+    }
+    let code = if aborted_on_failure || *failure.borrow() {
+        1
+    } else {
+        code
+    };
+    if owns_log_file {
+        let _ = std::fs::remove_file(&log_path);
+    }
     Ok(code)
 }
 
@@ -732,6 +970,189 @@ mod tests {
         assert!(compacted_output.contains("oversized output truncated"));
         assert!(compacted_output.starts_with("中文输出-abc123\n"));
         assert!(compacted_output.ends_with("中文输出-abc123\n"));
+    }
+
+    #[test]
+    fn agy_log_tracker_tracks_new_resumed_switched_and_ignores_subagents_and_failed_resume() {
+        let id1 = uuid::Uuid::new_v4().to_string();
+        let id2 = uuid::Uuid::new_v4().to_string();
+        let id3 = uuid::Uuid::new_v4().to_string();
+        let sub_id = uuid::Uuid::new_v4().to_string();
+        let bad_id = uuid::Uuid::new_v4().to_string();
+
+        let mut tracker = AgyLogTracker::default();
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:32.911708     988 conversation_manager.go:1082] Streaming conversation {id1}"
+            )),
+            None
+        );
+        // Subagent stream in the same process must not hijack pending main conversation.
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:32.920000     999 server.go:1276] Starting conversation update stream for {sub_id}"
+            )),
+            None
+        );
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:32.921000     988 server.go:3537] GetConversationDetail: found conversation {id1} (active=true)"
+            )),
+            Some(id1.clone())
+        );
+        // Duplicate confirmation for the same claimed conversation does not re-emit.
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:32.932768     988 server.go:1276] Starting conversation update stream for {id1}"
+            )),
+            None
+        );
+        // Failed resume only logs Resuming conversation without backend confirmation.
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:33.000000       1 common.go:477] Resuming conversation {bad_id}"
+            )),
+            None
+        );
+        // Switching conversation in TUI updates pending_stream and emits on confirmation.
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:34.000000     988 conversation_manager.go:1082] Streaming conversation {id2}"
+            )),
+            None
+        );
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:34.010000     988 server.go:1276] Starting conversation update stream for {id2}"
+            )),
+            Some(id2.clone())
+        );
+        // Direct user prompt forwarding also claims when switching.
+        assert_eq!(
+            tracker.observe_line(&format!(
+                "I1119 01:16:35.000000     988 conversation_manager.go:884] Forwarding user message to conversation {id3} (items=1, media=0)"
+            )),
+            Some(id3)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agy_launcher_binds_from_log_file_and_enforces_expected_resume_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bindings_dir = root.path().join("terminal-bindings");
+        std::fs::create_dir_all(&bindings_dir).unwrap();
+
+        let id1 = uuid::Uuid::new_v4().to_string();
+        let id2 = uuid::Uuid::new_v4().to_string();
+        let script_path = root.path().join("fake-agy.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+LOG_FILE=""
+CONV_ID=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --log-file)
+      LOG_FILE="$2"
+      shift 2
+      ;;
+    --log-file=*)
+      LOG_FILE="${{1#--log-file=}}"
+      shift
+      ;;
+    --conversation)
+      CONV_ID="$2"
+      shift 2
+      ;;
+    --conversation=*)
+      CONV_ID="${{1#--conversation=}}"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+[ -n "$LOG_FILE" ]
+MODE="${{FAKE_AGY_MODE:-new}}"
+case "$MODE" in
+  new)
+    printf 'I1119 01:00:00.000000 1 conversation_manager.go:1082] Streaming conversation %s\n' "{id1}" >> "$LOG_FILE"
+    printf 'I1119 01:00:00.001000 1 server.go:1276] Starting conversation update stream for %s\n' "{id1}" >> "$LOG_FILE"
+    ;;
+  resume)
+    [ "$CONV_ID" = "{id1}" ]
+    printf 'I1119 01:00:00.000000 1 common.go:477] Resuming conversation %s\n' "$CONV_ID" >> "$LOG_FILE"
+    printf 'I1119 01:00:00.001000 1 conversation_manager.go:1082] Streaming conversation %s\n' "$CONV_ID" >> "$LOG_FILE"
+    printf 'I1119 01:00:00.002000 1 server.go:3537] GetConversationDetail: found conversation %s\n' "$CONV_ID" >> "$LOG_FILE"
+    ;;
+  mismatch)
+    printf 'I1119 01:00:00.000000 1 conversation_manager.go:1082] Streaming conversation %s\n' "{id2}" >> "$LOG_FILE"
+    printf 'I1119 01:00:00.001000 1 server.go:1276] Starting conversation update stream for %s\n' "{id2}" >> "$LOG_FILE"
+    sleep 5
+    ;;
+esac
+sleep 0.15
+"#,
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let binding1 = bindings_dir.join("sess-1.json");
+        let log1 = super::super::session::agy_log_path_for_binding(&binding1);
+        unsafe { std::env::set_var("FAKE_AGY_MODE", "new") };
+        let code1 = run(
+            "agy".into(),
+            script_path.to_string_lossy().into_owned(),
+            binding1.clone(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code1, 0);
+        let claimed1 = super::super::session::read_binding(&binding1)
+            .unwrap()
+            .expect("new session binding must exist");
+        assert_eq!(claimed1.native_id, id1);
+        assert!(!log1.exists(), "owned agy log must be removed on exit");
+
+        let binding2 = bindings_dir.join("sess-2.json");
+        unsafe { std::env::set_var("FAKE_AGY_MODE", "resume") };
+        let code2 = run(
+            "agy".into(),
+            script_path.to_string_lossy().into_owned(),
+            binding2.clone(),
+            Some(id1.clone()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code2, 0);
+        let claimed2 = super::super::session::read_binding(&binding2)
+            .unwrap()
+            .expect("resumed session binding must exist");
+        assert_eq!(claimed2.native_id, id1);
+
+        let binding3 = bindings_dir.join("sess-3.json");
+        let log3 = super::super::session::agy_log_path_for_binding(&binding3);
+        unsafe { std::env::set_var("FAKE_AGY_MODE", "mismatch") };
+        let code3 = run(
+            "agy".into(),
+            script_path.to_string_lossy().into_owned(),
+            binding3.clone(),
+            Some(id1),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        unsafe { std::env::remove_var("FAKE_AGY_MODE") };
+        assert_ne!(code3, 0);
+        assert!(!binding3.exists());
+        assert!(!log3.exists());
     }
 }
 

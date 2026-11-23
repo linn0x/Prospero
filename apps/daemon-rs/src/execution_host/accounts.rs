@@ -105,7 +105,11 @@ fn validate_reference(reference: &AccountSnapshotRef) -> Result<()> {
             .all(|byte| byte.is_ascii_hexdigit())
         || !matches!(
             reference.engine,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi | AgentKind::Agy
+            AgentKind::Claude
+                | AgentKind::Codex
+                | AgentKind::Opencode
+                | AgentKind::Pi
+                | AgentKind::Agy
         )
     {
         return Err(invalid_snapshot());
@@ -293,7 +297,11 @@ fn validate_frozen(snapshot: &FrozenAccount) -> Result<()> {
         || snapshot.credential.secret.contains(['\r', '\n', '\0'])
         || !matches!(
             snapshot.account_agent,
-            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode | AgentKind::Pi | AgentKind::Agy
+            AgentKind::Claude
+                | AgentKind::Codex
+                | AgentKind::Opencode
+                | AgentKind::Pi
+                | AgentKind::Agy
         )
     {
         return Err(invalid_snapshot());

@@ -141,9 +141,11 @@ impl Screen {
     }
 
     pub(crate) fn scrollback_len(&self) -> usize {
-        self.terminal
-            .as_ref()
-            .map_or(0, |t| t.lines().count().saturating_sub(usize::from(self.size.rows)))
+        self.terminal.as_ref().map_or(0, |t| {
+            t.lines()
+                .count()
+                .saturating_sub(usize::from(self.size.rows))
+        })
     }
 
     pub fn kitty_keyboard_flags(&self) -> u16 {
@@ -664,7 +666,8 @@ impl Screen {
                 Err(error) => last_error = Some(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| Error::Invalid("terminal checkpoint exceeds limit".into())))
+        Err(last_error
+            .unwrap_or_else(|| Error::Invalid("terminal checkpoint exceeds limit".into())))
     }
 
     fn snapshot_with_scrollback_limit(

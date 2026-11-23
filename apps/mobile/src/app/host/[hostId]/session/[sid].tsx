@@ -1808,8 +1808,8 @@ export default function SessionScreen() {
         <Pressable accessibilityRole="button" accessibilityLabel="关闭终端搜索" onPress={() => { termRef.current?.search(""); setSearch(null); }} style={styles.terminalSearchAction}><Text style={styles.terminalSearchActionText}>×</Text></Pressable>
       </View>}
 
-      {session.archived && <Pressable accessibilityRole="button" disabled={!isChat && !["claude", "codex", "pi"].includes(session.agent)} onPress={() => setLifecycleTarget(false)} style={{ padding: 12, backgroundColor: color.surface }}>
-        <Text style={{ color: color.accent }}>{isChat || ["claude", "codex", "pi"].includes(session.agent) ? "已归档 · 查看历史不会运行任务 · 点击继续对话" : "已归档 · 终端历史只读"}</Text>
+      {session.archived && <Pressable accessibilityRole="button" disabled={!isChat && !["claude", "codex", "pi", "agy"].includes(session.agent)} onPress={() => setLifecycleTarget(false)} style={{ padding: 12, backgroundColor: color.surface }}>
+        <Text style={{ color: color.accent }}>{isChat || ["claude", "codex", "pi", "agy"].includes(session.agent) ? "已归档 · 查看历史不会运行任务 · 点击继续对话" : "已归档 · 终端历史只读"}</Text>
       </Pressable>}
       {isChat ? (
         <ConversationFontScale value={settings.conversationFontSize / DEFAULT_CONVERSATION_FONT_SIZE}>
@@ -2223,7 +2223,7 @@ export default function SessionScreen() {
             }}
           />
         )}
-        {(!session.archived || isStructured || ["claude", "codex", "pi"].includes(session.agent)) && <SheetAction
+        {(!session.archived || isStructured || ["claude", "codex", "pi", "agy"].includes(session.agent)) && <SheetAction
           label={session.archived ? "继续对话" : "停止并归档"}
           detail={session.archived ? "恢复原生对话上下文" : "停止执行、释放资源并保留历史"}
           symbol="archivebox"

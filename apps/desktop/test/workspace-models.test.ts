@@ -14,6 +14,7 @@ describe("workspace model catalog", () => {
     delete legacy.agentControls;
     expect(modelSwitchSupported(legacy)).toBe(true);
     expect(modelSwitchSupported({ ...legacy, agent: "grok" })).toBe(false);
+    expect(modelSwitchSupported({ ...legacy, agent: "agy" })).toBe(true);
     expect(modelSwitchSupported(session, { capabilities: { modelSelection: false } })).toBe(true);
   });
 

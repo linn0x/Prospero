@@ -682,6 +682,7 @@ impl Api {
         {
             eprintln!("status projection failed: {error}");
         }
+        crate::agent::agy::warm_catalog_in_background();
         let mut next_write = tokio::time::Instant::now() + Duration::from_millis(100);
         loop {
             tokio::select! {

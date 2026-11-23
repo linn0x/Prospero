@@ -384,19 +384,12 @@ impl Host {
         if snap.seq <= 0 {
             return Ok(Some(snap));
         }
-        let Ok(first_page) = self
-            .get::<TerminalPage>("output?afterSeq=0&waitMs=0")
-            .await
-        else {
+        let Ok(first_page) = self.get::<TerminalPage>("output?afterSeq=0&waitMs=0").await else {
             return Ok(Some(snap));
         };
         let initial_size = first_page.initial_size;
         let resynced = first_page.resync_required;
-        let mut cursor = if resynced {
-            first_page.floor_seq
-        } else {
-            0
-        };
+        let mut cursor = if resynced { first_page.floor_seq } else { 0 };
         if cursor > snap.seq {
             return Ok(Some(snap));
         }
@@ -529,9 +522,10 @@ impl Host {
         };
         let default_mux_dir = data_dir.join("terminal-mux-host");
         let pin_data_dir = data_dir.clone();
-        let versioned_mux_dir = data_dir.join(format!("terminal-mux-host-{}", &expected_hash[..16]));
-        let (executable, mux_dir, _spawn_lock, launch) =
-            tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, SpawnLockGuard, Launch)> {
+        let versioned_mux_dir =
+            data_dir.join(format!("terminal-mux-host-{}", &expected_hash[..16]));
+        let (executable, mux_dir, _spawn_lock, launch) = tokio::task::spawn_blocking(
+            move || -> Result<(PathBuf, PathBuf, SpawnLockGuard, Launch)> {
                 use fs2::FileExt;
                 let cache = pin_data_dir.join("terminal-host-runtime");
                 let executable = pin_executable(&exe, &cache, &expected_hash)?;
@@ -568,9 +562,10 @@ impl Host {
                     return Err(Error::Invalid("terminal environment exceeds limit".into()));
                 }
                 Ok((executable, selected_mux_dir, guard, launch))
-            })
-            .await
-            .map_err(|_| Error::Closed)??;
+            },
+        )
+        .await
+        .map_err(|_| Error::Closed)??;
 
         let command_strings: Vec<String> = launch
             .argv

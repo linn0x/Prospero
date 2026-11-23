@@ -48,17 +48,24 @@ impl Drop for Daemon {
 }
 impl Daemon {
     async fn start(root: &Path) -> Self {
+        Self::start_with_env(root, &[]).await
+    }
+
+    async fn start_with_env(root: &Path, envs: &[(&str, &std::ffi::OsStr)]) -> Self {
         let ready = root.join("connection.json");
-        let child = Command::new(env!("CARGO_BIN_EXE_prosperod-rs"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_prosperod-rs"));
+        command
             .args(["serve", "--data-dir"])
             .arg(root)
             .env("CODEX_HOME", root.join("isolated-codex"))
             .env("PROSPERO_LEGACY_HOME", root.join("no-legacy"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let child = command.spawn().unwrap();
         let mut daemon = Self {
             child,
             url: String::new(),
@@ -484,4 +491,147 @@ async fn conpty_shell_survives_daemon_restarts_and_explicit_close_archives_it() 
     })
     .await
     .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agy_managed_terminal_auto_binds_archives_and_resumes_without_manual_binding() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let expected_uuid = "11111111-2222-4333-8444-555555555555";
+    let invocations = root.path().join("agy-invocations.log");
+    let fake_agy = root.path().join("fake-agy.sh");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+case "${{1:-}}" in
+  models|--help|--version)
+    exit 0
+    ;;
+esac
+LOG_FILE=""
+CONV_ID=""
+ARGS_LINE="$*"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --log-file)
+      LOG_FILE="$2"
+      shift 2
+      ;;
+    --log-file=*)
+      LOG_FILE="${{1#--log-file=}}"
+      shift
+      ;;
+    --conversation)
+      CONV_ID="$2"
+      shift 2
+      ;;
+    --conversation=*)
+      CONV_ID="${{1#--conversation=}}"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '%s\n' "$ARGS_LINE" >> '{invocations}'
+[ -n "$LOG_FILE" ]
+if [ -n "$CONV_ID" ]; then
+  printf 'I1119 01:00:00.000000 1 common.go:477] Resuming conversation %s\n' "$CONV_ID" >> "$LOG_FILE"
+  printf 'I1119 01:00:00.001000 1 conversation_manager.go:1082] Streaming conversation %s\n' "$CONV_ID" >> "$LOG_FILE"
+  printf 'I1119 01:00:00.002000 1 server.go:1276] Starting conversation update stream for %s\n' "$CONV_ID" >> "$LOG_FILE"
+else
+  printf 'I1119 01:00:00.000000 1 conversation_manager.go:1082] Streaming conversation {expected_uuid}\n' >> "$LOG_FILE"
+  printf 'I1119 01:00:00.001000 1 server.go:1276] Starting conversation update stream for {expected_uuid}\n' >> "$LOG_FILE"
+fi
+exec sleep 30
+"#,
+        invocations = invocations.display(),
+    );
+    std::fs::write(&fake_agy, script).unwrap();
+    std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let daemon =
+        Daemon::start_with_env(root.path(), &[("PROSPERO_AGY_BIN", fake_agy.as_os_str())]).await;
+
+    let head = daemon
+        .post(
+            "/v1/terminals",
+            json!({
+                "title": "agy-managed",
+                "workspace": workspace,
+                "size": { "cols": 80, "rows": 24 },
+                "agent": "agy"
+            }),
+        )
+        .await;
+    let id = head["id"].as_str().unwrap().to_owned();
+    assert_eq!(head["nativeSession"]["managed"], true);
+    assert_eq!(head["nativeSession"]["state"], "binding");
+    let first_runtime_id = head["nativeSession"]["runtimeId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let session = daemon.get(&format!("/v1/sessions/{id}")).await;
+            if session["nativeSession"]["state"] == "running"
+                && session["nativeSession"]["nativeId"] == expected_uuid
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let archived = daemon
+        .post(&format!("/v1/sessions/{id}/archive"), json!({}))
+        .await;
+    assert_eq!(archived["lifecycle"], "archived");
+    assert_eq!(archived["nativeSession"]["state"], "archived");
+    assert_eq!(archived["nativeSession"]["nativeId"], expected_uuid);
+    assert_eq!(archived["nativeSession"]["managed"], true);
+    let first_log = root
+        .path()
+        .join("terminal-bindings")
+        .join(format!("{first_runtime_id}.agy.log"));
+    assert!(!first_log.exists(), "first agy log should be cleaned up");
+
+    let resumed = daemon
+        .post(&format!("/v1/sessions/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(resumed["lifecycle"], "active");
+    assert_eq!(resumed["nativeSession"]["state"], "running");
+    assert_eq!(resumed["nativeSession"]["nativeId"], expected_uuid);
+    assert_eq!(resumed["nativeSession"]["managed"], true);
+    let second_runtime_id = resumed["nativeSession"]["runtimeId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let invocation_text = std::fs::read_to_string(&invocations).unwrap();
+    let lines = invocation_text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("--log-file "));
+    assert!(!lines[0].contains("--conversation "));
+    assert!(lines[1].contains(&format!("--conversation {expected_uuid}")));
+    assert!(lines[1].contains("--log-file "));
+
+    let final_archived = daemon
+        .post(&format!("/v1/sessions/{id}/archive"), json!({}))
+        .await;
+    assert_eq!(final_archived["lifecycle"], "archived");
+    let second_log = root
+        .path()
+        .join("terminal-bindings")
+        .join(format!("{second_runtime_id}.agy.log"));
+    assert!(!second_log.exists(), "second agy log should be cleaned up");
 }

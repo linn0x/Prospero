@@ -1485,10 +1485,11 @@ impl Agents {
                 None | Some(crate::accounts::NATIVE_AGY_ID) => {
                     input.account_id = None;
                     let (normalized_model, normalized_effort, _) =
-                        super::agy::resolve_cli_model_and_effort(
+                        super::agy::resolve_cli_model_and_effort_async(
                             input.model.as_deref(),
                             input.effort.as_deref(),
-                        );
+                        )
+                        .await;
                     input.model = normalized_model;
                     input.effort = normalized_effort;
                 }
@@ -1927,6 +1928,16 @@ impl Agents {
             .clone()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
+        let pre_resolved_agy = if !use_model_source && agent == AgentKind::Agy {
+            let (m, e, _) = super::agy::resolve_cli_model_and_effort_async(
+                requested_model.as_deref(),
+                requested_effort.as_deref(),
+            )
+            .await;
+            Some((m, e))
+        } else {
+            None
+        };
         let (
             account_id,
             resolved_model,
@@ -2039,11 +2050,7 @@ impl Agents {
                             .and_then(|a| a.api_profile.as_ref())
                             .is_none()
                     {
-                        let (m, e, _) = super::agy::resolve_cli_model_and_effort(
-                            requested_model.as_deref(),
-                            requested_effort.as_deref(),
-                        );
-                        (m, e)
+                        pre_resolved_agy.unwrap_or((requested_model, requested_effort))
                     } else {
                         (requested_model, requested_effort)
                     };
@@ -4654,10 +4661,7 @@ impl Agents {
         super::pi::launch_catalog(Path::new(&home), &environment).await
     }
 
-    pub async fn agy_launch_catalog(
-        &self,
-        account_id: Option<&str>,
-    ) -> Result<LaunchModelCatalog> {
+    pub async fn agy_launch_catalog(&self, account_id: Option<&str>) -> Result<LaunchModelCatalog> {
         let account_id = match account_id {
             None | Some(crate::accounts::NATIVE_AGY_ID) => None,
             Some(id) => {
@@ -5287,10 +5291,11 @@ impl Agents {
             super::claude::fetch_launch_catalog(&environment).await?
         };
         let (run_model, run_effort) = if run.agent == AgentKind::Agy {
-            let (m, e, _) = super::agy::resolve_cli_model_and_effort(
+            let (m, e, _) = super::agy::resolve_cli_model_and_effort_async(
                 run.model.as_deref(),
                 run.effort.as_deref(),
-            );
+            )
+            .await;
             (m, e)
         } else {
             (run.model, run.effort)
@@ -5441,7 +5446,8 @@ impl Agents {
         let (model, effort) =
             if run.agent == AgentKind::Agy && catalog.iter().all(|entry| entry.id != model) {
                 let (norm_model, norm_effort, _) =
-                    super::agy::resolve_cli_model_and_effort(Some(&model), effort.as_deref());
+                    super::agy::resolve_cli_model_and_effort_async(Some(&model), effort.as_deref())
+                        .await;
                 (norm_model.unwrap_or(model), norm_effort.or(effort))
             } else {
                 (model, effort)

@@ -1083,7 +1083,7 @@ export default function HostScreen() {
   // 所有行都会被判定为 props 变化,memo 等于没做。
   const sessionSwipeActions = useCallback((session: SessionInfo): SwipeAction[] => {
     const archived = session.archived ?? archivedIds.has(session.id);
-    const canResume = session.kind === "structured" || ["claude", "codex", "pi"].includes(session.agent);
+    const canResume = session.kind === "structured" || ["claude", "codex", "pi", "agy"].includes(session.agent);
     return [
       {
         id: "toggle-archive",

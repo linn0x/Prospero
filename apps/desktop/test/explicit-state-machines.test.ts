@@ -116,6 +116,51 @@ describe("Explicit State Machines (P0 / P1 / P2)", () => {
           nativeSession: { state: "unbound" },
         }),
       ).toBe(true);
+
+      expect(
+        needsNativeBinding({
+          title: "Antigravity",
+          kind: "pty",
+          agent: "agy",
+          nativeSession: { state: "binding", managed: true },
+        }),
+      ).toBe(false);
+
+      expect(
+        needsNativeBinding({
+          title: "Antigravity",
+          kind: "pty",
+          agent: "agy",
+          nativeSession: { state: "running", nativeId: "conv-agy-1", managed: true },
+        }),
+      ).toBe(false);
+
+      expect(
+        needsNativeBinding({
+          title: "Antigravity",
+          kind: "pty",
+          agent: "agy",
+          nativeSession: { state: "archived", managed: true },
+        }),
+      ).toBe(false);
+
+      expect(
+        needsNativeBinding({
+          title: "Antigravity",
+          kind: "pty",
+          agent: "agy",
+          nativeSession: { state: "archived", nativeId: "conv-agy-1", managed: true },
+        }),
+      ).toBe(false);
+
+      expect(
+        needsNativeBinding({
+          title: "Antigravity",
+          kind: "pty",
+          agent: "agy",
+          nativeSession: undefined,
+        }),
+      ).toBe(true);
     });
   });
 
