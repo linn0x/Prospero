@@ -26,4 +26,27 @@ describe("main-process page cancellation", () => {
       expect(await registry.run("request", async () => 1)).toBe(1);
     } finally { vi.useRealTimers(); }
   });
+
+  it("honors custom timeoutMs for long-polling timeline change requests", async () => {
+    vi.useFakeTimers();
+    try {
+      const registry = new RequestRegistry();
+      let aborted = false;
+      const pending = registry.run(
+        "poll",
+        signal => new Promise<boolean>((resolve) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            resolve(true);
+          }, { once: true });
+        }),
+        25_000,
+      );
+      await vi.advanceTimersByTimeAsync(24_999);
+      expect(aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toBe(true);
+      expect(aborted).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
 });

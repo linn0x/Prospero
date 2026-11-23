@@ -17,7 +17,7 @@ import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snap
 import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import { DaemonRuntime } from "./daemon-runtime";
-import { RustRuntime } from "./rust-runtime";
+import { RustRuntime, TIMELINE_LONG_POLL_WAIT_MS } from "./rust-runtime";
 import { RequestRegistry } from "./request-registry";
 import { LegacyOrchestrationProjection } from "./legacy-orchestration-projection";
 import { sessionInfoFromControl } from "./session-control";
@@ -1356,7 +1356,11 @@ function installIpc(): void {
   ipcMain.handle("timeline:changes", (event, rawId: unknown, after: unknown, rawRequest: unknown) => {
     if (!(runtime instanceof RustRuntime)) throw new Error("当前后端不支持时间线分页");
     const id = requireId(rawId, "会话"); const cursor = optionalCursor(after) ?? 0;
-    return sessionPageRequests.run(`${event.sender.id}:${requireId(rawRequest, "请求")}`, signal => runtime.readTimelineChanges(id, cursor, signal));
+    return sessionPageRequests.run(
+      `${event.sender.id}:${requireId(rawRequest, "请求")}`,
+      signal => runtime.readTimelineChanges(id, cursor, signal),
+      TIMELINE_LONG_POLL_WAIT_MS + 10_000,
+    );
   });
   ipcMain.handle("timeline:lookup", (event, rawId: unknown, rawIds: unknown, rawRequest: unknown) => {
     if (!(runtime instanceof RustRuntime)) throw new Error("当前后端不支持时间线分页");

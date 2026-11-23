@@ -192,7 +192,7 @@ export class TimelineController {
       else if (changes.items.length > 0) delay = ACTIVE_POLL_MS;
       else if (elapsed >= LONG_POLL_HELD_THRESHOLD_MS) delay = LONG_POLL_REENTER_MS;
       else delay = IDLE_POLL_MS;
-    } catch { if (!controller.signal.aborted) { this.failures++; delay = Math.min(8000, IDLE_POLL_MS * 2 ** Math.min(this.failures, 4)); this.publish({ ...this.state, error: "会话更新暂不可用，正在重试" }); } }
+    } catch { if (!controller.signal.aborted) { this.failures++; delay = Math.min(8000, IDLE_POLL_MS * 2 ** Math.min(this.failures, 4)); if (this.failures >= 2) this.publish({ ...this.state, error: "会话更新暂不可用，正在重试" }); } }
     finally { if (!controller.signal.aborted) this.schedule(delay); }
   }
 }
