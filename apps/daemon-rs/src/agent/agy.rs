@@ -24,7 +24,7 @@ use crate::orchestration::reliability::ControlEffectState;
 
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(600);
 const CATALOG_CMD_TIMEOUT: Duration = Duration::from_secs(20);
-const COLD_CATALOG_WAIT_TIMEOUT: Duration = Duration::from_secs(6);
+const COLD_CATALOG_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const NEGATIVE_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
 pub(crate) fn binary() -> String {
@@ -78,14 +78,62 @@ fn effort_rank(raw: &str) -> Option<u8> {
     }
 }
 
+fn agy_effort_label(effort: &str) -> &'static str {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "XHigh",
+        "max" => "Max",
+        _ => "Medium",
+    }
+}
+
+const ORCHESTRATOR_PLANNERS: &[(&str, &str, &str)] = &[
+    (
+        "gemini-pro-orchestrator-neon",
+        "gemini-4-neon",
+        "Gemini 4 Neon",
+    ),
+    (
+        "gemini-pro-orchestrator",
+        "gemini-4-carbon",
+        "Gemini 4 Carbon",
+    ),
+    (
+        "gemini-pro-orchestrator-argon",
+        "gemini-4-argon",
+        "Gemini 4 Argon",
+    ),
+    (
+        "gemini-pro-orchestrator-claude-opus-5-5",
+        "claude-opus-5-5",
+        "Claude Opus 5.5",
+    ),
+];
+
+fn orchestrator_planner_spec(id: &str) -> Option<(&'static str, &'static str)> {
+    ORCHESTRATOR_PLANNERS
+        .iter()
+        .find(|(orch_id, _, _)| *orch_id == id)
+        .map(|(_, planner_base, fallback_label)| (*planner_base, *fallback_label))
+}
+
+fn is_builtin_orchestrator_cli_slug(id: &str) -> bool {
+    matches!(
+        id,
+        "gemini-pro-orchestrator"
+            | "gemini-pro-orchestrator-neon"
+            | "gemini-pro-orchestrator-argon"
+    ) || (id.starts_with("gemini-pro-orchestrator-")
+        && id != "gemini-pro-orchestrator-claude-opus-5-5")
+}
+
 fn default_effort_for_base(base_id: &str, supported: &[String]) -> String {
-    let preferred = if matches!(
-        base_id,
-        "gemini-4-carbon" | "gemini-4-argon" | "gpt-oss-120b"
-    ) {
-        "medium"
-    } else {
+    let preferred = if base_id == "gemini-pro-orchestrator-neon" {
         "high"
+    } else {
+        "medium"
     };
     if supported.iter().any(|item| item == preferred) {
         return preferred.to_owned();
@@ -149,7 +197,12 @@ fn slugify_token(text: &str) -> String {
         if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
             slug.push(ch);
             prev_dash = false;
-        } else if (ch == '-' || ch.is_whitespace()) && !prev_dash && !slug.is_empty() {
+        } else if (ch == '-'
+            || ch.is_whitespace()
+            || matches!(ch, '·' | '/' | ':' | '(' | ')'))
+            && !prev_dash
+            && !slug.is_empty()
+        {
             slug.push('-');
             prev_dash = true;
         }
@@ -201,9 +254,19 @@ fn normalize_model_alias(raw_model: &str) -> String {
         "argon-4" | "argon" | "gemini-argon-4" => "gemini-4-argon",
         "carbon-4" | "carbon" | "gemini-carbon-4" => "gemini-4-carbon",
         "hydrogen" | "gemini-hydrogen" | "gemini-hydrogen-4" | "hydrogen-4" => "gemini-4-hydrogen",
-        "orchestrator" | "orchestrator-carbon" => "gemini-pro-orchestrator",
-        "orchestrator-argon" => "gemini-pro-orchestrator-argon",
-        "orchestrator-neon" => "gemini-pro-orchestrator-neon",
+        "orchestrator"
+        | "orchestrator-carbon"
+        | "orchestrator-gemini-4-carbon"
+        | "gemini-pro-orchestrator-carbon" => "gemini-pro-orchestrator",
+        "orchestrator-argon" | "orchestrator-gemini-4-argon" => "gemini-pro-orchestrator-argon",
+        "orchestrator-neon" | "orchestrator-gemini-4-neon" => "gemini-pro-orchestrator-neon",
+        "orchestrator-claude-opus-5.5"
+        | "orchestrator-claude-opus-5-5"
+        | "orchestrator-opus"
+        | "orchestrator-opus-5.5"
+        | "orchestrator-opus-5-5"
+        | "gemini-pro-orchestrator-claude-opus-5.5"
+        | "gemini-pro-orchestrator-opus" => "gemini-pro-orchestrator-claude-opus-5-5",
         "claude-opus-5.5" => "claude-opus-5-5",
         "claude-sonnet-5.5" => "claude-sonnet-5-5",
         other => other,
@@ -250,9 +313,14 @@ fn resolve_cli_model_and_effort_with_catalog_match(
     let Some(raw_model) = clean_model else {
         if let Some(raw_effort) = clean_effort {
             let clamped = clamp_effort_to_supported(
-                "gemini-4-carbon",
+                "gemini-4-neon",
                 raw_effort,
-                &["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+                &[
+                    "low".to_owned(),
+                    "medium".to_owned(),
+                    "high".to_owned(),
+                    "xhigh".to_owned(),
+                ],
                 Some("medium"),
             );
             return (
@@ -270,6 +338,76 @@ fn resolve_cli_model_and_effort_with_catalog_match(
     let normalized_model = normalize_model_alias(raw_model);
     let (base_id, embedded_effort) = split_model_effort_suffix(&normalized_model);
     if let Some(entry) = find_catalog_entry(&normalized_model, base_id, catalog) {
+        if entry.id.starts_with("gemini-pro-orchestrator") {
+            if !entry.supported_efforts.is_empty()
+                && let Some((planner_base, fallback_planner_label)) =
+                    orchestrator_planner_spec(&entry.id)
+            {
+                let effective_effort = match clean_effort.or(embedded_effort) {
+                    Some(chosen) => clamp_effort_to_supported(
+                        &entry.id,
+                        chosen,
+                        &entry.supported_efforts,
+                        entry.default_effort.as_deref(),
+                    ),
+                    None => entry
+                        .default_effort
+                        .clone()
+                        .filter(|d| entry.supported_efforts.iter().any(|s| s == d))
+                        .unwrap_or_else(|| {
+                            default_effort_for_base(&entry.id, &entry.supported_efforts)
+                        }),
+                };
+                let planner_display_base = catalog
+                    .iter()
+                    .find(|candidate| candidate.id == planner_base)
+                    .map(|candidate| candidate.label.as_str())
+                    .unwrap_or(fallback_planner_label);
+                let planner_label = format!(
+                    "{planner_display_base} ({})",
+                    agy_effort_label(&effective_effort)
+                );
+                let cli_slug = if is_builtin_orchestrator_cli_slug(&entry.id) {
+                    entry.id.clone()
+                } else {
+                    catalog
+                        .iter()
+                        .find(|candidate| candidate.id == "gemini-pro-orchestrator-neon")
+                        .or_else(|| {
+                            catalog
+                                .iter()
+                                .find(|candidate| candidate.id == "gemini-pro-orchestrator")
+                        })
+                        .or_else(|| {
+                            catalog
+                                .iter()
+                                .find(|candidate| is_builtin_orchestrator_cli_slug(&candidate.id))
+                        })
+                        .map(|candidate| candidate.id.clone())
+                        .unwrap_or_else(|| "gemini-pro-orchestrator".to_owned())
+                };
+                let settings = serde_json::json!({
+                    "orchestrator": { "planner": planner_label }
+                })
+                .to_string();
+                return (
+                    true,
+                    (
+                        Some(entry.id.clone()),
+                        Some(effective_effort),
+                        vec!["--model".into(), cli_slug, "--settings".into(), settings],
+                    ),
+                );
+            }
+            return (
+                true,
+                (
+                    Some(entry.id.clone()),
+                    None,
+                    vec!["--model".into(), entry.id.clone()],
+                ),
+            );
+        }
         if !entry.supported_efforts.is_empty() {
             let effective_effort = match clean_effort.or(embedded_effort) {
                 Some(chosen) => clamp_effort_to_supported(
@@ -324,16 +462,18 @@ fn effective_catalog_snapshot() -> Vec<LaunchModelInfo> {
         .unwrap_or_else(fallback_models)
 }
 
-/// Resolves a `(model, effort)` selection into `(canonical_base_model, canonical_effort, cli_args)`
-/// using the live `agy models` catalog (falling back to offline builtins before first fetch)
-/// so that `agy` never receives a conflicting `--model <slug>-<effort1> --effort <effort2>` pair,
-/// and standalone or custom gateway models never receive a spurious `-{effort}` suffix.
-#[cfg(test)]
-pub(crate) fn resolve_cli_model_and_effort(
-    model: Option<&str>,
-    effort: Option<&str>,
-) -> (Option<String>, Option<String>, Vec<String>) {
-    resolve_cli_model_and_effort_with_catalog(model, effort, &effective_catalog_snapshot())
+async fn wait_for_catalog_refresh(
+    timeout: Duration,
+    force_after: Option<Duration>,
+) -> Option<Vec<LaunchModelInfo>> {
+    // Detach the fetch task on timeout so `agy models` finishes warming the cache
+    // instead of getting killed mid-request via `kill_on_drop`.
+    let handle = tokio::spawn(fetch_live_catalog_once(force_after));
+    tokio::time::timeout(timeout, handle)
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .flatten()
 }
 
 pub(crate) async fn resolve_cli_model_and_effort_async(
@@ -348,8 +488,7 @@ pub(crate) async fn resolve_cli_model_and_effort_async(
         .ok()
         .is_some_and(|guard| guard.is_some());
     if !had_cache {
-        let _ =
-            tokio::time::timeout(COLD_CATALOG_WAIT_TIMEOUT, fetch_live_catalog_once(None)).await;
+        let _ = wait_for_catalog_refresh(COLD_CATALOG_WAIT_TIMEOUT, None).await;
     }
     let snapshot = effective_catalog_snapshot();
     let (matched, resolved) =
@@ -363,9 +502,9 @@ pub(crate) async fn resolve_cli_model_and_effort_async(
             .is_some_and(|(updated_at, _)| updated_at.elapsed() >= NEGATIVE_REFRESH_COOLDOWN)
     });
     if can_refresh {
-        let _ = tokio::time::timeout(
+        let _ = wait_for_catalog_refresh(
             COLD_CATALOG_WAIT_TIMEOUT,
-            fetch_live_catalog_once(Some(NEGATIVE_REFRESH_COOLDOWN)),
+            Some(NEGATIVE_REFRESH_COOLDOWN),
         )
         .await;
         return resolve_cli_model_and_effort_with_catalog(
@@ -387,8 +526,8 @@ pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
             label: "Gemini 4 Neon".into(),
             description: Some("Antigravity 订阅模型".into()),
             supported_efforts: xhigh_efforts.clone(),
-            default_effort: Some("high".into()),
-            is_default: false,
+            default_effort: Some("medium".into()),
+            is_default: true,
         },
         LaunchModelInfo {
             id: "gemini-4-carbon".into(),
@@ -396,7 +535,7 @@ pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
             description: Some("Antigravity 订阅模型".into()),
             supported_efforts: std_efforts.clone(),
             default_effort: Some("medium".into()),
-            is_default: true,
+            is_default: false,
         },
         LaunchModelInfo {
             id: "gemini-4-argon".into(),
@@ -410,32 +549,40 @@ pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
             id: "gemini-4-hydrogen".into(),
             label: "Gemini 4 Hydrogen".into(),
             description: Some("Antigravity 订阅模型".into()),
+            supported_efforts: xhigh_efforts.clone(),
+            default_effort: Some("medium".into()),
+            is_default: false,
+        },
+        LaunchModelInfo {
+            id: "gemini-pro-orchestrator-neon".into(),
+            label: "Orchestrator · Gemini 4 Neon".into(),
+            description: Some("Orchestrator 规划模型 · 执行由 Gemini 4 Hydrogen 完成".into()),
             supported_efforts: xhigh_efforts,
             default_effort: Some("high".into()),
             is_default: false,
         },
         LaunchModelInfo {
-            id: "gemini-pro-orchestrator-neon".into(),
-            label: "Orchestrator (Neon)".into(),
-            description: Some("Antigravity 订阅模型".into()),
-            supported_efforts: Vec::new(),
-            default_effort: None,
-            is_default: false,
-        },
-        LaunchModelInfo {
             id: "gemini-pro-orchestrator".into(),
-            label: "Orchestrator (Carbon)".into(),
-            description: Some("Antigravity 订阅模型".into()),
-            supported_efforts: Vec::new(),
-            default_effort: None,
+            label: "Orchestrator · Gemini 4 Carbon".into(),
+            description: Some("Orchestrator 规划模型 · 执行由 Gemini 4 Hydrogen 完成".into()),
+            supported_efforts: std_efforts.clone(),
+            default_effort: Some("medium".into()),
             is_default: false,
         },
         LaunchModelInfo {
             id: "gemini-pro-orchestrator-argon".into(),
-            label: "Orchestrator (Argon)".into(),
-            description: Some("Antigravity 订阅模型".into()),
-            supported_efforts: Vec::new(),
-            default_effort: None,
+            label: "Orchestrator · Gemini 4 Argon".into(),
+            description: Some("Orchestrator 规划模型 · 执行由 Gemini 4 Hydrogen 完成".into()),
+            supported_efforts: std_efforts.clone(),
+            default_effort: Some("medium".into()),
+            is_default: false,
+        },
+        LaunchModelInfo {
+            id: "gemini-pro-orchestrator-claude-opus-5-5".into(),
+            label: "Orchestrator · Claude Opus 5.5".into(),
+            description: Some("Orchestrator 规划模型 · 执行由 Gemini 4 Hydrogen 完成".into()),
+            supported_efforts: std_efforts.clone(),
+            default_effort: Some("medium".into()),
             is_default: false,
         },
         LaunchModelInfo {
@@ -443,7 +590,7 @@ pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
             label: "Gemini 3.8 Flash".into(),
             description: Some("Antigravity 订阅模型".into()),
             supported_efforts: std_efforts.clone(),
-            default_effort: Some("high".into()),
+            default_effort: Some("medium".into()),
             is_default: false,
         },
         LaunchModelInfo {
@@ -451,7 +598,7 @@ pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
             label: "Claude Opus 5.5".into(),
             description: Some("Antigravity 订阅模型".into()),
             supported_efforts: std_efforts.clone(),
-            default_effort: Some("high".into()),
+            default_effort: Some("medium".into()),
             is_default: false,
         },
         LaunchModelInfo {
@@ -459,7 +606,7 @@ pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
             label: "Claude Sonnet 5.5".into(),
             description: Some("Antigravity 订阅模型".into()),
             supported_efforts: std_efforts,
-            default_effort: Some("high".into()),
+            default_effort: Some("medium".into()),
             is_default: false,
         },
         LaunchModelInfo {
@@ -474,7 +621,10 @@ pub(crate) fn fallback_models() -> Vec<LaunchModelInfo> {
 }
 
 pub(crate) fn parse_models_output(output: &str) -> Vec<LaunchModelInfo> {
-    let mut models: Vec<LaunchModelInfo> = Vec::new();
+    let mut standalone: Vec<LaunchModelInfo> = Vec::new();
+    let mut raw_orchestrators: Vec<LaunchModelInfo> = Vec::new();
+    let mut first_orchestrator_index: Option<usize> = None;
+
     for line in output.lines() {
         let sanitized = strip_ansi_and_spinner(line);
         let trimmed = sanitized.trim();
@@ -503,31 +653,47 @@ pub(crate) fn parse_models_output(output: &str) -> Vec<LaunchModelInfo> {
             .unwrap_or(id);
         let (base_id, suffix_effort) = split_model_effort_suffix(id);
         let base_label = strip_label_effort_suffix(raw_label);
-        if let Some(existing) = models.iter_mut().find(|model| model.id == base_id) {
+
+        if base_id.starts_with("gemini-pro-orchestrator") {
+            if first_orchestrator_index.is_none() {
+                first_orchestrator_index = Some(standalone.len());
+            }
+            if !raw_orchestrators.iter().any(|model| model.id == base_id) {
+                raw_orchestrators.push(LaunchModelInfo {
+                    id: base_id.to_owned(),
+                    label: base_label,
+                    description: Some("Antigravity 订阅模型".into()),
+                    supported_efforts: Vec::new(),
+                    default_effort: None,
+                    is_default: false,
+                });
+            }
+            continue;
+        }
+
+        if let Some(existing) = standalone.iter_mut().find(|model| model.id == base_id) {
             if let Some(effort) = suffix_effort
                 && !existing.supported_efforts.iter().any(|item| item == effort)
             {
                 existing.supported_efforts.push(effort.to_owned());
-            }
-            if id == "gemini-4-carbon-medium" {
-                existing.is_default = true;
             }
         } else {
             let mut supported_efforts = Vec::new();
             if let Some(effort) = suffix_effort {
                 supported_efforts.push(effort.to_owned());
             }
-            models.push(LaunchModelInfo {
+            standalone.push(LaunchModelInfo {
                 id: base_id.to_owned(),
                 label: base_label,
                 description: Some("Antigravity 订阅模型".into()),
                 supported_efforts,
                 default_effort: None,
-                is_default: base_id == "gemini-4-carbon",
+                is_default: false,
             });
         }
     }
-    for model in &mut models {
+
+    for model in &mut standalone {
         if model.supported_efforts.is_empty() {
             model.default_effort = None;
         } else {
@@ -541,8 +707,63 @@ pub(crate) fn parse_models_output(output: &str) -> Vec<LaunchModelInfo> {
                 Some(default_effort_for_base(&model.id, &model.supported_efforts));
         }
     }
-    if !models.is_empty() && !models.iter().any(|model| model.is_default) {
-        models[0].is_default = true;
+
+    let has_consumer_orchestrator = raw_orchestrators.iter().any(|model| {
+        model.id == "gemini-pro-orchestrator-neon" || model.id == "gemini-pro-orchestrator-argon"
+    }) || raw_orchestrators.len() > 1;
+
+    let mut orchestrators = if has_consumer_orchestrator {
+        let mut expanded = Vec::new();
+        for &(orch_id, planner_base, fallback_label) in ORCHESTRATOR_PLANNERS {
+            let planner = standalone.iter().find(|model| model.id == planner_base);
+            let in_raw = raw_orchestrators.iter().any(|model| model.id == orch_id);
+            if planner.is_some() || in_raw {
+                let supported_efforts = planner
+                    .map(|model| model.supported_efforts.clone())
+                    .unwrap_or_default();
+                let default_effort = (!supported_efforts.is_empty())
+                    .then(|| default_effort_for_base(orch_id, &supported_efforts));
+                let planner_label = planner
+                    .map(|model| model.label.as_str())
+                    .unwrap_or(fallback_label);
+                expanded.push(LaunchModelInfo {
+                    id: orch_id.to_owned(),
+                    label: format!("Orchestrator · {planner_label}"),
+                    description: Some("Orchestrator 规划模型 · 执行由 Gemini 4 Hydrogen 完成".into()),
+                    supported_efforts,
+                    default_effort,
+                    is_default: false,
+                });
+            }
+        }
+        for raw in raw_orchestrators {
+            if !ORCHESTRATOR_PLANNERS
+                .iter()
+                .any(|(orch_id, _, _)| *orch_id == raw.id)
+            {
+                expanded.push(raw);
+            }
+        }
+        expanded
+    } else {
+        raw_orchestrators
+    };
+
+    let mut models = standalone;
+    let insert_at = first_orchestrator_index
+        .unwrap_or(models.len())
+        .min(models.len());
+    models.splice(insert_at..insert_at, orchestrators.drain(..));
+
+    for model in &mut models {
+        model.is_default = false;
+    }
+    if let Some(neon) = models.iter_mut().find(|model| model.id == "gemini-4-neon") {
+        neon.is_default = true;
+    } else if let Some(carbon) = models.iter_mut().find(|model| model.id == "gemini-4-carbon") {
+        carbon.is_default = true;
+    } else if let Some(first) = models.first_mut() {
+        first.is_default = true;
     }
     models
 }
@@ -618,10 +839,8 @@ pub(crate) async fn launch_catalog() -> Result<LaunchModelCatalog> {
             warm_catalog_in_background();
             models
         }
-        None => tokio::time::timeout(COLD_CATALOG_WAIT_TIMEOUT, fetch_live_catalog_once(None))
+        None => wait_for_catalog_refresh(COLD_CATALOG_WAIT_TIMEOUT, None)
             .await
-            .ok()
-            .flatten()
             .unwrap_or_else(fallback_models),
     };
     let default_model = models
@@ -1202,16 +1421,18 @@ Available models (18):
   gemini-pro-orchestrator-neon\tOrchestrator (Neon)
   gemini-pro-orchestrator          Orchestrator (Carbon)
   gemini-pro-orchestrator-argon    Orchestrator (Argon)
+  claude-opus-5-5-low              Claude Opus 5.5 (Low)
+  claude-opus-5-5-medium           Claude Opus 5.5 (Medium)
   claude-opus-5-5-high             Claude Opus 5.5 (High)
 
 Usage: agy --model <id> [prompt]
 ";
         let models = parse_models_output(sample);
-        assert_eq!(models.len(), 8);
+        assert_eq!(models.len(), 9);
 
         assert_eq!(models[0].id, "gemini-4-neon");
         assert_eq!(models[0].label, "Gemini 4 Neon");
-        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
+        assert_eq!(models[0].default_effort.as_deref(), Some("medium"));
         assert_eq!(
             models[0].supported_efforts,
             vec![
@@ -1221,10 +1442,10 @@ Usage: agy --model <id> [prompt]
                 "xhigh".to_owned(),
             ]
         );
-        assert!(!models[0].is_default);
+        assert!(models[0].is_default);
 
         assert_eq!(models[1].id, "gemini-4-carbon");
-        assert!(models[1].is_default);
+        assert!(!models[1].is_default);
         assert_eq!(models[2].id, "gemini-4-argon");
         assert_eq!(models[2].label, "Gemini 4 Argon");
         assert_eq!(models[2].default_effort.as_deref(), Some("medium"));
@@ -1236,7 +1457,7 @@ Usage: agy --model <id> [prompt]
 
         assert_eq!(models[3].id, "gemini-4-hydrogen");
         assert_eq!(models[3].label, "Gemini 4 Hydrogen");
-        assert_eq!(models[3].default_effort.as_deref(), Some("high"));
+        assert_eq!(models[3].default_effort.as_deref(), Some("medium"));
         assert_eq!(
             models[3].supported_efforts,
             vec![
@@ -1248,126 +1469,290 @@ Usage: agy --model <id> [prompt]
         );
 
         assert_eq!(models[4].id, "gemini-pro-orchestrator-neon");
-        assert_eq!(models[4].label, "Orchestrator (Neon)");
-        assert!(models[4].supported_efforts.is_empty());
-        assert_eq!(models[4].default_effort, None);
+        assert_eq!(models[4].label, "Orchestrator · Gemini 4 Neon");
+        assert_eq!(
+            models[4].supported_efforts,
+            vec![
+                "low".to_owned(),
+                "medium".to_owned(),
+                "high".to_owned(),
+                "xhigh".to_owned(),
+            ]
+        );
+        assert_eq!(models[4].default_effort.as_deref(), Some("high"));
 
         assert_eq!(models[5].id, "gemini-pro-orchestrator");
-        assert_eq!(models[5].label, "Orchestrator (Carbon)");
-        assert!(models[5].supported_efforts.is_empty());
-        assert_eq!(models[5].default_effort, None);
+        assert_eq!(models[5].label, "Orchestrator · Gemini 4 Carbon");
+        assert_eq!(models[5].supported_efforts, vec!["medium".to_owned()]);
+        assert_eq!(models[5].default_effort.as_deref(), Some("medium"));
 
         assert_eq!(models[6].id, "gemini-pro-orchestrator-argon");
-        assert_eq!(models[6].label, "Orchestrator (Argon)");
-        assert!(models[6].supported_efforts.is_empty());
-        assert_eq!(models[6].default_effort, None);
+        assert_eq!(models[6].label, "Orchestrator · Gemini 4 Argon");
+        assert_eq!(
+            models[6].supported_efforts,
+            vec!["medium".to_owned(), "high".to_owned()]
+        );
+        assert_eq!(models[6].default_effort.as_deref(), Some("medium"));
 
-        assert_eq!(models[7].id, "claude-opus-5-5");
-        assert_eq!(models[7].label, "Claude Opus 5.5");
-        assert_eq!(models[7].default_effort.as_deref(), Some("high"));
+        assert_eq!(models[7].id, "gemini-pro-orchestrator-claude-opus-5-5");
+        assert_eq!(models[7].label, "Orchestrator · Claude Opus 5.5");
+        assert_eq!(
+            models[7].supported_efforts,
+            vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()]
+        );
+        assert_eq!(models[7].default_effort.as_deref(), Some("medium"));
+
+        assert_eq!(models[8].id, "claude-opus-5-5");
+        assert_eq!(models[8].label, "Claude Opus 5.5");
+        assert_eq!(models[8].default_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn parses_enterprise_orchestrator_without_consumer_planners() {
+        let sample = "\
+  gemini-4-carbon-high             Gemini 4 Carbon (High)
+  gemini-4-hydrogen-high           Gemini 4 Hydrogen (High)
+  gemini-pro-orchestrator          Orchestrator
+";
+        let models = parse_models_output(sample);
+        let orchestrator = models
+            .iter()
+            .find(|model| model.id == "gemini-pro-orchestrator")
+            .unwrap();
+        assert_eq!(orchestrator.label, "Orchestrator");
+        assert!(orchestrator.supported_efforts.is_empty());
+        assert_eq!(orchestrator.default_effort, None);
+
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-pro-orchestrator"),
+            Some("high"),
+            &models,
+        );
+        assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator"));
+        assert_eq!(effort, None);
+        assert_eq!(args, vec!["--model", "gemini-pro-orchestrator"]);
     }
 
     #[test]
     fn resolves_cli_model_and_effort_without_conflict() {
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("gemini-4-argon-medium"), Some("max"));
+        let catalog = fallback_models();
+
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-4-argon-medium"),
+            Some("max"),
+            &catalog,
+        );
         assert_eq!(model.as_deref(), Some("gemini-4-argon"));
         assert_eq!(effort.as_deref(), Some("high"));
         assert_eq!(args, vec!["--model", "gemini-4-argon-high"]);
 
         let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("gpt-oss-120b"), Some("high"));
+            resolve_cli_model_and_effort_with_catalog(Some("gpt-oss-120b"), Some("high"), &catalog);
         assert_eq!(model.as_deref(), Some("gpt-oss-120b"));
         assert_eq!(effort.as_deref(), Some("medium"));
         assert_eq!(args, vec!["--model", "gpt-oss-120b-medium"]);
 
-        let (model, effort, args) = resolve_cli_model_and_effort(None, Some("max"));
+        let (model, effort, args) =
+            resolve_cli_model_and_effort_with_catalog(None, Some("max"), &catalog);
         assert_eq!(model, None);
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+        assert_eq!(args, vec!["--effort", "xhigh"]);
+
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("Gemini 4 Argon (High)"),
+            None,
+            &catalog,
+        );
+        assert_eq!(model.as_deref(), Some("gemini-4-argon"));
         assert_eq!(effort.as_deref(), Some("high"));
-        assert_eq!(args, vec!["--effort", "high"]);
+        assert_eq!(args, vec!["--model", "gemini-4-argon-high"]);
 
         let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("Gemini 4 Argon (High)"), None);
+            resolve_cli_model_and_effort_with_catalog(Some("Argon 4 High"), None, &catalog);
         assert_eq!(model.as_deref(), Some("gemini-4-argon"));
         assert_eq!(effort.as_deref(), Some("high"));
         assert_eq!(args, vec!["--model", "gemini-4-argon-high"]);
 
-        let (model, effort, args) = resolve_cli_model_and_effort(Some("Argon 4 High"), None);
-        assert_eq!(model.as_deref(), Some("gemini-4-argon"));
-        assert_eq!(effort.as_deref(), Some("high"));
-        assert_eq!(args, vec!["--model", "gemini-4-argon-high"]);
-
-        let (model, effort, args) = resolve_cli_model_and_effort(Some("gemini-4-carbon"), None);
+        let (model, effort, args) =
+            resolve_cli_model_and_effort_with_catalog(Some("gemini-4-carbon"), None, &catalog);
         assert_eq!(model.as_deref(), Some("gemini-4-carbon"));
         assert_eq!(effort.as_deref(), Some("medium"));
         assert_eq!(args, vec!["--model", "gemini-4-carbon-medium"]);
 
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("gemini-4-hydrogen"), Some("xhigh"));
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-4-hydrogen"),
+            Some("xhigh"),
+            &catalog,
+        );
         assert_eq!(model.as_deref(), Some("gemini-4-hydrogen"));
         assert_eq!(effort.as_deref(), Some("xhigh"));
         assert_eq!(args, vec!["--model", "gemini-4-hydrogen-xhigh"]);
 
-        let (model, effort, args) = resolve_cli_model_and_effort(Some("gemini-4-hydrogen"), None);
+        let (model, effort, args) =
+            resolve_cli_model_and_effort_with_catalog(Some("gemini-4-hydrogen"), None, &catalog);
         assert_eq!(model.as_deref(), Some("gemini-4-hydrogen"));
-        assert_eq!(effort.as_deref(), Some("high"));
-        assert_eq!(args, vec!["--model", "gemini-4-hydrogen-high"]);
-
-        let (model, effort, args) = resolve_cli_model_and_effort(Some("gemini-4-neon"), None);
-        assert_eq!(model.as_deref(), Some("gemini-4-neon"));
-        assert_eq!(effort.as_deref(), Some("high"));
-        assert_eq!(args, vec!["--model", "gemini-4-neon-high"]);
+        assert_eq!(effort.as_deref(), Some("medium"));
+        assert_eq!(args, vec!["--model", "gemini-4-hydrogen-medium"]);
 
         let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("Gemini 4 Neon (XHigh)"), None);
+            resolve_cli_model_and_effort_with_catalog(Some("gemini-4-neon"), None, &catalog);
+        assert_eq!(model.as_deref(), Some("gemini-4-neon"));
+        assert_eq!(effort.as_deref(), Some("medium"));
+        assert_eq!(args, vec!["--model", "gemini-4-neon-medium"]);
+
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("Gemini 4 Neon (XHigh)"),
+            None,
+            &catalog,
+        );
         assert_eq!(model.as_deref(), Some("gemini-4-neon"));
         assert_eq!(effort.as_deref(), Some("xhigh"));
         assert_eq!(args, vec!["--model", "gemini-4-neon-xhigh"]);
 
-        let (model, effort, args) = resolve_cli_model_and_effort(Some("neon"), Some("max"));
+        let (model, effort, args) =
+            resolve_cli_model_and_effort_with_catalog(Some("neon"), Some("max"), &catalog);
         assert_eq!(model.as_deref(), Some("gemini-4-neon"));
         assert_eq!(effort.as_deref(), Some("xhigh"));
         assert_eq!(args, vec!["--model", "gemini-4-neon-xhigh"]);
 
-        // Standalone built-in orchestrators must never receive -{effort} suffixes.
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("gemini-pro-orchestrator"), Some("high"));
-        assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator"));
-        assert_eq!(effort, None);
-        assert_eq!(args, vec!["--model", "gemini-pro-orchestrator"]);
+        // Consumer Orchestrator planners emit a valid built-in orchestrator CLI slug plus `--settings` override.
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-pro-orchestrator-neon"),
+            Some("xhigh"),
+            &catalog,
+        );
+        assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator-neon"));
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gemini-pro-orchestrator-neon",
+                "--settings",
+                r#"{"orchestrator":{"planner":"Gemini 4 Neon (XHigh)"}}"#,
+            ]
+        );
 
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("gemini-pro-orchestrator-high"), Some("high"));
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-pro-orchestrator"),
+            Some("high"),
+            &catalog,
+        );
         assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator"));
-        assert_eq!(effort, None);
-        assert_eq!(args, vec!["--model", "gemini-pro-orchestrator"]);
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gemini-pro-orchestrator",
+                "--settings",
+                r#"{"orchestrator":{"planner":"Gemini 4 Carbon (High)"}}"#,
+            ]
+        );
 
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("gemini-pro-orchestrator-argon"), Some("medium"));
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-pro-orchestrator-argon"),
+            Some("low"),
+            &catalog,
+        );
         assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator-argon"));
-        assert_eq!(effort, None);
-        assert_eq!(args, vec!["--model", "gemini-pro-orchestrator-argon"]);
+        assert_eq!(effort.as_deref(), Some("low"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gemini-pro-orchestrator-argon",
+                "--settings",
+                r#"{"orchestrator":{"planner":"Gemini 4 Argon (Low)"}}"#,
+            ]
+        );
 
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("Orchestrator (Neon)"), Some("high"));
-        assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator-neon"));
-        assert_eq!(effort, None);
-        assert_eq!(args, vec!["--model", "gemini-pro-orchestrator-neon"]);
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-pro-orchestrator-claude-opus-5-5"),
+            Some("high"),
+            &catalog,
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("gemini-pro-orchestrator-claude-opus-5-5")
+        );
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gemini-pro-orchestrator-neon",
+                "--settings",
+                r#"{"orchestrator":{"planner":"Claude Opus 5.5 (High)"}}"#,
+            ]
+        );
 
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("gemini-pro-orchestrator-neon-high"), None);
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("Orchestrator · Claude Opus 5.5"),
+            None,
+            &catalog,
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("gemini-pro-orchestrator-claude-opus-5-5")
+        );
+        assert_eq!(effort.as_deref(), Some("medium"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gemini-pro-orchestrator-neon",
+                "--settings",
+                r#"{"orchestrator":{"planner":"Claude Opus 5.5 (Medium)"}}"#,
+            ]
+        );
+
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("Orchestrator (Neon)"),
+            Some("high"),
+            &catalog,
+        );
         assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator-neon"));
-        assert_eq!(effort, None);
-        assert_eq!(args, vec!["--model", "gemini-pro-orchestrator-neon"]);
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gemini-pro-orchestrator-neon",
+                "--settings",
+                r#"{"orchestrator":{"planner":"Gemini 4 Neon (High)"}}"#,
+            ]
+        );
+
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("gemini-pro-orchestrator-neon-high"),
+            None,
+            &catalog,
+        );
+        assert_eq!(model.as_deref(), Some("gemini-pro-orchestrator-neon"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "gemini-pro-orchestrator-neon",
+                "--settings",
+                r#"{"orchestrator":{"planner":"Gemini 4 Neon (High)"}}"#,
+            ]
+        );
 
         // Custom / gateway models are passed through verbatim without appending -{effort}.
-        let (model, effort, args) =
-            resolve_cli_model_and_effort(Some("deepseek-chat"), Some("high"));
+        let (model, effort, args) = resolve_cli_model_and_effort_with_catalog(
+            Some("deepseek-chat"),
+            Some("high"),
+            &catalog,
+        );
         assert_eq!(model.as_deref(), Some("deepseek-chat"));
         assert_eq!(effort, None);
         assert_eq!(args, vec!["--model", "deepseek-chat"]);
 
-        let (model, effort, args) = resolve_cli_model_and_effort(Some("gpt-5.4"), None);
+        let (model, effort, args) =
+            resolve_cli_model_and_effort_with_catalog(Some("gpt-5.4"), None, &catalog);
         assert_eq!(model.as_deref(), Some("gpt-5.4"));
         assert_eq!(effort, None);
         assert_eq!(args, vec!["--model", "gpt-5.4"]);

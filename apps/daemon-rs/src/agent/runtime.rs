@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -509,6 +509,8 @@ enum Driver {
     Opencode(OpencodeTurn),
     Pi(super::pi::PiTurn),
     Agy(super::agy::AgyTurn),
+    #[cfg(test)]
+    Mock(Option<tokio::sync::mpsc::Receiver<AdapterEvent>>),
 }
 
 fn engine_agent(agent: AgentKind, profile: Option<&crate::accounts::ApiProfile>) -> AgentKind {
@@ -543,6 +545,8 @@ impl Driver {
             Driver::Opencode(driver) => driver.take_events(),
             Driver::Pi(driver) => driver.take_events(),
             Driver::Agy(driver) => driver.take_events(),
+            #[cfg(test)]
+            Driver::Mock(events) => events.take(),
         }
     }
 
@@ -554,6 +558,8 @@ impl Driver {
             Driver::Opencode(driver) => driver.interrupt().await,
             Driver::Pi(driver) => driver.interrupt(),
             Driver::Agy(driver) => driver.interrupt().await,
+            #[cfg(test)]
+            Driver::Mock(_) => ControlEffectState::Received,
         }
     }
 
@@ -596,6 +602,8 @@ impl Driver {
                 .await
                 .map(|_| ControlEffectState::Delivered),
             Driver::Agy(_) => Err(Error::Conflict),
+            #[cfg(test)]
+            Driver::Mock(_) => Err(Error::Conflict),
         }
     }
 
@@ -609,6 +617,8 @@ impl Driver {
             Driver::Agy(_) => Err(Error::Invalid(
                 "Antigravity CLI 暂不支持手动压缩上下文".into(),
             )),
+            #[cfg(test)]
+            Driver::Mock(_) => Ok(()),
         }
     }
 
@@ -623,6 +633,8 @@ impl Driver {
             | Driver::Opencode(_)
             | Driver::Pi(_)
             | Driver::Agy(_) => Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into())),
+            #[cfg(test)]
+            Driver::Mock(_) => Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into())),
         }
     }
 
@@ -637,6 +649,8 @@ impl Driver {
             | Driver::Opencode(_)
             | Driver::Pi(_)
             | Driver::Agy(_) => Ok(None),
+            #[cfg(test)]
+            Driver::Mock(_) => Ok(None),
         }
     }
 
@@ -648,6 +662,8 @@ impl Driver {
             Driver::Opencode(driver) => driver.apply_selection(model).await,
             Driver::Pi(driver) => driver.apply_selection(model, effort).await,
             Driver::Agy(_) => Ok(()),
+            #[cfg(test)]
+            Driver::Mock(_) => Ok(()),
         }
     }
 
@@ -656,6 +672,8 @@ impl Driver {
             Driver::Deepseek(driver) => Some(driver.models().await),
             Driver::Opencode(driver) => Some(driver.models(workspace).await),
             Driver::Claude(_) | Driver::Codex(_) | Driver::Pi(_) | Driver::Agy(_) => None,
+            #[cfg(test)]
+            Driver::Mock(_) => None,
         }
     }
 
@@ -667,6 +685,8 @@ impl Driver {
             Driver::Opencode(driver) => driver.kill().await,
             Driver::Pi(driver) => driver.kill().await,
             Driver::Agy(driver) => driver.kill().await,
+            #[cfg(test)]
+            Driver::Mock(_) => ControlEffectState::Delivered,
         }
     }
 
@@ -678,8 +698,30 @@ impl Driver {
             Driver::Opencode(driver) => driver.lifecycle(),
             Driver::Pi(driver) => driver.lifecycle(),
             Driver::Agy(driver) => driver.lifecycle(),
+            #[cfg(test)]
+            Driver::Mock(_) => ProcessLifecycle::new(0),
         }
     }
+}
+
+struct PendingPermission {
+    reply: oneshot::Sender<bool>,
+    auto_allow_in_standard: bool,
+}
+
+fn evaluate_tiered_permission(
+    policy: ApprovalPolicy,
+    tool: &str,
+    target: &super::approval::PermissionTarget,
+    workspace: &str,
+) -> (bool, bool) {
+    let auto_allow_in_standard = matches!(
+        super::approval::classify(tool, target, workspace),
+        super::approval::RiskDecision::AutoAllow(_)
+    );
+    let allow_now = policy == ApprovalPolicy::Auto
+        || (policy == ApprovalPolicy::Standard && auto_allow_in_standard);
+    (allow_now, auto_allow_in_standard)
 }
 
 struct Handle {
@@ -687,7 +729,7 @@ struct Handle {
     quiesced: watch::Sender<bool>,
     turn_finished: watch::Sender<bool>,
     quiescence_unknown: AtomicBool,
-    replies: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    replies: Mutex<HashMap<String, PendingPermission>>,
     /// request id -> timeline record id of pending approvals.
     records: Mutex<HashMap<String, String>>,
     questions: Mutex<HashMap<String, QuestionPending>>,
@@ -698,6 +740,9 @@ struct Handle {
     /// of trusting a write that the kernel pipe buffer may absorb silently.
     steerable: AtomicBool,
     permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    disable_interactive_questions: bool,
+    policy: AtomicU8,
+    workspace: String,
 }
 
 impl Handle {
@@ -744,6 +789,13 @@ struct State {
     changed: watch::Sender<u64>,
     control_environment: std::sync::Mutex<Option<crate::control_cli::ControlEnvironment>>,
     execution_environment: Mutex<HashMap<String, Vec<(String, String)>>>,
+    non_interactive_question_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+fn is_managed_bot_workspace_path(daemon_home: &Path, workspace: &str) -> bool {
+    let bots_root = daemon_home.join("bots");
+    let path = Path::new(workspace);
+    path.starts_with(&bots_root) && path.file_name().and_then(|n| n.to_str()) == Some("workspace")
 }
 
 fn profile_model_catalog(
@@ -785,7 +837,29 @@ impl Agents {
             changed: watch::channel(0).0,
             control_environment: std::sync::Mutex::new(None),
             execution_environment: Mutex::new(HashMap::new()),
+            non_interactive_question_sessions: std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            ),
         }))
+    }
+
+    pub fn set_disable_interactive_questions(&self, session_id: &str, disabled: bool) {
+        if let Ok(mut set) = self.0.non_interactive_question_sessions.lock() {
+            if disabled {
+                set.insert(session_id.to_owned());
+            } else {
+                set.remove(session_id);
+            }
+        }
+    }
+
+    pub fn is_interactive_questions_disabled(&self, session_id: &str, workspace: &str) -> bool {
+        if let Ok(set) = self.0.non_interactive_question_sessions.lock()
+            && set.contains(session_id)
+        {
+            return true;
+        }
+        is_managed_bot_workspace_path(self.0.database.directory(), workspace)
     }
 
     pub async fn set_execution_environment(
@@ -1434,10 +1508,17 @@ impl Agents {
             .to_str()
             .ok_or_else(|| Error::Invalid("workspace must be Unicode".into()))?
             .to_owned();
-        let policy = if input.auto_approve {
-            ApprovalPolicy::Auto
-        } else {
-            ApprovalPolicy::Manual
+        let policy = match input.approval_policy {
+            Some(crate::protocol::TerminalApprovalPolicy::Strict) => ApprovalPolicy::Strict,
+            Some(crate::protocol::TerminalApprovalPolicy::Standard) => ApprovalPolicy::Standard,
+            Some(crate::protocol::TerminalApprovalPolicy::Yolo) => ApprovalPolicy::Auto,
+            None => {
+                if input.auto_approve {
+                    ApprovalPolicy::Auto
+                } else {
+                    ApprovalPolicy::Standard
+                }
+            }
         };
         if !matches!(
             input.agent,
@@ -1615,6 +1696,7 @@ impl Agents {
                 .unwrap_or(input.title),
             workspace,
             auto_approve: input.auto_approve,
+            approval_policy: input.approval_policy,
             mode: input.mode,
             model: input.model,
             effort: input.effort,
@@ -1803,6 +1885,7 @@ impl Agents {
             api_profile: Self::account_api_profile(&self.0.database, run.account_id.clone())
                 .await?,
             agent_preset: run.agent_preset.clone(),
+            disable_interactive_questions: self.is_interactive_questions_disabled(source, &head.workspace),
         };
         let forked_id = if run.agent == AgentKind::Claude {
             super::claude::fork_session(&head.workspace, native_id, &options).await?
@@ -1844,6 +1927,7 @@ impl Agents {
                     title: head.title.chars().take(480).collect::<String>() + " · 分支",
                     workspace: head.workspace,
                     auto_approve: run.policy == ApprovalPolicy::Auto,
+                    approval_policy: Some(run.policy.to_terminal_policy()),
                     mode: Some(run.mode.label().into()),
                     model: run.model,
                     effort: run.effort,
@@ -2126,6 +2210,7 @@ impl Agents {
                 title,
                 workspace: target_workspace,
                 auto_approve: true,
+                approval_policy: None,
                 mode: None,
                 model: resolved_model,
                 effort: resolved_effort,
@@ -2986,6 +3071,7 @@ impl Agents {
                 crate::accounts::profile::normalize_profile_effort(profile, run.effort.as_deref())
             },
         );
+        let disable_interactive_questions = self.is_interactive_questions_disabled(id, &workspace);
         let options = TurnOptions {
             policy: run.policy,
             mode: run.mode,
@@ -2994,6 +3080,7 @@ impl Agents {
             environment,
             api_profile,
             agent_preset: run.agent_preset.clone(),
+            disable_interactive_questions,
         };
         if let Some(claim_id) = cross_model_claim_id {
             self.mark_cross_model_fan_in_delivered(id, claim_id).await?;
@@ -3152,6 +3239,9 @@ impl Agents {
             compact: Mutex::new(None),
             steerable: AtomicBool::new(true),
             permit: Mutex::new(Some(turn_permit)),
+            disable_interactive_questions,
+            policy: AtomicU8::new(run.policy.as_u8()),
+            workspace,
         });
         **guard = Some(handle.clone());
         Ok((turn, handle))
@@ -3905,8 +3995,21 @@ impl Agents {
                     request_id,
                     tool,
                     summary,
+                    target,
                     reply,
                 } => {
+                    let current_policy =
+                        ApprovalPolicy::from_u8(handle.policy.load(Ordering::Acquire));
+                    let (allow_now, auto_allow_in_standard) = evaluate_tiered_permission(
+                        current_policy,
+                        &tool,
+                        &target,
+                        &handle.workspace,
+                    );
+                    if allow_now {
+                        let _ = reply.send(true);
+                        continue;
+                    }
                     let owner = subagent.as_deref().map(safe_owner);
                     text_segments
                         .entry(owner.clone())
@@ -3921,11 +4024,13 @@ impl Agents {
                     // answered there; the subagent id rides along as metadata
                     // and the detail pane picks them up via body.subagent.
                     let record_id = format!("turn{turn}-perm-{request_id}");
-                    handle
-                        .replies
-                        .lock()
-                        .await
-                        .insert(request_id.clone(), reply);
+                    handle.replies.lock().await.insert(
+                        request_id.clone(),
+                        PendingPermission {
+                            reply,
+                            auto_allow_in_standard,
+                        },
+                    );
                     handle
                         .records
                         .lock()
@@ -3967,6 +4072,18 @@ impl Agents {
                     questions,
                     reply,
                 } => {
+                    if handle.disable_interactive_questions {
+                        let guidance = "当前为 Bot/IM 对话模式，不支持弹窗交互选择；请直接用自然语言在回复中向用户简短追问，或按最安全合理的默认方案直接执行并在回复中说明。";
+                        let answers = questions
+                            .into_iter()
+                            .map(|spec| (spec.native_question, guidance.to_owned()))
+                            .collect();
+                        let _ = reply.send(QuestionReply {
+                            answers,
+                            cancelled: false,
+                        });
+                        continue;
+                    }
                     let owner = subagent.as_deref().map(safe_owner);
                     text_segments
                         .entry(owner.clone())
@@ -4358,7 +4475,7 @@ impl Agents {
         let entry = self.session_entry(id).await?;
         let guard = entry.handle.lock().await;
         let handle = guard.as_ref().ok_or(Error::NotFound)?;
-        let reply = handle
+        let pending = handle
             .replies
             .lock()
             .await
@@ -4367,7 +4484,7 @@ impl Agents {
         let record_id = handle.records.lock().await.remove(request_id);
         let next_status = handle.derived_running_status().await;
         // The translator's reply task owns the control_response frame.
-        let _ = reply.send(allow);
+        let _ = pending.reply.send(allow);
         drop(guard);
         if let Some(record_id) = record_id {
             let id = id.to_owned();
@@ -5106,57 +5223,60 @@ impl Agents {
                 move |store| store.set_approval_policy(&id, policy)
             })
             .await?;
-        if policy == ApprovalPolicy::Auto
-            && let Ok(entry) = self.session_entry(&id).await
-        {
+        if let Ok(entry) = self.session_entry(&id).await {
             let pending = {
                 let guard = entry.handle.lock().await;
                 if let Some(handle) = guard.as_ref() {
-                    let replies = std::mem::take(&mut *handle.replies.lock().await);
-                    let mut records = handle.records.lock().await;
-                    let has_questions = !handle.questions.lock().await.is_empty();
-                    replies
-                        .into_iter()
-                        .map(|(request_id, reply)| (reply, records.remove(&request_id)))
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .map(|pending| (pending, has_questions))
-                        .collect::<Vec<_>>()
+                    handle.policy.store(policy.as_u8(), Ordering::Release);
+                    if policy == ApprovalPolicy::Strict {
+                        None
+                    } else {
+                        let mut replies = handle.replies.lock().await;
+                        let mut records = handle.records.lock().await;
+                        let matched_ids: Vec<String> = replies
+                            .iter()
+                            .filter(|(_, item)| {
+                                policy == ApprovalPolicy::Auto || item.auto_allow_in_standard
+                            })
+                            .map(|(request_id, _)| request_id.clone())
+                            .collect();
+                        let mut resolved = Vec::with_capacity(matched_ids.len());
+                        for request_id in matched_ids {
+                            if let Some(item) = replies.remove(&request_id) {
+                                resolved.push((item.reply, records.remove(&request_id)));
+                            }
+                        }
+                        drop(replies);
+                        drop(records);
+                        let next_status = if resolved.is_empty() {
+                            None
+                        } else {
+                            Some(handle.derived_running_status().await)
+                        };
+                        Some((resolved, next_status))
+                    }
                 } else {
-                    Vec::new()
+                    None
                 }
             };
-            let resolved_any = !pending.is_empty();
-            let has_questions = pending
-                .first()
-                .map(|(_, has_questions)| *has_questions)
-                .unwrap_or(false);
-            for ((reply, record_id), _) in pending {
-                let _ = reply.send(true);
-                if let Some(record_id) = record_id {
-                    let result = self
-                        .0
-                        .database
-                        .call({
-                            let id = id.clone();
-                            move |store| store.resolve_agent_permission(&id, &record_id)
-                        })
-                        .await;
-                    if !matches!(result, Err(Error::NotFound)) {
-                        result?;
+            if let Some((resolved, Some(next_status))) = pending {
+                for (reply, record_id) in resolved {
+                    let _ = reply.send(true);
+                    if let Some(record_id) = record_id {
+                        let result = self
+                            .0
+                            .database
+                            .call({
+                                let id = id.clone();
+                                move |store| store.resolve_agent_permission(&id, &record_id)
+                            })
+                            .await;
+                        if !matches!(result, Err(Error::NotFound)) {
+                            result?;
+                        }
                     }
                 }
-            }
-            if resolved_any {
-                self.set_status(
-                    &id,
-                    if has_questions {
-                        SessionStatus::WaitingInput
-                    } else {
-                        SessionStatus::Running
-                    },
-                )
-                .await?;
+                self.set_status(&id, next_status).await?;
                 return Ok(());
             }
         }
@@ -5652,9 +5772,9 @@ impl Agents {
             .collect();
         std::mem::take(&mut *handle.questions.lock().await);
         std::mem::take(&mut *handle.records.lock().await);
-        for (_request_id, reply) in pending {
+        for (_request_id, pending) in pending {
             // The translator's reply task writes the deny frame.
-            let _ = reply.send(false);
+            let _ = pending.reply.send(false);
         }
         drop(guard);
         let resolved = {
@@ -5862,11 +5982,11 @@ impl Agents {
                 // Dropping pending question senders makes the translator
                 // answer deny; no explicit send needed.
                 std::mem::take(&mut *handle.questions.lock().await);
-                for (_request_id, reply) in pending {
+                for (_request_id, pending) in pending {
                     // The translator's reply task owns the deny frame; sending
                     // here is enough, calling driver.respond_permission too
                     // would write the frame twice.
-                    let _ = reply.send(false);
+                    let _ = pending.reply.send(false);
                 }
                 let lifecycle = {
                     let driver = handle.driver.lock().await;
@@ -6207,9 +6327,9 @@ impl Agents {
             if let Some(handle) = handle {
                 let pending = std::mem::take(&mut *handle.replies.lock().await);
                 std::mem::take(&mut *handle.questions.lock().await);
-                for (_request_id, reply) in pending {
+                for (_request_id, pending) in pending {
                     // See close(): the translator task writes the deny frame.
-                    let _ = reply.send(false);
+                    let _ = pending.reply.send(false);
                 }
                 let lifecycle = {
                     let driver = handle.driver.lock().await;
@@ -6321,6 +6441,7 @@ mod persistence_tests {
                 title: "completed worker".into(),
                 workspace: root.path().to_string_lossy().into_owned(),
                 auto_approve: false,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -6377,6 +6498,7 @@ mod persistence_tests {
                 title: "late status".into(),
                 workspace: root.path().to_string_lossy().into_owned(),
                 auto_approve: false,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -6413,6 +6535,7 @@ mod persistence_tests {
             title: title.into(),
             workspace: root.path().to_string_lossy().into_owned(),
             auto_approve: false,
+            approval_policy: None,
             mode: None,
             model: None,
             effort: None,
@@ -6489,6 +6612,7 @@ mod persistence_tests {
                 title: "idle shutdown".into(),
                 workspace: root.path().to_string_lossy().into_owned(),
                 auto_approve: false,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -6545,6 +6669,7 @@ mod persistence_tests {
                 title: "timed out archive".into(),
                 workspace: root.path().to_string_lossy().into_owned(),
                 auto_approve: false,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -6783,6 +6908,7 @@ mod persistence_tests {
                     title: format!("idle-{index}"),
                     workspace: workspace.clone(),
                     auto_approve: false,
+                    approval_policy: None,
                     mode: None,
                     model: None,
                     effort: None,
@@ -6863,6 +6989,243 @@ mod persistence_tests {
         assert!(!active);
         assert_eq!(result, "Auth flow verified.");
         assert!(needs_reactivation);
+
+        agents.shutdown().await.unwrap();
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tiered_permission_evaluation_and_live_policy_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("ws");
+        std::fs::create_dir_all(workspace_dir.join("src")).unwrap();
+        std::fs::write(workspace_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let workspace = std::fs::canonicalize(&workspace_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let read_target = super::super::approval::classify_claude(
+            "Read",
+            &serde_json::json!({ "file_path": "src/main.rs" }),
+        );
+        let edit_target = super::super::approval::classify_claude(
+            "Edit",
+            &serde_json::json!({ "file_path": "src/main.rs" }),
+        );
+
+        assert_eq!(
+            evaluate_tiered_permission(ApprovalPolicy::Strict, "Read", &read_target, &workspace),
+            (false, true)
+        );
+        assert_eq!(
+            evaluate_tiered_permission(ApprovalPolicy::Standard, "Read", &read_target, &workspace),
+            (true, true)
+        );
+        assert_eq!(
+            evaluate_tiered_permission(ApprovalPolicy::Standard, "Edit", &edit_target, &workspace),
+            (false, false)
+        );
+        assert_eq!(
+            evaluate_tiered_permission(ApprovalPolicy::Auto, "Edit", &edit_target, &workspace),
+            (true, false)
+        );
+
+        // Verify live `set_approval_policy` transitions on a session with pending permissions:
+        // Strict -> Standard resolves only read-only pending requests;
+        // Standard -> Auto resolves the remaining mutating request and restores Running status.
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let head = agents
+            .create(CreateAgentSession {
+                agent: AgentKind::Claude,
+                title: "tiered live".into(),
+                workspace: workspace.clone(),
+                auto_approve: false,
+                approval_policy: Some(TerminalApprovalPolicy::Strict),
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id: None,
+                resume: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(head.approval_policy, Some(TerminalApprovalPolicy::Strict));
+
+        // Exercise `run_turn` + live `set_approval_policy` via an in-process mock driver
+        // so no external CLI process is spawned.
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let entry = agents.session_entry(&head.id).await.unwrap();
+        let handle = Arc::new(Handle {
+            driver: Mutex::new(Driver::Mock(Some(events_rx))),
+            quiesced: watch::channel(false).0,
+            turn_finished: watch::channel(false).0,
+            quiescence_unknown: AtomicBool::new(false),
+            replies: Mutex::new(HashMap::new()),
+            records: Mutex::new(HashMap::new()),
+            questions: Mutex::new(HashMap::new()),
+            compact: Mutex::new(None),
+            steerable: AtomicBool::new(true),
+            permit: Mutex::new(None),
+            disable_interactive_questions: false,
+            policy: AtomicU8::new(ApprovalPolicy::Standard.as_u8()),
+            workspace: workspace.clone(),
+        });
+        *entry.handle.lock().await = Some(handle.clone());
+        agents
+            .set_approval_policy(&head.id, ApprovalPolicy::Standard)
+            .await
+            .unwrap();
+        agents
+            .set_status(&head.id, SessionStatus::Running)
+            .await
+            .unwrap();
+
+        let turn_task = tokio::spawn({
+            let agents = agents.clone();
+            let id = head.id.clone();
+            let handle = handle.clone();
+            async move { agents.run_turn(id, 1, handle).await }
+        });
+
+        // 1. In Standard mode, a read-only `Read` permission is auto-allowed immediately
+        //    without emitting a PermissionRequest card or leaving Running status.
+        let (std_read_tx, std_read_rx) = oneshot::channel();
+        events_tx
+            .send(AdapterEvent::Permission {
+                subagent: None,
+                request_id: "perm-std-read".into(),
+                tool: "Read".into(),
+                summary: "src/main.rs".into(),
+                target: read_target.clone(),
+                reply: std_read_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), std_read_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            true
+        );
+
+        // 2. Still in Standard mode, an `Edit` permission pauses in WaitingPermission.
+        let (std_edit_tx, std_edit_rx) = oneshot::channel();
+        events_tx
+            .send(AdapterEvent::Permission {
+                subagent: None,
+                request_id: "perm-std-edit".into(),
+                tool: "Edit".into(),
+                summary: "src/main.rs".into(),
+                target: edit_target.clone(),
+                reply: std_edit_tx,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let current = database
+                .read("test.wait_perm", {
+                    let id = head.id.clone();
+                    move |store| store.session(&id)
+                })
+                .await
+                .unwrap();
+            if current.status == SessionStatus::WaitingPermission {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(handle.replies.lock().await.contains_key("perm-std-edit"));
+        assert!(!handle.replies.lock().await.contains_key("perm-std-read"));
+
+        // 3. Switch live to Strict while `perm-std-edit` is pending and enqueue a read-only check:
+        //    both pending permissions wait until user/policy approves them.
+        agents
+            .set_approval_policy(&head.id, ApprovalPolicy::Strict)
+            .await
+            .unwrap();
+        let (strict_read_tx, strict_read_rx) = oneshot::channel();
+        events_tx
+            .send(AdapterEvent::Permission {
+                subagent: None,
+                request_id: "perm-strict-read".into(),
+                tool: "Read".into(),
+                summary: "src/main.rs".into(),
+                target: read_target,
+                reply: strict_read_tx,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !handle.replies.lock().await.contains_key("perm-strict-read") {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        // 4. Switch live from Strict -> Standard: only `perm-strict-read` resolves;
+        //    `perm-std-edit` remains in WaitingPermission until switched to Auto.
+        agents
+            .set_approval_policy(&head.id, ApprovalPolicy::Standard)
+            .await
+            .unwrap();
+        assert_eq!(strict_read_rx.await.unwrap(), true);
+        assert!(handle.replies.lock().await.contains_key("perm-std-edit"));
+        let after_standard = database
+            .read("test.after_standard", {
+                let id = head.id.clone();
+                move |store| store.session(&id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_standard.status, SessionStatus::WaitingPermission);
+        assert_eq!(
+            after_standard.approval_policy,
+            Some(TerminalApprovalPolicy::Standard)
+        );
+
+        agents
+            .set_approval_policy(&head.id, ApprovalPolicy::Auto)
+            .await
+            .unwrap();
+        assert_eq!(std_edit_rx.await.unwrap(), true);
+        assert!(handle.replies.lock().await.is_empty());
+        let after_auto = database
+            .read("test.after_auto", {
+                let id = head.id.clone();
+                move |store| store.session(&id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_auto.status, SessionStatus::Running);
+        assert_eq!(
+            after_auto.approval_policy,
+            Some(TerminalApprovalPolicy::Yolo)
+        );
+
+        events_tx
+            .send(AdapterEvent::Finish {
+                interrupted: false,
+                error: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                diffs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), turn_task)
+            .await
+            .unwrap();
+        *entry.handle.lock().await = None;
+        agents
+            .set_status(&head.id, SessionStatus::Idle)
+            .await
+            .unwrap();
 
         agents.shutdown().await.unwrap();
         database.shutdown().await.unwrap();

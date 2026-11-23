@@ -71,6 +71,7 @@ import type {
   RemoteWorkspace,
 } from "../../shared/types";
 import { AgentLogo } from "./AgentLogo";
+import { AgyModelPicker, formatAgyEffortLabel } from "./workspace/AgyModelPicker";
 import {
   getCachedAccountUsage,
   loadAccountUsage,
@@ -764,11 +765,8 @@ const ShellSidebar = memo(function ShellSidebar({
   onShellModeChange,
   bots = [],
   selectedBotId,
-  activeBotThreadId,
   onSelectBot,
-  onSelectBotThread,
   onNewBotThread,
-  onArchiveBotThread,
   onOpenNewBot,
   onEditBot,
   activeId,
@@ -805,11 +803,8 @@ const ShellSidebar = memo(function ShellSidebar({
   onShellModeChange?: (mode: ShellMode) => void;
   bots?: PublicBot[];
   selectedBotId?: string | undefined;
-  activeBotThreadId?: string | undefined;
   onSelectBot?: (botId: string) => void;
-  onSelectBotThread?: (botId: string, threadId: string) => void;
   onNewBotThread?: (botId?: string) => void;
-  onArchiveBotThread?: (botId: string, threadId: string) => void;
   onOpenNewBot?: () => void;
   onEditBot?: (bot: PublicBot) => void;
   activeId: string | undefined;
@@ -1628,97 +1623,53 @@ const ShellSidebar = memo(function ShellSidebar({
                   {bots.filter((bot) => bot.kind === "master").map((bot) => {
                     const isSelected = view === "workspaces" && selectedBotId === bot.id;
                     return (
-                      <Collapsible key={bot.id} defaultOpen className="group/bot">
-                        <SidebarMenuItem>
-                          <SidebarMenuButton
-                            isActive={isSelected && !activeBotThreadId}
-                            tooltip={`${bot.name} · ${bot.agent}${bot.model ? ` / ${bot.model}` : ""}`}
-                            onClick={() => {
-                              onSelectBot?.(bot.id);
-                              closeMobileSidebar();
-                            }}
-                          >
-                            <span className="bot-roster-row">
-                              <span className="bot-roster-avatar" aria-hidden="true">{bot.avatar}</span>
-                              <span className="bot-roster-copy">
-                                <span className="bot-roster-name-line">
-                                  <span className="truncate font-medium">{bot.name}</span>
-                                  {bot.feishu.enabled && <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />}
-                                </span>
-                                <span className="bot-roster-meta truncate">
-                                  {bot.agent}{bot.model ? ` · ${bot.model}` : ""}
-                                </span>
+                      <SidebarMenuItem key={bot.id}>
+                        <SidebarMenuButton
+                          isActive={isSelected}
+                          tooltip={`${bot.name} · ${bot.agent}${bot.model ? ` / ${bot.model}` : ""}`}
+                          onClick={() => {
+                            onSelectBot?.(bot.id);
+                            closeMobileSidebar();
+                          }}
+                        >
+                          <span className="bot-roster-row">
+                            <span className="bot-roster-avatar" aria-hidden="true">{bot.avatar}</span>
+                            <span className="bot-roster-copy">
+                              <span className="bot-roster-name-line">
+                                <span className="truncate font-medium">{bot.name}</span>
+                                {bot.feishu.enabled && <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />}
+                                {bot.threads.length > 0 && (
+                                  <span className="bot-roster-count">{bot.threads.length}</span>
+                                )}
+                              </span>
+                              <span className="bot-roster-meta truncate">
+                                {bot.agent}{bot.model ? ` · ${bot.model}` : ""}
                               </span>
                             </span>
-                          </SidebarMenuButton>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger
-                              render={
-                                <SidebarMenuAction
-                                  showOnHover
-                                  aria-label={t("Bot 操作", "Bot actions")}
-                                  title={t("更多操作", "More")}
-                                >
-                                  <MoreHorizontal />
-                                </SidebarMenuAction>
-                              }
-                            />
-                            <DropdownMenuContent align="end" side="right">
-                              <DropdownMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
-                                <Plus />{t("新建话题", "New thread")}
-                              </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => { onEditBot?.(bot); closeMobileSidebar(); }}>
-                                <Settings />{t("配置 Bot", "Configure Bot")}
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                          {bot.threads.length > 0 && (
-                            <SidebarMenuSub>
-                              {bot.threads.map((thread) => (
-                                <ContextMenu key={thread.id}>
-                                  <ContextMenuTrigger render={<SidebarMenuSubItem className="group/thread relative" />}>
-                                    <SidebarMenuSubButton
-                                      className="pr-6"
-                                      isActive={view === "workspaces" && selectedBotId === bot.id && activeBotThreadId === thread.id}
-                                      onClick={() => {
-                                        onSelectBotThread?.(bot.id, thread.id);
-                                        closeMobileSidebar();
-                                      }}
-                                    >
-                                      <span className="truncate flex-1">{thread.title}</span>
-                                      {thread.channel !== "desktop" && (
-                                        <span className="bot-thread-channel" data-channel={thread.channel}>
-                                          {thread.channel === "feishu_p2p" ? t("飞书", "DM") : t("群聊", "Group")}
-                                        </span>
-                                      )}
-                                    </SidebarMenuSubButton>
-                                    <button
-                                      type="button"
-                                      className="bot-thread-delete"
-                                      aria-label={t("删除话题", "Delete thread")}
-                                      title={t("删除话题", "Delete thread")}
-                                      onClick={(event) => {
-                                        consumeSidebarAction(event);
-                                        onArchiveBotThread?.(bot.id, thread.id);
-                                      }}
-                                    >
-                                      <X aria-hidden="true" />
-                                    </button>
-                                  </ContextMenuTrigger>
-                                  <ContextMenuContent>
-                                    <ContextMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
-                                      <Plus />{t("新建话题", "New thread")}
-                                    </ContextMenuItem>
-                                    <ContextMenuItem variant="destructive" onClick={() => onArchiveBotThread?.(bot.id, thread.id)}>
-                                      <Trash2 />{t("删除话题", "Delete thread")}
-                                    </ContextMenuItem>
-                                  </ContextMenuContent>
-                                </ContextMenu>
-                              ))}
-                            </SidebarMenuSub>
-                          )}
-                        </SidebarMenuItem>
-                      </Collapsible>
+                          </span>
+                        </SidebarMenuButton>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            render={
+                              <SidebarMenuAction
+                                showOnHover
+                                aria-label={t("Bot 操作", "Bot actions")}
+                                title={t("更多操作", "More")}
+                              >
+                                <MoreHorizontal />
+                              </SidebarMenuAction>
+                            }
+                          />
+                          <DropdownMenuContent align="end" side="right">
+                            <DropdownMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
+                              <Plus />{t("新建话题", "New thread")}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { onEditBot?.(bot); closeMobileSidebar(); }}>
+                              <Settings />{t("配置 Bot", "Configure Bot")}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </SidebarMenuItem>
                     );
                   })}
                 </SidebarMenu>
@@ -1746,7 +1697,7 @@ const ShellSidebar = memo(function ShellSidebar({
                     return (
                       <SidebarMenuItem key={bot.id}>
                         <SidebarMenuButton
-                          isActive={isSelected && !activeBotThreadId}
+                          isActive={isSelected}
                           tooltip={`${bot.name} · ${bot.agent}${bot.model ? ` / ${bot.model}` : ""}`}
                           onClick={() => {
                             onSelectBot?.(bot.id);
@@ -1759,6 +1710,9 @@ const ShellSidebar = memo(function ShellSidebar({
                               <span className="bot-roster-name-line">
                                 <span className="truncate font-medium">{bot.name}</span>
                                 <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
+                                {bot.threads.length > 0 && (
+                                  <span className="bot-roster-count">{bot.threads.length}</span>
+                                )}
                               </span>
                               <span className="bot-roster-meta truncate">
                                 {bot.agent}{bot.model ? ` · ${bot.model}` : ""}
@@ -1787,51 +1741,6 @@ const ShellSidebar = memo(function ShellSidebar({
                             </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
-                        {bot.threads.length > 0 && (
-                          <SidebarMenuSub>
-                            {bot.threads.map((thread) => (
-                              <ContextMenu key={thread.id}>
-                                <ContextMenuTrigger render={<SidebarMenuSubItem className="group/thread relative" />}>
-                                  <SidebarMenuSubButton
-                                    className="pr-6"
-                                    isActive={view === "workspaces" && selectedBotId === bot.id && activeBotThreadId === thread.id}
-                                    onClick={() => {
-                                      onSelectBotThread?.(bot.id, thread.id);
-                                      closeMobileSidebar();
-                                    }}
-                                  >
-                                    <span className="truncate flex-1">{thread.title}</span>
-                                    {thread.channel !== "desktop" && (
-                                      <span className="bot-thread-channel" data-channel={thread.channel}>
-                                        {thread.channel === "feishu_p2p" ? t("飞书", "DM") : t("群聊", "Group")}
-                                      </span>
-                                    )}
-                                  </SidebarMenuSubButton>
-                                  <button
-                                    type="button"
-                                    className="bot-thread-delete"
-                                    aria-label={t("删除话题", "Delete thread")}
-                                    title={t("删除话题", "Delete thread")}
-                                    onClick={(event) => {
-                                      consumeSidebarAction(event);
-                                      onArchiveBotThread?.(bot.id, thread.id);
-                                    }}
-                                  >
-                                    <X aria-hidden="true" />
-                                  </button>
-                                </ContextMenuTrigger>
-                                <ContextMenuContent>
-                                  <ContextMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
-                                    <Plus />{t("新建话题", "New thread")}
-                                  </ContextMenuItem>
-                                  <ContextMenuItem variant="destructive" onClick={() => onArchiveBotThread?.(bot.id, thread.id)}>
-                                    <Trash2 />{t("删除话题", "Delete thread")}
-                                  </ContextMenuItem>
-                                </ContextMenuContent>
-                              </ContextMenu>
-                            ))}
-                          </SidebarMenuSub>
-                        )}
                       </SidebarMenuItem>
                     );
                   })}
@@ -2694,7 +2603,7 @@ function NewSessionDialog({
             model: model?.id,
             effort:
               (preferred && current.effort && preferred.supportedEfforts.includes(current.effort) ? current.effort : undefined) ??
-              (catalog.currentEffort && model?.supportedEfforts.includes(catalog.currentEffort) ? catalog.currentEffort : undefined) ??
+              (model && model.id === catalog.currentModel && catalog.currentEffort && model.supportedEfforts.includes(catalog.currentEffort) ? catalog.currentEffort : undefined) ??
               model?.defaultEffort ??
               model?.supportedEfforts[0],
           };
@@ -2996,36 +2905,58 @@ function NewSessionDialog({
                         <FieldLabel htmlFor="session-model">
                           {t("模型", "Model")}
                         </FieldLabel>
-                        <NativeSelect
-                          id="session-model"
-                          value={input.model ?? ""}
-                          disabled={launchModelsLoading || launchModels.length === 0}
-                          aria-busy={launchModelsLoading}
-                          aria-describedby={launchModelsError ? "session-model-error" : undefined}
-                          aria-invalid={Boolean(launchModelsError)}
-                          onChange={(event) => {
-                            const model = launchModels.find(
-                              (candidate) => candidate.id === event.target.value,
-                            );
-                            setInput({
-                              ...input,
-                              model: model?.id,
-                              effort:
-                                model?.defaultEffort ?? model?.supportedEfforts[0],
-                            });
-                          }}
-                        >
-                          <NativeSelectOption value="" disabled>
-                            {launchModelsLoading
-                              ? t("读取模型中…", "Loading models…")
-                              : t("没有可用模型", "No models available")}
-                          </NativeSelectOption>
-                          {launchModels.map((model) => (
-                            <NativeSelectOption value={model.id} key={model.id}>
-                              {model.label}
-                            </NativeSelectOption>
-                          ))}
-                        </NativeSelect>
+                        {input.agent === "agy" ? (
+                          <AgyModelPicker
+                            id="session-model"
+                            models={launchModels}
+                            value={input.model}
+                            effort={input.effort}
+                            loading={launchModelsLoading}
+                            disabled={busy || launchModelsLoading || launchModels.length === 0}
+                            ariaInvalid={Boolean(launchModelsError)}
+                            ariaDescribedBy={launchModelsError ? "session-model-error" : undefined}
+                            onChange={(modelId, nextEffort) =>
+                              setInput({
+                                ...input,
+                                model: modelId,
+                                effort: nextEffort,
+                              })
+                            }
+                          />
+                        ) : (
+                          <NativeSelect
+                            id="session-model"
+                            value={input.model ?? ""}
+                            disabled={launchModelsLoading || launchModels.length === 0}
+                            aria-busy={launchModelsLoading}
+                            aria-describedby={launchModelsError ? "session-model-error" : undefined}
+                            aria-invalid={Boolean(launchModelsError)}
+                            onChange={(event) => {
+                              const model = launchModels.find(
+                                (candidate) => candidate.id === event.target.value,
+                              );
+                              setInput({
+                                ...input,
+                                model: model?.id,
+                                effort:
+                                  model?.defaultEffort ?? model?.supportedEfforts[0],
+                              });
+                            }}
+                          >
+                            {(launchModelsLoading || launchModels.length === 0) && (
+                              <NativeSelectOption value="" disabled>
+                                {launchModelsLoading
+                                  ? t("读取模型中…", "Loading models…")
+                                  : t("没有可用模型", "No models available")}
+                              </NativeSelectOption>
+                            )}
+                            {launchModels.map((model) => (
+                              <NativeSelectOption value={model.id} key={model.id}>
+                                {model.label}
+                              </NativeSelectOption>
+                            ))}
+                          </NativeSelect>
+                        )}
                         <FieldDescription
                           id={launchModelsError ? "session-model-error" : undefined}
                           role={launchModelsError ? "alert" : undefined}
@@ -3054,12 +2985,14 @@ function NewSessionDialog({
                             })
                           }
                         >
-                          <NativeSelectOption value="" disabled>
-                            {t("使用模型默认值", "Use model default")}
-                          </NativeSelectOption>
+                          {(!selectedLaunchModel?.supportedEfforts.length || !input.effort) && (
+                            <NativeSelectOption value="" disabled>
+                              {t("使用模型默认值", "Use model default")}
+                            </NativeSelectOption>
+                          )}
                           {selectedLaunchModel?.supportedEfforts.map((effort) => (
                             <NativeSelectOption value={effort} key={effort}>
-                              {effort}
+                              {input.agent === "agy" ? formatAgyEffortLabel(effort) : effort}
                             </NativeSelectOption>
                           ))}
                         </NativeSelect>
@@ -3089,16 +3022,16 @@ function NewSessionDialog({
                 else setInput({ ...input, approvalPolicy: policy });
               }}
             >
-              <NativeSelectOption value="strict">{t("严格确认", "Strict")}</NativeSelectOption>
-              <NativeSelectOption value="standard">{t("标准确认", "Standard")}</NativeSelectOption>
+              <NativeSelectOption value="strict">{t("严格确认（全操作审批）", "Strict (approve all)")}</NativeSelectOption>
+              <NativeSelectOption value="standard">{t("分级审批（只读免批 · 高危才批）", "Tiered (auto-allow read-only)")}</NativeSelectOption>
               <NativeSelectOption value="yolo">{t("自动批准（高风险）", "Auto-approve (high risk)")}</NativeSelectOption>
             </NativeSelect>
             <FieldDescription>
               {!supportsApprovalPolicy ? t("此终端的操作确认由 CLI 自身配置管理。", "This terminal uses the CLI's own approval configuration.") : selectedApprovalPolicy === "strict"
-                ? t("严格确认所有可能修改系统或文件的操作。", "Ask before operations that may modify files or the system.")
+                ? t("严格确认所有工具与命令执行（含只读操作）。", "Ask before every tool and command, including read-only actions.")
                 : selectedApprovalPolicy === "yolo"
-                  ? managedAgentTerminal ? t("终端默认免审批；Codex 同时关闭沙箱。", "Terminal sessions bypass approvals by default; Codex also disables its sandbox.") : t("高风险：自动批准操作，仅用于可信工作区。", "High risk: approve operations automatically; use only in trusted workspaces.")
-                  : t("在高风险操作前请求确认。", "Ask for confirmation before high-risk actions.")}
+                  ? managedAgentTerminal ? t("终端默认免审批；Codex 同时关闭沙箱。", "Terminal sessions bypass approvals by default; Codex also disables its sandbox.") : t("高风险：自动批准所有操作，仅用于可信工作区。", "High risk: approve all operations automatically; use only in trusted workspaces.")
+                  : t("工作区只读操作自动放行，写入文件、变更状态、敏感路径或高危命令前请求确认。", "Auto-allow safe read-only workspace actions; ask before edits, mutations, sensitive paths, or high-risk commands.")}
             </FieldDescription>
           </Field>
           </>}
@@ -4227,11 +4160,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onShellModeChange={handleShellModeChange}
         bots={botsState.bots}
         selectedBotId={selectedBot?.id}
-        activeBotThreadId={activeBotThread?.id}
         onSelectBot={selectBot}
-        onSelectBotThread={selectBotThread}
         onNewBotThread={createBotThread}
-        onArchiveBotThread={archiveBotThread}
         onOpenNewBot={() => setBotEditorState({ open: true })}
         onEditBot={(targetBot) => setBotEditorState({ open: true, bot: targetBot })}
         activeId={activeRemoteId ? undefined : activeId}

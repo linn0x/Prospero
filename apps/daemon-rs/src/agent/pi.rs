@@ -995,6 +995,7 @@ pub(super) async fn spawn_turn(
                                         request_id: safe_id(&req_id, "pi-perm"),
                                         tool: summarize(title, 128),
                                         summary: summarize(message, 2000),
+                                        target: super::approval::PermissionTarget::MutatingOrUnknown,
                                         reply,
                                     })
                                     .await;

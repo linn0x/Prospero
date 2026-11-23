@@ -1,4 +1,5 @@
 pub(crate) mod agy;
+pub(crate) mod approval;
 mod claude;
 pub(crate) mod codex;
 pub(crate) mod conversations;
@@ -51,6 +52,9 @@ pub struct CreateAgentSession {
     pub workspace: String,
     #[serde(default)]
     pub auto_approve: bool,
+    /// Three-tier approval policy; takes precedence over `auto_approve` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<crate::protocol::TerminalApprovalPolicy>,
     /// Optional initial collaboration mode for structured Claude sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,

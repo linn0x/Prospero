@@ -1200,6 +1200,7 @@ mod tests {
                         title: "legacy fixture".into(),
                         workspace: "/tmp".into(),
                         auto_approve: false,
+                        approval_policy: None,
                         mode: None,
                         model: None,
                         effort: None,
@@ -1207,7 +1208,7 @@ mod tests {
                         account_id: Some("legacy-account".into()),
                         resume: None,
                     },
-                    crate::agent::ApprovalPolicy::Manual,
+                    crate::agent::ApprovalPolicy::Standard,
                 )?;
                 store.archive_agent_session_for_stop(&session.id, true)?;
                 assert_eq!(store.active_session_count("legacy-account")?, 1);

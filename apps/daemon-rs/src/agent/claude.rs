@@ -92,6 +92,7 @@ pub(super) enum AdapterEvent {
         request_id: String,
         tool: String,
         summary: String,
+        target: super::approval::PermissionTarget,
         reply: oneshot::Sender<bool>,
     },
     Question {
@@ -492,6 +493,61 @@ mod tests {
             messages[0].get("uuid").and_then(Value::as_str)
         );
     }
+
+    #[tokio::test]
+    async fn ask_user_question_is_denied_when_interactive_questions_disabled() {
+        let control_request = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-ask-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": {
+                    "questions": [
+                        {
+                            "question": "锐评谁？",
+                            "header": "锐评对象",
+                            "options": [
+                                { "label": "张三", "description": "群成员" },
+                                { "label": "李四", "description": "群成员" }
+                            ],
+                            "multiSelect": false
+                        }
+                    ]
+                }
+            }
+        });
+
+        let (writer_tx, mut writer_rx) =
+            tokio::sync::mpsc::channel::<(String, Option<tokio::sync::oneshot::Sender<()>>)>(8);
+        let mut disabled_translator = Translator {
+            disable_interactive_questions: true,
+            ..Translator::default()
+        };
+        let events = disabled_translator.feed(control_request.clone(), true, false, &writer_tx);
+        assert!(events.is_empty());
+        let (frame, _) = writer_rx.try_recv().unwrap();
+        let reply: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(
+            reply.pointer("/response/response/behavior").and_then(Value::as_str),
+            Some("deny")
+        );
+        assert!(
+            reply
+                .pointer("/response/response/message")
+                .and_then(Value::as_str)
+                .is_some_and(|msg| msg.contains("AskUserQuestion"))
+        );
+
+        let (writer_tx2, _writer_rx2) =
+            tokio::sync::mpsc::channel::<(String, Option<tokio::sync::oneshot::Sender<()>>)>(8);
+        let mut enabled_translator = Translator::default();
+        let events2 = enabled_translator.feed(control_request, true, false, &writer_tx2);
+        assert!(matches!(
+            events2.as_slice(),
+            [AdapterEvent::Question { request_id, .. }] if request_id == "req-ask-1"
+        ));
+    }
 }
 
 /// Parses the `models` array from an `initialize` control_response payload
@@ -562,6 +618,9 @@ pub(super) struct TurnOptions {
     /// Non-secret API profile metadata for runtimes that need launch-time
     /// configuration in addition to environment variables.
     pub(super) api_profile: Option<crate::accounts::ApiProfile>,
+    /// When true (Bot / IM mode), block interactive `AskUserQuestion` popups
+    /// so the model asks or clarifies directly in plain chat text instead.
+    pub(super) disable_interactive_questions: bool,
 }
 
 fn resolve_claude_config_dir(environment: &[(String, String)]) -> Option<std::path::PathBuf> {
@@ -896,6 +955,9 @@ pub(super) fn spawn_turn(
         // Plan mode: the CLI investigates and plans but does not apply edits.
         command.args(["--permission-mode", "plan"]);
     }
+    if options.disable_interactive_questions {
+        command.args(["--disallowedTools", "AskUserQuestion"]);
+    }
     if let Some(model) = &options.model {
         command.args(["--model", model]);
     }
@@ -956,10 +1018,14 @@ pub(super) fn spawn_turn(
     let reader_writer = frames_tx.clone();
     let reader_controls = controls.clone();
     let reader_lifecycle = lifecycle.clone();
+    let disable_interactive_questions = options.disable_interactive_questions;
     let (mut child, _) = guard.into_child();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
-        let mut translator = Translator::default();
+        let mut translator = Translator {
+            disable_interactive_questions,
+            ..Translator::default()
+        };
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -1218,6 +1284,7 @@ struct Translator {
     /// stream-json process alive afterwards waiting for another prompt, so the
     /// reader must terminate the process rather than wait for exit.
     finished: bool,
+    disable_interactive_questions: bool,
 }
 
 fn summarize(mut value: String, maximum: usize) -> String {
@@ -1420,10 +1487,26 @@ impl Translator {
                         request.get("input").cloned().unwrap_or(Value::Null),
                     );
                     if tool == "AskUserQuestion" {
-                        // Questions are an interaction, not an approval: they
-                        // surface even under auto-approval policy (mirrors the
-                        // legacy adapter, which intercepts before policy).
-                        self.translate_question(&mut out, writer, agent, request_id, input);
+                        if self.disable_interactive_questions {
+                            let frame = serde_json::json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": request_id,
+                                    "response": {
+                                        "behavior": "deny",
+                                        "message": "Interactive question popups (AskUserQuestion) are disabled in Bot/IM mode. Do NOT call AskUserQuestion. Instead, either ask the user directly in your normal text/Markdown reply so they can answer in chat, or choose the safest sensible default and proceed."
+                                    }
+                                }
+                            })
+                            .to_string();
+                            let _ = writer.try_send((frame, None));
+                        } else {
+                            // Questions are an interaction, not an approval: they
+                            // surface even under auto-approval policy (mirrors the
+                            // legacy adapter, which intercepts before policy).
+                            self.translate_question(&mut out, writer, agent, request_id, input);
+                        }
                     } else if auto {
                         let frame = serde_json::json!({
                             "type":"control_response",
@@ -1456,11 +1539,14 @@ impl Translator {
                             .to_string();
                             let _ = writer.send((frame, None)).await;
                         });
+                        let summary = tool_summary(&input);
+                        let target = super::approval::classify_claude(&tool, &input);
                         out.push(AdapterEvent::Permission {
                             subagent: agent,
                             request_id,
                             tool,
-                            summary: tool_summary(&input),
+                            summary,
+                            target,
                             reply,
                         });
                     }

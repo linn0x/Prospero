@@ -453,6 +453,7 @@ mod tests {
                     title: "cleanup pressure".into(),
                     workspace,
                     auto_approve: false,
+                    approval_policy: None,
                     mode: None,
                     model: None,
                     effort: None,

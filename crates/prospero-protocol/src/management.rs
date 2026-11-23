@@ -19,6 +19,8 @@ pub struct AgentSessionCreate {
     pub title: String,
     pub workspace: String,
     pub auto_approve: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<crate::TerminalApprovalPolicy>,
     pub mode: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,

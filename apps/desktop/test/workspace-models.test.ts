@@ -8,6 +8,7 @@ const session: SessionInfo = { id: "s", cwd: "/repo", agent: "codex", kind: "str
 describe("workspace model catalog", () => {
   it("uses the active session capability, including API accounts, and never supports PTY", () => {
     expect(modelSwitchSupported(session)).toBe(true);
+    expect(modelSwitchSupported({ ...session, agent: "agy", agentControls: { model: true, mode: true, compact: false } })).toBe(true);
     expect(modelSwitchSupported({ ...session, kind: "pty" })).toBe(false);
     expect(modelSwitchSupported({ ...session, agentControls: { model: false, mode: false, compact: false } })).toBe(false);
     const legacy = { ...session };

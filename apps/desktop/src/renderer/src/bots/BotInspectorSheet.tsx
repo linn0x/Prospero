@@ -1,34 +1,46 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plus, RefreshCw, Save, Search, Settings, Trash2 } from "lucide-react";
+import {
+  BookMarked,
+  Plus,
+  RefreshCw,
+  Save,
+  Search,
+  Settings,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 import type {
+  BotFeishuAdmin,
   BotMemoryEntry,
   BotMemoryScope,
   BotThread,
+  FeishuAccessPolicy,
   PublicBot,
 } from "../../../shared/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
   NativeSelect,
   NativeSelectOption,
 } from "@/components/ui/native-select";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { useLocale } from "../locale";
 import { displayError } from "../state";
+import { FeishuAccessControlPanel } from "./FeishuAccessControlPanel";
 import { runBotAction } from "./use-bots";
 
 type ScopeFilter = "all" | BotMemoryScope;
 type CreatableScope = Exclude<BotMemoryScope, "global">;
+export type BotStudioTab = "memory" | "access";
 
 export function feishuStateLabel(
   state: PublicBot["feishuStatus"]["state"],
@@ -100,16 +112,21 @@ export function BotInspectorSheet({
   open,
   bot,
   activeThread,
+  initialTab = "memory",
   onOpenChange,
   onEditBot,
+  onBotsUpdated,
 }: {
   open: boolean;
   bot: PublicBot;
   activeThread?: BotThread | undefined;
+  initialTab?: BotStudioTab;
   onOpenChange: (open: boolean) => void;
   onEditBot: () => void;
+  onBotsUpdated?: ((bots: PublicBot[]) => void) | undefined;
 }) {
   const { t } = useLocale();
+  const [studioTab, setStudioTab] = useState<BotStudioTab>(initialTab);
   const [entries, setEntries] = useState<BotMemoryEntry[]>([]);
   const [scopeFilter, setScopeFilter] = useState<ScopeFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
@@ -124,6 +141,7 @@ export function BotInspectorSheet({
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [savingAccess, setSavingAccess] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
 
@@ -215,6 +233,7 @@ export function BotInspectorSheet({
 
   useEffect(() => {
     if (!open) return;
+    setStudioTab(initialTab);
     setError(undefined);
     setSavedNotice(false);
     setConfirmDelete(false);
@@ -231,7 +250,7 @@ export function BotInspectorSheet({
     }
 
     void loadList({ silent: false, preferKey: preferredKey });
-  }, [activeThread?.feishuChatId, bot.id, loadList, open]);
+  }, [activeThread?.feishuChatId, bot.id, initialTab, loadList, open]);
 
   useEffect(() => {
     if (!open || typeof window.prospero?.subscribeBots !== "function") return;
@@ -287,6 +306,7 @@ export function BotInspectorSheet({
           : "global");
 
   const selectEntry = async (key: string): Promise<void> => {
+    setCreateOpen(false);
     if (key === selectedKey && !dirty) return;
     setSelectedKey(key);
     selectedKeyRef.current = key;
@@ -433,6 +453,30 @@ export function BotInspectorSheet({
     }
   };
 
+  const updateAccessControl = async (
+    nextPolicy: FeishuAccessPolicy,
+    nextAdmins: BotFeishuAdmin[],
+  ): Promise<void> => {
+    if (savingAccess) return;
+    setSavingAccess(true);
+    setError(undefined);
+    try {
+      const result = await runBotAction({
+        kind: "feishu.access.update",
+        botId: bot.id,
+        accessPolicy: nextPolicy,
+        adminUsers: nextAdmins,
+      });
+      if (result.bots) {
+        onBotsUpdated?.(result.bots);
+      }
+    } catch (reason) {
+      setError(displayError(reason));
+    } finally {
+      setSavingAccess(false);
+    }
+  };
+
   const knownChats = useMemo(
     () =>
       entries.filter(
@@ -443,128 +487,109 @@ export function BotInspectorSheet({
   );
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="w-full sm:max-w-2xl overflow-y-auto">
-        <SheetHeader>
-          <SheetTitle className="flex items-center gap-2">
-            <span>{bot.avatar}</span>
-            <span>{bot.name}</span>
-          </SheetTitle>
-          <SheetDescription>
-            {bot.description ||
-              t(
-                "Bot 运行参数、飞书 IM 状态与群/人分层长期记忆",
-                "Runtime profile, Feishu IM status, and scoped long-term memory",
-              )}
-          </SheetDescription>
-        </SheetHeader>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex h-[min(84vh,720px)] w-[min(940px,calc(100vw-2rem))] flex-col gap-0 overflow-hidden p-0 sm:max-w-[940px]">
+        {/* Studio Header */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3.5 pr-12 bg-muted/15">
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="bots-pane-avatar" aria-hidden="true">
+              {bot.avatar}
+            </span>
+            <div className="min-w-0 grid gap-0.5">
+              <div className="flex items-center gap-2 min-w-0">
+                <DialogTitle className="text-sm font-semibold truncate">{bot.name}</DialogTitle>
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                  {bot.agent}
+                </Badge>
+                {bot.model && (
+                  <code className="hidden sm:inline truncate text-[11px] text-muted-foreground">
+                    {bot.model}
+                  </code>
+                )}
+              </div>
+              <DialogDescription className="flex items-center gap-2 text-xs text-muted-foreground truncate">
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
+                  {feishuStateLabel(bot.feishuStatus.state, t)}
+                </span>
+                {bot.description && (
+                  <>
+                    <span>·</span>
+                    <span className="truncate">{bot.description}</span>
+                  </>
+                )}
+              </DialogDescription>
+            </div>
+          </div>
 
-        <div className="grid gap-4 p-4 pt-0">
-          {error && (
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="bot-studio-tabs" role="tablist" aria-label={t("功能视图切换", "Studio views")}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={studioTab === "memory"}
+                className="bot-studio-tab"
+                data-active={studioTab === "memory"}
+                onClick={() => setStudioTab("memory")}
+              >
+                <BookMarked className="size-3.5" />
+                <span>{t("分层长期记忆", "Memory")}</span>
+                <span className="opacity-70 tabular-nums">{entries.length}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={studioTab === "access"}
+                className="bot-studio-tab"
+                data-active={studioTab === "access"}
+                onClick={() => setStudioTab("access")}
+              >
+                <ShieldCheck className="size-3.5" />
+                <span>{t("飞书与权限", "Feishu & Access")}</span>
+                {bot.feishu.adminUsers.length > 0 && (
+                  <span className="opacity-70 tabular-nums">{bot.feishu.adminUsers.length}</span>
+                )}
+              </button>
+            </div>
+            <Button variant="outline" size="xs" onClick={onEditBot}>
+              <Settings data-icon="inline-start" />
+              {t("编辑配置", "Edit Bot")}
+            </Button>
+          </div>
+        </div>
+
+        {error && (
+          <div className="px-5 pt-3">
             <Alert variant="destructive">
               <AlertTitle>{t("操作失败", "Error")}</AlertTitle>
               <AlertDescription>{error}</AlertDescription>
             </Alert>
-          )}
-
-          {/* Profile summary */}
-          <div className="bot-editor-section">
-            <div className="flex items-center justify-between gap-2">
-              <strong className="text-xs font-semibold text-muted-foreground">
-                {t("运行参数", "Runtime")}
-              </strong>
-              <Button variant="outline" size="xs" onClick={onEditBot}>
-                <Settings data-icon="inline-start" />
-                {t("编辑配置", "Edit Bot")}
-              </Button>
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              <Badge variant="secondary">{bot.agent}</Badge>
-              {bot.model && <Badge variant="outline">{bot.model}</Badge>}
-              {bot.effort && <Badge variant="outline">{bot.effort}</Badge>}
-              {bot.allowCrossWorkspace && (
-                <Badge variant="outline">{t("多 Bot 协同", "Multi-Bot")}</Badge>
-              )}
-            </div>
           </div>
+        )}
 
-          {/* Feishu Status */}
-          <div className="bot-editor-section">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
-                <strong className="text-xs font-semibold">
-                  {feishuStateLabel(bot.feishuStatus.state, t)}
-                </strong>
-              </div>
-              {bot.feishu.enabled && (
-                <Button
-                  variant="outline"
-                  size="xs"
-                  disabled={reconnecting}
-                  onClick={() => void reconnectFeishu()}
-                >
-                  {reconnecting ? (
-                    <Spinner data-icon="inline-start" />
-                  ) : (
-                    <RefreshCw data-icon="inline-start" />
-                  )}
-                  {t("重连", "Reconnect")}
-                </Button>
-              )}
-            </div>
-            {bot.feishu.enabled ? (
-              <div className="grid gap-1 text-xs text-muted-foreground">
-                <div>
-                  App ID: <code>{bot.feishu.appId}</code>
-                </div>
-                {bot.feishuStatus.botName && (
-                  <div>
-                    {t("识别机器人：", "Bot name: ")}
-                    {bot.feishuStatus.botName}
-                  </div>
-                )}
-                {bot.feishuStatus.lastError && (
-                  <p className="text-destructive">{bot.feishuStatus.lastError}</p>
-                )}
-              </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                {t(
-                  "当前未绑定飞书应用。点击上方「编辑配置」即可配置 App ID / Secret 接入飞书长连接。",
-                  "Feishu IM is disabled for this Bot. Click Edit Bot to bind a Feishu App ID & Secret.",
-                )}
-              </p>
-            )}
-          </div>
-
-          {/* Layered Scoped Long-term Memory Viewer & Editor */}
-          <div className="bot-editor-section">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <strong className="text-xs font-semibold text-muted-foreground">
-                  {t("分层长期记忆", "Layered Long-Term Memory")}
-                </strong>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  {t(
-                    "按「全局 / 群记忆 / 个人记忆 / 群+人记忆」自动隔离存储与检索，绝不跨群串味。",
-                    "Isolated automatically across Global, Group, Personal, and Group+Member scopes.",
-                  )}
-                </p>
-              </div>
+        {/* Body */}
+        {studioTab === "memory" ? (
+          <div className="bot-studio-memory-layout">
+            {/* Left memory list rail */}
+            <aside className="bot-studio-memory-rail">
               <div className="flex items-center gap-1.5">
+                <div className="relative flex-1 min-w-0">
+                  <Search className="pointer-events-none absolute left-2.5 top-2 size-3.5 text-muted-foreground" />
+                  <Input
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    placeholder={t("搜索群、人或摘要…", "Search group, user...")}
+                    className="h-7.5 pl-7.5 text-xs"
+                  />
+                </div>
                 <Button
                   variant="outline"
-                  size="xs"
+                  size="icon-xs"
+                  title={t("刷新记忆列表", "Refresh")}
                   disabled={loadingList}
                   onClick={() => void loadList({ silent: false })}
                 >
-                  {loadingList ? (
-                    <Spinner data-icon="inline-start" />
-                  ) : (
-                    <RefreshCw data-icon="inline-start" />
-                  )}
-                  {t("刷新", "Refresh")}
+                  {loadingList ? <Spinner /> : <RefreshCw />}
                 </Button>
                 <Button
                   variant={createOpen ? "secondary" : "outline"}
@@ -572,191 +597,43 @@ export function BotInspectorSheet({
                   onClick={() => setCreateOpen((prev) => !prev)}
                 >
                   <Plus data-icon="inline-start" />
-                  {t("新建记忆", "New memory")}
+                  {t("新建", "New")}
                 </Button>
               </div>
-            </div>
 
-            {/* Scope Filter Tabs */}
-            <div className="bot-memory-tabs" role="tablist" aria-label={t("记忆作用域", "Memory scopes")}>
-              {(
-                [
-                  ["all", t("全部", "All"), counts.all],
-                  ["global", t("全局", "Global"), counts.global],
-                  ["chat", t("群记忆", "Group"), counts.chat],
-                  ["user", t("个人记忆", "Personal"), counts.user],
-                  ["member", t("群+人记忆", "Member"), counts.member],
-                ] as const
-              ).map(([scopeId, title, count]) => (
-                <button
-                  key={scopeId}
-                  type="button"
-                  role="tab"
-                  aria-selected={scopeFilter === scopeId}
-                  className="bot-memory-tab"
-                  data-active={scopeFilter === scopeId}
-                  onClick={() => setScopeFilter(scopeId)}
-                >
-                  <span>{title}</span>
-                  <span className="text-[11px] opacity-75">{count}</span>
-                </button>
-              ))}
-            </div>
-
-            {/* Search Filter */}
-            <div className="bot-memory-toolbar">
-              <div className="relative flex-1 min-w-[180px]">
-                <Search className="pointer-events-none absolute left-2.5 top-2 size-3.5 text-muted-foreground" />
-                <Input
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder={t(
-                    "按群名、成员、ID 或摘要关键词筛选…",
-                    "Filter by group, member, ID, or snippet...",
-                  )}
-                  className="h-8 pl-8 text-xs"
-                />
-              </div>
-            </div>
-
-            {/* Inline Create Form */}
-            {createOpen && (
-              <div className="bot-memory-create">
-                <div className="bot-editor-grid-2">
-                  <div className="grid gap-1">
-                    <span className="text-xs font-medium">{t("记忆层级", "Scope")}</span>
-                    <NativeSelect
-                      value={createScope}
-                      onChange={(event) => setCreateScope(event.target.value as CreatableScope)}
-                    >
-                      <NativeSelectOption value="chat">
-                        {t("群记忆 (chat)", "Group memory (chat)")}
-                      </NativeSelectOption>
-                      <NativeSelectOption value="user">
-                        {t("个人记忆 (user)", "Personal memory (user)")}
-                      </NativeSelectOption>
-                      <NativeSelectOption value="member">
-                        {t("群+人记忆 (member)", "Group + Member memory")}
-                      </NativeSelectOption>
-                    </NativeSelect>
-                  </div>
-                  <div className="grid gap-1">
-                    <span className="text-xs font-medium">
-                      {t("备注名称（可选）", "Display label (optional)")}
-                    </span>
-                    <Input
-                      value={createLabel}
-                      onChange={(event) => setCreateLabel(event.target.value)}
-                      placeholder={t("例如：核心研发群 / 张三", "e.g. Core Team / Alice")}
-                    />
-                  </div>
-                </div>
-
-                {(createScope === "chat" || createScope === "member") && (
-                  <div className="bot-editor-grid-2">
-                    <div className="grid gap-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-medium">
-                          {t("飞书群聊 ID", "Feishu Chat ID")}
-                        </span>
-                        {knownChats.length > 0 && (
-                          <select
-                            aria-label={t("选择已有群聊", "Pick existing group")}
-                            className="max-w-[140px] truncate rounded border border-border bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground"
-                            value=""
-                            onChange={(event) => {
-                              const picked = knownChats.find((c) => c.chatId === event.target.value);
-                              if (!picked) return;
-                              setCreateChatId(picked.chatId);
-                              if (picked.chatName) setCreateChatName(picked.chatName);
-                            }}
-                          >
-                            <option value="">{t("填入已知群…", "Pick group...")}</option>
-                            {knownChats.map((c) => (
-                              <option key={c.key} value={c.chatId}>
-                                {c.label}
-                              </option>
-                            ))}
-                          </select>
-                        )}
-                      </div>
-                      <Input
-                        value={createChatId}
-                        onChange={(event) => setCreateChatId(event.target.value)}
-                        placeholder="oc_..."
-                      />
-                    </div>
-                    <div className="grid gap-1">
-                      <span className="text-xs font-medium">
-                        {t("群名称（可选）", "Group name (optional)")}
-                      </span>
-                      <Input
-                        value={createChatName}
-                        onChange={(event) => setCreateChatName(event.target.value)}
-                        placeholder={t("自动识别或手动备注", "Auto-detected or custom")}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {(createScope === "user" || createScope === "member") && (
-                  <div className="bot-editor-grid-2">
-                    <div className="grid gap-1">
-                      <span className="text-xs font-medium">
-                        {t("成员 Open ID", "User Open ID")}
-                      </span>
-                      <Input
-                        value={createUserId}
-                        onChange={(event) => setCreateUserId(event.target.value)}
-                        placeholder="ou_..."
-                      />
-                    </div>
-                    <div className="grid gap-1">
-                      <span className="text-xs font-medium">
-                        {t("成员姓名（可选）", "User name (optional)")}
-                      </span>
-                      <Input
-                        value={createUserName}
-                        onChange={(event) => setCreateUserName(event.target.value)}
-                        placeholder={t("例如：张三", "e.g. Alice")}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                <div className="flex items-center justify-end gap-2">
-                  <Button
+              <div className="bot-memory-tabs" role="tablist" aria-label={t("记忆作用域", "Memory scopes")}>
+                {(
+                  [
+                    ["all", t("全部", "All"), counts.all],
+                    ["global", t("全局", "Global"), counts.global],
+                    ["chat", t("群记忆", "Group"), counts.chat],
+                    ["user", t("个人记忆", "Personal"), counts.user],
+                    ["member", t("群+人记忆", "Member"), counts.member],
+                  ] as const
+                ).map(([scopeId, title, count]) => (
+                  <button
+                    key={scopeId}
                     type="button"
-                    variant="ghost"
-                    size="xs"
-                    disabled={creating}
-                    onClick={() => setCreateOpen(false)}
+                    role="tab"
+                    aria-selected={scopeFilter === scopeId}
+                    className="bot-memory-tab"
+                    data-active={scopeFilter === scopeId}
+                    onClick={() => setScopeFilter(scopeId)}
                   >
-                    {t("取消", "Cancel")}
-                  </Button>
-                  <Button
-                    type="button"
-                    size="xs"
-                    disabled={creating}
-                    onClick={() => void createScopedEntry()}
-                  >
-                    {creating && <Spinner data-icon="inline-start" />}
-                    {t("创建并编辑", "Create & edit")}
-                  </Button>
-                </div>
+                    <span>{title}</span>
+                    <span className="text-[11px] opacity-75 tabular-nums">{count}</span>
+                  </button>
+                ))}
               </div>
-            )}
 
-            {/* Split List + Editor */}
-            {loadingList && entries.length === 0 ? (
-              <div className="flex items-center justify-center py-8 text-muted-foreground">
-                <Spinner />
-              </div>
-            ) : (
-              <div className="bot-memory-grid">
-                <div className="bot-memory-list">
+              {loadingList && entries.length === 0 ? (
+                <div className="flex flex-1 items-center justify-center py-8 text-muted-foreground">
+                  <Spinner />
+                </div>
+              ) : (
+                <div className="bot-studio-memory-list">
                   {filteredEntries.length === 0 ? (
-                    <div className="rounded-md border border-dashed border-border p-4 text-center text-xs text-muted-foreground">
+                    <div className="rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground">
                       {t("当前筛选下暂无记忆条目。", "No memory entries match this filter.")}
                     </div>
                   ) : (
@@ -765,10 +642,10 @@ export function BotInspectorSheet({
                         key={item.key}
                         type="button"
                         className="bot-memory-item"
-                        data-selected={item.key === selectedKey}
+                        data-selected={!createOpen && item.key === selectedKey}
                         onClick={() => void selectEntry(item.key)}
                       >
-                        <div className="flex items-center justify-between gap-1.5">
+                        <div className="flex items-center justify-between gap-1.5 min-w-0">
                           <span className="truncate text-xs font-semibold text-foreground">
                             {item.label}
                           </span>
@@ -776,15 +653,6 @@ export function BotInspectorSheet({
                             {scopeBadgeLabel(item.scope, t)}
                           </Badge>
                         </div>
-                        {(item.chatId || item.userId) && (
-                          <div className="truncate font-mono text-[10px] text-muted-foreground">
-                            {item.scope === "member"
-                              ? `${item.chatName ?? item.chatId ?? ""} · ${item.userName ?? item.userId ?? ""}`
-                              : item.scope === "chat"
-                                ? item.chatId
-                                : item.userId}
-                          </div>
-                        )}
                         <div className="line-clamp-2 text-[11px] text-muted-foreground">
                           {item.preview || t("尚无内容", "Empty")}
                         </div>
@@ -792,86 +660,182 @@ export function BotInspectorSheet({
                     ))
                   )}
                 </div>
+              )}
+            </aside>
 
-                <div className="bot-memory-editor">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <Badge variant="outline">{scopeBadgeLabel(activeScope, t)}</Badge>
-                      {selectedMeta?.chatId && (
-                        <code className="truncate text-[11px] text-muted-foreground">
-                          {selectedMeta.chatId}
-                        </code>
+            {/* Right memory editor / create form */}
+            <div className="flex flex-1 min-w-0 min-h-0 flex-col p-5 gap-3.5 overflow-y-auto">
+              {createOpen ? (
+                <div className="mx-auto w-full max-w-lg grid gap-4 py-2">
+                  <div>
+                    <h3 className="text-sm font-semibold text-foreground">
+                      {t("新建作用域记忆", "New Scoped Memory")}
+                    </h3>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t(
+                        "按飞书群聊、个人或群内成员单独隔离沉淀记忆，绝不跨群串味。",
+                        "Create an isolated memory file scoped to a group, user, or group member.",
                       )}
-                      {selectedMeta?.userId && (
-                        <code className="truncate text-[11px] text-muted-foreground">
-                          {selectedMeta.userId}
-                        </code>
-                      )}
-                    </div>
-                    <Button
-                      size="xs"
-                      disabled={loadingEntry || saving}
-                      onClick={() => void saveEntry()}
-                    >
-                      {saving ? (
-                        <Spinner data-icon="inline-start" />
-                      ) : (
-                        <Save data-icon="inline-start" />
-                      )}
-                      {t("保存记忆", "Save")}
-                    </Button>
+                    </p>
                   </div>
 
-                  {selectedKey !== "global" ? (
-                    <div className="grid gap-1">
-                      <span className="text-[11px] font-medium text-muted-foreground">
-                        {t("显示名称", "Display name")}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="grid gap-1.5">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        {t("记忆层级", "Scope")}
+                      </span>
+                      <NativeSelect
+                        value={createScope}
+                        onChange={(event) => setCreateScope(event.target.value as CreatableScope)}
+                      >
+                        <NativeSelectOption value="chat">
+                          {t("群记忆 (chat)", "Group memory (chat)")}
+                        </NativeSelectOption>
+                        <NativeSelectOption value="user">
+                          {t("个人记忆 (user)", "Personal memory (user)")}
+                        </NativeSelectOption>
+                        <NativeSelectOption value="member">
+                          {t("群+人记忆 (member)", "Group + Member memory")}
+                        </NativeSelectOption>
+                      </NativeSelect>
+                    </div>
+                    <div className="grid gap-1.5">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        {t("备注名称（可选）", "Display label (optional)")}
                       </span>
                       <Input
-                        value={labelInput}
-                        disabled={loadingEntry || saving}
-                        onChange={(event) => {
-                          setLabelInput(event.target.value);
-                          setDirty(true);
-                          dirtyRef.current = true;
-                          setSavedNotice(false);
-                        }}
-                        placeholder={t("输入易于辨识的备注名", "Friendly display label")}
-                        className="h-8 text-xs"
+                        value={createLabel}
+                        onChange={(event) => setCreateLabel(event.target.value)}
+                        placeholder={t("例如：核心研发群 / 张三", "e.g. Core Team / Alice")}
                       />
                     </div>
-                  ) : (
-                    <div className="text-xs font-medium text-foreground">
-                      {t("全局长期记忆", "Global Long-Term Memory")}
+                  </div>
+
+                  {(createScope === "chat" || createScope === "member") && (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="grid gap-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-medium text-muted-foreground">
+                            {t("飞书群聊 ID", "Feishu Chat ID")}
+                          </span>
+                          {knownChats.length > 0 && (
+                            <select
+                              aria-label={t("选择已有群聊", "Pick existing group")}
+                              className="max-w-[140px] truncate rounded border border-border bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                              value=""
+                              onChange={(event) => {
+                                const picked = knownChats.find((c) => c.chatId === event.target.value);
+                                if (!picked) return;
+                                setCreateChatId(picked.chatId);
+                                if (picked.chatName) setCreateChatName(picked.chatName);
+                              }}
+                            >
+                              <option value="">{t("填入已知群…", "Pick group...")}</option>
+                              {knownChats.map((c) => (
+                                <option key={c.key} value={c.chatId}>
+                                  {c.label}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </div>
+                        <Input
+                          value={createChatId}
+                          onChange={(event) => setCreateChatId(event.target.value)}
+                          placeholder="oc_..."
+                          className="font-mono text-xs"
+                        />
+                      </div>
+                      <div className="grid gap-1.5">
+                        <span className="text-xs font-medium text-muted-foreground">
+                          {t("群名称（可选）", "Group name (optional)")}
+                        </span>
+                        <Input
+                          value={createChatName}
+                          onChange={(event) => setCreateChatName(event.target.value)}
+                          placeholder={t("自动识别或手动备注", "Auto-detected or custom")}
+                        />
+                      </div>
                     </div>
                   )}
 
-                  <p className="text-[11px] text-muted-foreground">
-                    {scopeDescription(activeScope, t)}
-                  </p>
-
-                  {loadingEntry ? (
-                    <div className="flex items-center justify-center py-8 text-muted-foreground">
-                      <Spinner />
+                  {(createScope === "user" || createScope === "member") && (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="grid gap-1.5">
+                        <span className="text-xs font-medium text-muted-foreground">
+                          {t("成员 Open ID", "User Open ID")}
+                        </span>
+                        <Input
+                          value={createUserId}
+                          onChange={(event) => setCreateUserId(event.target.value)}
+                          placeholder="ou_..."
+                          className="font-mono text-xs"
+                        />
+                      </div>
+                      <div className="grid gap-1.5">
+                        <span className="text-xs font-medium text-muted-foreground">
+                          {t("成员姓名（可选）", "User name (optional)")}
+                        </span>
+                        <Input
+                          value={createUserName}
+                          onChange={(event) => setCreateUserName(event.target.value)}
+                          placeholder={t("例如：张三", "e.g. Alice")}
+                        />
+                      </div>
                     </div>
-                  ) : (
-                    <Textarea
-                      rows={11}
-                      value={contentInput}
-                      disabled={saving}
-                      onChange={(event) => {
-                        setContentInput(event.target.value);
-                        setDirty(true);
-                        dirtyRef.current = true;
-                        setSavedNotice(false);
-                      }}
-                    />
                   )}
 
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={creating}
+                      onClick={() => setCreateOpen(false)}
+                    >
+                      {t("取消", "Cancel")}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={creating}
+                      onClick={() => void createScopedEntry()}
+                    >
+                      {creating && <Spinner data-icon="inline-start" />}
+                      {t("创建并编辑", "Create & edit")}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <>
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                      <Badge variant="outline" className="shrink-0">
+                        {scopeBadgeLabel(activeScope, t)}
+                      </Badge>
+                      {selectedKey !== "global" ? (
+                        <Input
+                          value={labelInput}
+                          disabled={loadingEntry || saving}
+                          onChange={(event) => {
+                            setLabelInput(event.target.value);
+                            setDirty(true);
+                            dirtyRef.current = true;
+                            setSavedNotice(false);
+                          }}
+                          placeholder={t("显示名称", "Display name")}
+                          className="h-8 max-w-xs text-sm font-medium"
+                        />
+                      ) : (
+                        <strong className="text-sm font-semibold text-foreground">
+                          {t("全局长期记忆", "Global Long-Term Memory")}
+                        </strong>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
                       {confirmDelete ? (
-                        <div className="flex items-center gap-1.5">
+                        <>
                           <Button
                             type="button"
                             variant="destructive"
@@ -881,7 +845,7 @@ export function BotInspectorSheet({
                           >
                             {deleting && <Spinner data-icon="inline-start" />}
                             {selectedKey === "global"
-                              ? t("确认重置", "Confirm clear")
+                              ? t("确认清空", "Confirm reset")
                               : t("确认删除", "Confirm delete")}
                           </Button>
                           <Button
@@ -893,7 +857,7 @@ export function BotInspectorSheet({
                           >
                             {t("取消", "Cancel")}
                           </Button>
-                        </div>
+                        </>
                       ) : (
                         <Button
                           type="button"
@@ -904,24 +868,138 @@ export function BotInspectorSheet({
                         >
                           <Trash2 data-icon="inline-start" />
                           {selectedKey === "global"
-                            ? t("清空全局记忆", "Reset global")
-                            : t("删除此记忆", "Delete entry")}
+                            ? t("清空", "Reset")
+                            : t("删除", "Delete")}
                         </Button>
                       )}
+                      <Button
+                        size="sm"
+                        disabled={loadingEntry || saving}
+                        onClick={() => void saveEntry()}
+                      >
+                        {saving ? (
+                          <Spinner data-icon="inline-start" />
+                        ) : (
+                          <Save data-icon="inline-start" />
+                        )}
+                        {t("保存记忆", "Save")}
+                      </Button>
                     </div>
+                  </div>
 
-                    {savedNotice && (
-                      <span className="text-xs text-emerald-600 dark:text-emerald-400">
-                        {t("已保存，后续对话将生效。", "Memory saved.")}
-                      </span>
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                    <span>{scopeDescription(activeScope, t)}</span>
+                    <div className="flex items-center gap-2 font-mono text-[11px]">
+                      {selectedMeta?.chatId && <code>{selectedMeta.chatId}</code>}
+                      {selectedMeta?.userId && <code>{selectedMeta.userId}</code>}
+                    </div>
+                  </div>
+
+                  {loadingEntry ? (
+                    <div className="flex flex-1 items-center justify-center py-8 text-muted-foreground">
+                      <Spinner />
+                    </div>
+                  ) : (
+                    <Textarea
+                      value={contentInput}
+                      disabled={saving}
+                      className="flex-1 min-h-[260px] resize-none font-mono text-xs leading-relaxed"
+                      onChange={(event) => {
+                        setContentInput(event.target.value);
+                        setDirty(true);
+                        dirtyRef.current = true;
+                        setSavedNotice(false);
+                      }}
+                    />
+                  )}
+
+                  {savedNotice && (
+                    <p className="text-xs text-emerald-600 dark:text-emerald-400">
+                      {t("已保存，后续对话将自动生效。", "Saved and active for upcoming turns.")}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 min-h-0 overflow-y-auto p-6">
+            <div className="mx-auto max-w-2xl grid gap-6">
+              {/* Connection Status Card */}
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-border bg-muted/20 px-4 py-3.5">
+                <div className="grid gap-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
+                    <strong className="text-sm font-semibold text-foreground">
+                      {feishuStateLabel(bot.feishuStatus.state, t)}
+                    </strong>
+                    {bot.feishuStatus.botName && (
+                      <Badge variant="secondary" className="text-[11px]">
+                        {bot.feishuStatus.botName}
+                      </Badge>
                     )}
                   </div>
+                  {bot.feishu.enabled ? (
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <span>App ID: <code>{bot.feishu.appId}</code></span>
+                      <span>·</span>
+                      <span>
+                        {bot.feishu.groupTrigger === "mention"
+                          ? t("仅 @提及回复", "@mention in groups")
+                          : t("响应群内全量消息", "All group messages")}
+                      </span>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      {t(
+                        "尚未配置飞书应用凭据。点击右侧「修改凭据」即可接入飞书长连接。",
+                        "Feishu IM is currently disabled. Click Edit Credentials to bind your Feishu app.",
+                      )}
+                    </p>
+                  )}
+                  {bot.feishuStatus.lastError && (
+                    <p className="text-xs text-destructive">{bot.feishuStatus.lastError}</p>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {bot.feishu.enabled && (
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      disabled={reconnecting}
+                      onClick={() => void reconnectFeishu()}
+                    >
+                      {reconnecting ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />}
+                      {t("重连", "Reconnect")}
+                    </Button>
+                  )}
+                  <Button variant="outline" size="xs" onClick={onEditBot}>
+                    <Settings data-icon="inline-start" />
+                    {t("修改凭据", "Edit Credentials")}
+                  </Button>
                 </div>
               </div>
-            )}
+
+              {/* Access Control & Admins */}
+              <div className="relative rounded-xl border border-border bg-background/60 p-4">
+                {savingAccess && (
+                  <div className="absolute right-4 top-4">
+                    <Spinner />
+                  </div>
+                )}
+                <FeishuAccessControlPanel
+                  accessPolicy={bot.feishu.accessPolicy}
+                  adminUsers={bot.feishu.adminUsers}
+                  recentSenders={bot.feishuStatus.recentSenders}
+                  disabled={savingAccess}
+                  onChange={(nextPolicy, nextAdmins) => void updateAccessControl(nextPolicy, nextAdmins)}
+                />
+              </div>
+            </div>
           </div>
-        </div>
-      </SheetContent>
-    </Sheet>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

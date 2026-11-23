@@ -131,6 +131,7 @@ fn start_command(workspace: &str) -> HostCommand {
         title: "runtime reliability Host fixture".into(),
         workspace: workspace.into(),
         auto_approve: false,
+        approval_policy: None,
         mode: None,
         model: None,
         effort: None,

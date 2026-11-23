@@ -79,6 +79,12 @@ pub(super) async fn launch_hosted_worker(
         title: title.clone(),
         workspace: workspace.clone(),
         auto_approve,
+        approval_policy: match input.approval_policy.as_deref() {
+            Some("strict") => Some(crate::protocol::TerminalApprovalPolicy::Strict),
+            Some("standard") => Some(crate::protocol::TerminalApprovalPolicy::Standard),
+            Some("yolo") => Some(crate::protocol::TerminalApprovalPolicy::Yolo),
+            _ => None,
+        },
         mode: None,
         model: None,
         effort: None,

@@ -3372,6 +3372,12 @@ async fn remote_session_create(
                         message.get("approvalPolicy").and_then(JsonValue::as_str),
                         Some("always" | "yolo" | "auto")
                     ),
+                    approval_policy: match message.get("approvalPolicy").and_then(JsonValue::as_str) {
+                        Some("strict") => Some(TerminalApprovalPolicy::Strict),
+                        Some("standard") => Some(TerminalApprovalPolicy::Standard),
+                        Some("always" | "yolo" | "auto") => Some(TerminalApprovalPolicy::Yolo),
+                        _ => None,
+                    },
                     mode: message
                         .get("mode")
                         .and_then(JsonValue::as_str)
@@ -9399,6 +9405,7 @@ mod tests {
                     title: format!("occupied {index}"),
                     workspace: root.path().to_string_lossy().into_owned(),
                     auto_approve: false,
+                    approval_policy: None,
                     mode: None,
                     model: None,
                     effort: None,

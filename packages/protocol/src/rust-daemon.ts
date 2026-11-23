@@ -62,6 +62,10 @@ export type TerminalInput = { dataB64: string, };
 export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: string, };
 export type CreateAgentSession = { agent: AgentKind, title: string, workspace: string, autoApprove: boolean,
 /**
+ * Three-tier approval policy; takes precedence over `auto_approve` when present.
+ */
+approvalPolicy?: TerminalApprovalPolicy | null,
+/**
  * Optional initial collaboration mode for structured Claude sessions.
  */
 mode?: string | null,
@@ -293,21 +297,24 @@ export type SourceResult = { type: string, requestId: string, ok: boolean, sourc
 export type BotKind = "master" | "sub";
 export type FeishuDomain = "feishu" | "lark";
 export type FeishuGroupTrigger = "mention" | "all";
+export type FeishuAccessPolicy = "everyone" | "admins_dm_all_groups" | "admins_only";
 export type FeishuConnectionState = "disabled" | "connecting" | "connected" | "reconnecting" | "error";
 export type BotThreadChannel = "desktop" | "feishu_p2p" | "feishu_group";
 export type BotSourceBinding = { sourceId: string, routeId: string, boundAccountId: string, };
-export type PublicBotFeishuConfig = { enabled: boolean, domain: FeishuDomain, appId: string, hasAppSecret: boolean, groupTrigger: FeishuGroupTrigger, streamingCard: boolean, };
-export type BotFeishuRuntimeStatus = { state: FeishuConnectionState, botName?: string | null, botOpenId?: string | null, lastConnectedAt?: number | null, lastEventAt?: number | null, lastError?: string | null, };
-export type BotThread = { id: string, botId: string, sessionId: string, title: string, channel: BotThreadChannel, feishuChatId?: string | null, createdAt: number, updatedAt: number, };
+export type BotFeishuAdmin = { openId: string, name?: string | null, };
+export type BotFeishuRecentSender = { openId: string, name?: string | null, lastChatId?: string | null, lastChatName?: string | null, lastSeenAt: number, denied: boolean, };
+export type PublicBotFeishuConfig = { enabled: boolean, domain: FeishuDomain, appId: string, hasAppSecret: boolean, groupTrigger: FeishuGroupTrigger, streamingCard: boolean, accessPolicy: FeishuAccessPolicy, adminUsers: Array<BotFeishuAdmin>, };
+export type BotFeishuRuntimeStatus = { state: FeishuConnectionState, botName?: string | null, botOpenId?: string | null, lastConnectedAt?: number | null, lastEventAt?: number | null, lastError?: string | null, recentSenders: Array<BotFeishuRecentSender>, };
+export type BotThread = { id: string, botId: string, sessionId: string, title: string, channel: BotThreadChannel, feishuChatId?: string | null, chatName?: string | null, lastSenderId?: string | null, lastSenderName?: string | null, lastMessagePreview?: string | null, messageCount: number, createdAt: number, updatedAt: number, };
 export type PublicBot = { id: string, kind: BotKind, name: string, avatar: string, description: string, systemPrompt: string, agent: AgentKind, accountId?: string | null, model?: string | null, effort?: string | null, sourceBinding?: BotSourceBinding | null, workspace: string, customWorkspace?: string | null, allowCrossWorkspace: boolean, feishu: PublicBotFeishuConfig, feishuStatus: BotFeishuRuntimeStatus, threads: Array<BotThread>, createdAt: number, updatedAt: number, };
-export type BotFeishuInput = { enabled: boolean, domain: FeishuDomain, appId: string, appSecret: string | null, groupTrigger: FeishuGroupTrigger, streamingCard: boolean, };
+export type BotFeishuInput = { enabled: boolean, domain: FeishuDomain, appId: string, appSecret: string | null, groupTrigger: FeishuGroupTrigger, streamingCard: boolean, accessPolicy: FeishuAccessPolicy, adminUsers: Array<BotFeishuAdmin>, };
 export type BotUpsertInput = { name: string, avatar: string, description: string, systemPrompt: string, agent: AgentKind, accountId: string | null, model: string | null, effort: string | null, sourceBinding: BotSourceBinding | null, customWorkspace: string | null, allowCrossWorkspace: boolean, feishu: BotFeishuInput | null, };
 export type BotFeishuProbeResult = { ok: boolean, botName?: string | null, botOpenId?: string | null, wsReady: boolean, message: string, };
 export type BotMemoryScope = "global" | "chat" | "user" | "member";
 export type BotMemoryEntry = { key: string, scope: BotMemoryScope, label: string, chatId?: string | null, chatName?: string | null, userId?: string | null, userName?: string | null, preview: string, hasContent: boolean, updatedAt: number, };
 export type BotMemoryView = { botId: string, key: string, scope: BotMemoryScope, label: string, chatId?: string | null, chatName?: string | null, userId?: string | null, userName?: string | null, path: string, content: string, updatedAt: number, };
 export type BotActionRequest = { type: string, requestId: string, action: BotAction, };
-export type BotAction = { "kind": "list" } | { "kind": "create", input: BotUpsertInput, } | { "kind": "update", botId: string, input: BotUpsertInput, } | { "kind": "delete", botId: string, } | { "kind": "thread.create", botId: string, title: string | null, } | { "kind": "thread.adopt", botId: string, sessionId: string, } | { "kind": "thread.archive", botId: string, threadId: string, } | { "kind": "thread.dispatch", botId: string, task: string, threadId: string | null, title: string | null, } | { "kind": "feishu.test", botId: string | null, domain: FeishuDomain, appId: string, appSecret: string | null, } | { "kind": "feishu.reconnect", botId: string, } | { "kind": "memory.read", botId: string, } | { "kind": "memory.write", botId: string, content: string, } | { "kind": "memory.list", botId: string, } | { "kind": "memory.entry.read", botId: string, key: string, } | { "kind": "memory.entry.write", botId: string, key: string, content: string, label: string | null, chatId: string | null, chatName: string | null, userId: string | null, userName: string | null, } | { "kind": "memory.entry.delete", botId: string, key: string, };
+export type BotAction = { "kind": "list" } | { "kind": "create", input: BotUpsertInput, } | { "kind": "update", botId: string, input: BotUpsertInput, } | { "kind": "delete", botId: string, } | { "kind": "thread.create", botId: string, title: string | null, } | { "kind": "thread.adopt", botId: string, sessionId: string, } | { "kind": "thread.archive", botId: string, threadId: string, } | { "kind": "thread.dispatch", botId: string, task: string, threadId: string | null, title: string | null, } | { "kind": "feishu.test", botId: string | null, domain: FeishuDomain, appId: string, appSecret: string | null, } | { "kind": "feishu.reconnect", botId: string, } | { "kind": "feishu.access.update", botId: string, accessPolicy: FeishuAccessPolicy, adminUsers: Array<BotFeishuAdmin>, } | { "kind": "memory.read", botId: string, } | { "kind": "memory.write", botId: string, content: string, } | { "kind": "memory.list", botId: string, } | { "kind": "memory.entry.read", botId: string, key: string, } | { "kind": "memory.entry.write", botId: string, key: string, content: string, label: string | null, chatId: string | null, chatName: string | null, userId: string | null, userName: string | null, } | { "kind": "memory.entry.delete", botId: string, key: string, };
 export type BotActionResult = { type: string, requestId: string, ok: boolean, bot?: PublicBot | null, bots?: Array<PublicBot> | null, thread?: BotThread | null, sessionId?: string | null, probe?: BotFeishuProbeResult | null, memory?: BotMemoryView | null, memories?: Array<BotMemoryEntry> | null, error?: FeatureError | null, };
 export type FsEntry = { name: string, kind: string, size: number, mtime: number, };
 export type FsListing = { type: string, sid: string, path: string, entries: Array<FsEntry>, };

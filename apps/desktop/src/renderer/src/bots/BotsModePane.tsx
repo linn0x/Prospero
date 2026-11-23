@@ -3,8 +3,10 @@ import {
   BookMarked,
   Bot,
   MessageSquarePlus,
+  PanelLeft,
   Send,
   Settings,
+  ShieldCheck,
   Sparkles,
   Trash2,
 } from "lucide-react";
@@ -22,7 +24,9 @@ import { AgentLogo } from "../AgentLogo";
 import { ChatPane } from "../ChatPane";
 import { useLocale } from "../locale";
 import { displayError } from "../state";
-import { BotInspectorSheet, feishuStateLabel } from "./BotInspectorSheet";
+import { BotConversationList } from "./BotConversationList";
+import { BotInspectorSheet, feishuStateLabel, type BotStudioTab } from "./BotInspectorSheet";
+import { accessPolicyLabel } from "./FeishuAccessControlPanel";
 import { runBotAction } from "./use-bots";
 
 const MASTER_STARTERS_ZH = [
@@ -70,6 +74,8 @@ export function BotsModePane({
 }) {
   const { language, t } = useLocale();
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<BotStudioTab>("memory");
+  const [listOpen, setListOpen] = useState(true);
   const [creatingThread, setCreatingThread] = useState(false);
   const [heroPrompt, setHeroPrompt] = useState("");
   const [heroError, setHeroError] = useState<string | undefined>(undefined);
@@ -124,6 +130,19 @@ export function BotsModePane({
     if (!id) return undefined;
     return snapshot.accounts.find((item) => item["id"] === id);
   }, [bot?.accountId, resolvedSession?.accountId, snapshot.accounts]);
+
+  const speakerNames = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const sender of bot?.feishuStatus.recentSenders ?? []) {
+      const name = sender.name?.trim();
+      if (sender.openId && name) map[sender.openId] = name;
+    }
+    for (const admin of bot?.feishu.adminUsers ?? []) {
+      const name = admin.name?.trim();
+      if (admin.openId && name) map[admin.openId] = name;
+    }
+    return map;
+  }, [bot?.feishu.adminUsers, bot?.feishuStatus.recentSenders]);
 
   if (!bot) {
     return (
@@ -221,11 +240,43 @@ export function BotsModePane({
                 <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
                 {feishuStateLabel(bot.feishuStatus.state, t)}
               </span>
+              {bot.feishu.enabled && (
+                <>
+                  <span>·</span>
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 rounded px-1 py-0.5 text-[11px] hover:bg-muted transition-colors"
+                    title={t("点击配置飞书权限与管理员", "Configure Feishu permissions & admins")}
+                    onClick={() => {
+                      setInspectorTab("access");
+                      setInspectorOpen(true);
+                    }}
+                  >
+                    <ShieldCheck className="size-3 text-emerald-600 dark:text-emerald-400" />
+                    <span>
+                      {accessPolicyLabel(bot.feishu.accessPolicy, t)}
+                      {bot.feishu.adminUsers.length > 0 ? ` (${bot.feishu.adminUsers.length})` : ""}
+                    </span>
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
 
         <div className="bots-pane-actions">
+          <Button
+            variant={listOpen ? "secondary" : "outline"}
+            size="sm"
+            aria-pressed={listOpen}
+            onClick={() => setListOpen((prev) => !prev)}
+          >
+            <PanelLeft data-icon="inline-start" />
+            {t("会话列表", "Chats")}
+            {bot.threads.length > 0 && (
+              <span className="ml-0.5 text-[11px] opacity-75">({bot.threads.length})</span>
+            )}
+          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -246,9 +297,16 @@ export function BotsModePane({
               {t("删除话题", "Delete")}
             </Button>
           )}
-          <Button variant="outline" size="sm" onClick={() => setInspectorOpen(true)}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setInspectorTab("memory");
+              setInspectorOpen(true);
+            }}
+          >
             <BookMarked data-icon="inline-start" />
-            {t("记忆与状态", "Memory & Status")}
+            {t("记忆与权限", "Memory & ACL")}
           </Button>
           <Button variant="outline" size="sm" onClick={() => onEditBot(bot)}>
             <Settings data-icon="inline-start" />
@@ -257,101 +315,125 @@ export function BotsModePane({
         </div>
       </header>
 
-      <div className="bots-pane-body">
-        {resolvedSession ? (
-          <ChatPane
-            key={resolvedSession.id}
-            session={resolvedSession}
-            account={resolvedAccount}
-            snapshot={snapshot}
-            botContext={{ name: bot.name, avatar: bot.avatar, description: bot.description }}
-            onMissingSession={() => {
-              if (activeThread) onArchiveThread(bot.id, activeThread.id);
-            }}
+      <div className="bots-pane-split">
+        {listOpen && (
+          <BotConversationList
+            botId={bot.id}
+            threads={bot.threads}
+            sessions={snapshot.daemon.sessions}
+            adminUsers={bot.feishu.adminUsers}
+            activeThreadId={activeThread?.id}
+            creatingThread={creatingThread}
+            onSelectThread={onSelectThread}
+            onNewThread={() => void startNewThread()}
+            onArchiveThread={onArchiveThread}
           />
-        ) : (
-          <div className="bots-hero">
-            <div className="bots-hero-avatar">{bot.avatar}</div>
-            <div className="grid gap-1.5">
-              <h3 className="text-lg font-semibold">{bot.name}</h3>
-              <p className="text-sm text-muted-foreground">
-                {bot.description ||
-                  t(
-                    "类似 GrokBot / Muse 的常驻个人智能体：发送一条消息开启新话题，或绑定飞书随时对话。",
-                    "Always-on personal agent: send a message to start a thread or connect Feishu IM.",
-                  )}
-              </p>
-            </div>
+        )}
 
-            {heroError && (
-              <p className="text-xs text-destructive" role="alert">
-                {heroError}
-              </p>
-            )}
+        <div className="bots-pane-body">
+          {resolvedSession ? (
+            <ChatPane
+              key={resolvedSession.id}
+              session={resolvedSession}
+              account={resolvedAccount}
+              snapshot={snapshot}
+              botContext={{
+                name: bot.name,
+                avatar: bot.avatar,
+                description: bot.description,
+                channel: activeThread?.channel,
+                speakerNames,
+              }}
+              onMissingSession={() => {
+                if (activeThread) onArchiveThread(bot.id, activeThread.id);
+              }}
+            />
+          ) : (
+            <div className="bots-hero">
+              <div className="bots-hero-avatar">{bot.avatar}</div>
+              <div className="grid gap-1.5">
+                <h3 className="text-lg font-semibold">{bot.name}</h3>
+                <p className="text-sm text-muted-foreground">
+                  {bot.description ||
+                    t(
+                      "类似 GrokBot / Muse 的常驻个人智能体：发送一条消息开启新话题，或绑定飞书随时对话。",
+                      "Always-on personal agent: send a message to start a thread or connect Feishu IM.",
+                    )}
+                </p>
+              </div>
 
-            <div className="w-full max-w-xl grid gap-2">
-              <InputGroup className="h-auto rounded-xl bg-card shadow-sm">
-                <InputGroupTextarea
-                  rows={3}
-                  value={heroPrompt}
-                  disabled={creatingThread}
-                  placeholder={t(
-                    `向 ${bot.name} 发送一条消息，开启第一个话题…`,
-                    `Message ${bot.name} to start a new thread…`,
+              {heroError && (
+                <p className="text-xs text-destructive" role="alert">
+                  {heroError}
+                </p>
+              )}
+
+              <div className="w-full max-w-xl grid gap-2">
+                <InputGroup className="h-auto rounded-xl bg-card shadow-sm">
+                  <InputGroupTextarea
+                    rows={3}
+                    value={heroPrompt}
+                    disabled={creatingThread}
+                    placeholder={t(
+                      `向 ${bot.name} 发送一条消息，开启第一个话题…`,
+                      `Message ${bot.name} to start a new thread…`,
+                    )}
+                    onChange={(event) => setHeroPrompt(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                        event.preventDefault();
+                        if (heroPrompt.trim()) void startNewThread(heroPrompt);
+                      }
+                    }}
+                  />
+                </InputGroup>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  {bot.kind === "sub" && !bot.feishu.enabled ? (
+                    <Button variant="ghost" size="sm" onClick={() => onEditBot(bot)}>
+                      {t("配置飞书机器人 IM", "Connect Feishu Bot IM")}
+                    </Button>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      {bot.feishu.enabled
+                        ? t("飞书 IM 已配置，桌面与飞书消息将实时同步", "Feishu IM enabled; synced with Desktop")
+                        : t("支持自由切换 Codex / Claude / AGY / DeepSeek / 模型源", "Supports Codex / Claude / AGY / DeepSeek / Model Sources")}
+                    </span>
                   )}
-                  onChange={(event) => setHeroPrompt(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                      event.preventDefault();
-                      if (heroPrompt.trim()) void startNewThread(heroPrompt);
-                    }
-                  }}
-                />
-              </InputGroup>
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                {bot.kind === "sub" && !bot.feishu.enabled ? (
-                  <Button variant="ghost" size="sm" onClick={() => onEditBot(bot)}>
-                    {t("配置飞书机器人 IM", "Connect Feishu Bot IM")}
+                  <Button
+                    disabled={creatingThread || !heroPrompt.trim()}
+                    onClick={() => void startNewThread(heroPrompt)}
+                  >
+                    {creatingThread ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}
+                    {t("开始对话", "Start chat")}
                   </Button>
-                ) : (
-                  <span className="text-xs text-muted-foreground">
-                    {bot.feishu.enabled
-                      ? t("飞书 IM 已配置，桌面与飞书消息将实时同步", "Feishu IM enabled; synced with Desktop")
-                      : t("支持自由切换 Codex / Claude / AGY / DeepSeek / 模型源", "Supports Codex / Claude / AGY / DeepSeek / Model Sources")}
-                  </span>
-                )}
-                <Button
-                  disabled={creatingThread || !heroPrompt.trim()}
-                  onClick={() => void startNewThread(heroPrompt)}
-                >
-                  {creatingThread ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}
-                  {t("开始对话", "Start chat")}
-                </Button>
+                </div>
+              </div>
+
+              <div className="bots-hero-prompts">
+                {starters.map((prompt) => (
+                  <Button
+                    key={prompt}
+                    variant="outline"
+                    size="sm"
+                    disabled={creatingThread}
+                    onClick={() => void startNewThread(prompt)}
+                  >
+                    {prompt}
+                  </Button>
+                ))}
               </div>
             </div>
-
-            <div className="bots-hero-prompts">
-              {starters.map((prompt) => (
-                <Button
-                  key={prompt}
-                  variant="outline"
-                  size="sm"
-                  disabled={creatingThread}
-                  onClick={() => void startNewThread(prompt)}
-                >
-                  {prompt}
-                </Button>
-              ))}
-            </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       <BotInspectorSheet
         open={inspectorOpen}
         bot={bot}
         activeThread={activeThread}
+        initialTab={inspectorTab}
         onOpenChange={setInspectorOpen}
+        onBotsUpdated={onBotsUpdated}
         onEditBot={() => {
           setInspectorOpen(false);
           onEditBot(bot);

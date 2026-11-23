@@ -1389,6 +1389,7 @@ export class RustRuntime {
           "memory.entry.write",
           "memory.entry.delete",
           "feishu.test",
+          "feishu.access.update",
         ].includes(String(kind))
       ) {
         await this.refresh(true);
@@ -1747,6 +1748,7 @@ export class RustRuntime {
         title: resume?.title ?? (agent === "deepseek" ? "DeepSeek" : agent === "opencode" ? "OpenCode" : agent === "pi" ? "Pi" : agent === "agy" ? "Antigravity" : agent === "codex" ? "Codex" : "Claude"),
         workspace: String(input["cwd"]),
         autoApprove: policy === "yolo",
+        approvalPolicy: policy,
         ...(mode !== undefined ? { mode } : {}),
         ...(model !== undefined ? { model } : {}),
         ...(effort !== undefined ? { effort } : {}),

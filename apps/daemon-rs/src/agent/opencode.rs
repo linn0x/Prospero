@@ -785,6 +785,7 @@ async fn consume_event(
                 }
                 return false;
             }
+            let target = super::approval::classify_opencode(action, &data);
             let (reply, receiver) = oneshot::channel();
             if context
                 .events
@@ -793,6 +794,7 @@ async fn consume_event(
                     request_id,
                     tool: action.chars().take(128).collect(),
                     summary,
+                    target,
                     reply,
                 })
                 .await

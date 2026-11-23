@@ -549,6 +549,7 @@ async fn handle_approval(
         .await;
         return;
     }
+    let target = super::approval::classify_deepseek(&tool, frame);
     let (reply, receiver) = oneshot::channel();
     if events
         .send(AdapterEvent::Permission {
@@ -556,6 +557,7 @@ async fn handle_approval(
             request_id,
             tool,
             summary: summarize(reason),
+            target,
             reply,
         })
         .await

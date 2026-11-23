@@ -431,6 +431,7 @@ fn recovery_abandons_orphans_without_promoting_live_starts_and_is_idempotent() {
                 title: "live".into(),
                 workspace: "/w".into(),
                 auto_approve: false,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -438,7 +439,7 @@ fn recovery_abandons_orphans_without_promoting_live_starts_and_is_idempotent() {
                 account_id: None,
                 resume: None,
             },
-            ApprovalPolicy::Manual,
+            ApprovalPolicy::Standard,
         )
         .unwrap();
 
@@ -553,6 +554,7 @@ fn active_completed_turn_stays_dispatched_until_explicit_settlement() {
                 title: "worker".into(),
                 workspace: "/w".into(),
                 auto_approve: true,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -603,6 +605,7 @@ fn stale_idle_worker_is_archived_only_while_its_dispatch_is_still_unreported() {
                 title: "worker".into(),
                 workspace: "/w".into(),
                 auto_approve: true,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,
@@ -984,6 +987,7 @@ fn archived_structured_session_fails_dispatch_and_preserves_explicit_delivery() 
         title: "worker".into(),
         workspace: "/w".into(),
         auto_approve: true,
+        approval_policy: None,
         mode: None,
         model: None,
         effort: None,
@@ -1050,6 +1054,7 @@ fn task_activity_batch_preserves_order_dependencies_and_progress() {
                 title: "worker".into(),
                 workspace: "/w".into(),
                 auto_approve: true,
+                approval_policy: None,
                 mode: None,
                 model: None,
                 effort: None,

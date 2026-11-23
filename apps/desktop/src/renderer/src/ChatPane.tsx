@@ -1,4 +1,5 @@
 import { ConversationTurn, INITIAL_DIFF_LINE_LIMIT } from "./chat/ConversationTurn";
+import { BotQaListView, extractBotQaEntries, stripInjectedMemoryContext } from "./bots/BotQaListView";
 import { usePagedTimeline } from "./use-paged-timeline";
 import { TimelineBodyDialog } from "./TimelineBodyDialog";
 import { conversationTurns } from "./chat/conversation-turns";
@@ -10,10 +11,11 @@ import { supportsTrajectory } from "./workspace/dock-state";
 import { isProsperoBotSession, PROSPERO_BOT_SESSION_STORAGE_KEY, PROSPERO_BOT_TITLE } from "./workspace/session-presentation";
 import { createPortal } from "react-dom";
 import { notify } from "./notifications/notifications";
+import { AgyModelPicker, formatAgyEffortLabel } from "./workspace/AgyModelPicker";
 import { ModelSwitcher } from "./workspace/ModelSwitcher";
 import { modelSwitchSupported } from "./workspace/model-catalog";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type RefObject, type UIEvent } from "react";
-import { Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, FolderKanban, ListChecks, Paperclip, Send, Settings, ShieldAlert, Sparkles, Target, Trash2, UserRound, X, Workflow } from "lucide-react";
+import { AlignLeft, Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, FolderKanban, ListChecks, ListOrdered, Paperclip, Search, Send, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Target, Trash2, UserRound, X, Workflow } from "lucide-react";
 import type { AgentModeCatalog, AgentModel, DesktopSnapshot, JsonObject, SessionCreateInput, SessionInfo, SkillSuggestion } from "../../shared/types";
 import { defaultSessionLaunchAccountId, sessionLaunchAccounts, sessionLaunchWorkspaces } from "../../shared/session-launch-options";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -221,10 +223,13 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
             catalog.models.find((item) => item.isDefault) ??
             catalog.models[0];
           setEffort(
-            fallback?.defaultEffort ??
-              (catalog.currentEffort && fallback?.supportedEfforts.includes(catalog.currentEffort)
-                ? catalog.currentEffort
-                : fallback?.supportedEfforts[0]),
+            (fallback?.id === catalog.currentModel &&
+            catalog.currentEffort &&
+            fallback?.supportedEfforts.includes(catalog.currentEffort)
+              ? catalog.currentEffort
+              : undefined) ??
+              fallback?.defaultEffort ??
+              fallback?.supportedEfforts[0],
           );
           return fallback?.id;
         });
@@ -413,29 +418,44 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
               disabled={busy}
             />
           ) : (
-            launchModels.length > 0 && (
+            (launchModels.length > 0 || (agent === "agy" && launchModelsLoading)) && (
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="grid gap-1.5">
                   <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-model">
                     {t("模型", "Model")}
                   </label>
-                  <NativeSelect
-                    id="child-dispatch-model"
-                    value={model ?? ""}
-                    disabled={busy || launchModelsLoading}
-                    aria-label={t("模型", "Model")}
-                    onChange={(event) => {
-                      const nextModel = launchModels.find((item) => item.id === event.target.value);
-                      setModel(nextModel?.id);
-                      setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
-                    }}
-                  >
-                    {launchModels.map((item) => (
-                      <NativeSelectOption key={item.id} value={item.id}>
-                        {item.label}
-                      </NativeSelectOption>
-                    ))}
-                  </NativeSelect>
+                  {agent === "agy" ? (
+                    <AgyModelPicker
+                      id="child-dispatch-model"
+                      models={launchModels}
+                      value={model}
+                      effort={effort}
+                      loading={launchModelsLoading}
+                      disabled={busy || launchModelsLoading || launchModels.length === 0}
+                      onChange={(nextModel, nextEffort) => {
+                        setModel(nextModel);
+                        setEffort(nextEffort);
+                      }}
+                    />
+                  ) : (
+                    <NativeSelect
+                      id="child-dispatch-model"
+                      value={model ?? ""}
+                      disabled={busy || launchModelsLoading}
+                      aria-label={t("模型", "Model")}
+                      onChange={(event) => {
+                        const nextModel = launchModels.find((item) => item.id === event.target.value);
+                        setModel(nextModel?.id);
+                        setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
+                      }}
+                    >
+                      {launchModels.map((item) => (
+                        <NativeSelectOption key={item.id} value={item.id}>
+                          {item.label}
+                        </NativeSelectOption>
+                      ))}
+                    </NativeSelect>
+                  )}
                 </div>
                 {Boolean(selectedLaunchModel?.supportedEfforts.length) && (
                   <div className="grid gap-1.5">
@@ -451,7 +471,7 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
                     >
                       {selectedLaunchModel?.supportedEfforts.map((level) => (
                         <NativeSelectOption key={level} value={level}>
-                          {level}
+                          {agent === "agy" ? formatAgyEffortLabel(level) : level}
                         </NativeSelectOption>
                       ))}
                     </NativeSelect>
@@ -613,9 +633,16 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
             models.find((item) => item.isDefault) ??
             models[0];
           setEffort((currentEffort) =>
-            currentEffort && fallback?.supportedEfforts.includes(currentEffort)
+            (currentEffort && fallback?.supportedEfforts.includes(currentEffort)
               ? currentEffort
-              : fallback?.defaultEffort ?? fallback?.supportedEfforts[0],
+              : undefined) ??
+            (fallback?.id === catalog.currentModel &&
+            catalog.currentEffort &&
+            fallback?.supportedEfforts.includes(catalog.currentEffort)
+              ? catalog.currentEffort
+              : undefined) ??
+            fallback?.defaultEffort ??
+            fallback?.supportedEfforts[0],
           );
           return fallback?.id;
         });
@@ -797,9 +824,12 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
                 onChange={(event) => {
                   const next = event.target.value as ChildDispatchAgent;
                   setAgent(next);
+                  setSelection(undefined);
                   if (!useSource) {
                     setAccountId(defaultSessionLaunchAccountId(independentAccounts, next));
                     setModel(next === "codex" ? "gpt-6-astra" : undefined);
+                    setCustomModel("");
+                    setEffort(undefined);
                   }
                 }}
               >
@@ -845,30 +875,46 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
             />
           ) : (
             <div className="grid gap-3">
-              {launchModels.length > 0 && (
+              {(launchModels.length > 0 || (agent === "agy" && launchModelsLoading)) && (
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="grid gap-1.5">
                     <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-model">
                       {t("模型", "Model")}
                     </label>
-                    <NativeSelect
-                      id="master-config-model"
-                      value={model ?? ""}
-                      disabled={busy || launchModelsLoading}
-                      aria-label={t("模型", "Model")}
-                      onChange={(event) => {
-                        const nextModel = launchModels.find((item) => item.id === event.target.value);
-                        setModel(nextModel?.id ?? event.target.value);
-                        setCustomModel("");
-                        setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
-                      }}
-                    >
-                      {launchModels.map((item) => (
-                        <NativeSelectOption key={item.id} value={item.id}>
-                          {item.label} ({item.id})
-                        </NativeSelectOption>
-                      ))}
-                    </NativeSelect>
+                    {agent === "agy" ? (
+                      <AgyModelPicker
+                        id="master-config-model"
+                        models={launchModels}
+                        value={model}
+                        effort={effort}
+                        loading={launchModelsLoading}
+                        disabled={busy || launchModelsLoading || launchModels.length === 0}
+                        onChange={(nextModel, nextEffort) => {
+                          setModel(nextModel);
+                          setCustomModel("");
+                          setEffort(nextEffort);
+                        }}
+                      />
+                    ) : (
+                      <NativeSelect
+                        id="master-config-model"
+                        value={model ?? ""}
+                        disabled={busy || launchModelsLoading}
+                        aria-label={t("模型", "Model")}
+                        onChange={(event) => {
+                          const nextModel = launchModels.find((item) => item.id === event.target.value);
+                          setModel(nextModel?.id ?? event.target.value);
+                          setCustomModel("");
+                          setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
+                        }}
+                      >
+                        {launchModels.map((item) => (
+                          <NativeSelectOption key={item.id} value={item.id}>
+                            {item.label} ({item.id})
+                          </NativeSelectOption>
+                        ))}
+                      </NativeSelect>
+                    )}
                   </div>
                   {Boolean(selectedLaunchModel?.supportedEfforts.length) && (
                     <div className="grid gap-1.5">
@@ -884,7 +930,7 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
                       >
                         {selectedLaunchModel?.supportedEfforts.map((level) => (
                           <NativeSelectOption key={level} value={level}>
-                            {level}
+                            {agent === "agy" ? formatAgyEffortLabel(level) : level}
                           </NativeSelectOption>
                         ))}
                       </NativeSelect>
@@ -989,8 +1035,25 @@ const TurnCardBody = memo(function TurnCardBody({
   return <ConversationTurn event={event} projectRoot={projectRoot} renderEvent={renderTurnEvent} />;
 });
 
-export function stripInjectedMemoryContext(raw: string): string {
-  return raw.replace(/\n*<prospero_memory_context>[\s\S]*?(?:<\/prospero_memory_context>|$)\s*/g, "").trim();
+export { stripInjectedMemoryContext } from "./bots/BotQaListView";
+
+const BOT_CHAT_VIEW_STORAGE_KEY = "prospero.botChatViewMode";
+
+function readBotChatViewMode(): "qa" | "timeline" {
+  try {
+    const value = typeof localStorage !== "undefined" ? localStorage.getItem(BOT_CHAT_VIEW_STORAGE_KEY) : null;
+    return value === "timeline" ? "timeline" : "qa";
+  } catch {
+    return "qa";
+  }
+}
+
+function writeBotChatViewMode(mode: "qa" | "timeline"): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(BOT_CHAT_VIEW_STORAGE_KEY, mode);
+  } catch {
+    // ignore storage unavailability in restricted contexts
+  }
 }
 
 const EventCardBody = memo(function EventCardBody(props: EventProps) {
@@ -1035,7 +1098,10 @@ const EventCardBody = memo(function EventCardBody(props: EventProps) {
 type TimelineItemProps = Omit<EventProps, "event"> & { item: ChatTimelineItem };
 const EventCard = memo(function EventCard(props: EventProps) {
   const { t } = useLocale();
-  return <><EventCardBody {...props} />{props.event.hasMore === true && Boolean(props.event.bodyRecordId) && !["tool.start", "tool.end"].includes(text(props.event.kind)) && <Button variant="outline" size="sm" onClick={() => props.openOutput(text(props.event.bodyRecordId), t("完整内容", "Full content"))}><ExternalLink data-icon="inline-start" />{t("查看完整内容", "Read full content")}</Button>}</>;
+  const isMemoryContextTruncatedUserMsg =
+    text(props.event.kind) === "user.message" &&
+    text(props.event.text).includes("<prospero_memory_context>");
+  return <><EventCardBody {...props} />{props.event.hasMore === true && Boolean(props.event.bodyRecordId) && !["tool.start", "tool.end"].includes(text(props.event.kind)) && !isMemoryContextTruncatedUserMsg && <Button variant="outline" size="sm" onClick={() => props.openOutput(text(props.event.bodyRecordId), t("完整内容", "Full content"))}><ExternalLink data-icon="inline-start" />{t("查看完整内容", "Read full content")}</Button>}</>;
 });
 const TimelineItem = memo(function TimelineItem({ item, ...props }: TimelineItemProps) {
   const kind = text(item.event.kind);
@@ -1058,7 +1124,13 @@ const TrajectoryFeed = memo(function TrajectoryFeed({ items, resolutions, ...pro
   </div>;
 });
 
-export type ChatBotContext = { name: string; avatar: string; description?: string | undefined };
+export type ChatBotContext = {
+  name: string;
+  avatar: string;
+  description?: string | undefined;
+  channel?: "desktop" | "feishu_p2p" | "feishu_group" | undefined;
+  speakerNames?: Readonly<Record<string, string>> | undefined;
+};
 type StarterProjectChip = { path: string; name: string };
 type ConversationTimelineSectionProps = {
   sessionId: string;
@@ -1359,6 +1431,13 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
   const [attaching, setAttaching] = useState(false); const [attachmentProgress, setAttachmentProgress] = useState<{ current: number; total: number }>(); const attachingRef = useRef(false); const attachmentBatchRef = useRef(0);
   const [skills, setSkills] = useState<SkillSuggestion[]>([]); const [activeSkillIndex, setActiveSkillIndex] = useState(-1); const skillLookupRef = useRef(0); const skillListId = useId();
   const [modes, setModes] = useState<AgentModeCatalog>(); const [modeBusy, setModeBusy] = useState(false);
+  const [approvalBusy, setApprovalBusy] = useState(false);
+  const [optimisticApprovalPolicy, setOptimisticApprovalPolicy] = useState<"strict" | "standard" | "yolo">();
+  const sessionApprovalPolicy: "strict" | "standard" | "yolo" =
+    optimisticApprovalPolicy ??
+    (session.approvalPolicy === "strict" || session.approvalPolicy === "yolo"
+      ? session.approvalPolicy
+      : "standard");
   const [operationError, setOperationError] = useState<string>(); const [legacyConnectionError, setConnectionError] = useState<string>();
   const connectionError = paged.enabled ? paged.state.error : legacyConnectionError;
   const [detail, setDetail] = useState<{ title: string; content: string; loading?: boolean; truncated?: boolean }>(); const detailRequest = useRef(0); const fileInput = useRef<HTMLInputElement>(null);
@@ -1372,8 +1451,18 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
   const jumpCompleted = useCallback(() => setPendingJumpKey(undefined), []);
   const deepseek = supportsTrajectory(session);
   const isBotSession = !inBotMode && isProsperoBotSession(session);
+  const isFeishuBotThread =
+    inBotMode && (botContext?.channel === "feishu_group" || botContext?.channel === "feishu_p2p");
   const hasComposerOptions = !inBotMode || Boolean(modes?.modes.length) || Boolean(onOpenGoal);
   const displayItems = useMemo(() => conversationTurns(timeline.items, timeline.resolutions), [timeline]);
+  const [botViewMode, setBotViewMode] = useState<"qa" | "timeline">(() => readBotChatViewMode());
+  const [qaSearch, setQaSearch] = useState("");
+  useEffect(() => { setQaSearch(""); }, [session.id]);
+  const updateBotViewMode = useCallback((mode: "qa" | "timeline"): void => {
+    setBotViewMode(mode);
+    writeBotChatViewMode(mode);
+  }, []);
+  const qaCount = useMemo(() => (inBotMode ? extractBotQaEntries(displayItems).length : 0), [displayItems, inBotMode]);
   const starterProjects = useMemo<StarterProjectChip[]>(() => {
     if (!isBotSession || displayItems.length > 0 || !snapshot?.projects.length) return [];
     return snapshot.projects.slice(0, 6).map((project) => ({
@@ -1438,6 +1527,9 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
       : (pending?.sessionId === current.sessionId ? pending.attachments : EMPTY_ATTACHMENTS);
     saveChatSessionDraft(current.sessionId, { text: textValue, attachments: attachmentItems }, true);
   }, []);
+  useEffect(() => {
+    setOptimisticApprovalPolicy(undefined);
+  }, [session.id, session.approvalPolicy]);
   useEffect(() => {
     let active = true;
     setTimeline(accumulator.current!.reset([]));
@@ -1600,6 +1692,20 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
   };
   const chooseSkill = (skill: SkillSuggestion): void => { skillLookupRef.current += 1; setDraft((current) => current.replace(/(?:^|\s)\$[^\s]*$/, (match) => `${match.startsWith(" ") ? " " : ""}$${skill.value} `)); setSkills([]); setActiveSkillIndex(-1); };
   const setMode = async (mode: string): Promise<void> => { setModeBusy(true); try { const result = await window.prospero.setAgentMode(session.id, mode); setModes((current) => current ? { ...current, currentMode: result.currentMode } : current); setOperationError(undefined); } catch (reason) { setOperationError(reportError(reason)); } finally { setModeBusy(false); } };
+  const setApprovalPolicy = async (policy: "strict" | "standard" | "yolo"): Promise<void> => {
+    if (policy === sessionApprovalPolicy) return;
+    setApprovalBusy(true);
+    setOptimisticApprovalPolicy(policy);
+    try {
+      await window.prospero.interact(session.id, { type: "approval.policy.set", policy });
+      setOperationError(undefined);
+    } catch (reason) {
+      setOptimisticApprovalPolicy(undefined);
+      setOperationError(reportError(reason));
+    } finally {
+      setApprovalBusy(false);
+    }
+  };
   const queueAction = async (queueId: string, action: "remove" | "guide"): Promise<void> => {
     if (queueBusyRef.current.has(queueId)) return;
     queueBusyRef.current.add(queueId);
@@ -1657,6 +1763,38 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
       setOperationError(reportError(reason));
     }
   }, [session.id]);
+  const renderQaActivityEvent = useCallback(
+    (entry: JsonObject, completed: boolean) => (
+      <TurnEntryCard
+        entry={entry}
+        activity
+        turnCompleted={completed}
+        projectRoot={undefined}
+        sessionId={session.id}
+        onError={setOperationError}
+        openOutput={openOutput}
+        openSubagent={openSubagent}
+        onOpenSession={openSessionHandler}
+      />
+    ),
+    [openOutput, openSessionHandler, openSubagent, session.id],
+  );
+  const renderQaOutcomeEvent = useCallback(
+    (entry: JsonObject, completed: boolean, isResolved: boolean) => (
+      <EventCard
+        event={entry}
+        isResolved={isResolved}
+        streaming={!completed}
+        projectRoot={undefined}
+        sessionId={session.id}
+        onError={setOperationError}
+        openOutput={openOutput}
+        openSubagent={openSubagent}
+        onOpenSession={openSessionHandler}
+      />
+    ),
+    [openOutput, openSessionHandler, openSubagent, session.id],
+  );
   const handleComposerPaste = (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
     const files = event.clipboardData?.files;
     if (!files?.length || event.clipboardData.getData("text/plain")) return;
@@ -1678,7 +1816,7 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
     if (action === "selectSkill") chooseSkill(skills[activeSkillIndex] ?? skills[0]!);
     if (action === "send") void send();
   };
-  return <div className="chat-pane flex size-full min-h-0 flex-col bg-background" style={{ "--conversation-font-size": `${fontSize}px` } as CSSProperties}>
+  return <div className="chat-pane flex size-full min-h-0 flex-col bg-background" data-bot-view={inBotMode && botViewMode === "qa" ? "qa" : undefined} style={{ "--conversation-font-size": `${fontSize}px` } as CSSProperties}>
     {bodyDetail?.sessionId === session.id && <TimelineBodyDialog key={`${session.id}:${bodyDetail.id}`} sessionId={session.id} recordId={bodyDetail.id} title={bodyDetail.title} onClose={() => setBodyDetail(undefined)} />}
     {isBotSession && (
       <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/25 px-3 py-1.5" data-testid="master-session-config-bar">
@@ -1709,43 +1847,161 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
         </div>
       </div>
     )}
-    {paged.enabled && <div className="flex flex-wrap items-center justify-center gap-2 px-6 py-2" aria-label={t("会话历史分页", "Conversation history pages")}>
+    {!inBotMode && paged.enabled && <div className="flex flex-wrap items-center justify-center gap-2 px-6 py-2" aria-label={t("会话历史分页", "Conversation history pages")}>
       {paged.state.page?.older && <Button variant="outline" size="sm" disabled={paged.state.loading} onClick={() => void paged.controller.older()}>{t("查看更早记录", "Older records")}</Button>}
       {paged.state.page?.newer && <Button variant="outline" size="sm" disabled={paged.state.loading} onClick={() => void paged.controller.newer()}>{t("查看较新记录", "Newer records")}</Button>}
       {!paged.state.live && <Button size="sm" disabled={paged.state.loading} onClick={jumpToLatest}>{t("回到最新", "Jump to latest")}</Button>}
       {paged.state.loading && <Spinner />}
       {paged.state.error && <Button variant="outline" size="sm" onClick={() => void paged.controller.retry()}>{t("重新读取", "Reload")}</Button>}
     </div>}
+    {inBotMode && botContext && (
+      <div className="bot-qa-toolbar" data-testid="bot-chat-view-toolbar">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground">
+            {qaCount > 0
+              ? t(`共 ${String(qaCount)} 组问答`, `${String(qaCount)} Q&A turns`)
+              : t("问答视图", "Q&A view")}
+          </span>
+          {botViewMode === "qa" && qaCount > 0 && (
+            <div className="bot-qa-search">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={qaSearch}
+                onChange={(event) => setQaSearch(event.target.value)}
+                placeholder={t("筛选提问或回答…", "Filter Q&A…")}
+                className="h-7 pl-7 pr-6 text-xs"
+                aria-label={t("筛选问答", "Filter Q&A")}
+              />
+              {qaSearch && (
+                <button
+                  type="button"
+                  aria-label={t("清空筛选", "Clear filter")}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                  onClick={() => setQaSearch("")}
+                >
+                  <X className="size-3" />
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {paged.enabled && (
+            <div className="flex flex-wrap items-center gap-1.5" aria-label={t("会话历史分页", "Conversation history pages")}>
+              {paged.state.page?.older && (
+                <Button variant="outline" size="xs" disabled={paged.state.loading} onClick={() => void paged.controller.older()}>
+                  {t("更早记录", "Older")}
+                </Button>
+              )}
+              {paged.state.page?.newer && (
+                <Button variant="outline" size="xs" disabled={paged.state.loading} onClick={() => void paged.controller.newer()}>
+                  {t("较新记录", "Newer")}
+                </Button>
+              )}
+              {!paged.state.live && (
+                <Button variant="outline" size="xs" disabled={paged.state.loading} onClick={jumpToLatest}>
+                  {t("回到最新", "Latest")}
+                </Button>
+              )}
+              {paged.state.loading && <Spinner className="size-3.5" />}
+              {paged.state.error && (
+                <Button variant="outline" size="xs" onClick={() => void paged.controller.retry()}>
+                  {t("重新读取", "Reload")}
+                </Button>
+              )}
+            </div>
+          )}
+          <div className="bot-qa-mode-switch" role="tablist" aria-label={t("会话展示模式", "Conversation display mode")}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={botViewMode === "qa"}
+              className="bot-qa-mode-btn"
+              data-active={botViewMode === "qa" ? "true" : "false"}
+              onClick={() => updateBotViewMode("qa")}
+            >
+              <ListOrdered className="size-3.5" />
+              <span>{t("问答列表", "Q&A List")}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={botViewMode === "timeline"}
+              className="bot-qa-mode-btn"
+              data-active={botViewMode === "timeline" ? "true" : "false"}
+              onClick={() => updateBotViewMode("timeline")}
+            >
+              <AlignLeft className="size-3.5" />
+              <span>{t("完整时间线", "Timeline")}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
     {deepseek && trajectoryHost && createPortal(<TrajectoryFeed key={session.id} items={timeline.items} resolutions={timeline.resolutions} sessionId={session.id} projectRoot={inBotMode ? undefined : session.cwd} onError={setOperationError} openOutput={openOutput} openSubagent={openSubagent} onOpenSession={openSessionHandler} />, trajectoryHost)}
-    <ConversationTimelineSection
-      sessionId={session.id}
-      sessionAgent={session.agent}
-      projectRoot={inBotMode ? undefined : session.cwd}
-      isBotSession={isBotSession}
-      botContext={botContext}
-      starterProjects={starterProjects}
-      onSelectStarterProject={handleSelectStarterProject}
-      displayItems={displayItems}
-      resolutions={timeline.resolutions}
-      nextOrdinal={timeline.nextOrdinal}
-      pagedEnabled={paged.enabled}
-      pagedLive={paged.state.live}
-      historyCursor={historyCursor}
-      selectHistoryCursor={selectHistoryCursor}
-      jumpToLatest={jumpToLatest}
-      handleTimelineScroll={handleTimelineScroll}
-      timelineViewport={timelineViewport}
-      pendingJumpKey={pendingJumpKey}
-      setPendingJumpKey={setPendingJumpKey}
-      jumpCompleted={jumpCompleted}
-      onError={setOperationError}
-      openOutput={openOutput}
-      openSubagent={openSubagent}
-      onOpenSession={openSessionHandler}
-    />
-    <div className="chat-composer-shell"><div className="chat-composer-inner flex flex-col gap-2">{connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}{operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}{messageQueue.length > 0 && <section className="grid gap-2 rounded-xl border bg-muted/35 p-3" aria-label={t("待发送消息", "Queued messages")} aria-live="polite"><header className="flex flex-wrap items-center justify-between gap-2"><strong className="flex items-center gap-2 text-sm"><Clock3 className="size-4" />{t("待发送", "Queued")} · {messageQueue.length}</strong><span className="text-xs text-muted-foreground">{t("当前轮结束后依次发送", "Sent in order after the current turn")}</span></header><div className="grid max-h-52 gap-1.5 overflow-y-auto">{messageQueue.map((item) => <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background/80 px-2.5 py-2" key={item.id}><Badge variant="outline">{item.kind === "guide" ? t("引导", "Guide") : t("排队", "Queue")}</Badge><span className="min-w-0 flex-1 truncate text-sm" title={item.text}>{item.text || t(`${String(item.attachmentCount)} 张图片`, `${String(item.attachmentCount)} images`)}</span>{item.attachmentCount > 0 && <span className="flex items-center gap-1 text-xs text-muted-foreground"><FileImage className="size-3.5" />{item.attachmentCount}</span>}{item.kind !== "guide" && <Button variant="ghost" size="xs" aria-busy={queueBusy[item.id] === "guide"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "guide")}>{queueBusy[item.id] === "guide" ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{t("现在引导", "Guide now")}</Button>}<Button variant="ghost" size="icon-xs" aria-label={t("取消待发送消息", "Cancel queued message")} aria-busy={queueBusy[item.id] === "remove"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "remove")}>{queueBusy[item.id] === "remove" ? <Spinner /> : <Trash2 />}</Button></div>)}</div></section>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t(`图片 · ${(item.size / 1024 / 1024).toFixed(1)} MB · 等待发送`, `Image · ${(item.size / 1024 / 1024).toFixed(1)} MB · waiting to send`)}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
-      {attachmentProgress && <div className="flex items-center gap-2 text-xs text-muted-foreground" role="status"><Spinner />{t(`正在处理图片 ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`, `Processing image ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`)}</div>}
-      {hasComposerOptions && <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}>{!inBotMode && <CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) openSessionHandler?.(id); }} onError={setOperationError} />}{isBotSession && <MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} />}{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>}{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onPaste={handleComposerPaste} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={botContext ? t(`向 ${botContext.name} 发送消息；输入 $ 可调用技能…`, `Message ${botContext.name}; type $ to use a skill…`) : isBotSession ? t("向 Prospero Bot 发送全局指令，如“在某工作区派发会话完成某任务”…", "Ask Prospero Bot to dispatch tasks to any workspace…") : t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} />{isBotSession && !composerOptionsOpen && <><MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} /><CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) openSessionHandler?.(id); }} onError={setOperationError} /></>}{hasComposerOptions && <Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}<ChevronDown /></Button>}{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片（支持粘贴或拖拽，最多 6 张，单张 5 MB / 共 10 MB）", "Upload images (paste or drag, up to 6 images, 5 MB each / 10 MB total)")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send title={t("发送 (Enter 发送 · Shift + Enter 换行)", "Send (Enter to send · Shift + Enter for new line)")} onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup></div></div>
+    {inBotMode && botContext && botViewMode === "qa" ? (
+      <BotQaListView
+        botName={botContext.name}
+        botAvatar={botContext.avatar}
+        botDescription={botContext.description}
+        speakerNames={botContext.speakerNames}
+        displayItems={displayItems}
+        resolutions={timeline.resolutions}
+        nextOrdinal={timeline.nextOrdinal}
+        pagedEnabled={paged.enabled}
+        pagedLive={paged.state.live}
+        historyCursor={historyCursor}
+        selectHistoryCursor={selectHistoryCursor}
+        jumpToLatest={jumpToLatest}
+        handleTimelineScroll={handleTimelineScroll}
+        timelineViewport={timelineViewport}
+        searchQuery={qaSearch}
+        onClearSearch={() => setQaSearch("")}
+        onError={setOperationError}
+        openOutput={openOutput}
+        renderActivityEvent={renderQaActivityEvent}
+        renderOutcomeEvent={renderQaOutcomeEvent}
+      />
+    ) : (
+      <ConversationTimelineSection
+        sessionId={session.id}
+        sessionAgent={session.agent}
+        projectRoot={inBotMode ? undefined : session.cwd}
+        isBotSession={isBotSession}
+        botContext={botContext}
+        starterProjects={starterProjects}
+        onSelectStarterProject={handleSelectStarterProject}
+        displayItems={displayItems}
+        resolutions={timeline.resolutions}
+        nextOrdinal={timeline.nextOrdinal}
+        pagedEnabled={paged.enabled}
+        pagedLive={paged.state.live}
+        historyCursor={historyCursor}
+        selectHistoryCursor={selectHistoryCursor}
+        jumpToLatest={jumpToLatest}
+        handleTimelineScroll={handleTimelineScroll}
+        timelineViewport={timelineViewport}
+        pendingJumpKey={pendingJumpKey}
+        setPendingJumpKey={setPendingJumpKey}
+        jumpCompleted={jumpCompleted}
+        onError={setOperationError}
+        openOutput={openOutput}
+        openSubagent={openSubagent}
+        onOpenSession={openSessionHandler}
+      />
+    )}
+    {isFeishuBotThread ? (
+      (connectionError || operationError) && (
+        <div className="flex flex-col gap-2 border-t bg-background px-4 py-2">
+          {connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}
+          {operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}
+        </div>
+      )
+    ) : (
+      <div className="chat-composer-shell"><div className="chat-composer-inner flex flex-col gap-2">{connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}{operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}{messageQueue.length > 0 && <section className="grid gap-2 rounded-xl border bg-muted/35 p-3" aria-label={t("待发送消息", "Queued messages")} aria-live="polite"><header className="flex flex-wrap items-center justify-between gap-2"><strong className="flex items-center gap-2 text-sm"><Clock3 className="size-4" />{t("待发送", "Queued")} · {messageQueue.length}</strong><span className="text-xs text-muted-foreground">{t("当前轮结束后依次发送", "Sent in order after the current turn")}</span></header><div className="grid max-h-52 gap-1.5 overflow-y-auto">{messageQueue.map((item) => <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background/80 px-2.5 py-2" key={item.id}><Badge variant="outline">{item.kind === "guide" ? t("引导", "Guide") : t("排队", "Queue")}</Badge><span className="min-w-0 flex-1 truncate text-sm" title={item.text}>{item.text || t(`${String(item.attachmentCount)} 张图片`, `${String(item.attachmentCount)} images`)}</span>{item.attachmentCount > 0 && <span className="flex items-center gap-1 text-xs text-muted-foreground"><FileImage className="size-3.5" />{item.attachmentCount}</span>}{item.kind !== "guide" && <Button variant="ghost" size="xs" aria-busy={queueBusy[item.id] === "guide"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "guide")}>{queueBusy[item.id] === "guide" ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{t("现在引导", "Guide now")}</Button>}<Button variant="ghost" size="icon-xs" aria-label={t("取消待发送消息", "Cancel queued message")} aria-busy={queueBusy[item.id] === "remove"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "remove")}>{queueBusy[item.id] === "remove" ? <Spinner /> : <Trash2 />}</Button></div>)}</div></section>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t(`图片 · ${(item.size / 1024 / 1024).toFixed(1)} MB · 等待发送`, `Image · ${(item.size / 1024 / 1024).toFixed(1)} MB · waiting to send`)}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
+        {attachmentProgress && <div className="flex items-center gap-2 text-xs text-muted-foreground" role="status"><Spinner />{t(`正在处理图片 ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`, `Processing image ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`)}</div>}
+        {hasComposerOptions && <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}>{!inBotMode && <CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) openSessionHandler?.(id); }} onError={setOperationError} />}{isBotSession && <MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} />}{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{!inBotMode && !isBotSession && session.kind === "structured" && !session.archived && <ToggleGroup value={[sessionApprovalPolicy]} onValueChange={(values) => { const next = values[0]; if (next === "strict" || next === "standard" || next === "yolo") void setApprovalPolicy(next); }} disabled={approvalBusy} variant="outline" size="sm" aria-label={t("审批策略", "Approval policy")}><ToggleGroupItem value="strict" title={t("严格审批：所有工具与命令均需确认（含只读）", "Strict: ask before all tools and commands, including read-only")}><Shield />{t("严格审批", "Strict")}</ToggleGroupItem><ToggleGroupItem value="standard" title={t("分级审批：工作区只读免批，修改/敏感/高危命令才批", "Tiered: auto-allow safe read-only workspace actions; confirm edits, sensitive paths, and risky commands")}><ShieldCheck />{t("只读免批", "Tiered")}</ToggleGroupItem><ToggleGroupItem value="yolo" title={t("全自动（高风险）：跳过所有审批弹窗", "Auto (high risk): approve all tool calls automatically")}><ShieldAlert />{t("全自动", "Auto")}</ToggleGroupItem></ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>}{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onPaste={handleComposerPaste} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={botContext ? t(`向 ${botContext.name} 发送消息；输入 $ 可调用技能…`, `Message ${botContext.name}; type $ to use a skill…`) : isBotSession ? t("向 Prospero Bot 发送全局指令，如“在某工作区派发会话完成某任务”…", "Ask Prospero Bot to dispatch tasks to any workspace…") : t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} />{isBotSession && !composerOptionsOpen && <><MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} /><CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) openSessionHandler?.(id); }} onError={setOperationError} /></>}{hasComposerOptions && <Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}{!inBotMode && !isBotSession && session.kind === "structured" && sessionApprovalPolicy !== "standard" && <span> · {sessionApprovalPolicy === "strict" ? t("严格", "Strict") : t("全自动", "Auto")}</span>}<ChevronDown /></Button>}{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片（支持粘贴或拖拽，最多 6 张，单张 5 MB / 共 10 MB）", "Upload images (paste or drag, up to 6 images, 5 MB each / 10 MB total)")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send title={t("发送 (Enter 发送 · Shift + Enter 换行)", "Send (Enter to send · Shift + Enter for new line)")} onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup></div></div>
+    )}
     <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open) closeDetail(); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{detail?.title}</DialogTitle><DialogDescription>{t("可选择部分内容，或复制全部已显示内容。", "Select part of the output, or copy all displayed content.")}</DialogDescription></DialogHeader>{detail?.loading ? <div className="flex items-center justify-center gap-2 py-16 text-muted-foreground"><Spinner />{t("正在读取…", "Loading…")}</div> : <>{detail?.truncated && <Alert><CircleAlert /><AlertTitle>{t("输出已截断", "Output truncated")}</AlertTitle><AlertDescription>{t("daemon 仅保留了这次工具输出的前 200,000 个字符。", "The daemon retained only the first 200,000 characters of this tool output.")}</AlertDescription></Alert>}<pre className="terminal-output-text max-h-[60vh] overflow-auto rounded-lg bg-muted p-4 text-xs leading-relaxed">{detail?.content}</pre></>}<DialogFooter>{detail?.content && <Button variant="outline" onClick={() => void window.prospero.writeClipboard(detail.content)}><Copy data-icon="inline-start" />{t("复制", "Copy")}</Button>}<Button variant="outline" onClick={closeDetail}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }

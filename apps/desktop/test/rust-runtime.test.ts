@@ -31,6 +31,14 @@ it.each(["strict", "standard", "yolo"] as const)("forwards the %s policy when cr
   expect(createTerminal).toHaveBeenCalledWith(expect.objectContaining({ approvalPolicy, accountId: "native-codex" }), expect.any(AbortSignal), 180_000);
 });
 
+it.each(["strict", "standard", "yolo"] as const)("forwards the %s policy when creating a Rust structured session", async approvalPolicy => {
+  const createAgentSession = vi.fn(async (input: Record<string, unknown>) => ({ id: "structured", agent: "claude", kind: "structured", title: "Claude", workspace: "/project", lifecycle: "active", status: "idle", createdAt: 1, updatedAt: 1, revision: 1, ...input }));
+  const runtime = new RustRuntime({ backend: "api" } as StateStore, "/synthetic/prosperod", "/synthetic/daemon");
+  Object.assign(runtime, { connection: { client: { createAgentSession } }, refresh: async () => undefined });
+  await runtime.request("/_prospero/control/session/create", { method: "POST", body: { kind: "structured", agent: "claude", cwd: "/project", approvalPolicy } });
+  expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ approvalPolicy, autoApprove: approvalPolicy === "yolo" }), expect.any(AbortSignal), 180_000);
+});
+
 function health(buildId: string, activeRuntimeSessions = 0): Record<string, unknown> {
   return {
     apiVersion: 1,

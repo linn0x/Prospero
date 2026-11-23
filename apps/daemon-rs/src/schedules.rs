@@ -637,6 +637,12 @@ impl Schedules {
                     title: task.name.clone(),
                     workspace: task.cwd.clone(),
                     auto_approve: task.approval_policy == "yolo" || task.approval_policy == "auto",
+                    approval_policy: match task.approval_policy.as_str() {
+                        "strict" => Some(crate::protocol::TerminalApprovalPolicy::Strict),
+                        "standard" => Some(crate::protocol::TerminalApprovalPolicy::Standard),
+                        "yolo" | "auto" => Some(crate::protocol::TerminalApprovalPolicy::Yolo),
+                        _ => None,
+                    },
                     mode: task.mode.clone(),
                     model: task.model.clone(),
                     effort: task.reasoning_effort.clone(),

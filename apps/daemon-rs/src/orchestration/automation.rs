@@ -378,7 +378,7 @@ mod tests {
             let session=if hosted {
                 store.create_session(crate::protocol::CreateSession{agent:AgentKind::Claude,kind:SessionKind::Structured,title:"hosted placeholder".into(),workspace:"/tmp".into()})?
             }else{
-                store.create_agent_session(crate::agent::CreateAgentSession{agent:AgentKind::Claude,title:"direct worker".into(),workspace:"/tmp".into(),auto_approve:false,mode:None,model:None,effort:None,agent_preset:None,account_id:None,resume:None},crate::agent::ApprovalPolicy::Manual)?
+                store.create_agent_session(crate::agent::CreateAgentSession{agent:AgentKind::Claude,title:"direct worker".into(),workspace:"/tmp".into(),auto_approve:false,approval_policy:None,mode:None,model:None,effort:None,agent_preset:None,account_id:None,resume:None},crate::agent::ApprovalPolicy::Standard)?
             };
             let dispatch=store.dispatch_task(&task.id,&session.id,None,None)?.dispatch;
             let identity=if hosted {

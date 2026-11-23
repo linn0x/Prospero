@@ -2665,6 +2665,7 @@ async fn handle_request(
         respond_result(writer, rpc_id, approval_response(kind, true, params)).await;
         return;
     }
+    let target = super::approval::classify_codex(method, params);
     let (reply, reply_rx) = oneshot::channel();
     if events
         .send(AdapterEvent::Permission {
@@ -2672,6 +2673,7 @@ async fn handle_request(
             request_id: item_id,
             tool,
             summary: format!("{action}:{subject}"),
+            target,
             reply,
         })
         .await

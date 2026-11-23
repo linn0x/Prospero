@@ -7,23 +7,50 @@ use crate::protocol::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
-    Manual,
+    Strict,
+    Standard,
     Auto,
 }
 
 impl ApprovalPolicy {
     fn label(self) -> &'static str {
         match self {
-            ApprovalPolicy::Manual => "manual",
+            ApprovalPolicy::Strict => "strict",
+            ApprovalPolicy::Standard => "standard",
             ApprovalPolicy::Auto => "auto",
         }
     }
 
     pub(crate) fn from_wire(value: &str) -> Result<Self> {
         match value {
-            "strict" | "standard" | "manual" => Ok(ApprovalPolicy::Manual),
+            "strict" => Ok(ApprovalPolicy::Strict),
+            "standard" | "manual" => Ok(ApprovalPolicy::Standard),
             "yolo" | "auto" => Ok(ApprovalPolicy::Auto),
             _ => Err(Error::Invalid("审批策略无效".into())),
+        }
+    }
+
+    pub(crate) fn to_terminal_policy(self) -> TerminalApprovalPolicy {
+        match self {
+            ApprovalPolicy::Strict => TerminalApprovalPolicy::Strict,
+            ApprovalPolicy::Standard => TerminalApprovalPolicy::Standard,
+            ApprovalPolicy::Auto => TerminalApprovalPolicy::Yolo,
+        }
+    }
+
+    pub(crate) fn as_u8(self) -> u8 {
+        match self {
+            ApprovalPolicy::Strict => 0,
+            ApprovalPolicy::Standard => 1,
+            ApprovalPolicy::Auto => 2,
+        }
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => ApprovalPolicy::Standard,
+            2 => ApprovalPolicy::Auto,
+            _ => ApprovalPolicy::Strict,
         }
     }
 }
@@ -1255,10 +1282,7 @@ impl Store {
                 }),
                 model: model.clone(),
                 effort: effort.clone(),
-                approval_policy: Some(match policy {
-                    ApprovalPolicy::Manual => TerminalApprovalPolicy::Standard,
-                    ApprovalPolicy::Auto => TerminalApprovalPolicy::Yolo,
-                }),
+                approval_policy: Some(policy.to_terminal_policy()),
             },
             |tx, head| {
                 tx.execute(
@@ -1402,7 +1426,8 @@ impl Store {
             .optional()?
             .ok_or(Error::NotFound)?;
         let policy = match row.2.as_str() {
-            "manual" => ApprovalPolicy::Manual,
+            "strict" => ApprovalPolicy::Strict,
+            "standard" | "manual" => ApprovalPolicy::Standard,
             "auto" => ApprovalPolicy::Auto,
             _ => return Err(Error::Schema),
         };
@@ -1444,11 +1469,7 @@ impl Store {
         if !run.active {
             return Err(Error::Conflict);
         }
-        let head_policy = if policy == ApprovalPolicy::Auto {
-            TerminalApprovalPolicy::Yolo
-        } else {
-            TerminalApprovalPolicy::Standard
-        };
+        let head_policy = policy.to_terminal_policy();
         self.update_session_metadata_with(
             id,
             |head| head.approval_policy = Some(head_policy),
@@ -1536,9 +1557,10 @@ impl Store {
                     || agent == "codex"
                     || agent == "deepseek"
                     || agent == "opencode"
-                    || agent == "pi")
+                    || agent == "pi"
+                    || agent == "agy")
                     && !profile_bound,
-                mode: (agent == "claude" || agent == "codex") && !profile_bound,
+                mode: (agent == "claude" || agent == "codex" || agent == "agy") && !profile_bound,
                 current_model: row.get(3)?,
                 current_effort: row.get(4)?,
                 current_mode: Some(mode),
@@ -2074,6 +2096,7 @@ mod tests {
                     title: "metadata".into(),
                     workspace: "/synthetic".into(),
                     auto_approve: false,
+                    approval_policy: None,
                     mode: None,
                     model: Some("gpt-test".into()),
                     effort: Some("medium".into()),
@@ -2081,7 +2104,7 @@ mod tests {
                     account_id: None,
                     resume: None,
                 },
-                ApprovalPolicy::Manual,
+                ApprovalPolicy::Standard,
             )
             .unwrap();
         let updated = store.session(&head.id).unwrap();
@@ -2106,6 +2129,159 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts_revision, 3);
+    }
+
+    #[test]
+    fn approval_policy_tiers_and_legacy_manual_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let head = store
+            .create_agent_session(
+                CreateAgentSession {
+                    agent: AgentKind::Claude,
+                    title: "tiered".into(),
+                    workspace: "/synthetic".into(),
+                    auto_approve: false,
+                    approval_policy: Some(TerminalApprovalPolicy::Strict),
+                    mode: None,
+                    model: None,
+                    effort: None,
+                    agent_preset: None,
+                    account_id: None,
+                    resume: None,
+                },
+                ApprovalPolicy::Strict,
+            )
+            .unwrap();
+        assert_eq!(head.approval_policy, Some(TerminalApprovalPolicy::Strict));
+        assert_eq!(
+            store.agent_run(&head.id).unwrap().policy,
+            ApprovalPolicy::Strict
+        );
+
+        store
+            .set_approval_policy(&head.id, ApprovalPolicy::Standard)
+            .unwrap();
+        assert_eq!(
+            store.session(&head.id).unwrap().approval_policy,
+            Some(TerminalApprovalPolicy::Standard)
+        );
+        assert_eq!(
+            store.agent_run(&head.id).unwrap().policy,
+            ApprovalPolicy::Standard
+        );
+
+        store
+            .set_approval_policy(&head.id, ApprovalPolicy::Auto)
+            .unwrap();
+        assert_eq!(
+            store.session(&head.id).unwrap().approval_policy,
+            Some(TerminalApprovalPolicy::Yolo)
+        );
+        assert_eq!(
+            store.agent_run(&head.id).unwrap().policy,
+            ApprovalPolicy::Auto
+        );
+
+        // Legacy `'manual'` row stored before upgrade must decode cleanly as Standard.
+        store
+            .connection
+            .execute(
+                "UPDATE agent_runs SET approval_policy='manual' WHERE session_id=?1",
+                [&head.id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.agent_run(&head.id).unwrap().policy,
+            ApprovalPolicy::Standard
+        );
+    }
+
+    #[test]
+    fn agent_runs_approval_upgrade_prunes_orphaned_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid_id = {
+            let mut store = Store::open(directory.path()).unwrap();
+            let head = store
+                .create_agent_session(
+                    CreateAgentSession {
+                        agent: AgentKind::Claude,
+                        title: "valid".into(),
+                        workspace: "/synthetic".into(),
+                        auto_approve: false,
+                        approval_policy: Some(TerminalApprovalPolicy::Standard),
+                        mode: None,
+                        model: None,
+                        effort: None,
+                        agent_preset: None,
+                        account_id: None,
+                        resume: None,
+                    },
+                    ApprovalPolicy::Standard,
+                )
+                .unwrap();
+
+            // Simulate a legacy DB table lacking `'strict'`/`'standard'` plus a dangling
+            // pre-FK orphaned row in `agent_runs`.
+            store
+                .connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                    DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_insert;
+                    DROP TRIGGER IF EXISTS orch_dispatch_legacy_unknown_update;
+                    CREATE TABLE agent_runs_legacy (
+                        session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
+                        agent TEXT NOT NULL CHECK(agent IN ('claude','codex','deepseek','opencode','pi','agy')),
+                        active INTEGER NOT NULL CHECK(active IN (0,1)),
+                        approval_policy TEXT NOT NULL CHECK(approval_policy IN ('manual','auto')),
+                        turn INTEGER NOT NULL DEFAULT 0 CHECK(turn >= 0),
+                        native_id TEXT CHECK(native_id IS NULL OR length(native_id) <= 256),
+                        permission_mode TEXT NOT NULL DEFAULT 'default' CHECK(permission_mode IN ('default','plan')),
+                        model TEXT,
+                        effort TEXT,
+                        account_id TEXT,
+                        agent_preset TEXT,
+                        execution_unknown INTEGER NOT NULL DEFAULT 0 CHECK(execution_unknown IN (0,1))
+                    ) STRICT;
+                    INSERT INTO agent_runs_legacy(
+                        session_id,agent,active,approval_policy,turn,native_id,
+                        permission_mode,model,effort,account_id,agent_preset,execution_unknown
+                    ) VALUES (?1,'claude',1,'manual',0,NULL,'default',NULL,NULL,NULL,NULL,0),
+                             ('orphan-missing-head','claude',0,'auto',0,NULL,'default',NULL,NULL,NULL,NULL,0);
+                    DROP TABLE agent_runs;
+                    ALTER TABLE agent_runs_legacy RENAME TO agent_runs;
+                    PRAGMA foreign_keys=ON;"
+                        .replace("?1", &format!("'{}'", head.id))
+                        .as_str(),
+                )
+                .unwrap();
+            head.id
+        };
+
+        let reopened = Store::open(directory.path()).unwrap();
+        let upgraded_sql: String = reopened
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='agent_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(upgraded_sql.contains("'strict'"));
+        assert!(upgraded_sql.contains("'standard'"));
+        assert_eq!(
+            reopened.agent_run(&valid_id).unwrap().policy,
+            ApprovalPolicy::Standard
+        );
+        let orphan_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE session_id='orphan-missing-head'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_count, 0);
     }
 
     #[test]
@@ -3553,5 +3729,74 @@ mod tests {
         assert!(combined.report.contains("result B"));
         // Previous unpopped queue entry was replaced so only one combined turn runs:
         assert!(store.message_queue(&parent).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agy_agent_controls_enable_model_and_mode_unless_profile_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let native_head = store
+            .create_agent_session(
+                CreateAgentSession {
+                    agent: AgentKind::Agy,
+                    title: "agy-native".into(),
+                    workspace: "/synthetic".into(),
+                    auto_approve: false,
+                    approval_policy: Some(TerminalApprovalPolicy::Standard),
+                    mode: None,
+                    model: Some("gemini-4-neon".into()),
+                    effort: Some("medium".into()),
+                    agent_preset: None,
+                    account_id: None,
+                    resume: None,
+                },
+                ApprovalPolicy::Standard,
+            )
+            .unwrap();
+
+        let controls = store.agent_controls().unwrap();
+        let native_controls = controls
+            .iter()
+            .find(|item| item.session_id == native_head.id)
+            .unwrap();
+        assert!(native_controls.model);
+        assert!(native_controls.mode);
+        assert!(!native_controls.compact);
+
+        let now = crate::database::now();
+        store
+            .connection
+            .execute(
+                "INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at,api_profile)
+                 VALUES('agy-gateway','agy','AGY Gateway',0,?1,?1,'{\"model\":\"custom-gw\"}')",
+                params![now],
+            )
+            .unwrap();
+        let bound_head = store
+            .create_agent_session(
+                CreateAgentSession {
+                    agent: AgentKind::Agy,
+                    title: "agy-bound".into(),
+                    workspace: "/synthetic".into(),
+                    auto_approve: false,
+                    approval_policy: Some(TerminalApprovalPolicy::Standard),
+                    mode: None,
+                    model: Some("custom-gw".into()),
+                    effort: None,
+                    agent_preset: None,
+                    account_id: Some("agy-gateway".into()),
+                    resume: None,
+                },
+                ApprovalPolicy::Standard,
+            )
+            .unwrap();
+
+        let controls = store.agent_controls().unwrap();
+        let bound_controls = controls
+            .iter()
+            .find(|item| item.session_id == bound_head.id)
+            .unwrap();
+        assert!(!bound_controls.model);
+        assert!(!bound_controls.mode);
     }
 }

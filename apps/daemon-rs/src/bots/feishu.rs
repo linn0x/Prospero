@@ -16,7 +16,8 @@ use super::pbbp2::{
 };
 use super::{
     BotFeishuProbeResult, BotFeishuRuntimeStatus, BotThreadChannel, BotsSupervisor,
-    FeishuConnectionState, FeishuDomain, FeishuGroupTrigger, FeishuMemoryTurnInput,
+    FeishuAccessPolicy, FeishuConnectionState, FeishuDomain, FeishuGroupTrigger,
+    FeishuMemoryTurnInput, FeishuThreadMetadata,
 };
 use crate::database::now;
 use crate::error::{Error, Result};
@@ -34,7 +35,9 @@ pub struct FeishuWorkerConfig {
     pub domain: FeishuDomain,
     pub app_id: String,
     pub app_secret: String,
+    #[allow(dead_code)]
     pub group_trigger: FeishuGroupTrigger,
+    #[allow(dead_code)]
     pub streaming_card: bool,
 }
 
@@ -765,24 +768,59 @@ fn strip_bot_mentions(text: &str, mentions: &[FeishuMention], bot_open_id: Optio
         .to_owned()
 }
 
+const MAX_TABLES_PER_CARD: usize = 5;
+
 pub(crate) fn build_card_json(title: &str, body_markdown: &str, footer: Option<&str>) -> Value {
     let truncated = truncate_chars(body_markdown, MAX_CARD_CHARS);
-    let mut elements = vec![json!({
-        "tag": "markdown",
-        "content": if truncated.trim().is_empty() { "…" } else { truncated.as_str() },
-    })];
-    if let Some(footer) = footer.filter(|text| !text.trim().is_empty()) {
+    let content = if truncated.trim().is_empty() {
+        "…"
+    } else {
+        truncated.as_str()
+    };
+    let elements = markdown_to_card_elements(content);
+    assemble_card_v2(title, elements, footer)
+}
+
+pub(crate) fn build_simple_markdown_card_json(
+    title: &str,
+    body_markdown: &str,
+    footer: Option<&str>,
+) -> Value {
+    let truncated = truncate_chars(body_markdown, MAX_CARD_CHARS);
+    let content = if truncated.trim().is_empty() {
+        "…"
+    } else {
+        truncated.as_str()
+    };
+    assemble_card_v2(
+        title,
+        vec![json!({
+            "tag": "markdown",
+            "content": content,
+        })],
+        footer,
+    )
+}
+
+fn assemble_card_v2(title: &str, mut elements: Vec<Value>, footer: Option<&str>) -> Value {
+    if elements.is_empty() {
         elements.push(json!({
-            "tag": "note",
-            "elements": [{
-                "tag": "plain_text",
-                "content": footer,
-            }]
+            "tag": "markdown",
+            "content": "…",
+        }));
+    }
+    if let Some(footer) = footer.map(str::trim).filter(|text| !text.is_empty()) {
+        elements.push(json!({ "tag": "hr" }));
+        elements.push(json!({
+            "tag": "markdown",
+            "text_size": "notation",
+            "content": format!("<font color='grey'>{}</font>", escape_markdown_html(footer)),
         }));
     }
     json!({
+        "schema": "2.0",
         "config": {
-            "wide_screen_mode": true,
+            "width_mode": "fill",
             "update_multi": true,
         },
         "header": {
@@ -791,8 +829,286 @@ pub(crate) fn build_card_json(title: &str, body_markdown: &str, footer: Option<&
                 "content": title,
             }
         },
-        "elements": elements,
+        "body": {
+            "elements": elements,
+        },
     })
+}
+
+fn escape_markdown_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn markdown_to_card_elements(markdown: &str) -> Vec<Value> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut elements: Vec<Value> = Vec::new();
+    let mut text_buf: Vec<&str> = Vec::new();
+    let mut table_count = 0usize;
+    let mut fence: Option<char> = None;
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        let trimmed = line.trim_start();
+        if let Some(marker) = fence {
+            text_buf.push(line);
+            if trimmed.starts_with(&marker.to_string().repeat(3)) {
+                fence = None;
+            }
+            idx += 1;
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            fence = Some('`');
+            text_buf.push(line);
+            idx += 1;
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            fence = Some('~');
+            text_buf.push(line);
+            idx += 1;
+            continue;
+        }
+
+        if let Some((table, next_idx)) = parse_gfm_table(&lines, idx) {
+            flush_markdown_buffer(&mut elements, &mut text_buf);
+            if table_count < MAX_TABLES_PER_CARD {
+                elements.push(table.into_card_element());
+                table_count += 1;
+            } else {
+                elements.push(json!({
+                    "tag": "markdown",
+                    "content": table.into_fallback_markdown(),
+                }));
+            }
+            idx = next_idx;
+            continue;
+        }
+
+        text_buf.push(line);
+        idx += 1;
+    }
+
+    flush_markdown_buffer(&mut elements, &mut text_buf);
+    elements
+}
+
+fn flush_markdown_buffer(elements: &mut Vec<Value>, buf: &mut Vec<&str>) {
+    if buf.is_empty() {
+        return;
+    }
+    let chunk = buf.join("\n");
+    buf.clear();
+    let trimmed = chunk.trim();
+    if !trimmed.is_empty() {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": trimmed,
+        }));
+    }
+}
+
+struct ParsedTable {
+    headers: Vec<String>,
+    alignments: Vec<&'static str>,
+    rows: Vec<Vec<String>>,
+}
+
+impl ParsedTable {
+    fn into_card_element(self) -> Value {
+        let col_count = self.headers.len();
+        let columns: Vec<Value> = self
+            .headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| {
+                let display_name = if header.trim().is_empty() {
+                    " ".to_owned()
+                } else {
+                    header.trim().to_owned()
+                };
+                let align = self.alignments.get(i).copied().unwrap_or("left");
+                json!({
+                    "name": format!("c{i}"),
+                    "display_name": display_name,
+                    "width": "auto",
+                    "data_type": "lark_md",
+                    "horizontal_align": align,
+                })
+            })
+            .collect();
+
+        let page_size = self.rows.len().clamp(1, 10);
+        let rows: Vec<Value> = self
+            .rows
+            .into_iter()
+            .map(|row| {
+                let mut obj = serde_json::Map::with_capacity(col_count);
+                for i in 0..col_count {
+                    let cell = row.get(i).cloned().unwrap_or_default();
+                    obj.insert(format!("c{i}"), Value::String(cell));
+                }
+                Value::Object(obj)
+            })
+            .collect();
+
+        json!({
+            "tag": "table",
+            "page_size": page_size,
+            "row_height": "auto",
+            "header_style": {
+                "text_align": "left",
+                "text_size": "normal",
+                "background_style": "grey",
+                "bold": true,
+            },
+            "columns": columns,
+            "rows": rows,
+        })
+    }
+
+    fn into_fallback_markdown(&self) -> String {
+        self.rows
+            .iter()
+            .map(|row| {
+                let pairs: Vec<String> = self
+                    .headers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, header)| {
+                        let val = row.get(i).map(String::as_str).unwrap_or("").trim();
+                        if val.is_empty() {
+                            return None;
+                        }
+                        let key = header.trim();
+                        if key.is_empty() {
+                            Some(val.to_owned())
+                        } else {
+                            Some(format!("**{key}**: {val}"))
+                        }
+                    })
+                    .collect();
+                format!("- {}", pairs.join(" · "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn parse_gfm_table(lines: &[&str], start: usize) -> Option<(ParsedTable, usize)> {
+    if start + 2 >= lines.len() {
+        return None;
+    }
+    let header_line = lines[start].trim();
+    let sep_line = lines[start + 1].trim();
+    if !header_line.contains('|') || !sep_line.contains('|') {
+        return None;
+    }
+    let headers = split_pipe_cells(header_line)?;
+    let alignments = parse_table_alignments(sep_line, headers.len())?;
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut cursor = start + 2;
+    while cursor < lines.len() {
+        let candidate = lines[cursor].trim();
+        if candidate.is_empty() || !candidate.contains('|') {
+            break;
+        }
+        // Stop before a new separator line if another table immediately follows without blank line.
+        if cursor + 1 < lines.len() && parse_table_alignments(lines[cursor + 1].trim(), split_pipe_cells(candidate).map(|c| c.len()).unwrap_or(0)).is_some() {
+            break;
+        }
+        let Some(mut cells) = split_pipe_cells(candidate) else {
+            break;
+        };
+        cells.resize(headers.len(), String::new());
+        rows.push(cells);
+        cursor += 1;
+    }
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    Some((
+        ParsedTable {
+            headers,
+            alignments,
+            rows,
+        },
+        cursor,
+    ))
+}
+
+fn split_pipe_cells(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let stripped = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed);
+    let stripped = stripped.strip_suffix('|').unwrap_or(stripped);
+
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in stripped.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '|' {
+            cells.push(current.trim().to_owned());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    cells.push(current.trim().to_owned());
+    if cells.is_empty() {
+        None
+    } else {
+        Some(cells)
+    }
+}
+
+fn parse_table_alignments(line: &str, expected_cols: usize) -> Option<Vec<&'static str>> {
+    if expected_cols == 0 {
+        return None;
+    }
+    let cells = split_pipe_cells(line)?;
+    if cells.len() != expected_cols {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(expected_cols);
+    for cell in cells {
+        let c = cell.trim();
+        let left = c.starts_with(':');
+        let right = c.ends_with(':');
+        let inner = c.trim_start_matches(':').trim_end_matches(':');
+        if inner.is_empty() || !inner.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        let align = match (left, right) {
+            (true, true) => "center",
+            (false, true) => "right",
+            _ => "left",
+        };
+        aligns.push(align);
+    }
+    Some(aligns)
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -861,6 +1177,7 @@ async fn run_worker(
                         last_connected_at: None,
                         last_event_at: None,
                         last_error: Some(error.to_string()),
+                        ..Default::default()
                     },
                 )
                 .await;
@@ -892,6 +1209,7 @@ async fn run_worker(
                     last_connected_at: None,
                     last_event_at: None,
                     last_error: None,
+                    ..Default::default()
                 },
             )
             .await;
@@ -918,6 +1236,7 @@ async fn run_worker(
                             last_connected_at: None,
                             last_event_at: None,
                             last_error: Some(error.to_string()),
+                            ..Default::default()
                         },
                     )
                     .await;
@@ -945,6 +1264,7 @@ async fn run_worker(
                             last_connected_at: None,
                             last_event_at: None,
                             last_error: Some(format!("WebSocket 连接失败：{error}")),
+                            ..Default::default()
                         },
                     )
                     .await;
@@ -969,6 +1289,7 @@ async fn run_worker(
                     last_connected_at: Some(connected_at),
                     last_event_at,
                     last_error: None,
+                    ..Default::default()
                 },
             )
             .await;
@@ -1064,6 +1385,7 @@ async fn run_worker(
                                             last_connected_at: Some(connected_at),
                                             last_event_at,
                                             last_error: None,
+                                            ..Default::default()
                                         },
                                     )
                                     .await;
@@ -1121,6 +1443,7 @@ async fn run_worker(
                     last_connected_at: Some(connected_at),
                     last_event_at,
                     last_error: disconnect_reason,
+                    ..Default::default()
                 },
             )
             .await;
@@ -1153,6 +1476,43 @@ fn reconnect_delay(attempt: u32, server_interval_secs: Option<u64>) -> Duration 
     Duration::from_secs(exp.clamp(2, 30))
 }
 
+async fn reply_card_with_fallback(
+    api: &FeishuApiClient,
+    message_id: &str,
+    title: &str,
+    body: &str,
+    note: Option<&str>,
+    reply_in_thread: bool,
+) -> Option<String> {
+    let card = build_card_json(title, body, note);
+    if let Ok(reply_id) = api.reply_card(message_id, &card, reply_in_thread).await {
+        return Some(reply_id);
+    }
+    let simple = build_simple_markdown_card_json(title, body, note);
+    if simple != card
+        && let Ok(reply_id) = api.reply_card(message_id, &simple, reply_in_thread).await
+    {
+        return Some(reply_id);
+    }
+    let _ = api.reply_text(message_id, body, reply_in_thread).await;
+    None
+}
+
+async fn patch_card_with_fallback(
+    api: &FeishuApiClient,
+    reply_message_id: &str,
+    title: &str,
+    body: &str,
+    footer: Option<&str>,
+) -> bool {
+    let card = build_card_json(title, body, footer);
+    if api.patch_card(reply_message_id, &card).await.is_ok() {
+        return true;
+    }
+    let simple = build_simple_markdown_card_json(title, body, footer);
+    simple != card && api.patch_card(reply_message_id, &simple).await.is_ok()
+}
+
 async fn dispatch_feishu_message(
     config: FeishuWorkerConfig,
     api: FeishuApiClient,
@@ -1160,7 +1520,10 @@ async fn dispatch_feishu_message(
     msg: ParsedFeishuMessage,
 ) {
     let is_group = msg.chat_type == "group";
-    if is_group && config.group_trigger == FeishuGroupTrigger::Mention && !msg.mentioned_bot {
+    let (group_trigger, streaming_card) = supervisor
+        .live_feishu_runtime_options(&config.bot_id)
+        .await;
+    if is_group && group_trigger == FeishuGroupTrigger::Mention && !msg.mentioned_bot {
         return;
     }
 
@@ -1170,30 +1533,165 @@ async fn dispatch_feishu_message(
     }
     let reply_in_thread = msg.root_id.is_some();
 
-    if trimmed == "/status" {
-        if let Ok(status_text) = supervisor
-            .describe_feishu_status(&config.bot_id, &msg.chat_id)
+    let (chat_name, sender_name) = tokio::join!(
+        async {
+            if is_group {
+                api.chat_name(&msg.chat_id).await
+            } else {
+                None
+            }
+        },
+        async {
+            match msg.sender_open_id.as_deref() {
+                Some(open_id) => api.user_name(open_id).await,
+                None => None,
+            }
+        }
+    );
+
+    if matches!(trimmed, "/whoami" | "/id") {
+        if let Ok(identity) = supervisor
+            .inspect_feishu_identity(
+                &config.bot_id,
+                msg.sender_open_id.as_deref(),
+                sender_name.as_deref(),
+                &msg.chat_id,
+                chat_name.as_deref(),
+            )
             .await
         {
-            let card = build_card_json(&format!("{} · 状态", config.bot_name), &status_text, None);
-            if api
-                .reply_card(&msg.message_id, &card, reply_in_thread)
-                .await
-                .is_err()
-            {
-                let _ = api
-                    .reply_text(&msg.message_id, &status_text, reply_in_thread)
-                    .await;
-            }
+            let policy_text = match identity.access_policy {
+                FeishuAccessPolicy::Everyone => "全员可用",
+                FeishuAccessPolicy::AdminsDmAllGroups => "私聊仅管理员 · 群聊全员可用",
+                FeishuAccessPolicy::AdminsOnly => "仅管理员可用",
+            };
+            let uid_text = msg
+                .sender_open_id
+                .as_deref()
+                .map(|id| format!("`{id}`"))
+                .unwrap_or_else(|| "未知".into());
+            let name_line = sender_name
+                .as_deref()
+                .map(|name| format!("- **姓名**: {name}\n"))
+                .unwrap_or_default();
+            let group_line = if is_group {
+                let gname = chat_name
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default();
+                format!("- **当前群聊 ID**: `{}`{}\n", msg.chat_id, gname)
+            } else {
+                String::new()
+            };
+            let role_label = if identity.is_admin {
+                "管理员"
+            } else {
+                "普通成员"
+            };
+            let body = format!(
+                "{name_line}- **飞书 Open ID**: {uid_text}\n{group_line}- **当前权限角色**: {role_label}\n- **Bot 访问策略**: {policy_text}（已配置 {} 位管理员）\n\n提示：在 Prospero 桌面端「记忆与权限」可直接将最近发言成员一键设为管理员。",
+                identity.admin_count
+            );
+            reply_card_with_fallback(
+                &api,
+                &msg.message_id,
+                &format!("{} · 身份信息", config.bot_name),
+                &body,
+                Some("飞书 IM · 权限身份"),
+                reply_in_thread,
+            )
+            .await;
         }
         return;
     }
 
-    let (force_new, prompt) = if let Some(rest) = parse_new_command(trimmed) {
+    let parsed_new = parse_new_command(trimmed);
+    let is_status_cmd = trimmed == "/status";
+    let is_admin_command = is_status_cmd || parsed_new.is_some();
+
+    let access = match supervisor
+        .evaluate_feishu_access(
+            &config.bot_id,
+            is_group,
+            msg.sender_open_id.as_deref(),
+            sender_name.as_deref(),
+            &msg.chat_id,
+            chat_name.as_deref(),
+            is_admin_command,
+        )
+        .await
+    {
+        Ok(decision) => decision,
+        Err(_) => return,
+    };
+
+    if !access.allowed {
+        if (!is_group || is_admin_command)
+            && let Some(reason) = access.denial_reason
+        {
+            reply_card_with_fallback(
+                &api,
+                &msg.message_id,
+                &format!("{} · 访问受限", config.bot_name),
+                &reason,
+                Some("权限控制"),
+                reply_in_thread,
+            )
+            .await;
+        }
+        return;
+    }
+
+    if is_status_cmd {
+        if let Ok(status_text) = supervisor
+            .describe_feishu_status(&config.bot_id, &msg.chat_id)
+            .await
+        {
+            reply_card_with_fallback(
+                &api,
+                &msg.message_id,
+                &format!("{} · 状态", config.bot_name),
+                &status_text,
+                None,
+                reply_in_thread,
+            )
+            .await;
+        }
+        return;
+    }
+
+    let (force_new, prompt) = if let Some(rest) = parsed_new {
         (true, rest)
     } else {
         (false, trimmed.to_owned())
     };
+
+    if !access.is_admin
+        && let Some(category) = super::detect_non_admin_governance_attempt(&prompt)
+    {
+        supervisor
+            .record_feishu_denied_attempt(
+                &config.bot_id,
+                msg.sender_open_id.as_deref(),
+                sender_name.as_deref(),
+                &msg.chat_id,
+                chat_name.as_deref(),
+            )
+            .await;
+        let text = format!(
+            "🔒 **权限受限**：普通成员无权执行「{category}」等管理或规则变更操作。\n\n该操作仅限授权管理员执行，本次指令已拦截且未生效。"
+        );
+        reply_card_with_fallback(
+            &api,
+            &msg.message_id,
+            &format!("{} · 权限管控", config.bot_name),
+            &text,
+            Some("权限保护 · 已拦截"),
+            reply_in_thread,
+        )
+        .await;
+        return;
+    }
 
     let channel = if is_group {
         BotThreadChannel::FeishuGroup
@@ -1201,17 +1699,44 @@ async fn dispatch_feishu_message(
         BotThreadChannel::FeishuP2p
     };
 
+    let base_meta = FeishuThreadMetadata {
+        chat_name: chat_name.clone(),
+        sender_id: msg.sender_open_id.clone(),
+        sender_name: sender_name.clone(),
+        message_preview: if prompt.is_empty() {
+            None
+        } else {
+            Some(prompt.clone())
+        },
+    };
+
     if force_new && prompt.is_empty() {
+        let new_title = if is_group {
+            chat_name
+                .as_deref()
+                .map(|name| format!("{name} · 新话题"))
+                .unwrap_or_else(|| "新话题".into())
+        } else {
+            sender_name
+                .as_deref()
+                .map(|name| format!("{name} · 新话题"))
+                .unwrap_or_else(|| "新话题".into())
+        };
         match supervisor
-            .create_feishu_thread(&config.bot_id, &msg.chat_id, channel, "新话题")
+            .create_feishu_thread(&config.bot_id, &msg.chat_id, channel, &new_title, base_meta)
             .await
         {
             Ok(thread) => {
                 let text = format!("已开启新话题：**{}**\n请直接发送下一条消息。", thread.title);
-                let card = build_card_json(&config.bot_name, &text, Some("飞书 IM · 新话题"));
-                if let Ok(reply_id) = api
-                    .reply_card(&msg.message_id, &card, reply_in_thread)
-                    .await
+                if let Some(reply_id) = reply_card_with_fallback(
+                    &api,
+                    &msg.message_id,
+                    &config.bot_name,
+                    &text,
+                    Some("飞书 IM · 新话题"),
+                    reply_in_thread,
+                )
+                .await
                 {
                     supervisor
                         .record_feishu_reply(&config.bot_id, &reply_id, &thread.id)
@@ -1231,22 +1756,6 @@ async fn dispatch_feishu_message(
         return;
     }
 
-    let (chat_name, sender_name) = tokio::join!(
-        async {
-            if is_group {
-                api.chat_name(&msg.chat_id).await
-            } else {
-                None
-            }
-        },
-        async {
-            match msg.sender_open_id.as_deref() {
-                Some(open_id) => api.user_name(open_id).await,
-                None => None,
-            }
-        }
-    );
-
     let prepared = supervisor
         .prepare_feishu_memory_turn(FeishuMemoryTurnInput {
             bot_id: config.bot_id.clone(),
@@ -1255,6 +1764,7 @@ async fn dispatch_feishu_message(
             chat_name,
             sender_open_id: msg.sender_open_id.clone(),
             sender_name,
+            sender_is_admin: access.is_admin,
             user_prompt: prompt.clone(),
         })
         .await
@@ -1272,6 +1782,7 @@ async fn dispatch_feishu_message(
             msg.root_id.as_deref().or(msg.parent_id.as_deref()),
             &thread_title_hint,
             force_new,
+            base_meta,
         )
         .await
     {
@@ -1325,7 +1836,7 @@ async fn dispatch_feishu_message(
         }
     };
 
-    let card_message_id = if config.streaming_card {
+    let card_message_id = if streaming_card {
         let initial = build_card_json(
             &config.bot_name,
             "⏳ 正在思考…",
@@ -1347,6 +1858,12 @@ async fn dispatch_feishu_message(
         None
     };
 
+    let non_admin_guard = if !access.is_admin {
+        supervisor.begin_non_admin_guard(&config.bot_id).await.ok()
+    } else {
+        None
+    };
+
     if let Err(error) = supervisor
         .agents()
         .send(&session_id, dispatch_prompt.clone(), None, Vec::new())
@@ -1364,6 +1881,7 @@ async fn dispatch_feishu_message(
         return;
     }
 
+    let bot_id = config.bot_id.clone();
     stream_turn_to_feishu(
         config,
         api,
@@ -1371,6 +1889,7 @@ async fn dispatch_feishu_message(
         msg.message_id,
         reply_in_thread,
         card_message_id,
+        streaming_card,
         thread.title,
         session_id,
         baseline_pos,
@@ -1378,6 +1897,12 @@ async fn dispatch_feishu_message(
         dispatch_prompt,
     )
     .await;
+
+    if let Some(guard) = non_admin_guard {
+        let _ = supervisor.finish_non_admin_guard(guard).await;
+    } else {
+        supervisor.record_admin_feishu_turn_completed(&bot_id).await;
+    }
 
     supervisor.notify_memory_updated().await;
 }
@@ -1404,6 +1929,7 @@ async fn stream_turn_to_feishu(
     incoming_message_id: String,
     reply_in_thread: bool,
     card_message_id: Option<String>,
+    streaming_card: bool,
     thread_title: String,
     session_id: String,
     baseline_pos: i64,
@@ -1467,35 +1993,48 @@ async fn stream_turn_to_feishu(
             if finished {
                 let footer = format!("{} · 已完成", thread_title);
                 if let Some(reply_id) = card_message_id.as_deref() {
-                    let card = build_card_json(&config.bot_name, &body, Some(&footer));
-                    if api.patch_card(reply_id, &card).await.is_err() {
-                        let _ = api
-                            .reply_text(&incoming_message_id, &body, reply_in_thread)
-                            .await;
-                    }
-                } else {
-                    let card = build_card_json(&config.bot_name, &body, Some(&footer));
-                    if api
-                        .reply_card(&incoming_message_id, &card, reply_in_thread)
-                        .await
-                        .is_err()
+                    if !patch_card_with_fallback(
+                        &api,
+                        reply_id,
+                        &config.bot_name,
+                        &body,
+                        Some(&footer),
+                    )
+                    .await
                     {
                         let _ = api
                             .reply_text(&incoming_message_id, &body, reply_in_thread)
                             .await;
                     }
+                } else {
+                    let _ = reply_card_with_fallback(
+                        &api,
+                        &incoming_message_id,
+                        &config.bot_name,
+                        &body,
+                        Some(&footer),
+                        reply_in_thread,
+                    )
+                    .await;
                 }
                 break;
             }
 
-            if config.streaming_card
+            if streaming_card
                 && let Some(reply_id) = card_message_id.as_deref()
                 && body != last_pushed_content
                 && last_patch_at.elapsed() >= STREAM_THROTTLE
             {
                 let footer = format!("{} · 生成中", thread_title);
-                let card = build_card_json(&config.bot_name, &body, Some(&footer));
-                if api.patch_card(reply_id, &card).await.is_ok() {
+                if patch_card_with_fallback(
+                    &api,
+                    reply_id,
+                    &config.bot_name,
+                    &body,
+                    Some(&footer),
+                )
+                .await
+                {
                     last_pushed_content = body;
                     last_patch_at = Instant::now();
                 }
@@ -1786,9 +2325,68 @@ mod tests {
     #[test]
     fn builds_update_multi_markdown_card() {
         let card = build_card_json("ResearchBot", "**Hello**\nWorld", Some("话题 · 完成"));
+        assert_eq!(card["schema"], "2.0");
         assert_eq!(card["config"]["update_multi"], true);
-        assert_eq!(card["elements"][0]["tag"], "markdown");
-        assert_eq!(card["elements"][1]["tag"], "note");
+        assert_eq!(card["config"]["width_mode"], "fill");
+        assert_eq!(card["body"]["elements"][0]["tag"], "markdown");
+        assert_eq!(card["body"]["elements"][1]["tag"], "hr");
+        assert_eq!(card["body"]["elements"][2]["tag"], "markdown");
+        assert_eq!(card["body"]["elements"][2]["text_size"], "notation");
+    }
+
+    #[test]
+    fn converts_markdown_tables_to_card_v2_table_elements_and_ignores_code_fences() {
+        let sample = "\
+「示例项目群」群目前共 12 人：
+
+| | 成员 |
+|---|---|
+| 👑 群主 | 林一 |
+| 成员 | 陈二、周三 |
+
+```markdown
+| a | b |
+|---|---|
+| 1 | 2 |
+```
+
+需要我帮大家做点什么吗？";
+
+        let card = build_card_json("示例助手", sample, Some("示例项目群 · 已完成"));
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements[0]["tag"], "markdown");
+        assert!(
+            elements[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("群目前共 12 人")
+        );
+        assert_eq!(elements[1]["tag"], "table");
+        assert_eq!(elements[1]["row_height"], "auto");
+        assert_eq!(elements[1]["columns"][0]["display_name"], " ");
+        assert_eq!(elements[1]["columns"][0]["data_type"], "lark_md");
+        assert_eq!(elements[1]["columns"][1]["display_name"], "成员");
+        assert_eq!(elements[1]["rows"][0]["c0"], "👑 群主");
+        assert_eq!(elements[1]["rows"][0]["c1"], "林一");
+        assert_eq!(elements[1]["rows"][1]["c0"], "成员");
+        assert_eq!(elements[1]["rows"][1]["c1"], "陈二、周三");
+        // Code fence table stays verbatim inside markdown element, not converted into a table.
+        assert_eq!(elements[2]["tag"], "markdown");
+        assert!(
+            elements[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("```markdown")
+        );
+        assert!(
+            elements[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("需要我帮大家做点什么吗")
+        );
+        assert_eq!(elements[3]["tag"], "hr");
+        assert_eq!(elements[4]["tag"], "markdown");
+        assert_eq!(elements[4]["text_size"], "notation");
     }
 
     #[test]

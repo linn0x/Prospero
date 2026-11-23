@@ -675,7 +675,7 @@ mod conformance {
             }
         }
         let options = TurnOptions {
-            policy: ApprovalPolicy::Manual,
+            policy: ApprovalPolicy::Standard,
             mode: PermissionMode::Default,
             model: None,
             effort: None,
@@ -685,6 +685,7 @@ mod conformance {
                 "isolated.socket".into(),
             )],
             api_profile: None,
+            disable_interactive_questions: false,
         };
         let workspace = directory.path().to_str().unwrap();
         let mut claude =

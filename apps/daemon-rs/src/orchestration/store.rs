@@ -209,6 +209,7 @@ mod worker_start_tests {
                         title: format!("controller {index}"),
                         workspace: "/tmp".into(),
                         auto_approve: false,
+                        approval_policy: None,
                         mode: None,
                         model: None,
                         effort: None,
@@ -216,7 +217,7 @@ mod worker_start_tests {
                         account_id: None,
                         resume: None,
                     },
-                    crate::agent::ApprovalPolicy::Manual,
+                    crate::agent::ApprovalPolicy::Standard,
                 )
                 .unwrap();
         }
@@ -540,6 +541,7 @@ mod worker_start_tests {
                     title: "worker delivery".into(),
                     workspace: "/tmp".into(),
                     auto_approve: false,
+                    approval_policy: None,
                     mode: None,
                     model: None,
                     effort: None,
@@ -547,7 +549,7 @@ mod worker_start_tests {
                     account_id: None,
                     resume: None,
                 },
-                crate::agent::ApprovalPolicy::Manual,
+                crate::agent::ApprovalPolicy::Standard,
                 Some(session_id.into()),
             )
             .unwrap();
@@ -587,6 +589,7 @@ mod worker_start_tests {
                     title: title.into(),
                     workspace: "/tmp".into(),
                     auto_approve: false,
+                    approval_policy: None,
                     mode: None,
                     model: None,
                     effort: None,
@@ -594,7 +597,7 @@ mod worker_start_tests {
                     account_id: None,
                     resume: None,
                 },
-                crate::agent::ApprovalPolicy::Manual,
+                crate::agent::ApprovalPolicy::Standard,
             )
             .unwrap()
     }
