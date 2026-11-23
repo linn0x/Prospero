@@ -1584,6 +1584,7 @@ async fn serve(
     }
     prosperod_rs::orchestration::recover_worker_starts(&database, &api.agents).await?;
     api.schedules.start().await;
+    api.bots.start().await;
     api.plugin_services.start_auto().await;
     let running_automations = database
         .call(|store| {
@@ -1656,6 +1657,7 @@ async fn serve(
         tokio::select! { _ = wait_for_shutdown() => {}, _ = shutdown_api.wait_stopped() => {} }
         shutdown_api.stop();
         shutdown_api.schedules.close();
+        shutdown_api.bots.stop_all().await;
         shutdown_api.plugin_services.stop_all().await;
         let _ = shutdown_api.agents.shutdown().await;
         let _ = shutdown_api.terminals.shutdown().await;
@@ -1674,6 +1676,7 @@ async fn serve(
         _ = stopped.changed() => { let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await; }
     }
     api.stop();
+    api.bots.stop_all().await;
     if let Some(remote_server) = remote_server {
         remote_server.abort();
         let _ = remote_server.await;

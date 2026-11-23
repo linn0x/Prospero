@@ -53,7 +53,7 @@ mod tests {
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
-pub(crate) struct FeatureError {
+pub struct FeatureError {
     pub code: String,
     pub message: String,
 }

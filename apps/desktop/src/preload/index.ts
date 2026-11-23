@@ -73,6 +73,12 @@ const api: DesktopApi = {
     ipcRenderer.on("model-source:changed", wrapped);
     return () => ipcRenderer.removeListener("model-source:changed", wrapped);
   },
+  botAction: action => ipcRenderer.invoke("bots:action", action),
+  subscribeBots: listener => {
+    const wrapped = (_event: Electron.IpcRendererEvent, bots: Parameters<typeof listener>[0]) => listener(bots);
+    ipcRenderer.on("bots:changed", wrapped);
+    return () => ipcRenderer.removeListener("bots:changed", wrapped);
+  },
   platform: process.platform,
   listNetworkInterfaces: () => ipcRenderer.invoke("network:interfaces"),
   openWindowMenu: (request) => ipcRenderer.invoke("window:menu", request),

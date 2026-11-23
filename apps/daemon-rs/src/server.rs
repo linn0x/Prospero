@@ -33,6 +33,7 @@ use crate::agent::{
     ScheduleCrossModelCheck, UsageReport, UsageResult, mode_catalog,
 };
 use crate::auth::Token;
+use crate::bots::{BotActionRequest, BotActionResult, BotsSupervisor};
 use crate::database::Store;
 use crate::error::{Error, ResourceBackpressure, Result};
 use crate::orchestration::{
@@ -72,6 +73,7 @@ pub struct Api {
     pub agents: Agents,
     pub relay_status: crate::relay::RelayStatusHandle,
     pub schedules: Schedules,
+    pub bots: BotsSupervisor,
     pub plugin_services: PluginServiceSupervisor,
     build_id: Arc<str>,
     token: Token,
@@ -175,12 +177,15 @@ impl Api {
         let mut agent_changes = agents.changes().subscribe();
         let schedules = Schedules::new(database.directory(), agents.clone());
         let mut schedule_changes = schedules.changes();
+        let bots = BotsSupervisor::new(database.clone(), agents.clone());
+        let mut bot_changes = bots.changes();
         let plugin_services = PluginServiceSupervisor::new(database.directory());
         let shared_api = Self {
             terminals: terminals.clone(),
             agents: agents.clone(),
             relay_status: relay_status.clone(),
             schedules: schedules.clone(),
+            bots: bots.clone(),
             plugin_services,
             build_id: build_id.into(),
             database: database.clone(),
@@ -215,6 +220,12 @@ impl Api {
         tokio::spawn(async move {
             while schedule_changes.changed().await.is_ok() {
                 schedule_api.publish();
+            }
+        });
+        let bot_api = shared_api.clone();
+        tokio::spawn(async move {
+            while bot_changes.changed().await.is_ok() {
+                bot_api.publish();
             }
         });
         let monitor = shared_api.clone();
@@ -580,6 +591,7 @@ impl Api {
             .route("/v1/schedules/{id}/run", post(schedule_run))
             .route("/v1/accounts", post(accounts_route))
             .route("/v1/model-sources", post(model_sources_route))
+            .route("/v1/bots", get(bots_list_route).post(bots_action_route))
             .route("/v1/launch/models", get(launch_models))
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
@@ -1372,6 +1384,7 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
         "chat.attachment-previews.v1",
         "agent.deepseek-harness.v1",
         "model.sources.v1",
+        "bots.v1",
         "orchestration.automation.v1",
         "operations.query.v1",
         "executions.query.v1",
@@ -4788,6 +4801,7 @@ fn health_capabilities() -> Vec<String> {
         "chat.attachment-previews.v1",
         "agent.deepseek-harness.v1",
         "model.sources.v1",
+        "bots.v1",
         "session.codex-fork.v1",
         "session.claude-fork.v1",
         "session.terminal-fork-picker.v1",
@@ -5089,9 +5103,11 @@ async fn agent_send(
     body: std::result::Result<Json<AgentSend>, axum::extract::rejection::JsonRejection>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let Json(input) = body.map_err(|_| Error::Invalid("invalid agent message".into()))?;
+    let preview_text = input.text.clone();
     api.agents
         .send(&id, input.text, input.delivery, input.attachments)
         .await?;
+    api.bots.touch_session_message(&id, &preview_text).await;
     api.publish();
     Ok(Json(serde_json::json!({"ok":true})))
 }
@@ -5759,6 +5775,36 @@ async fn model_sources_route(
             result.sources = Some(sources);
             result.accounts = Some(accounts);
             Json(result).into_response()
+        }
+    }
+}
+
+async fn bots_list_route(State(api): State<Api>) -> Response {
+    Json(api.bots.list_public().await).into_response()
+}
+
+async fn bots_action_route(
+    State(api): State<Api>,
+    body: std::result::Result<Json<BotActionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(request) => request,
+        Err(error) => {
+            return ApiError(Error::Invalid(format!("invalid bot request: {error}")))
+                .into_response();
+        }
+    };
+    let request_id = request.request_id.clone();
+    match api.bots.handle_action(request).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => {
+            let err = feature_error(error);
+            Json(BotActionResult::failure(
+                &request_id,
+                &err.code,
+                err.message,
+            ))
+            .into_response()
         }
     }
 }

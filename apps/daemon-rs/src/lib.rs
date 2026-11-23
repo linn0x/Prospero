@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod agent;
 pub mod auth;
+pub mod bots;
 pub mod control_cli;
 #[doc(hidden)]
 pub mod cross_model_tool;

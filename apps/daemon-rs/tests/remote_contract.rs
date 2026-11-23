@@ -189,6 +189,7 @@ async fn health_capabilities_are_explicitly_local_http_not_mobile_ws() {
         "chat.attachment-previews.v1",
         "agent.deepseek-harness.v1",
         "model.sources.v1",
+        "bots.v1",
         "relay.host.v1",
     ] {
         assert!(

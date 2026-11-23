@@ -106,6 +106,11 @@ enum Command {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    /// Inspect or dispatch tasks to configured Prospero Bots.
+    Bot {
+        #[command(subcommand)]
+        command: BotCommand,
+    },
     Status {
         #[arg(long)]
         run: Option<String>,
@@ -113,6 +118,23 @@ enum Command {
         all: bool,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BotCommand {
+    /// List configured Bots and their threads.
+    List,
+    /// Dispatch a task to a Bot (creating or reusing a thread).
+    Dispatch {
+        #[arg(long)]
+        bot: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        thread: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
     },
 }
 
@@ -888,6 +910,23 @@ fn command_request(
             }
         },
         Command::Schedule { command } => schedule_request(command, session)?,
+        Command::Bot { command } => match command {
+            BotCommand::List => ("bot.list", json!({})),
+            BotCommand::Dispatch {
+                bot,
+                task,
+                thread,
+                title,
+            } => (
+                "bot.dispatch",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "task": require_text(task, "--task")?,
+                    "threadId": thread,
+                    "title": title,
+                }),
+            ),
+        },
         Command::Status { run, all, json } => {
             let mut params = serde_json::Map::new();
             if let Some(run) = run {

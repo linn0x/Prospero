@@ -1,0 +1,421 @@
+.shell-mode-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  margin: 8px 10px 4px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+}
+
+.shell-mode-switch-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: calc(var(--radius-lg) - 3px);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+
+.shell-mode-switch-btn svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.shell-mode-switch-btn[data-active="true"] {
+  background: var(--background);
+  color: var(--foreground);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.08);
+}
+
+[data-collapsible="icon"] .shell-mode-switch {
+  grid-template-columns: 1fr;
+  margin: 6px 6px 4px;
+}
+
+[data-collapsible="icon"] .shell-mode-switch-btn span {
+  display: none;
+}
+
+.bot-roster-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.bot-roster-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  font-size: 13px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.bot-roster-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.bot-roster-name-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.bot-roster-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+  min-width: 0;
+}
+
+.bot-feishu-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.bot-feishu-dot[data-state="connected"] {
+  background: var(--success, #22c55e);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--success, #22c55e) 22%, transparent);
+}
+
+.bot-feishu-dot[data-state="connecting"],
+.bot-feishu-dot[data-state="reconnecting"] {
+  background: #f59e0b;
+}
+
+.bot-feishu-dot[data-state="error"] {
+  background: var(--destructive);
+}
+
+.bot-feishu-dot[data-state="disabled"] {
+  background: color-mix(in srgb, var(--muted-foreground) 40%, transparent);
+}
+
+.bot-thread-channel {
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 90%, transparent);
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+}
+
+.bot-thread-channel[data-channel="feishu_p2p"],
+.bot-thread-channel[data-channel="feishu_group"] {
+  background: color-mix(in srgb, #3370ff 14%, transparent);
+  color: #3370ff;
+}
+
+.bot-thread-delete {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  opacity: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.group\/thread:hover .bot-thread-delete,
+.group\/thread:focus-within .bot-thread-delete,
+.bot-thread-delete:focus-visible {
+  opacity: 1;
+}
+
+.bot-thread-delete:hover {
+  background: color-mix(in srgb, var(--destructive) 14%, transparent);
+  color: var(--destructive);
+}
+
+.bot-thread-delete svg {
+  width: 12px;
+  height: 12px;
+}
+
+.bots-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--background);
+}
+
+.bots-pane-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--background) 92%, var(--muted));
+}
+
+[data-platform="darwin"] .bots-pane-header {
+  padding-top: 10px;
+}
+
+.bots-pane-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bots-pane-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.bots-pane-titles {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.bots-pane-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bots-pane-title-row h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bots-pane-subtitle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bots-pane-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.bots-pane-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.bots-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 32px 24px;
+  text-align: center;
+  gap: 16px;
+  max-width: 680px;
+  margin: 0 auto;
+}
+
+.bots-hero-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 60px;
+  height: 60px;
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  font-size: 32px;
+}
+
+.bots-hero-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.bot-editor-section {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--muted) 25%, transparent);
+}
+
+.bot-editor-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.bot-avatar-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+@media (max-width: 720px) {
+  .bot-editor-grid-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.bot-memory-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.bot-memory-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.bot-memory-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+
+.bot-memory-tab:hover {
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+}
+
+.bot-memory-tab[data-active="true"] {
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--primary) 50%, var(--border));
+}
+
+.bot-memory-create {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--background) 80%, transparent);
+}
+
+.bot-memory-grid {
+  display: grid;
+  grid-template-columns: minmax(190px, 230px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.bot-memory-list {
+  display: grid;
+  gap: 6px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.bot-memory-item {
+  width: 100%;
+  text-align: left;
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--background);
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.bot-memory-item:hover {
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+}
+
+.bot-memory-item[data-selected="true"] {
+  background: color-mix(in srgb, var(--primary) 10%, var(--background));
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+}
+
+.bot-memory-editor {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+@media (max-width: 640px) {
+  .bot-memory-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bot-memory-list {
+    max-height: 180px;
+  }
+}

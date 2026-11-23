@@ -29,6 +29,7 @@ import {
   ArchiveRestore,
   ArrowDownAZ,
   BookOpen,
+  Bot,
   Boxes,
   ChevronRight,
   CircleAlert,
@@ -54,6 +55,7 @@ import {
   Settings,
   Smartphone,
   SquareTerminal,
+  Trash2,
   WifiOff,
   Workflow,
   X,
@@ -61,6 +63,7 @@ import {
 import type {
   AgentModel,
   DesktopSnapshot,
+  PublicBot,
   SessionCreateInput,
   SessionInfo,
   SessionPage,
@@ -214,6 +217,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import "./styles.css";
 import "./workspace/workspace.css";
+import "./bots/bots.css";
+import { useBots, runBotAction } from "./bots/use-bots";
 import { rememberedLaunchAgent, rememberedLaunchKind, rememberLaunch } from "./workspace/session-launch-preferences";
 import { RemoteWorkspaceList } from "./remote-workspaces/RemoteWorkspaceList";
 import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
@@ -236,7 +241,18 @@ const SEARCH_QUERY_MAX_LENGTH = 500;
 const OPEN_SESSIONS_STORAGE_KEY = "prospero.openSessions";
 const ACTIVE_SESSION_STORAGE_KEY = "prospero.activeSession";
 const ACTIVE_VIEW_STORAGE_KEY = "prospero.activeView";
+const SHELL_MODE_STORAGE_KEY = "prospero.shellMode";
 const FOCUS_STORAGE_KEY = "prospero.workspaceFocus";
+
+type ShellMode = "workspace" | "bots";
+
+function readStoredShellMode(): ShellMode {
+  try {
+    return localStorage.getItem(SHELL_MODE_STORAGE_KEY) === "bots" ? "bots" : "workspace";
+  } catch {
+    return "workspace";
+  }
+}
 
 function consumeSidebarAction(event: { preventDefault(): void; stopPropagation(): void }): void {
   event.preventDefault();
@@ -314,6 +330,16 @@ const SettingsPane = lazy(() =>
 );
 const SkillsPane = lazy(() =>
   import("./SkillsPane").then((module) => ({ default: module.SkillsPane })),
+);
+const BotsModePane = lazy(() =>
+  import("./bots/BotsModePane").then((module) => ({
+    default: module.BotsModePane,
+  })),
+);
+const BotEditorDialog = lazy(() =>
+  import("./bots/BotEditorDialog").then((module) => ({
+    default: module.BotEditorDialog,
+  })),
 );
 
 type View =
@@ -734,6 +760,17 @@ function DaemonAgentsCard({
 const ShellSidebar = memo(function ShellSidebar({
   snapshot,
   view,
+  shellMode = "workspace",
+  onShellModeChange,
+  bots = [],
+  selectedBotId,
+  activeBotThreadId,
+  onSelectBot,
+  onSelectBotThread,
+  onNewBotThread,
+  onArchiveBotThread,
+  onOpenNewBot,
+  onEditBot,
   activeId,
   botSession: _botSession,
   botBusy: _botBusy,
@@ -764,6 +801,17 @@ const ShellSidebar = memo(function ShellSidebar({
 }: {
   snapshot: DesktopSnapshot;
   view: View;
+  shellMode?: ShellMode;
+  onShellModeChange?: (mode: ShellMode) => void;
+  bots?: PublicBot[];
+  selectedBotId?: string | undefined;
+  activeBotThreadId?: string | undefined;
+  onSelectBot?: (botId: string) => void;
+  onSelectBotThread?: (botId: string, threadId: string) => void;
+  onNewBotThread?: (botId?: string) => void;
+  onArchiveBotThread?: (botId: string, threadId: string) => void;
+  onOpenNewBot?: () => void;
+  onEditBot?: (bot: PublicBot) => void;
   activeId: string | undefined;
   botSession?: SessionInfo | undefined;
   botBusy?: boolean | undefined;
@@ -1503,11 +1551,11 @@ const ShellSidebar = memo(function ShellSidebar({
       collapsible="icon"
       className="prospero-sidebar"
       mobileTitle={t("侧边栏", "Sidebar")}
-      mobileDescription={t("主导航、工作区与会话", "Main navigation, workspaces, and sessions")}
+      mobileDescription={shellMode === "bots" ? t("Bot 团队与对话话题", "Bots and conversation threads") : t("主导航、工作区与会话", "Main navigation, workspaces, and sessions")}
     >
       {(isMac || focus) && <SidebarHeader className="sidebar-shell-header">
         {isMac && <>
-        <Button className="sidebar-new-session" variant="ghost" size="icon-sm" aria-label={t("新建会话", "New session")} title={t("新建会话", "New session")} onClick={() => newSession()}><Plus /><span className="sidebar-new-session-label">{t("新建会话", "New session")}</span></Button>
+        <Button className="sidebar-new-session" variant="ghost" size="icon-sm" aria-label={shellMode === "bots" ? t("新建话题", "New thread") : t("新建会话", "New session")} title={shellMode === "bots" ? t("新建话题", "New thread") : t("新建会话", "New session")} onClick={() => { if (shellMode === "bots") { onNewBotThread?.(); closeMobileSidebar(); } else { newSession(); } }}><Plus /><span className="sidebar-new-session-label">{shellMode === "bots" ? t("新话题", "New thread") : t("新建会话", "New session")}</span></Button>
         <SidebarTrigger
           className="sidebar-header-toggle"
           aria-label={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
@@ -1517,6 +1565,290 @@ const ShellSidebar = memo(function ShellSidebar({
         {focus && <Button className="sidebar-exit-focus" variant="ghost" size="icon-sm" aria-label={t("退出专注", "Exit focus")} title={t("退出专注", "Exit focus")} onClick={onExitFocus}><Minimize2 /></Button>}
       </SidebarHeader>}
       <SidebarContent className="sidebar-content-shell">
+        {onShellModeChange && (
+          <div className="shell-mode-switch" role="tablist" aria-label={t("工作模式切换", "Shell mode switch")}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={shellMode === "workspace"}
+              data-active={shellMode === "workspace" ? "true" : "false"}
+              className="shell-mode-switch-btn"
+              title={t("开发工作区模式", "Workspace mode")}
+              onClick={() => {
+                onShellModeChange("workspace");
+                closeMobileSidebar();
+              }}
+            >
+              <FolderKanban />
+              <span>{t("工作区", "Workspaces")}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={shellMode === "bots"}
+              data-active={shellMode === "bots" ? "true" : "false"}
+              className="shell-mode-switch-btn"
+              title={t("Bot 模式（GrokBot / Muse）", "Bot mode")}
+              onClick={() => {
+                onShellModeChange("bots");
+                closeMobileSidebar();
+              }}
+            >
+              <Bot />
+              <span>{t("Bot 模式", "Bots")}</span>
+            </button>
+          </div>
+        )}
+        {shellMode === "bots" ? (
+          <div className="sidebar-workspace-scroll" role="region" aria-label={t("Bot 与话题", "Bots and threads")}>
+            {!snapshot.daemon.running && (
+              <SidebarGroup>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton
+                        className="sidebar-attention-row tone-danger"
+                        disabled={snapshot.daemon.starting}
+                        onClick={() => void window.prospero.startDaemon()}
+                      >
+                        <WifiOff />
+                        <span className="truncate">{snapshot.daemon.starting ? t("正在连接服务…", "Connecting…") : t("Daemon 离线 · 点击重连", "Daemon offline · Reconnect")}</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            )}
+            <SidebarGroup className="workspace-sidebar-group">
+              <SidebarGroupLabel>
+                <span>{t("主控 Bot", "Master Bot")}</span>
+              </SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {bots.filter((bot) => bot.kind === "master").map((bot) => {
+                    const isSelected = view === "workspaces" && selectedBotId === bot.id;
+                    return (
+                      <Collapsible key={bot.id} defaultOpen className="group/bot">
+                        <SidebarMenuItem>
+                          <SidebarMenuButton
+                            isActive={isSelected && !activeBotThreadId}
+                            tooltip={`${bot.name} · ${bot.agent}${bot.model ? ` / ${bot.model}` : ""}`}
+                            onClick={() => {
+                              onSelectBot?.(bot.id);
+                              closeMobileSidebar();
+                            }}
+                          >
+                            <span className="bot-roster-row">
+                              <span className="bot-roster-avatar" aria-hidden="true">{bot.avatar}</span>
+                              <span className="bot-roster-copy">
+                                <span className="bot-roster-name-line">
+                                  <span className="truncate font-medium">{bot.name}</span>
+                                  {bot.feishu.enabled && <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />}
+                                </span>
+                                <span className="bot-roster-meta truncate">
+                                  {bot.agent}{bot.model ? ` · ${bot.model}` : ""}
+                                </span>
+                              </span>
+                            </span>
+                          </SidebarMenuButton>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger
+                              render={
+                                <SidebarMenuAction
+                                  showOnHover
+                                  aria-label={t("Bot 操作", "Bot actions")}
+                                  title={t("更多操作", "More")}
+                                >
+                                  <MoreHorizontal />
+                                </SidebarMenuAction>
+                              }
+                            />
+                            <DropdownMenuContent align="end" side="right">
+                              <DropdownMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
+                                <Plus />{t("新建话题", "New thread")}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => { onEditBot?.(bot); closeMobileSidebar(); }}>
+                                <Settings />{t("配置 Bot", "Configure Bot")}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                          {bot.threads.length > 0 && (
+                            <SidebarMenuSub>
+                              {bot.threads.map((thread) => (
+                                <ContextMenu key={thread.id}>
+                                  <ContextMenuTrigger render={<SidebarMenuSubItem className="group/thread relative" />}>
+                                    <SidebarMenuSubButton
+                                      className="pr-6"
+                                      isActive={view === "workspaces" && selectedBotId === bot.id && activeBotThreadId === thread.id}
+                                      onClick={() => {
+                                        onSelectBotThread?.(bot.id, thread.id);
+                                        closeMobileSidebar();
+                                      }}
+                                    >
+                                      <span className="truncate flex-1">{thread.title}</span>
+                                      {thread.channel !== "desktop" && (
+                                        <span className="bot-thread-channel" data-channel={thread.channel}>
+                                          {thread.channel === "feishu_p2p" ? t("飞书", "DM") : t("群聊", "Group")}
+                                        </span>
+                                      )}
+                                    </SidebarMenuSubButton>
+                                    <button
+                                      type="button"
+                                      className="bot-thread-delete"
+                                      aria-label={t("删除话题", "Delete thread")}
+                                      title={t("删除话题", "Delete thread")}
+                                      onClick={(event) => {
+                                        consumeSidebarAction(event);
+                                        onArchiveBotThread?.(bot.id, thread.id);
+                                      }}
+                                    >
+                                      <X aria-hidden="true" />
+                                    </button>
+                                  </ContextMenuTrigger>
+                                  <ContextMenuContent>
+                                    <ContextMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
+                                      <Plus />{t("新建话题", "New thread")}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem variant="destructive" onClick={() => onArchiveBotThread?.(bot.id, thread.id)}>
+                                      <Trash2 />{t("删除话题", "Delete thread")}
+                                    </ContextMenuItem>
+                                  </ContextMenuContent>
+                                </ContextMenu>
+                              ))}
+                            </SidebarMenuSub>
+                          )}
+                        </SidebarMenuItem>
+                      </Collapsible>
+                    );
+                  })}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+            <SidebarSeparator className="sidebar-detail-section" />
+            <SidebarGroup className="workspace-sidebar-group">
+              <SidebarGroupLabel>
+                <span>{t("子 Bot 团队", "Sub-Bots")}</span>
+              </SidebarGroupLabel>
+              <SidebarGroupAction
+                aria-label={t("新建子 Bot", "New Sub-Bot")}
+                title={t("新建子 Bot", "New Sub-Bot")}
+                onClick={() => {
+                  onOpenNewBot?.();
+                  closeMobileSidebar();
+                }}
+              >
+                <Plus />
+              </SidebarGroupAction>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {bots.filter((bot) => bot.kind === "sub").map((bot) => {
+                    const isSelected = view === "workspaces" && selectedBotId === bot.id;
+                    return (
+                      <SidebarMenuItem key={bot.id}>
+                        <SidebarMenuButton
+                          isActive={isSelected && !activeBotThreadId}
+                          tooltip={`${bot.name} · ${bot.agent}${bot.model ? ` / ${bot.model}` : ""}`}
+                          onClick={() => {
+                            onSelectBot?.(bot.id);
+                            closeMobileSidebar();
+                          }}
+                        >
+                          <span className="bot-roster-row">
+                            <span className="bot-roster-avatar" aria-hidden="true">{bot.avatar}</span>
+                            <span className="bot-roster-copy">
+                              <span className="bot-roster-name-line">
+                                <span className="truncate font-medium">{bot.name}</span>
+                                <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
+                              </span>
+                              <span className="bot-roster-meta truncate">
+                                {bot.agent}{bot.model ? ` · ${bot.model}` : ""}
+                              </span>
+                            </span>
+                          </span>
+                        </SidebarMenuButton>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            render={
+                              <SidebarMenuAction
+                                showOnHover
+                                aria-label={t("Bot 操作", "Bot actions")}
+                                title={t("更多操作", "More")}
+                              >
+                                <MoreHorizontal />
+                              </SidebarMenuAction>
+                            }
+                          />
+                          <DropdownMenuContent align="end" side="right">
+                            <DropdownMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
+                              <Plus />{t("新建话题", "New thread")}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { onEditBot?.(bot); closeMobileSidebar(); }}>
+                              <Settings />{t("配置模型与飞书 IM", "Configure model & Feishu")}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                        {bot.threads.length > 0 && (
+                          <SidebarMenuSub>
+                            {bot.threads.map((thread) => (
+                              <ContextMenu key={thread.id}>
+                                <ContextMenuTrigger render={<SidebarMenuSubItem className="group/thread relative" />}>
+                                  <SidebarMenuSubButton
+                                    className="pr-6"
+                                    isActive={view === "workspaces" && selectedBotId === bot.id && activeBotThreadId === thread.id}
+                                    onClick={() => {
+                                      onSelectBotThread?.(bot.id, thread.id);
+                                      closeMobileSidebar();
+                                    }}
+                                  >
+                                    <span className="truncate flex-1">{thread.title}</span>
+                                    {thread.channel !== "desktop" && (
+                                      <span className="bot-thread-channel" data-channel={thread.channel}>
+                                        {thread.channel === "feishu_p2p" ? t("飞书", "DM") : t("群聊", "Group")}
+                                      </span>
+                                    )}
+                                  </SidebarMenuSubButton>
+                                  <button
+                                    type="button"
+                                    className="bot-thread-delete"
+                                    aria-label={t("删除话题", "Delete thread")}
+                                    title={t("删除话题", "Delete thread")}
+                                    onClick={(event) => {
+                                      consumeSidebarAction(event);
+                                      onArchiveBotThread?.(bot.id, thread.id);
+                                    }}
+                                  >
+                                    <X aria-hidden="true" />
+                                  </button>
+                                </ContextMenuTrigger>
+                                <ContextMenuContent>
+                                  <ContextMenuItem onClick={() => { onNewBotThread?.(bot.id); closeMobileSidebar(); }}>
+                                    <Plus />{t("新建话题", "New thread")}
+                                  </ContextMenuItem>
+                                  <ContextMenuItem variant="destructive" onClick={() => onArchiveBotThread?.(bot.id, thread.id)}>
+                                    <Trash2 />{t("删除话题", "Delete thread")}
+                                  </ContextMenuItem>
+                                </ContextMenuContent>
+                              </ContextMenu>
+                            ))}
+                          </SidebarMenuSub>
+                        )}
+                      </SidebarMenuItem>
+                    );
+                  })}
+                  {bots.filter((bot) => bot.kind === "sub").length === 0 && (
+                    <SidebarMenuItem>
+                      <SidebarMenuButton onClick={() => { onOpenNewBot?.(); closeMobileSidebar(); }}>
+                        <Plus />
+                        <span>{t("创建第一个子 Bot", "Create first Sub-Bot")}</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  )}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          </div>
+        ) : (
+        <>
         <nav className="sidebar-nav-fixed" aria-label={t("主导航", "Main navigation")}>
           <SidebarGroup>
             <SidebarGroupContent>
@@ -1921,6 +2253,8 @@ const ShellSidebar = memo(function ShellSidebar({
           </SidebarGroup>
         </Collapsible>
         </div>
+        </>
+        )}
       </SidebarContent>
       <SidebarFooter className="sidebar-shell-footer">
         <nav className="sidebar-resource-nav" aria-label={t("连接与工具", "Connections & tools")}>
@@ -3435,6 +3769,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     const targetSession = session ?? sessionSnapshot.daemon.sessions.find((item) => item.id === id);
     const workspace = targetSession ? (projectForSession(snapshotRef.current.projects, targetSession) ?? targetSession.cwd) : undefined;
     if (options.openTab !== false) {
+      setShellMode("workspace");
       setOpenIds((current) => {
         const next = current.includes(id) ? current : [...current, id];
         persistWorkspaceTabs(workspace, next, id);
@@ -3453,11 +3788,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, []);
   const selectView = useCallback((next: View): void => {
     if (next !== "workspaces") setActiveRemoteId(undefined);
-    void remote.refresh();
     if (next === "runs") {
+      setShellMode("workspace");
       setRunTargetId(undefined);
       setTaskTargetId(undefined);
     }
+    void remote.refresh();
     setView(next);
   }, [remote.refresh]);
   const closeSession = (id: string): void => {
@@ -3488,6 +3824,27 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setEditingSession((current) => current === id ? undefined : current);
     void window.prospero.forgetMissingSession(id).catch(() => undefined);
   }, []);
+  const [shellMode, setShellMode] = useState<ShellMode>(readStoredShellMode);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SHELL_MODE_STORAGE_KEY, shellMode);
+    } catch {}
+  }, [shellMode]);
+  const [selectedBotId, setSelectedBotId] = useState<string>("master");
+  const [selectedThreadsByBot, setSelectedThreadsByBot] = useState<Record<string, string>>({});
+  const [botEditorState, setBotEditorState] = useState<{ open: boolean; bot?: PublicBot | undefined }>({ open: false });
+  const botsSupported =
+    snapshot.daemon.running &&
+    snapshot.daemon.capabilities?.includes("bots.v1") === true &&
+    typeof window.prospero?.botAction === "function";
+  const botSessionSignature = useMemo(
+    () =>
+      snapshot.daemon.sessions
+        .map((session) => `${session.id}:${session.status}`)
+        .slice(0, 60)
+        .join("|"),
+    [snapshot.daemon.sessions],
+  );
   const [newSessionBotMode, setNewSessionBotMode] = useState(false);
   const [botCreating, setBotCreating] = useState(false);
   const botCreatingRef = useRef(false);
@@ -3537,7 +3894,71 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setCreateTab("session");
     setNewSessionOpen(true);
   }, [activeId, activeRemoteId, sessionSnapshot]);
+  const botsState = useBots(botsSupported, botSessionSignature);
+  const selectedBot = useMemo(
+    () =>
+      botsState.bots.find((item) => item.id === selectedBotId) ??
+      botsState.bots.find((item) => item.kind === "master") ??
+      botsState.bots[0],
+    [botsState.bots, selectedBotId],
+  );
+  const activeBotThread = useMemo(() => {
+    if (!selectedBot) return undefined;
+    const preferredId = selectedThreadsByBot[selectedBot.id];
+    return (
+      selectedBot.threads.find((thread) => thread.id === preferredId) ??
+      selectedBot.threads[0]
+    );
+  }, [selectedBot, selectedThreadsByBot]);
+  const handleShellModeChange = useCallback((mode: ShellMode): void => {
+    setShellMode(mode);
+    setView("workspaces");
+    setActiveRemoteId(undefined);
+  }, []);
+  const selectBot = useCallback((botId: string): void => {
+    setSelectedBotId(botId);
+    setShellMode("bots");
+    setView("workspaces");
+    setActiveRemoteId(undefined);
+  }, []);
+  const selectBotThread = useCallback((botId: string, threadId: string): void => {
+    setSelectedBotId(botId);
+    setSelectedThreadsByBot((current) => ({ ...current, [botId]: threadId }));
+    setShellMode("bots");
+    setView("workspaces");
+    setActiveRemoteId(undefined);
+  }, []);
+  const createBotThread = useCallback((explicitBotId?: string): void => {
+    const targetBotId = explicitBotId ?? selectedBot?.id ?? "master";
+    void runBotAction({ kind: "thread.create", botId: targetBotId, title: null })
+      .then((result) => {
+        if (result.bots) botsState.applyBots(result.bots);
+        if (result.thread) {
+          selectBotThread(targetBotId, result.thread.id);
+        } else {
+          selectBot(targetBotId);
+        }
+      })
+      .catch((reason) => setSessionActionError(reportError(reason)));
+  }, [botsState.applyBots, selectBot, selectBotThread, selectedBot?.id]);
+  const archiveBotThread = useCallback((botId: string, threadId: string): void => {
+    setSelectedThreadsByBot((current) => {
+      if (current[botId] !== threadId) return current;
+      const next = { ...current };
+      delete next[botId];
+      return next;
+    });
+    void runBotAction({ kind: "thread.archive", botId, threadId })
+      .then((result) => {
+        if (result.bots) botsState.applyBots(result.bots);
+      })
+      .catch((reason) => setSessionActionError(reportError(reason)));
+  }, [botsState.applyBots]);
   const openBotSession = useCallback((): void => {
+    if (botsSupported) {
+      selectBot("master");
+      return;
+    }
     if (botSession) {
       if (botSession.archived || snapshotRef.current.archivedSessionIds.includes(botSession.id)) {
         void window.prospero.setSessionArchived(botSession.id, false).catch(() => undefined);
@@ -3594,12 +4015,15 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         setLauncher("quick");
       } else if (matchesDesktopShortcut(event, "n", window.prospero.platform)) {
         event.preventDefault();
-        if (!event.repeat) openNewSession();
+        if (!event.repeat) {
+          if (shellMode === "bots") createBotThread();
+          else openNewSession();
+        }
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [openNewSession]);
+  }, [createBotThread, openNewSession, shellMode]);
   const [archiveBinding, setArchiveBinding] = useState<{ session: SessionInfo; archived: boolean }>();
   const toggleArchive = useCallback((id: string, passedSession?: SessionInfo): void => {
     const session = passedSession ?? snapshotRef.current.daemon.sessions.find(item => item.id === id);
@@ -3774,7 +4198,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const exitFocus = useCallback(() => setFocus(false), []);
   const retryRemote = useCallback(() => { void remote.refresh(); }, [remote.refresh]);
   const workspaceFocus = focus && view === "workspaces";
-  const localWorkspaceVisible = view === "workspaces" && !activeRemote && !(activeRemoteId && !remote.ready);
+  const localWorkspaceVisible = shellMode === "workspace" && view === "workspaces" && !activeRemote && !(activeRemoteId && !remote.ready);
   const [localWorkspaceVisited, setLocalWorkspaceVisited] = useState(false);
   if (localWorkspaceVisible && !localWorkspaceVisited) setLocalWorkspaceVisited(true);
   const [topbarActionsContainer] = useState<HTMLDivElement | null>(() => {
@@ -3791,7 +4215,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       onOpenChange={changeSidebarOpen}
       className="prospero-shell"
     >
-      <WindowsTitlebar canBack={navigation.canBack} canForward={navigation.canForward} onBack={navigation.back} onForward={navigation.forward} onAction={(action) => { if (action === "new-session") openNewSession(); if (action === "settings") selectView("settings"); if (action === "command") setLauncher("command"); }} />
+      <WindowsTitlebar canBack={navigation.canBack} canForward={navigation.canForward} onBack={navigation.back} onForward={navigation.forward} onAction={(action) => { if (action === "new-session") { if (shellMode === "bots") createBotThread(); else openNewSession(); } if (action === "settings") selectView("settings"); if (action === "command") setLauncher("command"); }} />
       <a className="skip-link" href="#main-content">
         {t("跳到主内容", "Skip to main content")}
       </a>
@@ -3799,6 +4223,17 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       <ShellSidebar
         snapshot={sessionSnapshot}
         view={view}
+        shellMode={shellMode}
+        onShellModeChange={handleShellModeChange}
+        bots={botsState.bots}
+        selectedBotId={selectedBot?.id}
+        activeBotThreadId={activeBotThread?.id}
+        onSelectBot={selectBot}
+        onSelectBotThread={selectBotThread}
+        onNewBotThread={createBotThread}
+        onArchiveBotThread={archiveBotThread}
+        onOpenNewBot={() => setBotEditorState({ open: true })}
+        onEditBot={(targetBot) => setBotEditorState({ open: true, bot: targetBot })}
         activeId={activeRemoteId ? undefined : activeId}
         botSession={botSession}
         botBusy={botCreating}
@@ -3829,8 +4264,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
 
-        <div className={cn("main-viewport", pendingSessionDraft && (view === "providers" || view === "workspaces") && "has-session-draft")} style={{ position: "relative" }}>
-          {pendingSessionDraft && (view === "providers" || view === "workspaces") && <div className="session-draft-banner" role="region" aria-label={t("待继续的新建会话", "Pending session draft")}>
+        <div className={cn("main-viewport", shellMode === "workspace" && pendingSessionDraft && (view === "providers" || view === "workspaces") && "has-session-draft")} style={{ position: "relative" }}>
+          {shellMode === "workspace" && pendingSessionDraft && (view === "providers" || view === "workspaces") && <div className="session-draft-banner" role="region" aria-label={t("待继续的新建会话", "Pending session draft")}>
             <div><strong>{t("配置完成后继续创建会话", "Continue creating your session after setup")}</strong><p title={pendingSessionDraft.input.cwd}>{pendingSessionDraft.input.cwd}</p></div>
             <Button size="sm" onClick={() => {
               setInitialSessionDraft(pendingSessionDraft);
@@ -3847,7 +4282,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             fallback={
               <div className="boot-screen">
                 <Spinner />
-                <span>Loading workspace…</span>
+                <span>{shellMode === "bots" ? t("正在加载…", "Loading…") : "Loading workspace…"}</span>
               </div>
             }
           >
@@ -3856,7 +4291,18 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             ) : view === "mobile" ? (
               <DevicesPane snapshot={sessionSnapshot} />
             ) : view === "workspaces" ? (
-              activeRemote ? <RemoteWorkspacePane key={activeRemote.id} workspace={activeRemote} settings={sessionSnapshot.settings} focus={focus} onToggleFocus={() => setFocus(current => !current)} newSessionRequest={remoteSessionRequest} /> : activeRemoteId && !remote.ready ? <div className="boot-screen"><p role={remote.error ? "alert" : "status"}>{remote.error ?? t("正在恢复远程工作区…", "Restoring remote workspace…")}</p>{remote.error && <Button onClick={() => void remote.refresh()}>{t("重试", "Retry")}</Button>}</div> : null
+              shellMode === "bots" ? (
+                <BotsModePane
+                  bot={selectedBot}
+                  activeThread={activeBotThread}
+                  snapshot={sessionSnapshot}
+                  onSelectThread={selectBotThread}
+                  onArchiveThread={archiveBotThread}
+                  onEditBot={(targetBot) => setBotEditorState({ open: true, bot: targetBot })}
+                  onOpenNewBot={() => setBotEditorState({ open: true })}
+                  onBotsUpdated={botsState.applyBots}
+                />
+              ) : activeRemote ? <RemoteWorkspacePane key={activeRemote.id} workspace={activeRemote} settings={sessionSnapshot.settings} focus={focus} onToggleFocus={() => setFocus(current => !current)} newSessionRequest={remoteSessionRequest} /> : activeRemoteId && !remote.ready ? <div className="boot-screen"><p role={remote.error ? "alert" : "status"}>{remote.error ?? t("正在恢复远程工作区…", "Restoring remote workspace…")}</p>{remote.error && <Button onClick={() => void remote.refresh()}>{t("重试", "Retry")}</Button>}</div> : null
             ) : view === "runs" ? (
               <OrchestrationPane
                 snapshot={sessionSnapshot}
@@ -3962,6 +4408,26 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             if (!open) setEditingSession(undefined);
           }}
         />
+      )}
+      {botEditorState.open && (
+        <Suspense fallback={null}>
+          <BotEditorDialog
+            open
+            bot={botEditorState.bot}
+            snapshot={sessionSnapshot}
+            onOpenChange={(next) => {
+              if (!next) setBotEditorState({ open: false });
+            }}
+            onSaved={(savedBot, nextBots) => {
+              botsState.applyBots(nextBots);
+              selectBot(savedBot.id);
+            }}
+            onDeleted={(nextBots) => {
+              botsState.applyBots(nextBots);
+              selectBot("master");
+            }}
+          />
+        </Suspense>
       )}
       {launcher && (
         <CommandDialog

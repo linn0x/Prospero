@@ -1,4 +1,5 @@
 import type { SessionInfo } from "../../../shared/types";
+import { isManagedBotWorkspacePath } from "../../../shared/bots";
 import { AgentLogo } from "../AgentLogo";
 import { cn } from "../lib/utils";
 import { useLocale } from "../locale";
@@ -64,6 +65,7 @@ export const PROSPERO_BOT_TITLE = "Prospero Bot";
 
 export function isProsperoBotSession(session: SessionInfo | undefined): boolean {
   if (!session) return false;
+  if (isManagedBotWorkspacePath(session.cwd)) return true;
   const title = (session.displayTitle ?? session.title ?? "").trim();
   if (title === PROSPERO_BOT_TITLE || title.startsWith(`${PROSPERO_BOT_TITLE} ·`) || title.startsWith(`${PROSPERO_BOT_TITLE} `)) {
     return true;

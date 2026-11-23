@@ -7,6 +7,7 @@ import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQue
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, AttachmentChunk, CreateAgentSession, CreateCrossModelChild, CrossModelChild, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, ConversationSearchResult, LaunchModelCatalog, ResumableConversation, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
+import type { BotActionResult } from "../shared/bots";
 import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, SearchResult as RustProjectSearchResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
@@ -703,6 +704,16 @@ export class RustClient {
 
   modelSource(body: Record<string, unknown>, signal: AbortSignal | null = null, timeoutMs = 45_000): Promise<SourceResult> {
     return this.json("/v1/model-sources", {
+      method: "POST",
+      signal,
+      timeoutMs,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  bots(body: Record<string, unknown>, signal: AbortSignal | null = null, timeoutMs = 45_000): Promise<BotActionResult> {
+    return this.json("/v1/bots", {
       method: "POST",
       signal,
       timeoutMs,

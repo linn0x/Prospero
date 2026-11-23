@@ -936,6 +936,33 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
         "mail.check" => check_messages(&client, params).await,
         "mail.ask" => ask_message(&client, params).await,
         "mail.reply" => reply_message(&client, params).await,
+        "bot.list" => client.get("/v1/bots").await,
+        "bot.dispatch" => {
+            let bot_id = required_text(&params, "botId")?;
+            let task = required_text(&params, "task")?;
+            let thread_id = optional_text(&params, "threadId");
+            let title = optional_text(&params, "title");
+            let req_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
+            client
+                .post(
+                    "/v1/bots",
+                    json!({
+                        "type": "bot.action",
+                        "requestId": req_id,
+                        "action": strip_empty(
+                            json!({
+                                "kind": "thread.dispatch",
+                                "botId": bot_id,
+                                "task": task,
+                                "threadId": thread_id,
+                                "title": title,
+                            }),
+                            &[],
+                        ),
+                    }),
+                )
+                .await
+        }
         _ => Err(Error::Feature(
             "method_not_found".into(),
             format!("未知控制方法: {method}"),

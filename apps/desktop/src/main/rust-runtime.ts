@@ -10,6 +10,7 @@ import { StateStore } from "./state-store";
 import { TerminalRecovery } from "./terminal-recovery";
 import type WebSocket from "ws";
 import { TERMINAL_STREAM_V1_CAPABILITY } from "../shared/terminal-stream";
+import { isManagedBotWorkspacePath } from "../shared/bots";
 import { RustProcess, type RustConnection } from "./rust-process";
 import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } from "./rust-orchestration";
 
@@ -643,7 +644,8 @@ export class RustRuntime {
       if (previous && previous.nativeSession?.runtimeId !== session.nativeSession?.runtimeId) await this.terminalRecovery.forget(session.id);
     }
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
-    this.store.setApiState({ running: true, config: {}, devices: devices as unknown as JsonObject, orchestration: this.orchestrationWindow, projects: workspaces.items.map(item => item.workspace), status: {
+    const visibleWorkspaces = workspaces.items.filter(item => !isManagedBotWorkspacePath(item.workspace));
+    this.store.setApiState({ running: true, config: {}, devices: devices as unknown as JsonObject, orchestration: this.orchestrationWindow, projects: visibleWorkspaces.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
       persistence: health.persistence,
       daemonVersion: health.daemonVersion,
@@ -652,7 +654,7 @@ export class RustRuntime {
       updatePending: this.connection?.upgradeDeferred === true,
       ...(health.relay ? { relay: health.relay as unknown as JsonObject } : {}),
       metadataRevision: `${pid}:${this.sequence}`,
-      workspaceCounts: Object.fromEntries(workspaces.items.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
+      workspaceCounts: Object.fromEntries(visibleWorkspaces.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
       ...(workspaceTabs.items.length > 0 ? {
         workspaceTabs: Object.fromEntries(workspaceTabs.items.map(item => [item.workspace, {
           openSessionIds: item.openSessionIds,
@@ -1367,6 +1369,32 @@ export class RustRuntime {
       if (result.ok && action["kind"] !== "list" && action["kind"] !== "models") await this.refresh(true);
       return result as unknown as JsonObject;
     }
+
+    if (path === "/_prospero/control/bots" && init?.method === "POST" && input) {
+      const type = input["type"];
+      const requestId = input["requestId"];
+      const rawAction = input["action"];
+      if (type !== "bot.action" || typeof requestId !== "string" || !requestId.trim() || requestId.length > 100 || !rawAction || typeof rawAction !== "object" || Array.isArray(rawAction)) throw new Error("Bot 请求无效");
+      const action = rawAction as Record<string, unknown>;
+      const result = await this.current().client.bots(input, signal, init.timeoutMs ?? 45_000);
+      const kind = action["kind"];
+      if (
+        result.ok &&
+        ![
+          "list",
+          "memory.read",
+          "memory.write",
+          "memory.list",
+          "memory.entry.read",
+          "memory.entry.write",
+          "memory.entry.delete",
+          "feishu.test",
+        ].includes(String(kind))
+      ) {
+        await this.refresh(true);
+      }
+      return result as unknown as JsonObject;
+    }
     const crossChildRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/cross-model-children$/.exec(path);
     if (crossChildRoute && init?.method === "POST" && input) {
       const hasSource = input["sourceId"] !== undefined && input["sourceId"] !== null && String(input["sourceId"]).trim() !== "";
@@ -1404,9 +1432,9 @@ export class RustRuntime {
       const result = await this.current().client.createCrossModelChild(
         crossChildRoute[1]!,
         {
-          ...(sourceId ? { sourceId } : {}),
-          ...(routeId ? { routeId } : {}),
-          ...(revision !== undefined ? { revision } : {}),
+          sourceId: sourceId ?? "",
+          routeId: routeId ?? "",
+          revision: revision ?? 0,
           agent,
           task,
           ...(title ? { title } : {}),

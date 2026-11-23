@@ -24,6 +24,7 @@ import { sessionInfoFromControl } from "./session-control";
 import { StateStore } from "./state-store";
 import { RemoteHostStore } from "./remote-host-store";
 import { modelSourceRequest, modelSourceResult } from "../shared/model-sources";
+import { botActionRequest, botActionResult } from "../shared/bots";
 import { RemoteShellManager } from "./remote-shell-manager";
 import { TerminalStreamBridge } from "./terminal-stream-bridge";
 import { NativeGhosttyManager } from "./native-ghostty";
@@ -1609,6 +1610,25 @@ function installIpc(): void {
       } catch { return failed("network", "模型源请求失败，请刷新确认后重试 / Model source request failed; refresh before retrying"); }
     };
     return message.action.kind === "list" || message.action.kind === "models" ? execute() : enqueueAccountAction(execute);
+  });
+  ipcMain.handle("bots:action", async (_event, raw: unknown) => {
+    const message = botActionRequest(raw, randomUUID());
+    const failed = (code: string, detail: string) => ({ type: "bot.result", requestId: message.requestId, ok: false, error: { code, message: detail } });
+    if (!store.snapshot().daemon.capabilities?.includes("bots.v1")) {
+      return failed("unsupported", "请更新 daemon 后使用 Bot 模式 / Update the daemon to use Bot mode");
+    }
+    try {
+      const result = botActionResult(
+        await runtime.request("/_prospero/control/bots", { method: "POST", body: message, timeoutMs: 45_000, acceptJsonError: true }),
+        message.requestId,
+      );
+      if (result.ok && result.bots) {
+        sendToMainWindow("bots:changed", result.bots);
+      }
+      return result;
+    } catch {
+      return failed("network", "Bot 服务请求失败，请确认 daemon 正在运行后重试 / Bot request failed; ensure daemon is running and retry");
+    }
   });
   const accountConfiguration = async (raw: unknown, write: boolean) => {
     const message = accountConfigRequest(raw, randomUUID(), write);

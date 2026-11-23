@@ -3,6 +3,29 @@ import type { EventPage, TimelinePage, TimelineQuery, TimelineLookupResult, Time
 import type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort, C2SAgentAccountApiModelsGet, C2SAgentAccountConfigSet, S2CAgentAccountApiModelsResult, S2CAgentAccountConfigResult } from "@prospero/protocol";
 import type { ModelSource, ModelSourceAction, ResumableConversation, S2CModelSourceResult } from "@prospero/protocol";
 export type { ModelSource, ModelSourceRoute, ModelSourceAction, ModelSourceMigration, ModelSourceBinding, S2CModelSourceResult } from "@prospero/protocol";
+import type { BotAction, BotActionResult, PublicBot } from "./bots";
+export { isManagedBotWorkspacePath } from "./bots";
+export type {
+  BotAction,
+  BotActionRequest,
+  BotActionResult,
+  BotFeishuInput,
+  BotFeishuProbeResult,
+  BotFeishuRuntimeStatus,
+  BotKind,
+  BotMemoryEntry,
+  BotMemoryScope,
+  BotMemoryView,
+  BotSourceBinding,
+  BotThread,
+  BotThreadChannel,
+  BotUpsertInput,
+  FeishuConnectionState,
+  FeishuDomain,
+  FeishuGroupTrigger,
+  PublicBot,
+  PublicBotFeishuConfig,
+} from "./bots";
 
 export type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort };
 import type { RemoteWorkspace, RemoteDirectoryRequest, RemoteDirectoryListing, RemoteWorkspaceInput, RemoteWorkspaceOpenOptions, RemoteWorkspaceOpenResult } from "./remote-workspaces";
@@ -366,6 +389,8 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   };
   modelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult>;
   subscribeModelSources(listener: (sources: ModelSource[]) => void): () => void;
+  botAction(action: BotAction): Promise<BotActionResult>;
+  subscribeBots(listener: (bots: PublicBot[]) => void): () => void;
   getSnapshot(): Promise<DesktopSnapshot>;
   subscribeSnapshot(listener: (patch: DesktopSnapshotPatch) => void): () => void;
   startDaemon(): Promise<{ ok: boolean; error?: string }>;

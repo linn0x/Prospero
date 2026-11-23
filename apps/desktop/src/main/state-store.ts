@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { sessionAgentControls } from "./session-control";
+import { isManagedBotWorkspacePath } from "../shared/bots";
 import { DEFAULT_TERMINAL_FONT_FAMILY, DEFAULT_TERMINAL_FONT_SIZE } from "../shared/terminal-typography";
 import type {
   DaemonSnapshot,
@@ -1318,7 +1319,7 @@ export class StateStore extends EventEmitter {
       this.pendingProjectPaths.clear();
       for (const entry of arrayValue(status["sessions"])) {
         const cwd = stringValue(objectValue(entry)["cwd"]);
-        if (!cwd || !isAbsolute(cwd)) continue;
+        if (!cwd || !isAbsolute(cwd) || isManagedBotWorkspacePath(cwd)) continue;
         const normalized = normalizeProject(cwd);
         const known = this.projects.some((item) => item.toLocaleLowerCase() === normalized.toLocaleLowerCase());
         if (known) continue;
@@ -1347,7 +1348,7 @@ export class StateStore extends EventEmitter {
       ? current
       : readJson(this.legacyDesktopStatePath) as PersistedDesktopState;
     for (const path of Array.isArray(raw.projects) ? raw.projects : []) {
-      if (typeof path === "string" && isAbsolute(path) && existsSync(path)) this.addProjectInMemory(path);
+      if (typeof path === "string" && isAbsolute(path) && !isManagedBotWorkspacePath(path) && existsSync(path)) this.addProjectInMemory(path);
     }
     const stored = objectValue(raw.settings);
     this.sessionTitles = this.backend === "api" ? {} : Object.fromEntries(
