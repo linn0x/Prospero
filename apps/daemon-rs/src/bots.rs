@@ -25,11 +25,17 @@ use crate::worker::Database;
 const REGISTRY_VERSION: u32 = 1;
 const THREADS_VERSION: u32 = 1;
 const MEMORY_INDEX_VERSION: u32 = 1;
+const TASKS_VERSION: u32 = 1;
+const MEMORY_ITEMS_VERSION: u32 = 1;
 const MAX_BOTS: usize = 64;
 const MAX_THREADS_PER_BOT: usize = 200;
+const MAX_TASKS_PER_BOT: usize = 100;
+const MAX_NOTICES_PER_BOT: usize = 50;
+const MAX_MEMORY_ITEMS_PER_BOT: usize = 500;
+const MAX_MEMORY_EVENTS_PER_BOT: usize = 50;
 const MAX_MEMORY_ENTRIES: usize = 500;
 const MAX_MEMORY_BYTES: usize = 256 * 1024;
-const MAX_PROMPT_MEMORY_CHARS: usize = 1_200;
+const MAX_PROMPT_MEMORY_CHARS: usize = 1_600;
 const MAX_PROMPT_CHARS: usize = 32_000;
 const MAX_FEISHU_REPLY_MAP: usize = 500;
 const MAX_FEISHU_ADMINS: usize = 50;
@@ -39,12 +45,9 @@ const BOT_SECTION_START: &str = "<!-- PROSPERO_BOT:START -->";
 const BOT_SECTION_END: &str = "<!-- PROSPERO_BOT:END -->";
 const LEGACY_MASTER_DESC: &str =
     "全局主控 Bot：统筹多个项目工作区与子 Bot 团队，适合跨仓库拆解与结果汇总。";
-const LEGACY_MASTER_PROMPT: &str =
-    "你是 Prospero 主控 Bot，负责帮助用户在个人工作台、多个代码工作区以及各专业子 Bot 之间统筹调度、拆解任务与综合汇报。";
-const DEFAULT_MASTER_DESC: &str =
-    "全能个人主控助手：跨话题持久记忆，支持自由切换模型与统筹子 Bot 团队协同。";
-const DEFAULT_MASTER_PROMPT: &str =
-    "你是用户的全能个人 AI 助手（Prospero Bot），负责日常问答、深度思考、计划制定，并在需要时统筹各专职子 Bot 协同完成复杂任务。";
+const LEGACY_MASTER_PROMPT: &str = "你是 Prospero 主控 Bot，负责帮助用户在个人工作台、多个代码工作区以及各专业子 Bot 之间统筹调度、拆解任务与综合汇报。";
+const DEFAULT_MASTER_DESC: &str = "全能个人主控助手：永续主对话、主动长期记忆、后台定时任务与主动提醒，支持自由切换模型与子 Bot 协同。";
+const DEFAULT_MASTER_PROMPT: &str = "你是用户的全能个人 AI 助手（Prospero Bot），对标 Grok Bot / Muse / 小豆的个人助理体验：负责日常问答、深度思考、长期记忆沉淀、后台巡检与定时提醒，并在需要时统筹各专职子 Bot 协同完成复杂任务。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -187,6 +190,13 @@ pub struct BotThread {
     pub session_id: String,
     pub title: String,
     pub channel: BotThreadChannel,
+    #[serde(default)]
+    pub is_primary: bool,
+    #[serde(default)]
+    pub unread_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub last_proactive_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feishu_chat_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,6 +213,200 @@ pub struct BotThread {
     pub created_at: i64,
     #[ts(type = "number")]
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BotTaskKind {
+    #[default]
+    Cron,
+    Heartbeat,
+    OneShot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BotTaskStatus {
+    #[default]
+    Enabled,
+    Paused,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BotTaskDelivery {
+    #[default]
+    PrimaryThread,
+    NewSideChat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct BotTask {
+    pub id: String,
+    pub bot_id: String,
+    pub name: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub kind: BotTaskKind,
+    #[serde(default)]
+    pub status: BotTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rrule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub run_at: Option<i64>,
+    #[serde(default)]
+    pub delivery: BotTaskDelivery,
+    #[serde(default = "default_true")]
+    pub notify_app: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_feishu_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub last_run_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub next_run_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub run_count: u32,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct BotTaskInput {
+    pub name: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub kind: BotTaskKind,
+    #[serde(default)]
+    pub rrule: Option<String>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub run_at: Option<i64>,
+    #[serde(default)]
+    pub delivery: Option<BotTaskDelivery>,
+    #[serde(default)]
+    pub notify_app: Option<bool>,
+    #[serde(default)]
+    pub notify_feishu_chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct BotTaskUpdateInput {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub kind: Option<BotTaskKind>,
+    #[serde(default)]
+    pub rrule: Option<Option<String>>,
+    #[serde(default)]
+    #[ts(type = "number | null | undefined")]
+    pub run_at: Option<Option<i64>>,
+    #[serde(default)]
+    pub delivery: Option<BotTaskDelivery>,
+    #[serde(default)]
+    pub notify_app: Option<bool>,
+    #[serde(default)]
+    pub notify_feishu_chat_id: Option<Option<String>>,
+    #[serde(default)]
+    pub status: Option<BotTaskStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct BotProactiveNotice {
+    pub id: String,
+    pub bot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub thread_id: String,
+    pub title: String,
+    pub summary: String,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[serde(default)]
+    pub read: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BotMemoryCategory {
+    Profile,
+    Preference,
+    Habit,
+    Project,
+    Rule,
+    #[default]
+    Fact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BotMemorySource {
+    #[default]
+    Manual,
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct BotMemoryItem {
+    pub id: String,
+    #[serde(default)]
+    pub category: BotMemoryCategory,
+    pub content: String,
+    #[serde(default = "default_memory_scope_global")]
+    pub scope: BotMemoryScope,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub source: BotMemorySource,
+    #[serde(default)]
+    pub archived: bool,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
+fn default_memory_scope_global() -> BotMemoryScope {
+    BotMemoryScope::Global
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct BotMemoryEvent {
+    pub id: String,
+    pub item_id: String,
+    pub action: String,
+    pub summary: String,
+    #[serde(default)]
+    pub category: BotMemoryCategory,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[serde(default)]
+    pub reverted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -228,9 +432,25 @@ pub struct PublicBot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_workspace: Option<String>,
     pub allow_cross_workspace: bool,
+    #[serde(default = "default_true")]
+    pub auto_memory: bool,
+    #[serde(default = "default_true")]
+    pub proactive_notifications: bool,
     pub feishu: PublicBotFeishuConfig,
     pub feishu_status: BotFeishuRuntimeStatus,
     pub threads: Vec<BotThread>,
+    #[serde(default)]
+    pub tasks: Vec<BotTask>,
+    #[serde(default)]
+    pub memory_items: Vec<BotMemoryItem>,
+    #[serde(default)]
+    pub recent_memory_events: Vec<BotMemoryEvent>,
+    #[serde(default)]
+    pub unread_proactive_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_proactive_notice: Option<BotProactiveNotice>,
+    #[serde(default)]
+    pub notices: Vec<BotProactiveNotice>,
     #[ts(type = "number")]
     pub created_at: i64,
     #[ts(type = "number")]
@@ -286,6 +506,10 @@ pub struct BotUpsertInput {
     pub custom_workspace: Option<String>,
     #[serde(default)]
     pub allow_cross_workspace: bool,
+    #[serde(default = "default_true")]
+    pub auto_memory: bool,
+    #[serde(default = "default_true")]
+    pub proactive_notifications: bool,
     #[serde(default)]
     pub feishu: Option<BotFeishuInput>,
 }
@@ -444,6 +668,60 @@ pub enum BotAction {
     },
     #[serde(rename = "memory.entry.delete")]
     MemoryEntryDelete { bot_id: String, key: String },
+    #[serde(rename = "thread.ensure_primary")]
+    ThreadEnsurePrimary { bot_id: String },
+    #[serde(rename = "thread.mark_read")]
+    ThreadMarkRead { bot_id: String, thread_id: String },
+    #[serde(rename = "task.create")]
+    TaskCreate { bot_id: String, input: BotTaskInput },
+    #[serde(rename = "task.update")]
+    TaskUpdate {
+        bot_id: String,
+        task_id: String,
+        input: BotTaskUpdateInput,
+    },
+    #[serde(rename = "task.pause")]
+    TaskPause { bot_id: String, task_id: String },
+    #[serde(rename = "task.resume")]
+    TaskResume { bot_id: String, task_id: String },
+    #[serde(rename = "task.delete")]
+    TaskDelete { bot_id: String, task_id: String },
+    #[serde(rename = "task.run")]
+    TaskRunNow { bot_id: String, task_id: String },
+    #[serde(rename = "notices.ack")]
+    NoticesAck {
+        bot_id: String,
+        #[serde(default)]
+        notice_id: Option<String>,
+    },
+    #[serde(rename = "memory.item.add")]
+    MemoryItemAdd {
+        bot_id: String,
+        #[serde(default)]
+        category: BotMemoryCategory,
+        content: String,
+        #[serde(default)]
+        scope: Option<BotMemoryScope>,
+        #[serde(default)]
+        pinned: Option<bool>,
+        #[serde(default)]
+        source: Option<BotMemorySource>,
+    },
+    #[serde(rename = "memory.item.update")]
+    MemoryItemUpdate {
+        bot_id: String,
+        item_id: String,
+        #[serde(default)]
+        category: Option<BotMemoryCategory>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        pinned: Option<bool>,
+    },
+    #[serde(rename = "memory.item.delete")]
+    MemoryItemDelete { bot_id: String, item_id: String },
+    #[serde(rename = "memory.item.restore")]
+    MemoryItemRestore { bot_id: String, item_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -469,6 +747,14 @@ pub struct BotActionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memories: Option<Vec<BotMemoryEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<BotTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<BotTask>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_item: Option<BotMemoryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_items: Option<Vec<BotMemoryItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<crate::accounts::models::FeatureError>,
 }
 
@@ -485,6 +771,10 @@ impl BotActionResult {
             probe: None,
             memory: None,
             memories: None,
+            task: None,
+            tasks: None,
+            memory_item: None,
+            memory_items: None,
             error: None,
         }
     }
@@ -567,10 +857,54 @@ struct StoredBot {
     custom_workspace: Option<String>,
     #[serde(default)]
     allow_cross_workspace: bool,
+    #[serde(default = "default_true")]
+    auto_memory: bool,
+    #[serde(default = "default_true")]
+    proactive_notifications: bool,
     #[serde(default)]
     feishu: StoredFeishuConfig,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BotTasksFile {
+    version: u32,
+    #[serde(default)]
+    tasks: Vec<BotTask>,
+    #[serde(default)]
+    notices: Vec<BotProactiveNotice>,
+}
+
+impl Default for BotTasksFile {
+    fn default() -> Self {
+        Self {
+            version: TASKS_VERSION,
+            tasks: Vec::new(),
+            notices: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BotMemoryItemsFile {
+    version: u32,
+    #[serde(default)]
+    items: Vec<BotMemoryItem>,
+    #[serde(default)]
+    events: Vec<BotMemoryEvent>,
+}
+
+impl Default for BotMemoryItemsFile {
+    fn default() -> Self {
+        Self {
+            version: MEMORY_ITEMS_VERSION,
+            items: Vec::new(),
+            events: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,6 +1025,8 @@ struct Inner {
     agents: Agents,
     state: Mutex<BotsState>,
     workers: Mutex<HashMap<String, WorkerSlot>>,
+    inflight_tasks: Mutex<HashSet<String>>,
+    scheduler_stop: watch::Sender<bool>,
     changes: watch::Sender<u64>,
     started: Mutex<bool>,
 }
@@ -699,6 +1035,8 @@ struct BotsState {
     registry: BotRegistryFile,
     threads: HashMap<String, BotThreadsFile>,
     memories: HashMap<String, BotMemoryIndexFile>,
+    tasks: HashMap<String, BotTasksFile>,
+    memory_items: HashMap<String, BotMemoryItemsFile>,
     statuses: HashMap<String, BotFeishuRuntimeStatus>,
     admin_mutation_seq: u64,
     admin_mutations: HashMap<String, VecDeque<(u64, Option<PathBuf>)>>,
@@ -724,12 +1062,15 @@ impl BotsSupervisor {
             }
         }
         let (changes, _) = watch::channel(0u64);
+        let (scheduler_stop, _) = watch::channel(false);
         Self(Arc::new(Inner {
             directory,
             database,
             agents,
             state: Mutex::new(state),
             workers: Mutex::new(HashMap::new()),
+            inflight_tasks: Mutex::new(HashSet::new()),
+            scheduler_stop,
             changes,
             started: Mutex::new(false),
         }))
@@ -761,6 +1102,7 @@ impl BotsSupervisor {
             }
             *started = true;
         }
+        let _ = self.0.scheduler_stop.send(false);
         let bots = {
             let guard = self.0.state.lock().await;
             guard.registry.bots.clone()
@@ -771,9 +1113,31 @@ impl BotsSupervisor {
                 self.reconcile_worker(&bot, false).await;
             }
         }
+        let supervisor = self.clone();
+        let mut stop_rx = self.0.scheduler_stop.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                        supervisor.tick_due_tasks().await;
+                    }
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn stop_all(&self) {
+        let _ = self.0.scheduler_stop.send(true);
         let mut workers = self.0.workers.lock().await;
         for (_, slot) in workers.drain() {
             let _ = slot.stop.send(true);
@@ -968,14 +1332,7 @@ impl BotsSupervisor {
             } => {
                 let memory = self
                     .write_memory_entry(
-                        &bot_id,
-                        &key,
-                        &content,
-                        label,
-                        chat_id,
-                        chat_name,
-                        user_id,
-                        user_name,
+                        &bot_id, &key, &content, label, chat_id, chat_name, user_id, user_name,
                     )
                     .await?;
                 let mut result = BotActionResult::success(&req_id);
@@ -986,6 +1343,139 @@ impl BotsSupervisor {
                 let memories = self.delete_memory_entry(&bot_id, &key).await?;
                 let mut result = BotActionResult::success(&req_id);
                 result.memories = Some(memories);
+                Ok(result)
+            }
+            BotAction::ThreadEnsurePrimary { bot_id } => {
+                let (thread, bots) = self.ensure_primary_thread(&bot_id).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.session_id = Some(thread.session_id.clone());
+                result.thread = Some(thread);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::ThreadMarkRead { bot_id, thread_id } => {
+                let (bot, bots) = self.mark_thread_read(&bot_id, &thread_id).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.bot = Some(bot);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::TaskCreate { bot_id, input } => {
+                let (task, tasks, bots) = self.create_task(&bot_id, input).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.task = Some(task);
+                result.tasks = Some(tasks);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::TaskUpdate {
+                bot_id,
+                task_id,
+                input,
+            } => {
+                let (task, tasks, bots) = self.update_task(&bot_id, &task_id, input).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.task = Some(task);
+                result.tasks = Some(tasks);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::TaskPause { bot_id, task_id } => {
+                let (task, tasks, bots) = self
+                    .set_task_status(&bot_id, &task_id, BotTaskStatus::Paused)
+                    .await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.task = Some(task);
+                result.tasks = Some(tasks);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::TaskResume { bot_id, task_id } => {
+                let (task, tasks, bots) = self
+                    .set_task_status(&bot_id, &task_id, BotTaskStatus::Enabled)
+                    .await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.task = Some(task);
+                result.tasks = Some(tasks);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::TaskDelete { bot_id, task_id } => {
+                let (tasks, bots) = self.delete_task(&bot_id, &task_id).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.tasks = Some(tasks);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::TaskRunNow { bot_id, task_id } => {
+                let (task, tasks, bots) = self.run_task_now(&bot_id, &task_id).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.task = Some(task);
+                result.tasks = Some(tasks);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::NoticesAck { bot_id, notice_id } => {
+                let (bot, bots) = self.ack_notices(&bot_id, notice_id.as_deref()).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.bot = Some(bot);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::MemoryItemAdd {
+                bot_id,
+                category,
+                content,
+                scope,
+                pinned,
+                source,
+            } => {
+                let (item, items, bots) = self
+                    .add_memory_item(
+                        &bot_id,
+                        category,
+                        &content,
+                        scope.unwrap_or(BotMemoryScope::Global),
+                        pinned.unwrap_or(false),
+                        source.unwrap_or(BotMemorySource::Manual),
+                    )
+                    .await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.memory_item = Some(item);
+                result.memory_items = Some(items);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::MemoryItemUpdate {
+                bot_id,
+                item_id,
+                category,
+                content,
+                pinned,
+            } => {
+                let (item, items, bots) = self
+                    .update_memory_item(&bot_id, &item_id, category, content.as_deref(), pinned)
+                    .await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.memory_item = Some(item);
+                result.memory_items = Some(items);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::MemoryItemDelete { bot_id, item_id } => {
+                let (item, items, bots) = self.delete_memory_item(&bot_id, &item_id).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.memory_item = Some(item);
+                result.memory_items = Some(items);
+                result.bots = Some(bots);
+                Ok(result)
+            }
+            BotAction::MemoryItemRestore { bot_id, item_id } => {
+                let (item, items, bots) = self.restore_memory_item(&bot_id, &item_id).await?;
+                let mut result = BotActionResult::success(&req_id);
+                result.memory_item = Some(item);
+                result.memory_items = Some(items);
+                result.bots = Some(bots);
                 Ok(result)
             }
         }
@@ -1009,6 +1499,8 @@ impl BotsSupervisor {
             source_binding: validated.source_binding,
             custom_workspace: validated.custom_workspace,
             allow_cross_workspace: validated.allow_cross_workspace,
+            auto_memory: validated.auto_memory,
+            proactive_notifications: validated.proactive_notifications,
             feishu: validated.feishu,
             created_at: ts,
             updated_at: ts,
@@ -1029,6 +1521,12 @@ impl BotsSupervisor {
                 .memories
                 .insert(id.clone(), BotMemoryIndexFile::default());
             save_memory_index(&self.0.directory, &id, &BotMemoryIndexFile::default())?;
+            guard.tasks.insert(id.clone(), BotTasksFile::default());
+            save_tasks(&self.0.directory, &id, &BotTasksFile::default())?;
+            guard
+                .memory_items
+                .insert(id.clone(), BotMemoryItemsFile::default());
+            save_memory_items(&self.0.directory, &id, &BotMemoryItemsFile::default())?;
             if !stored.feishu.enabled {
                 guard.statuses.insert(
                     id.clone(),
@@ -1086,6 +1584,8 @@ impl BotsSupervisor {
                 source_binding: validated.source_binding,
                 custom_workspace: validated.custom_workspace,
                 allow_cross_workspace: validated.allow_cross_workspace,
+                auto_memory: validated.auto_memory,
+                proactive_notifications: validated.proactive_notifications,
                 feishu: validated.feishu,
                 created_at: existing.created_at,
                 updated_at: now(),
@@ -1179,7 +1679,11 @@ impl BotsSupervisor {
             save_registry(&self.0.directory, &guard.registry)?;
             guard.statuses.remove(bot_id);
             guard.memories.remove(bot_id);
+            guard.tasks.remove(bot_id);
+            guard.memory_items.remove(bot_id);
             let _ = fs::remove_file(bot_memory_index_path(&self.0.directory, bot_id));
+            let _ = fs::remove_file(bot_tasks_path(&self.0.directory, bot_id));
+            let _ = fs::remove_file(bot_memory_items_path(&self.0.directory, bot_id));
             let removed_threads = guard.threads.remove(bot_id);
             let threads_path = bot_threads_path(&self.0.directory, bot_id);
             let _ = fs::remove_file(threads_path);
@@ -1258,6 +1762,9 @@ impl BotsSupervisor {
             session_id,
             title: thread_title,
             channel,
+            is_primary: false,
+            unread_count: 0,
+            last_proactive_at: None,
             feishu_chat_id: feishu_chat_id.clone(),
             chat_name: None,
             last_sender_id: None,
@@ -1325,6 +1832,9 @@ impl BotsSupervisor {
                 session_id: session_id.to_owned(),
                 title,
                 channel: BotThreadChannel::Desktop,
+                is_primary: false,
+                unread_count: 0,
+                last_proactive_at: None,
                 feishu_chat_id: None,
                 chat_name: None,
                 last_sender_id: None,
@@ -1434,6 +1944,1051 @@ impl BotsSupervisor {
         Ok((thread, bots))
     }
 
+    async fn ensure_primary_thread(&self, bot_id: &str) -> Result<(BotThread, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let candidate_threads: Vec<BotThread> = {
+            let guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            guard
+                .threads
+                .get(bot_id)
+                .map(|file| file.threads.clone())
+                .unwrap_or_default()
+        };
+
+        let mut valid_primary: Option<BotThread> = None;
+        for thr in candidate_threads.iter().filter(|t| t.is_primary) {
+            let sid = thr.session_id.clone();
+            if self
+                .0
+                .database
+                .read("bots.primary_session_check", move |store| {
+                    store.session(&sid)
+                })
+                .await
+                .is_ok()
+            {
+                valid_primary = Some(thr.clone());
+                break;
+            }
+        }
+        if let Some(thread) = valid_primary {
+            let bots = self.list_public().await;
+            return Ok((thread, bots));
+        }
+
+        let mut desktop_candidates: Vec<BotThread> = candidate_threads
+            .into_iter()
+            .filter(|t| t.channel == BotThreadChannel::Desktop)
+            .collect();
+        desktop_candidates.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+        for thr in desktop_candidates {
+            let sid = thr.session_id.clone();
+            if self
+                .0
+                .database
+                .read("bots.primary_promote_check", move |store| {
+                    store.session(&sid)
+                })
+                .await
+                .is_ok()
+            {
+                let (promoted, bots) = {
+                    let mut guard = self.0.state.lock().await;
+                    let file = guard.threads.entry(bot_id.to_owned()).or_default();
+                    let mut found = None;
+                    for item in &mut file.threads {
+                        if item.id == thr.id {
+                            item.is_primary = true;
+                            found = Some(item.clone());
+                        } else if item.is_primary {
+                            item.is_primary = false;
+                        }
+                    }
+                    let _ = save_threads(&self.0.directory, bot_id, file);
+                    let bots = build_public_bots(&self.0.directory, &guard);
+                    (found, bots)
+                };
+                if let Some(thread) = promoted {
+                    self.notify();
+                    return Ok((thread, bots));
+                }
+            }
+        }
+
+        let (mut created, _) = self
+            .create_thread(bot_id, Some("主对话"), BotThreadChannel::Desktop, None)
+            .await?;
+        let (thread, bots) = {
+            let mut guard = self.0.state.lock().await;
+            let file = guard.threads.entry(bot_id.to_owned()).or_default();
+            for item in &mut file.threads {
+                if item.id == created.id {
+                    item.is_primary = true;
+                    created = item.clone();
+                } else {
+                    item.is_primary = false;
+                }
+            }
+            save_threads(&self.0.directory, bot_id, file)?;
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (created, bots)
+        };
+        self.notify();
+        Ok((thread, bots))
+    }
+
+    async fn mark_thread_read(
+        &self,
+        bot_id: &str,
+        thread_id: &str,
+    ) -> Result<(PublicBot, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let (changed, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let mut changed = false;
+            if let Some(file) = guard.threads.get_mut(bot_id)
+                && let Some(thr) = file.threads.iter_mut().find(|t| t.id == thread_id)
+                && thr.unread_count > 0
+            {
+                thr.unread_count = 0;
+                save_threads(&self.0.directory, bot_id, file)?;
+                changed = true;
+            }
+            if let Some(tfile) = guard.tasks.get_mut(bot_id) {
+                let mut notice_changed = false;
+                for notice in &mut tfile.notices {
+                    if notice.thread_id == thread_id && !notice.read {
+                        notice.read = true;
+                        notice_changed = true;
+                    }
+                }
+                if notice_changed {
+                    save_tasks(&self.0.directory, bot_id, tfile)?;
+                    changed = true;
+                }
+            }
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (changed, bots)
+        };
+        if changed {
+            self.notify();
+        }
+        let bot = bots
+            .iter()
+            .find(|b| b.id == bot_id)
+            .cloned()
+            .ok_or(Error::NotFound)?;
+        Ok((bot, bots))
+    }
+
+    async fn ack_notices(
+        &self,
+        bot_id: &str,
+        notice_id: Option<&str>,
+    ) -> Result<(PublicBot, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let (changed, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let mut target_threads = HashSet::new();
+            let mut changed = false;
+            if let Some(tfile) = guard.tasks.get_mut(bot_id) {
+                for notice in &mut tfile.notices {
+                    let matches = notice_id.is_none_or(|nid| notice.id == nid);
+                    if matches && !notice.read {
+                        notice.read = true;
+                        target_threads.insert(notice.thread_id.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    save_tasks(&self.0.directory, bot_id, tfile)?;
+                }
+            }
+            if !target_threads.is_empty()
+                && let Some(file) = guard.threads.get_mut(bot_id)
+            {
+                let mut thr_changed = false;
+                for thr in &mut file.threads {
+                    if target_threads.contains(&thr.id) && thr.unread_count > 0 {
+                        thr.unread_count = 0;
+                        thr_changed = true;
+                    }
+                }
+                if thr_changed {
+                    save_threads(&self.0.directory, bot_id, file)?;
+                }
+            }
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (changed, bots)
+        };
+        if changed {
+            self.notify();
+        }
+        let bot = bots
+            .iter()
+            .find(|b| b.id == bot_id)
+            .cloned()
+            .ok_or(Error::NotFound)?;
+        Ok((bot, bots))
+    }
+
+    async fn create_task(
+        &self,
+        bot_id: &str,
+        input: BotTaskInput,
+    ) -> Result<(BotTask, Vec<BotTask>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let name = input.name.trim();
+        if name.is_empty() || name.chars().count() > 80 {
+            return Err(Error::Invalid("任务名称应为 1–80 个字符".into()));
+        }
+        let prompt = input.prompt.trim();
+        if prompt.is_empty() || prompt.chars().count() > 16_000 {
+            return Err(Error::Invalid("任务指令不能为空且不超过 16000 字符".into()));
+        }
+        let ts = now();
+        let (rrule, run_at, next_run_at) =
+            validate_task_schedule(input.kind, input.rrule.as_deref(), input.run_at, ts)?;
+        let notify_feishu_chat_id = input
+            .notify_feishu_chat_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+
+        let task = BotTask {
+            id: format!("tsk-{}", &Uuid::new_v4().simple().to_string()[..12]),
+            bot_id: bot_id.to_owned(),
+            name: name.to_owned(),
+            prompt: prompt.to_owned(),
+            kind: input.kind,
+            status: BotTaskStatus::Enabled,
+            rrule,
+            run_at,
+            delivery: input.delivery.unwrap_or(BotTaskDelivery::PrimaryThread),
+            notify_app: input.notify_app.unwrap_or(true),
+            notify_feishu_chat_id,
+            last_run_at: None,
+            next_run_at: Some(next_run_at),
+            last_session_id: None,
+            last_summary: None,
+            last_error: None,
+            run_count: 0,
+            created_at: ts,
+            updated_at: ts,
+        };
+
+        let (tasks, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let file = guard.tasks.entry(bot_id.to_owned()).or_default();
+            if file.tasks.len() >= MAX_TASKS_PER_BOT {
+                return Err(Error::Invalid("当前 Bot 后台任务数量已达上限".into()));
+            }
+            file.tasks.insert(0, task.clone());
+            save_tasks(&self.0.directory, bot_id, file)?;
+            let tasks = file.tasks.clone();
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (tasks, bots)
+        };
+        self.notify();
+        Ok((task, tasks, bots))
+    }
+
+    async fn update_task(
+        &self,
+        bot_id: &str,
+        task_id: &str,
+        input: BotTaskUpdateInput,
+    ) -> Result<(BotTask, Vec<BotTask>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let ts = now();
+        let (task, tasks, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let file = guard.tasks.entry(bot_id.to_owned()).or_default();
+            let pos = file
+                .tasks
+                .iter()
+                .position(|t| t.id == task_id)
+                .ok_or(Error::NotFound)?;
+            let mut next = file.tasks[pos].clone();
+            if let Some(ref name) = input.name {
+                let clean = name.trim();
+                if clean.is_empty() || clean.chars().count() > 80 {
+                    return Err(Error::Invalid("任务名称应为 1–80 个字符".into()));
+                }
+                next.name = clean.to_owned();
+            }
+            if let Some(ref prompt) = input.prompt {
+                let clean = prompt.trim();
+                if clean.is_empty() || clean.chars().count() > 16_000 {
+                    return Err(Error::Invalid("任务指令不能为空且不超过 16000 字符".into()));
+                }
+                next.prompt = clean.to_owned();
+            }
+            if let Some(kind) = input.kind {
+                next.kind = kind;
+            }
+            if let Some(rrule_opt) = input.rrule {
+                next.rrule = rrule_opt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned);
+            }
+            if let Some(run_at_opt) = input.run_at {
+                next.run_at = run_at_opt;
+            }
+            if let Some(delivery) = input.delivery {
+                next.delivery = delivery;
+            }
+            if let Some(notify_app) = input.notify_app {
+                next.notify_app = notify_app;
+            }
+            if let Some(chat_opt) = input.notify_feishu_chat_id {
+                next.notify_feishu_chat_id = chat_opt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned);
+            }
+            if let Some(status) = input.status {
+                next.status = status;
+            }
+            if next.status == BotTaskStatus::Enabled {
+                let (rrule, run_at, next_run_at) =
+                    validate_task_schedule(next.kind, next.rrule.as_deref(), next.run_at, ts)?;
+                next.rrule = rrule;
+                next.run_at = run_at;
+                next.next_run_at = Some(next_run_at);
+            } else if next.status == BotTaskStatus::Paused {
+                next.next_run_at = None;
+            }
+            next.updated_at = ts;
+            file.tasks[pos] = next.clone();
+            save_tasks(&self.0.directory, bot_id, file)?;
+            let tasks = file.tasks.clone();
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (next, tasks, bots)
+        };
+        self.notify();
+        Ok((task, tasks, bots))
+    }
+
+    async fn set_task_status(
+        &self,
+        bot_id: &str,
+        task_id: &str,
+        status: BotTaskStatus,
+    ) -> Result<(BotTask, Vec<BotTask>, Vec<PublicBot>)> {
+        self.update_task(
+            bot_id,
+            task_id,
+            BotTaskUpdateInput {
+                status: Some(status),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn delete_task(
+        &self,
+        bot_id: &str,
+        task_id: &str,
+    ) -> Result<(Vec<BotTask>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let (tasks, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let file = guard.tasks.entry(bot_id.to_owned()).or_default();
+            let before = file.tasks.len();
+            file.tasks.retain(|t| t.id != task_id);
+            if file.tasks.len() == before {
+                return Err(Error::NotFound);
+            }
+            save_tasks(&self.0.directory, bot_id, file)?;
+            let tasks = file.tasks.clone();
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (tasks, bots)
+        };
+        self.notify();
+        Ok((tasks, bots))
+    }
+
+    async fn run_task_now(
+        &self,
+        bot_id: &str,
+        task_id: &str,
+    ) -> Result<(BotTask, Vec<BotTask>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let task = {
+            let guard = self.0.state.lock().await;
+            let file = guard.tasks.get(bot_id).ok_or(Error::NotFound)?;
+            file.tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .cloned()
+                .ok_or(Error::NotFound)?
+        };
+        self.execute_task(task, now()).await
+    }
+
+    async fn tick_due_tasks(&self) {
+        let ts = now();
+        let due: Vec<BotTask> = {
+            let guard = self.0.state.lock().await;
+            let mut out = Vec::new();
+            for file in guard.tasks.values() {
+                for task in &file.tasks {
+                    if task.status == BotTaskStatus::Enabled
+                        && task.next_run_at.is_some_and(|next| next <= ts)
+                    {
+                        out.push(task.clone());
+                    }
+                }
+            }
+            out
+        };
+        for task in due {
+            let supervisor = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = supervisor.execute_task(task, ts).await {
+                    eprintln!("bot scheduled task failed: {err}");
+                }
+            });
+        }
+    }
+
+    async fn execute_task(
+        &self,
+        task: BotTask,
+        timestamp: i64,
+    ) -> Result<(BotTask, Vec<BotTask>, Vec<PublicBot>)> {
+        {
+            let mut inflight = self.0.inflight_tasks.lock().await;
+            if !inflight.insert(task.id.clone()) {
+                return Err(Error::Conflict);
+            }
+        }
+        let outcome = self.execute_task_inner(task.clone(), timestamp).await;
+        self.0.inflight_tasks.lock().await.remove(&task.id);
+        outcome
+    }
+
+    async fn execute_task_inner(
+        &self,
+        task: BotTask,
+        timestamp: i64,
+    ) -> Result<(BotTask, Vec<BotTask>, Vec<PublicBot>)> {
+        let thread = match task.delivery {
+            BotTaskDelivery::PrimaryThread => self.ensure_primary_thread(&task.bot_id).await?.0,
+            BotTaskDelivery::NewSideChat => {
+                let title = format!("⏰ {}", truncate_chars(&task.name, 28));
+                self.create_thread(&task.bot_id, Some(&title), BotThreadChannel::Desktop, None)
+                    .await?
+                    .0
+            }
+        };
+
+        let baseline_pos = self
+            .0
+            .database
+            .read("bots.task_baseline", {
+                let sid = thread.session_id.clone();
+                move |store| {
+                    store
+                        .timeline(
+                            &sid,
+                            crate::protocol::TimelineQuery {
+                                before: None,
+                                after: None,
+                                limit: Some(1),
+                            },
+                        )
+                        .map(|page| page.latest_position)
+                }
+            })
+            .await
+            .unwrap_or(0);
+
+        let raw_prompt = format!("[后台任务: {}]\n{}", task.name, task.prompt);
+        let effective_prompt = self
+            .prepare_app_turn(&thread.session_id, &raw_prompt)
+            .await
+            .unwrap_or(raw_prompt.clone());
+        let send_result = self
+            .0
+            .agents
+            .send(
+                &thread.session_id,
+                effective_prompt,
+                Some("queue".into()),
+                Vec::new(),
+            )
+            .await;
+
+        let (updated_task, tasks, bots, should_watch) = {
+            let mut guard = self.0.state.lock().await;
+            let file = guard.tasks.entry(task.bot_id.clone()).or_default();
+            let pos = file
+                .tasks
+                .iter()
+                .position(|t| t.id == task.id)
+                .ok_or(Error::NotFound)?;
+            let next_task = &mut file.tasks[pos];
+            next_task.last_run_at = Some(timestamp);
+            next_task.last_session_id = Some(thread.session_id.clone());
+            next_task.run_count = next_task.run_count.saturating_add(1);
+            next_task.updated_at = now();
+            match &send_result {
+                Ok(()) => {
+                    next_task.last_error = None;
+                    match next_task.kind {
+                        BotTaskKind::OneShot => {
+                            next_task.status = BotTaskStatus::Completed;
+                            next_task.next_run_at = None;
+                        }
+                        BotTaskKind::Cron | BotTaskKind::Heartbeat => {
+                            if let Some(ref rrule) = next_task.rrule {
+                                next_task.next_run_at =
+                                    crate::schedules::next_run_after(rrule, timestamp).ok();
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    next_task.last_error = Some(truncate_chars(&error.to_string(), 240));
+                    if matches!(next_task.kind, BotTaskKind::Cron | BotTaskKind::Heartbeat)
+                        && let Some(ref rrule) = next_task.rrule
+                    {
+                        next_task.next_run_at =
+                            crate::schedules::next_run_after(rrule, timestamp).ok();
+                    }
+                }
+            }
+            let updated_task = next_task.clone();
+            save_tasks(&self.0.directory, &task.bot_id, file)?;
+            let tasks = file.tasks.clone();
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (updated_task, tasks, bots, send_result.is_ok())
+        };
+        self.notify();
+
+        send_result?;
+
+        if should_watch {
+            let supervisor = self.clone();
+            let task_snapshot = updated_task.clone();
+            let thread_id = thread.id.clone();
+            let session_id = thread.session_id.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .watch_task_completion(task_snapshot, thread_id, session_id, baseline_pos)
+                    .await;
+            });
+        }
+
+        Ok((updated_task, tasks, bots))
+    }
+
+    async fn watch_task_completion(
+        &self,
+        task: BotTask,
+        thread_id: String,
+        session_id: String,
+        baseline_pos: i64,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
+        let mut last_summary: Option<String> = None;
+        let mut last_error: Option<String> = None;
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let sid = session_id.clone();
+            let poll = self
+                .0
+                .database
+                .read("bots.watch_task_completion", move |store| {
+                    let head = store.session(&sid)?;
+                    let page = store.timeline(
+                        &sid,
+                        crate::protocol::TimelineQuery {
+                            before: None,
+                            after: Some(baseline_pos),
+                            limit: Some(100),
+                        },
+                    )?;
+                    let mut assistant_parts = Vec::new();
+                    let mut err_text: Option<String> = None;
+                    let mut turn_ended = false;
+                    for record in &page.items {
+                        match &record.body {
+                            crate::protocol::TimelineBody::Message {
+                                role: crate::protocol::MessageRole::Assistant,
+                                ..
+                            } => {
+                                let txt = if record.truncated {
+                                    store
+                                        .timeline_text(
+                                            &sid,
+                                            &record.id,
+                                            crate::protocol::TimelineTextQuery::default(),
+                                        )
+                                        .map(|p| p.text)
+                                        .unwrap_or_else(|_| record.preview.clone())
+                                } else {
+                                    record.preview.clone()
+                                };
+                                if !txt.trim().is_empty() {
+                                    assistant_parts.push(txt);
+                                }
+                            }
+                            crate::protocol::TimelineBody::Error { .. }
+                                if !record.preview.trim().is_empty() =>
+                            {
+                                err_text = Some(record.preview.clone());
+                            }
+                            crate::protocol::TimelineBody::TurnEnd { .. } => {
+                                turn_ended = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok((
+                        head.status,
+                        assistant_parts.join("\n"),
+                        err_text,
+                        turn_ended,
+                    ))
+                })
+                .await;
+
+            match poll {
+                Ok((status, assistant_text, err_text, turn_ended)) => {
+                    if !assistant_text.trim().is_empty() {
+                        last_summary = Some(truncate_chars(assistant_text.trim(), 240));
+                    }
+                    if err_text.is_some() {
+                        last_error = err_text.map(|e| truncate_chars(&e, 240));
+                    }
+                    let finished = turn_ended
+                        || matches!(
+                            status,
+                            crate::protocol::SessionStatus::Idle
+                                | crate::protocol::SessionStatus::Completed
+                                | crate::protocol::SessionStatus::Failed
+                        ) && (!assistant_text.trim().is_empty() || last_error.is_some());
+                    if finished || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let summary_text = last_summary
+            .clone()
+            .or_else(|| last_error.clone())
+            .unwrap_or_else(|| "后台任务已执行完毕".into());
+        let ts = now();
+        let feishu_target: Option<(FeishuDomain, String, String, String, String)> = {
+            let mut guard = self.0.state.lock().await;
+            let bot = guard
+                .registry
+                .bots
+                .iter()
+                .find(|b| b.id == task.bot_id)
+                .cloned();
+            let proactive_enabled = bot.as_ref().is_some_and(|b| b.proactive_notifications);
+
+            if let Some(tfile) = guard.tasks.get_mut(&task.bot_id) {
+                if let Some(t) = tfile.tasks.iter_mut().find(|t| t.id == task.id) {
+                    t.last_summary = Some(summary_text.clone());
+                    if let Some(ref err) = last_error {
+                        t.last_error = Some(err.clone());
+                    }
+                    t.updated_at = ts;
+                }
+                if task.notify_app && proactive_enabled {
+                    tfile.notices.insert(
+                        0,
+                        BotProactiveNotice {
+                            id: format!("ntc-{}", &Uuid::new_v4().simple().to_string()[..12]),
+                            bot_id: task.bot_id.clone(),
+                            task_id: Some(task.id.clone()),
+                            thread_id: thread_id.clone(),
+                            title: task.name.clone(),
+                            summary: summary_text.clone(),
+                            created_at: ts,
+                            read: false,
+                        },
+                    );
+                    if tfile.notices.len() > MAX_NOTICES_PER_BOT {
+                        tfile.notices.truncate(MAX_NOTICES_PER_BOT);
+                    }
+                }
+                let _ = save_tasks(&self.0.directory, &task.bot_id, tfile);
+            }
+
+            if let Some(thr_file) = guard.threads.get_mut(&task.bot_id)
+                && let Some(thr) = thr_file.threads.iter_mut().find(|t| t.id == thread_id)
+            {
+                thr.updated_at = ts;
+                thr.last_message_preview = Some(truncate_chars(&summary_text, 96));
+                if task.notify_app && proactive_enabled {
+                    thr.unread_count = thr.unread_count.saturating_add(1);
+                    thr.last_proactive_at = Some(ts);
+                }
+                let _ = save_threads(&self.0.directory, &task.bot_id, thr_file);
+            }
+
+            bot.and_then(|b| {
+                let chat_id = task.notify_feishu_chat_id.as_deref()?.trim();
+                if b.feishu.enabled
+                    && !chat_id.is_empty()
+                    && !b.feishu.app_id.trim().is_empty()
+                    && !b.feishu.app_secret.trim().is_empty()
+                {
+                    Some((
+                        b.feishu.domain,
+                        b.feishu.app_id,
+                        b.feishu.app_secret,
+                        chat_id.to_owned(),
+                        b.name,
+                    ))
+                } else {
+                    None
+                }
+            })
+        };
+
+        self.notify();
+
+        if let Some((domain, app_id, app_secret, chat_id, bot_name)) = feishu_target
+            && let Ok(client) = feishu::FeishuApiClient::new(domain, app_id, app_secret)
+        {
+            let card = feishu::build_card_json(
+                &format!("⏰ {}", task.name),
+                &summary_text,
+                Some(&format!("{bot_name} · 后台定时提醒")),
+            );
+            let _ = client.send_card_to_chat(&chat_id, &card).await;
+        }
+    }
+
+    async fn add_memory_item(
+        &self,
+        bot_id: &str,
+        category: BotMemoryCategory,
+        content: &str,
+        scope: BotMemoryScope,
+        pinned: bool,
+        source: BotMemorySource,
+    ) -> Result<(BotMemoryItem, Vec<BotMemoryItem>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let clean = content.trim();
+        if clean.is_empty() || clean.chars().count() > 600 {
+            return Err(Error::Invalid("记忆条目内容应为 1–600 个字符".into()));
+        }
+        let ts = now();
+        let item = BotMemoryItem {
+            id: format!("mem-{}", &Uuid::new_v4().simple().to_string()[..12]),
+            category,
+            content: clean.to_owned(),
+            scope,
+            pinned,
+            source,
+            archived: false,
+            created_at: ts,
+            updated_at: ts,
+        };
+        let (items, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let file = guard.memory_items.entry(bot_id.to_owned()).or_default();
+            file.items.insert(0, item.clone());
+            if file.items.len() > MAX_MEMORY_ITEMS_PER_BOT {
+                file.items.truncate(MAX_MEMORY_ITEMS_PER_BOT);
+            }
+            push_memory_event(
+                file,
+                &item.id,
+                "added",
+                &truncate_chars(clean, 80),
+                category,
+                ts,
+            );
+            save_memory_items(&self.0.directory, bot_id, file)?;
+            let items = visible_memory_items(file);
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (items, bots)
+        };
+        self.notify();
+        Ok((item, items, bots))
+    }
+
+    async fn update_memory_item(
+        &self,
+        bot_id: &str,
+        item_id: &str,
+        category: Option<BotMemoryCategory>,
+        content: Option<&str>,
+        pinned: Option<bool>,
+    ) -> Result<(BotMemoryItem, Vec<BotMemoryItem>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let ts = now();
+        let (item, items, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let file = guard.memory_items.entry(bot_id.to_owned()).or_default();
+            let pos = file
+                .items
+                .iter()
+                .position(|it| it.id == item_id)
+                .ok_or(Error::NotFound)?;
+            if let Some(cat) = category {
+                file.items[pos].category = cat;
+            }
+            if let Some(raw) = content {
+                let clean = raw.trim();
+                if clean.is_empty() || clean.chars().count() > 600 {
+                    return Err(Error::Invalid("记忆条目内容应为 1–600 个字符".into()));
+                }
+                file.items[pos].content = clean.to_owned();
+            }
+            if let Some(p) = pinned {
+                file.items[pos].pinned = p;
+            }
+            file.items[pos].updated_at = ts;
+            let updated = file.items[pos].clone();
+            push_memory_event(
+                file,
+                &updated.id,
+                "updated",
+                &truncate_chars(&updated.content, 80),
+                updated.category,
+                ts,
+            );
+            save_memory_items(&self.0.directory, bot_id, file)?;
+            let items = visible_memory_items(file);
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (updated, items, bots)
+        };
+        self.notify();
+        Ok((item, items, bots))
+    }
+
+    async fn delete_memory_item(
+        &self,
+        bot_id: &str,
+        item_id: &str,
+    ) -> Result<(BotMemoryItem, Vec<BotMemoryItem>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let ts = now();
+        let (item, items, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let file = guard.memory_items.entry(bot_id.to_owned()).or_default();
+            let pos = file
+                .items
+                .iter()
+                .position(|it| it.id == item_id)
+                .ok_or(Error::NotFound)?;
+            file.items[pos].archived = true;
+            file.items[pos].updated_at = ts;
+            let archived_item = file.items[pos].clone();
+            for ev in &mut file.events {
+                if ev.item_id == item_id && ev.action == "added" {
+                    ev.reverted = true;
+                }
+            }
+            push_memory_event(
+                file,
+                &archived_item.id,
+                "deleted",
+                &truncate_chars(&archived_item.content, 80),
+                archived_item.category,
+                ts,
+            );
+            save_memory_items(&self.0.directory, bot_id, file)?;
+            let items = visible_memory_items(file);
+            let bots = build_public_bots(&self.0.directory, &guard);
+            (archived_item, items, bots)
+        };
+        self.notify();
+        Ok((item, items, bots))
+    }
+
+    async fn restore_memory_item(
+        &self,
+        bot_id: &str,
+        item_id: &str,
+    ) -> Result<(BotMemoryItem, Vec<BotMemoryItem>, Vec<PublicBot>)> {
+        validate_bot_id(bot_id)?;
+        let ts = now();
+        let (item, items, bots) = {
+            let mut guard = self.0.state.lock().await;
+            if !guard.registry.bots.iter().any(|b| b.id == bot_id) {
+                return Err(Error::NotFound);
+            }
+            let file = guard.memory_items.entry(bot_id.to_owned()).or_default();
+            let pos = file
+                .items
+                .iter()
+                .position(|it| it.id == item_id)
+                .ok_or(Error::NotFound)?;
+            let was_archived = file.items[pos].archived;
+            if was_archived {
+                file.items[pos].archived = false;
+                file.items[pos].updated_at = ts;
+                for ev in &mut file.events {
+                    if ev.item_id == item_id && ev.action == "deleted" {
+                        ev.reverted = true;
+                    }
+                }
+                let restored = file.items[pos].clone();
+                push_memory_event(
+                    file,
+                    &restored.id,
+                    "restored",
+                    &truncate_chars(&restored.content, 80),
+                    restored.category,
+                    ts,
+                );
+                save_memory_items(&self.0.directory, bot_id, file)?;
+                let items = visible_memory_items(file);
+                let bots = build_public_bots(&self.0.directory, &guard);
+                (restored, items, bots)
+            } else {
+                // Reverting a recent auto/manual add -> soft-archive it
+                file.items[pos].archived = true;
+                file.items[pos].updated_at = ts;
+                for ev in &mut file.events {
+                    if ev.item_id == item_id && ev.action == "added" {
+                        ev.reverted = true;
+                    }
+                }
+                let reverted_item = file.items[pos].clone();
+                save_memory_items(&self.0.directory, bot_id, file)?;
+                let items = visible_memory_items(file);
+                let bots = build_public_bots(&self.0.directory, &guard);
+                (reverted_item, items, bots)
+            }
+        };
+        self.notify();
+        Ok((item, items, bots))
+    }
+
+    pub async fn prepare_app_turn(&self, session_id: &str, raw_text: &str) -> Option<String> {
+        if raw_text.contains("<prospero_memory_context>") {
+            return None;
+        }
+        let (bot, items) = {
+            let guard = self.0.state.lock().await;
+            let bot_id = guard.threads.iter().find_map(|(bid, file)| {
+                file.threads
+                    .iter()
+                    .any(|t| t.session_id == session_id)
+                    .then(|| bid.clone())
+            })?;
+            let bot = guard.registry.bots.iter().find(|b| b.id == bot_id)?.clone();
+            if !bot.auto_memory {
+                return None;
+            }
+            let items = guard
+                .memory_items
+                .get(&bot_id)
+                .map(|file| {
+                    let mut active: Vec<BotMemoryItem> = file
+                        .items
+                        .iter()
+                        .filter(|it| !it.archived)
+                        .cloned()
+                        .collect();
+                    active.sort_by(|a, b| {
+                        b.pinned
+                            .cmp(&a.pinned)
+                            .then_with(|| b.updated_at.cmp(&a.updated_at))
+                    });
+                    active.truncate(30);
+                    active
+                })
+                .unwrap_or_default();
+            (bot, items)
+        };
+
+        let mut sections: Vec<String> = Vec::new();
+        if !items.is_empty() {
+            let mut lines = Vec::new();
+            let mut used = 0usize;
+            for item in &items {
+                let pin_mark = if item.pinned { "★ " } else { "" };
+                let line = format!(
+                    "- [{}{}] {}",
+                    pin_mark,
+                    memory_category_label(item.category),
+                    item.content
+                );
+                let chars = line.chars().count();
+                if used + chars > MAX_PROMPT_MEMORY_CHARS {
+                    break;
+                }
+                used += chars + 1;
+                lines.push(line);
+            }
+            if !lines.is_empty() {
+                sections.push(format!("[关于用户与长期记忆]\n{}", lines.join("\n")));
+            }
+        }
+
+        let global_path = bot_memory_path(&self.0.directory, &bot);
+        let global_excerpt = read_memory_excerpt_with_path_hint(&global_path, true);
+        if !global_excerpt.is_empty()
+            && global_excerpt.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#') && !t.starts_with('>')
+            })
+        {
+            sections.push(format!("[全局记忆文档 (`MEMORY.md`)]\n{global_excerpt}"));
+        }
+
+        let memory_block = if sections.is_empty() {
+            "（当前尚无已保存的结构化长期记忆）".to_owned()
+        } else {
+            sections.join("\n\n")
+        };
+
+        Some(format!(
+            "{}\n\n<prospero_memory_context>\n{memory_block}\n\n当你了解到用户的长期偏好、重要个人事实、习惯或固定规则时，可调用 `prospero bot memory-add --bot {} --category <profile|preference|habit|project|rule|fact> --content \"<精炼事实>\"` 自动记住；当用户要求设定定时提醒、日报或巡检时，可调用 `prospero bot task-create --bot {} --name \"<名称>\" --prompt \"<执行内容>\" --kind <cron|heartbeat|one_shot> --rrule \"<RRULE>\"`。回复时请自然呈现，不要提及内部命令行或记忆文件目录。\n</prospero_memory_context>",
+            raw_text.trim(),
+            bot.id,
+            bot.id
+        ))
+    }
+
     pub async fn update_feishu_status(&self, bot_id: &str, status: BotFeishuRuntimeStatus) {
         let mut guard = self.0.state.lock().await;
         guard.statuses.insert(bot_id.to_owned(), status);
@@ -1497,15 +3052,7 @@ impl BotsSupervisor {
                     let _ = save_registry(&self.0.directory, &guard.registry);
                 }
                 let file = guard.threads.entry(bot_id.to_owned()).or_default();
-                record_feishu_sender_locked(
-                    file,
-                    uid,
-                    sender_name,
-                    chat_id,
-                    chat_name,
-                    false,
-                    ts,
-                );
+                record_feishu_sender_locked(file, uid, sender_name, chat_id, chat_name, false, ts);
                 let _ = save_threads(&self.0.directory, bot_id, file);
             }
             FeishuIdentityInfo {
@@ -1558,9 +3105,7 @@ impl BotsSupervisor {
                         is_admin
                     }
                 }
-                FeishuAccessPolicy::Everyone => {
-                    !(is_admin_command && admin_count > 0 && !is_admin)
-                }
+                FeishuAccessPolicy::Everyone => !(is_admin_command && admin_count > 0 && !is_admin),
             };
 
             let denial_reason = if allowed {
@@ -1859,11 +3404,7 @@ impl BotsSupervisor {
                     }
                 }
             }
-            if full_admin_turn {
-                None
-            } else {
-                Some(paths)
-            }
+            if full_admin_turn { None } else { Some(paths) }
         };
 
         let Some(admin_paths) = admin_paths else {
@@ -2048,10 +3589,7 @@ impl BotsSupervisor {
             .unwrap_or("成员");
 
         let mut writable_targets: Vec<String> = if is_admin {
-            vec![format!(
-                "- 公共/跨场景事实 → `{}`",
-                global_path.display()
-            )]
+            vec![format!("- 公共/跨场景事实 → `{}`", global_path.display())]
         } else {
             Vec::new()
         };
@@ -2075,9 +3613,8 @@ impl BotsSupervisor {
                         "[本群记忆 · {chat_display} (`memory/chats/{clean_chat}.md`)]\n{chat_text}"
                     ));
                 } else {
-                    allowed_sections.push(format!(
-                        "[本群记忆 · {chat_display} · 只读]\n{chat_text}"
-                    ));
+                    allowed_sections
+                        .push(format!("[本群记忆 · {chat_display} · 只读]\n{chat_text}"));
                 }
             }
             if is_admin {
@@ -2185,9 +3722,7 @@ impl BotsSupervisor {
             if is_admin {
                 ensure_scoped_starter_file(
                     &chat_path,
-                    &format!(
-                        "# 对话记忆 · {chat_display}\n\n> 该记忆仅在当前飞书会话中读写。\n"
-                    ),
+                    &format!("# 对话记忆 · {chat_display}\n\n> 该记忆仅在当前飞书会话中读写。\n"),
                 )?;
             }
             let chat_text = read_memory_excerpt_with_path_hint(&chat_path, is_admin);
@@ -2197,9 +3732,8 @@ impl BotsSupervisor {
                         "[本会话记忆 · {chat_display} (`memory/chats/{clean_chat}.md`)]\n{chat_text}"
                     ));
                 } else {
-                    allowed_sections.push(format!(
-                        "[本会话记忆 · {chat_display} · 只读]\n{chat_text}"
-                    ));
+                    allowed_sections
+                        .push(format!("[本会话记忆 · {chat_display} · 只读]\n{chat_text}"));
                 }
             }
             if is_admin {
@@ -2211,7 +3745,11 @@ impl BotsSupervisor {
             self.notify();
         }
 
-        let role_tag = if is_admin { "管理员" } else { "普通成员" };
+        let role_tag = if is_admin {
+            "管理员"
+        } else {
+            "普通成员"
+        };
         let header = if input.is_group {
             format!("[飞书群聊: {chat_display} | 发言人: {sender_display} ({role_tag})]")
         } else {
@@ -2354,7 +3892,10 @@ impl BotsSupervisor {
             let mut guard = self.0.state.lock().await;
             let current = guard.memories.entry(bot.id.clone()).or_default();
             for (k, meta) in &index.entries {
-                current.entries.entry(k.clone()).or_insert_with(|| meta.clone());
+                current
+                    .entries
+                    .entry(k.clone())
+                    .or_insert_with(|| meta.clone());
             }
             prune_memory_index(current);
             let _ = save_memory_index(&self.0.directory, &bot.id, current);
@@ -2406,7 +3947,11 @@ impl BotsSupervisor {
                 updated_at,
             });
         }
-        scoped.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.key.cmp(&b.key)));
+        scoped.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.key.cmp(&b.key))
+        });
         items.extend(scoped);
         Ok(items)
     }
@@ -2754,6 +4299,8 @@ struct ValidatedUpsert {
     source_binding: Option<BotSourceBinding>,
     custom_workspace: Option<String>,
     allow_cross_workspace: bool,
+    auto_memory: bool,
+    proactive_notifications: bool,
     feishu: StoredFeishuConfig,
 }
 
@@ -2903,6 +4450,8 @@ fn validate_upsert_input(
         source_binding: input.source_binding,
         custom_workspace,
         allow_cross_workspace: input.allow_cross_workspace,
+        auto_memory: input.auto_memory,
+        proactive_notifications: input.proactive_notifications,
         feishu,
     })
 }
@@ -2923,6 +4472,8 @@ fn default_master_bot() -> StoredBot {
         source_binding: None,
         custom_workspace: None,
         allow_cross_workspace: true,
+        auto_memory: true,
+        proactive_notifications: true,
         feishu: StoredFeishuConfig::default(),
         created_at: ts,
         updated_at: ts,
@@ -2947,6 +4498,113 @@ fn bot_threads_path(daemon_home: &Path, bot_id: &str) -> PathBuf {
 
 fn bot_memory_index_path(daemon_home: &Path, bot_id: &str) -> PathBuf {
     bot_dir(daemon_home, bot_id).join("memory-index.json")
+}
+
+fn bot_tasks_path(daemon_home: &Path, bot_id: &str) -> PathBuf {
+    bot_dir(daemon_home, bot_id).join("tasks.json")
+}
+
+fn bot_memory_items_path(daemon_home: &Path, bot_id: &str) -> PathBuf {
+    bot_dir(daemon_home, bot_id).join("memory-items.json")
+}
+
+fn save_tasks(daemon_home: &Path, bot_id: &str, file: &BotTasksFile) -> Result<()> {
+    let dir = bot_dir(daemon_home, bot_id);
+    ensure_dir_private(&dir)?;
+    let bytes = serde_json::to_vec_pretty(file)?;
+    write_atomic_file(&bot_tasks_path(daemon_home, bot_id), &bytes)
+}
+
+fn save_memory_items(daemon_home: &Path, bot_id: &str, file: &BotMemoryItemsFile) -> Result<()> {
+    let dir = bot_dir(daemon_home, bot_id);
+    ensure_dir_private(&dir)?;
+    let bytes = serde_json::to_vec_pretty(file)?;
+    write_atomic_file(&bot_memory_items_path(daemon_home, bot_id), &bytes)
+}
+
+fn validate_task_schedule(
+    kind: BotTaskKind,
+    rrule: Option<&str>,
+    run_at: Option<i64>,
+    now_ms: i64,
+) -> Result<(Option<String>, Option<i64>, i64)> {
+    match kind {
+        BotTaskKind::OneShot => {
+            let target = run_at.unwrap_or_else(|| now_ms + 3_600_000);
+            if target <= now_ms - 60_000 {
+                return Err(Error::Invalid("一次性提醒时间不能早于当前时间".into()));
+            }
+            Ok((None, Some(target), target))
+        }
+        BotTaskKind::Cron | BotTaskKind::Heartbeat => {
+            let clean = rrule
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| Error::Invalid("周期任务必须提供有效的 RRULE 规则".into()))?;
+            let next_run = crate::schedules::next_run_after(clean, now_ms)?;
+            Ok((Some(clean.to_owned()), None, next_run))
+        }
+    }
+}
+
+fn memory_category_label(category: BotMemoryCategory) -> &'static str {
+    match category {
+        BotMemoryCategory::Profile => "个人画像",
+        BotMemoryCategory::Preference => "偏好设置",
+        BotMemoryCategory::Habit => "日常习惯",
+        BotMemoryCategory::Project => "长期项目",
+        BotMemoryCategory::Rule => "行为规则",
+        BotMemoryCategory::Fact => "重要事实",
+    }
+}
+
+fn push_memory_event(
+    file: &mut BotMemoryItemsFile,
+    item_id: &str,
+    action: &str,
+    summary: &str,
+    category: BotMemoryCategory,
+    ts: i64,
+) {
+    file.events.insert(
+        0,
+        BotMemoryEvent {
+            id: format!("mev-{}", &Uuid::new_v4().simple().to_string()[..12]),
+            item_id: item_id.to_owned(),
+            action: action.to_owned(),
+            summary: summary.to_owned(),
+            category,
+            created_at: ts,
+            reverted: false,
+        },
+    );
+    if file.events.len() > MAX_MEMORY_EVENTS_PER_BOT {
+        file.events.truncate(MAX_MEMORY_EVENTS_PER_BOT);
+    }
+}
+
+fn visible_memory_items(file: &BotMemoryItemsFile) -> Vec<BotMemoryItem> {
+    let mut active: Vec<BotMemoryItem> = file
+        .items
+        .iter()
+        .filter(|it| !it.archived)
+        .cloned()
+        .collect();
+    active.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    let mut archived: Vec<BotMemoryItem> = file
+        .items
+        .iter()
+        .filter(|it| it.archived)
+        .cloned()
+        .collect();
+    archived.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+    archived.truncate(20);
+    active.extend(archived);
+    active
 }
 
 fn resolve_bot_workspace(daemon_home: &Path, bot: &StoredBot) -> Result<PathBuf> {
@@ -2992,7 +4650,9 @@ fn sanitize_memory_entity_id(value: &str, label: &str) -> Result<String> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
     {
-        return Err(Error::Invalid(format!("{label} 无效（仅支持字母、数字、-、_）")));
+        return Err(Error::Invalid(format!(
+            "{label} 无效（仅支持字母、数字、-、_）"
+        )));
     }
     Ok(trimmed.to_owned())
 }
@@ -3129,7 +4789,7 @@ fn prune_memory_index(index: &mut BotMemoryIndexFile) {
         .iter()
         .map(|(k, v)| (k.clone(), v.updated_at))
         .collect();
-    keys.sort_by(|a, b| b.1.cmp(&a.1));
+    keys.sort_by_key(|b| std::cmp::Reverse(b.1));
     for (k, _) in keys.into_iter().skip(MAX_MEMORY_ENTRIES) {
         index.entries.remove(&k);
     }
@@ -3243,7 +4903,13 @@ fn discover_disk_memories(
                         if !index.entries.contains_key(&key) {
                             index.entries.insert(
                                 key.clone(),
-                                default_memory_meta(&key, BotMemoryScope::Chat, Some(cid), None, ts),
+                                default_memory_meta(
+                                    &key,
+                                    BotMemoryScope::Chat,
+                                    Some(cid),
+                                    None,
+                                    ts,
+                                ),
                             );
                             changed = true;
                         }
@@ -3255,7 +4921,13 @@ fn discover_disk_memories(
                         if !index.entries.contains_key(&key) {
                             index.entries.insert(
                                 key.clone(),
-                                default_memory_meta(&key, BotMemoryScope::User, None, Some(uid), ts),
+                                default_memory_meta(
+                                    &key,
+                                    BotMemoryScope::User,
+                                    None,
+                                    Some(uid),
+                                    ts,
+                                ),
                             );
                             changed = true;
                         }
@@ -3332,7 +5004,11 @@ fn sync_bot_workspace_files(daemon_home: &Path, bot: &StoredBot) -> Result<()> {
     Ok(())
 }
 
-fn build_bot_instruction_section(bot: &StoredBot, memory_path: &Path, memory_root: &Path) -> String {
+fn build_bot_instruction_section(
+    bot: &StoredBot,
+    memory_path: &Path,
+    memory_root: &Path,
+) -> String {
     let role_label = match bot.kind {
         BotKind::Master => "主控 Bot (Master Bot)",
         BotKind::Sub => "子 Bot (Sub-Bot)",
@@ -3357,11 +5033,17 @@ fn build_bot_instruction_section(bot: &StoredBot, memory_path: &Path, memory_roo
     );
     section.push_str("## 交互原则\n\n");
     section.push_str(
-        "你是一位直接面向用户的个人智能体（类似 GrokBot / Muse），用户可能从桌面端或飞书 IM 与你对话。\n\
-         - 严禁调用 `AskUserQuestion` 或任何阻塞式弹窗提问工具（IM/Bot 对话端不支持弹窗交互卡片）。若需求有歧义或需用户确认，请直接用自然语言或简洁列表在回复正文中追问，或按最安全合理的默认方案直接执行并在回复中说明。\n\
-         - 除非用户主动要求操作某个本地文件，否则不要在回复中向用户提及底层目录路径、`AGENTS.md` / `CLAUDE.md` 或“工作区（Workspace）”概念。\n\
-         - 对用户自然地呈现为纯粹的个人助手体验。\n\n",
+        "你是一位直接面向用户的全能个人智能体（类似 GrokBot / Muse / 小豆），用户可能从桌面端、手机 App 或可选飞书 IM 与你对话。\n\
+         - 严禁调用 `AskUserQuestion` 或任何阻塞式弹窗提问工具（Bot 对话端不支持弹窗交互卡片）。若需求有歧义或需用户确认，请直接用自然语言或简洁列表在回复正文中追问，或按最安全合理的默认方案直接执行并在回复中说明。\n\
+         - 除非用户主动要求操作某个本地文件，否则不要在回复中向用户提及底层目录路径、`AGENTS.md` / `CLAUDE.md`、CLI 指令或“工作区（Workspace）”概念。\n\
+         - 对用户自然地呈现为懂偏好、会跟进、能主动办事的个人数字管家。\n\n",
     );
+    section.push_str("## 主动记忆与后台定时任务（桌面 / 手机 App 原生支持）\n\n");
+    section.push_str(&format!(
+        "- 当你在对话中了解到用户的长期偏好、个人画像、习惯、正在推进的项目或明确规则时，可调用 `prospero bot memory-add --bot {} --category <profile|preference|habit|project|rule|fact> --content \"<精炼事实>\"` 记录到「关于你」记忆卡片；也可使用 `prospero bot memory-list --bot {}` 查看。\n\
+         - 当用户希望你定期汇报、持续盯盘或稍后主动提醒时，可调用 `prospero bot task-create --bot {} --name \"<任务名称>\" --prompt \"<执行指令>\" --kind <cron|heartbeat|one_shot> --rrule \"<RRULE>\"` 创建后台任务；执行结果会自动推送到桌面端与手机 App（并可选同步到飞书）。\n\n",
+        bot.id, bot.id, bot.id
+    ));
     section.push_str("## 分层长期记忆\n\n");
     section.push_str(&format!(
         "- 全局记忆文件：`{}`（公共事实、默认设定与桌面端对话通用偏好）。\n\
@@ -3426,11 +5108,7 @@ fn load_or_init_state(daemon_home: &Path) -> BotsState {
             bots: Vec::new(),
         });
 
-    if let Some(master) = registry
-        .bots
-        .iter_mut()
-        .find(|bot| bot.id == MASTER_BOT_ID)
-    {
+    if let Some(master) = registry.bots.iter_mut().find(|bot| bot.id == MASTER_BOT_ID) {
         let mut migrated = false;
         if master.description == LEGACY_MASTER_DESC {
             master.description = DEFAULT_MASTER_DESC.into();
@@ -3450,6 +5128,8 @@ fn load_or_init_state(daemon_home: &Path) -> BotsState {
 
     let mut threads = HashMap::new();
     let mut memories = HashMap::new();
+    let mut tasks = HashMap::new();
+    let mut memory_items = HashMap::new();
     let mut statuses = HashMap::new();
     for bot in &registry.bots {
         let _ = sync_bot_workspace_files(daemon_home, bot);
@@ -3465,6 +5145,18 @@ fn load_or_init_state(daemon_home: &Path) -> BotsState {
             .and_then(|raw| serde_json::from_str::<BotMemoryIndexFile>(&raw).ok())
             .unwrap_or_default();
         memories.insert(bot.id.clone(), mfile);
+        let tsk_path = bot_tasks_path(daemon_home, &bot.id);
+        let tsk_file = fs::read_to_string(&tsk_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<BotTasksFile>(&raw).ok())
+            .unwrap_or_default();
+        tasks.insert(bot.id.clone(), tsk_file);
+        let mipath = bot_memory_items_path(daemon_home, &bot.id);
+        let mifile = fs::read_to_string(&mipath)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<BotMemoryItemsFile>(&raw).ok())
+            .unwrap_or_default();
+        memory_items.insert(bot.id.clone(), mifile);
         statuses.insert(
             bot.id.clone(),
             BotFeishuRuntimeStatus {
@@ -3482,6 +5174,8 @@ fn load_or_init_state(daemon_home: &Path) -> BotsState {
         registry,
         threads,
         memories,
+        tasks,
+        memory_items,
         statuses,
         admin_mutation_seq: 0,
         admin_mutations: HashMap::new(),
@@ -3569,7 +5263,12 @@ fn normalize_for_governance_check(raw: &str) -> String {
     out
 }
 
-fn contains_nearby_pair(text: &str, group_a: &[&str], group_b: &[&str], max_gap_chars: usize) -> bool {
+fn contains_nearby_pair(
+    text: &str,
+    group_a: &[&str],
+    group_b: &[&str],
+    max_gap_chars: usize,
+) -> bool {
     let byte_to_char = |byte_idx: usize| text[..byte_idx].chars().count();
     let mut a_spans: Vec<(usize, usize)> = Vec::new();
     for needle in group_a {
@@ -3625,8 +5324,8 @@ pub fn detect_non_admin_governance_attempt(raw: &str) -> Option<&'static str> {
     if contains_nearby_pair(
         &norm,
         &[
-            "立", "定", "制定", "新增", "增加", "添加", "设", "设置", "修改", "改", "更新",
-            "颁布", "生效", "执行", "启用", "废", "废除", "撤销", "取消", "删除",
+            "立", "定", "制定", "新增", "增加", "添加", "设", "设置", "修改", "改", "更新", "颁布",
+            "生效", "执行", "启用", "废", "废除", "撤销", "取消", "删除",
         ],
         &[
             "群规",
@@ -3728,7 +5427,16 @@ pub fn detect_non_admin_governance_attempt(raw: &str) -> Option<&'static str> {
     if contains_nearby_pair(
         &norm,
         &[
-            "修改", "写入", "写进", "覆盖", "清空", "重置", "删除", "改写", "更新", "记录到",
+            "修改",
+            "写入",
+            "写进",
+            "覆盖",
+            "清空",
+            "重置",
+            "删除",
+            "改写",
+            "更新",
+            "记录到",
             "保存为",
         ],
         &[
@@ -3772,7 +5480,16 @@ pub fn detect_non_admin_governance_attempt(raw: &str) -> Option<&'static str> {
     ) || contains_nearby_pair(
         &norm,
         &[
-            "授予", "赋予", "添加", "设为", "设置为", "变成", "升级为", "提权", "取消", "移除",
+            "授予",
+            "赋予",
+            "添加",
+            "设为",
+            "设置为",
+            "变成",
+            "升级为",
+            "提权",
+            "取消",
+            "移除",
             "撤销",
         ],
         &["管理员", "admin", "最高权限", "root权限", "超级权限"],
@@ -3804,7 +5521,7 @@ fn build_public_bots(daemon_home: &Path, state: &BotsState) -> Vec<PublicBot> {
                 let mut threads = thread_file
                     .map(|file| file.threads.clone())
                     .unwrap_or_default();
-                threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                threads.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
                 let recent_senders = thread_file
                     .map(|file| file.recent_senders.clone())
                     .unwrap_or_default();
@@ -3819,6 +5536,23 @@ fn build_public_bots(daemon_home: &Path, state: &BotsState) -> Vec<PublicBot> {
                     }
                 });
                 feishu_status.recent_senders = recent_senders;
+                let task_file = state.tasks.get(&bot.id);
+                let tasks = task_file.map(|file| file.tasks.clone()).unwrap_or_default();
+                let mut notices = task_file
+                    .map(|file| file.notices.clone())
+                    .unwrap_or_default();
+                notices.truncate(20);
+                let unread_proactive_count = notices.iter().filter(|n| !n.read).count() as u32;
+                let latest_proactive_notice = notices
+                    .iter()
+                    .find(|n| !n.read)
+                    .cloned()
+                    .or_else(|| notices.first().cloned());
+                let mem_file = state.memory_items.get(&bot.id);
+                let memory_items = mem_file.map(visible_memory_items).unwrap_or_default();
+                let mut recent_memory_events =
+                    mem_file.map(|file| file.events.clone()).unwrap_or_default();
+                recent_memory_events.truncate(20);
                 PublicBot {
                     id: bot.id.clone(),
                     kind: bot.kind,
@@ -3834,6 +5568,8 @@ fn build_public_bots(daemon_home: &Path, state: &BotsState) -> Vec<PublicBot> {
                     workspace,
                     custom_workspace: bot.custom_workspace.clone(),
                     allow_cross_workspace: bot.allow_cross_workspace,
+                    auto_memory: bot.auto_memory,
+                    proactive_notifications: bot.proactive_notifications,
                     feishu: PublicBotFeishuConfig {
                         enabled: bot.feishu.enabled,
                         domain: bot.feishu.domain,
@@ -3846,6 +5582,12 @@ fn build_public_bots(daemon_home: &Path, state: &BotsState) -> Vec<PublicBot> {
                     },
                     feishu_status,
                     threads,
+                    tasks,
+                    memory_items,
+                    recent_memory_events,
+                    unread_proactive_count,
+                    latest_proactive_notice,
+                    notices,
                     created_at: bot.created_at,
                     updated_at: bot.updated_at,
                 }
@@ -4098,6 +5840,8 @@ mod tests {
                         source_binding: None,
                         custom_workspace: None,
                         allow_cross_workspace: false,
+                        auto_memory: true,
+                        proactive_notifications: true,
                         feishu: Some(BotFeishuInput {
                             enabled: false,
                             domain: FeishuDomain::Feishu,
@@ -4162,6 +5906,8 @@ mod tests {
                         source_binding: None,
                         custom_workspace: None,
                         allow_cross_workspace: true,
+                        auto_memory: true,
+                        proactive_notifications: true,
                         feishu: Some(BotFeishuInput {
                             enabled: false,
                             domain: FeishuDomain::Feishu,
@@ -4292,6 +6038,8 @@ mod tests {
                         source_binding: None,
                         custom_workspace: None,
                         allow_cross_workspace: false,
+                        auto_memory: true,
+                        proactive_notifications: true,
                         feishu: Some(BotFeishuInput {
                             enabled: false,
                             domain: FeishuDomain::Feishu,
@@ -4313,10 +6061,30 @@ mod tests {
         // Populate global + group A + group B + user Alice + user Bob + member(A,Alice) + member(B,Alice)
         for (req_id, key, label, content) in [
             ("w-global", "global", None, "全局习惯：始终用中文回答。"),
-            ("w-chat-a", "chat:oc_group_a", Some("研发群"), "A群规范：每天18点发日报。"),
-            ("w-chat-b", "chat:oc_group_b", Some("市场群"), "B群机密：仅B群可见。"),
-            ("w-user-a", "user:ou_alice", Some("Alice"), "Alice偏好：先给结论再展开。"),
-            ("w-user-b", "user:ou_bob", Some("Bob"), "Bob隐私：仅Bob可见。"),
+            (
+                "w-chat-a",
+                "chat:oc_group_a",
+                Some("研发群"),
+                "A群规范：每天18点发日报。",
+            ),
+            (
+                "w-chat-b",
+                "chat:oc_group_b",
+                Some("市场群"),
+                "B群机密：仅B群可见。",
+            ),
+            (
+                "w-user-a",
+                "user:ou_alice",
+                Some("Alice"),
+                "Alice偏好：先给结论再展开。",
+            ),
+            (
+                "w-user-b",
+                "user:ou_bob",
+                Some("Bob"),
+                "Bob隐私：仅Bob可见。",
+            ),
             (
                 "w-mem-a",
                 "member:oc_group_a:ou_alice",
@@ -4364,12 +6132,36 @@ mod tests {
             .await
             .unwrap();
         assert!(group_turn.thread_title_hint.starts_with("核心研发群 · "));
-        assert!(!group_turn.thread_title_hint.contains("<prospero_memory_context>"));
-        assert!(group_turn.augmented_prompt.contains("<prospero_memory_context>"));
-        assert!(group_turn.augmented_prompt.contains("全局习惯：始终用中文回答"));
-        assert!(group_turn.augmented_prompt.contains("A群规范：每天18点发日报"));
-        assert!(group_turn.augmented_prompt.contains("Alice偏好：先给结论再展开"));
-        assert!(group_turn.augmented_prompt.contains("Alice在A群角色：后端负责人"));
+        assert!(
+            !group_turn
+                .thread_title_hint
+                .contains("<prospero_memory_context>")
+        );
+        assert!(
+            group_turn
+                .augmented_prompt
+                .contains("<prospero_memory_context>")
+        );
+        assert!(
+            group_turn
+                .augmented_prompt
+                .contains("全局习惯：始终用中文回答")
+        );
+        assert!(
+            group_turn
+                .augmented_prompt
+                .contains("A群规范：每天18点发日报")
+        );
+        assert!(
+            group_turn
+                .augmented_prompt
+                .contains("Alice偏好：先给结论再展开")
+        );
+        assert!(
+            group_turn
+                .augmented_prompt
+                .contains("Alice在A群角色：后端负责人")
+        );
         assert!(!group_turn.augmented_prompt.contains("B群机密"));
         assert!(!group_turn.augmented_prompt.contains("Bob隐私"));
         assert!(!group_turn.augmented_prompt.contains("Alice在B群角色"));
@@ -4389,8 +6181,16 @@ mod tests {
             .await
             .unwrap();
         assert!(p2p_turn.thread_title_hint.starts_with("Alice Wang · "));
-        assert!(p2p_turn.augmented_prompt.contains("全局习惯：始终用中文回答"));
-        assert!(p2p_turn.augmented_prompt.contains("Alice偏好：先给结论再展开"));
+        assert!(
+            p2p_turn
+                .augmented_prompt
+                .contains("全局习惯：始终用中文回答")
+        );
+        assert!(
+            p2p_turn
+                .augmented_prompt
+                .contains("Alice偏好：先给结论再展开")
+        );
         assert!(!p2p_turn.augmented_prompt.contains("A群规范"));
         assert!(!p2p_turn.augmented_prompt.contains("B群机密"));
         assert!(!p2p_turn.augmented_prompt.contains("Bob隐私"));
@@ -4416,7 +6216,11 @@ mod tests {
             .unwrap()
             .memories
             .unwrap();
-        assert!(listed.iter().any(|e| e.key == "chat:oc_disk_chat" && e.has_content));
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.key == "chat:oc_disk_chat" && e.has_content)
+        );
         let group_a_entry = listed.iter().find(|e| e.key == "chat:oc_group_a").unwrap();
         assert_eq!(group_a_entry.label, "研发群");
         assert_eq!(group_a_entry.chat_name.as_deref(), Some("核心研发群"));
@@ -4486,6 +6290,8 @@ mod tests {
                         source_binding: None,
                         custom_workspace: None,
                         allow_cross_workspace: false,
+                        auto_memory: true,
+                        proactive_notifications: true,
                         feishu: Some(BotFeishuInput {
                             enabled: false,
                             domain: FeishuDomain::Feishu,
@@ -4524,7 +6330,13 @@ mod tests {
             .unwrap();
         assert!(!denied_dm.allowed);
         assert!(!denied_dm.is_admin);
-        assert!(denied_dm.denial_reason.as_deref().unwrap().contains("ou_stranger"));
+        assert!(
+            denied_dm
+                .denial_reason
+                .as_deref()
+                .unwrap()
+                .contains("ou_stranger")
+        );
 
         // Admin allowed, and admin's missing name is auto-hydrated from sender_name.
         let allowed_admin = supervisor
@@ -4548,11 +6360,13 @@ mod tests {
             updated_bot.feishu.admin_users[0].name.as_deref(),
             Some("管理员本人")
         );
-        assert!(updated_bot
-            .feishu_status
-            .recent_senders
-            .iter()
-            .any(|s| s.open_id == "ou_stranger" && s.denied));
+        assert!(
+            updated_bot
+                .feishu_status
+                .recent_senders
+                .iter()
+                .any(|s| s.open_id == "ou_stranger" && s.denied)
+        );
 
         // Switch live to AdminsDmAllGroups: group normal messages allowed for stranger, admin commands denied.
         let patched = supervisor
@@ -4583,11 +6397,13 @@ mod tests {
             FeishuAccessPolicy::AdminsDmAllGroups
         );
         assert_eq!(patched.feishu.admin_users.len(), 2);
-        assert!(patched
-            .feishu_status
-            .recent_senders
-            .iter()
-            .all(|s| !s.denied));
+        assert!(
+            patched
+                .feishu_status
+                .recent_senders
+                .iter()
+                .all(|s| !s.denied)
+        );
 
         // Third unprivileged user: allowed in group chat, denied in group admin command & DM.
         let grp_chat = supervisor
@@ -4663,7 +6479,10 @@ mod tests {
         assert_eq!(t1.chat_name.as_deref(), Some("核心研发群"));
         assert_eq!(t1.last_sender_id.as_deref(), Some("ou_alice"));
         assert_eq!(t1.last_sender_name.as_deref(), Some("Alice"));
-        assert_eq!(t1.last_message_preview.as_deref(), Some("请总结今天的 PR 列表"));
+        assert_eq!(
+            t1.last_message_preview.as_deref(),
+            Some("请总结今天的 PR 列表")
+        );
         assert_eq!(t1.message_count, 1);
 
         // Sending another message to same chat updates count & preview.
@@ -4765,6 +6584,8 @@ mod tests {
                         source_binding: None,
                         custom_workspace: None,
                         allow_cross_workspace: false,
+                        auto_memory: true,
+                        proactive_notifications: true,
                         feishu: None,
                     },
                 },
@@ -4808,7 +6629,11 @@ mod tests {
             .unwrap();
         assert!(non_admin_turn.augmented_prompt.contains("非管理员权限边界"));
         assert!(non_admin_turn.augmented_prompt.contains("只读"));
-        assert!(non_admin_turn.augmented_prompt.contains("原始群规范：保持礼貌"));
+        assert!(
+            non_admin_turn
+                .augmented_prompt
+                .contains("原始群规范：保持礼貌")
+        );
         assert!(
             !non_admin_turn
                 .augmented_prompt
@@ -4874,6 +6699,196 @@ mod tests {
                 .contains("管理员最新修订")
         );
         assert_eq!(fs::read(&claude_md).unwrap(), orig_claude);
+
+        agents.shutdown().await.unwrap();
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn primary_thread_tasks_and_structured_memory_lifecycle() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().to_path_buf()).await.unwrap();
+        let agents = Agents::new(db.clone());
+        let supervisor = BotsSupervisor::new(db.clone(), agents.clone());
+
+        // 1. Ensure primary thread creates once and reuses
+        let p1 = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-p1".into(),
+                action: BotAction::ThreadEnsurePrimary {
+                    bot_id: MASTER_BOT_ID.into(),
+                },
+            })
+            .await
+            .unwrap();
+        let thr1 = p1.thread.unwrap();
+        assert!(thr1.is_primary);
+        let p2 = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-p2".into(),
+                action: BotAction::ThreadEnsurePrimary {
+                    bot_id: MASTER_BOT_ID.into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(p2.thread.unwrap().id, thr1.id);
+
+        // 2. Task CRUD + Pause / Resume / OneShot validation
+        let t_created = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-t1".into(),
+                action: BotAction::TaskCreate {
+                    bot_id: MASTER_BOT_ID.into(),
+                    input: BotTaskInput {
+                        name: "每日早报".into(),
+                        prompt: "汇总今日待办".into(),
+                        kind: BotTaskKind::Cron,
+                        rrule: Some("FREQ=DAILY;BYHOUR=8;BYMINUTE=0".into()),
+                        run_at: None,
+                        delivery: Some(BotTaskDelivery::PrimaryThread),
+                        notify_app: Some(true),
+                        notify_feishu_chat_id: None,
+                    },
+                },
+            })
+            .await
+            .unwrap();
+        let task = t_created.task.unwrap();
+        assert_eq!(task.status, BotTaskStatus::Enabled);
+        assert!(task.next_run_at.is_some());
+
+        let t_paused = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-t2".into(),
+                action: BotAction::TaskPause {
+                    bot_id: MASTER_BOT_ID.into(),
+                    task_id: task.id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            t_paused.task.as_ref().unwrap().status,
+            BotTaskStatus::Paused
+        );
+        assert!(t_paused.task.as_ref().unwrap().next_run_at.is_none());
+
+        let t_resumed = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-t3".into(),
+                action: BotAction::TaskResume {
+                    bot_id: MASTER_BOT_ID.into(),
+                    task_id: task.id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            t_resumed.task.as_ref().unwrap().status,
+            BotTaskStatus::Enabled
+        );
+        assert!(t_resumed.task.as_ref().unwrap().next_run_at.is_some());
+
+        let t_deleted = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-t4".into(),
+                action: BotAction::TaskDelete {
+                    bot_id: MASTER_BOT_ID.into(),
+                    task_id: task.id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(t_deleted.tasks.unwrap().is_empty());
+
+        // 3. Structured Active Memory + Undo + prepare_app_turn injection
+        let m_added = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-m1".into(),
+                action: BotAction::MemoryItemAdd {
+                    bot_id: MASTER_BOT_ID.into(),
+                    category: BotMemoryCategory::Preference,
+                    content: "回复先给结论再给细节".into(),
+                    scope: None,
+                    pinned: Some(true),
+                    source: Some(BotMemorySource::Auto),
+                },
+            })
+            .await
+            .unwrap();
+        let mem_item = m_added.memory_item.unwrap();
+        assert!(mem_item.pinned);
+        assert_eq!(mem_item.source, BotMemorySource::Auto);
+
+        let injected = supervisor
+            .prepare_app_turn(&thr1.session_id, "帮我分析一下今天的工作")
+            .await
+            .expect("should inject memory context");
+        assert!(injected.contains("<prospero_memory_context>"));
+        assert!(injected.contains("回复先给结论再给细节"));
+        // Avoid double injection
+        assert!(
+            supervisor
+                .prepare_app_turn(&thr1.session_id, &injected)
+                .await
+                .is_none()
+        );
+        // Non-bot sessions are untouched
+        assert!(
+            supervisor
+                .prepare_app_turn("non-existent-session", "hello")
+                .await
+                .is_none()
+        );
+
+        // Soft delete & restore (undo)
+        let m_del = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-m2".into(),
+                action: BotAction::MemoryItemDelete {
+                    bot_id: MASTER_BOT_ID.into(),
+                    item_id: mem_item.id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(m_del.memory_item.unwrap().archived);
+
+        let m_restored = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-m3".into(),
+                action: BotAction::MemoryItemRestore {
+                    bot_id: MASTER_BOT_ID.into(),
+                    item_id: mem_item.id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(!m_restored.memory_item.unwrap().archived);
+
+        // Reverting an active item archives it (undoing an auto-add)
+        let m_reverted_add = supervisor
+            .handle_action(BotActionRequest {
+                kind: "bot.action".into(),
+                request_id: "r-m4".into(),
+                action: BotAction::MemoryItemRestore {
+                    bot_id: MASTER_BOT_ID.into(),
+                    item_id: mem_item.id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(m_reverted_add.memory_item.unwrap().archived);
 
         agents.shutdown().await.unwrap();
         db.shutdown().await.unwrap();

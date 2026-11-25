@@ -1640,6 +1640,9 @@ const ShellSidebar = memo(function ShellSidebar({
                             <span className="bot-roster-copy">
                               <span className="bot-roster-name-line">
                                 <span className="truncate font-medium">{bot.name}</span>
+                                {bot.unreadProactiveCount > 0 && (
+                                  <span className="bot-unread-pill">{bot.unreadProactiveCount}</span>
+                                )}
                                 {bot.feishu.enabled && <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />}
                                 {bot.threads.length > 0 && (
                                   <span className="bot-roster-count">{bot.threads.length}</span>
@@ -1715,7 +1718,10 @@ const ShellSidebar = memo(function ShellSidebar({
                             <span className="bot-roster-copy">
                               <span className="bot-roster-name-line">
                                 <span className="truncate font-medium">{bot.name}</span>
-                                <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
+                                {bot.unreadProactiveCount > 0 && (
+                                  <span className="bot-unread-pill">{bot.unreadProactiveCount}</span>
+                                )}
+                                {bot.feishu.enabled && <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />}
                                 {bot.threads.length > 0 && (
                                   <span className="bot-roster-count">{bot.threads.length}</span>
                                 )}
@@ -3718,6 +3724,34 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setNewSessionOpen(true);
   }, [activeId, activeRemoteId, sessionSnapshot]);
   const botsState = useBots(botsSupported, botSessionSignature);
+  const seenBotNoticeIdsRef = useRef<Set<string>>(new Set());
+  const botNoticesInitializedRef = useRef(false);
+  useEffect(() => {
+    if (!botsState.bots.length) return;
+    if (!botNoticesInitializedRef.current) {
+      botNoticesInitializedRef.current = true;
+      for (const b of botsState.bots) {
+        if (b.latestProactiveNotice) seenBotNoticeIdsRef.current.add(b.latestProactiveNotice.id);
+      }
+      return;
+    }
+    for (const b of botsState.bots) {
+      const notice = b.latestProactiveNotice;
+      if (!notice || notice.read || seenBotNoticeIdsRef.current.has(notice.id)) continue;
+      seenBotNoticeIdsRef.current.add(notice.id);
+      notify({
+        kind: "warning",
+        title: `${b.avatar} ${b.name} · ${notice.title}`,
+        message: notice.summary,
+        key: `bot-notice:${notice.id}`,
+      });
+      if (typeof document !== "undefined" && document.hidden && typeof Notification !== "undefined" && Notification.permission === "granted") {
+        try {
+          new Notification(`${b.avatar} ${b.name} · ${notice.title}`, { body: notice.summary });
+        } catch {}
+      }
+    }
+  }, [botsState.bots]);
   const selectedBot = useMemo(
     () =>
       botsState.bots.find((item) => item.id === selectedBotId) ??
@@ -3730,6 +3764,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     const preferredId = selectedThreadsByBot[selectedBot.id];
     return (
       selectedBot.threads.find((thread) => thread.id === preferredId) ??
+      selectedBot.threads.find((thread) => thread.isPrimary) ??
       selectedBot.threads[0]
     );
   }, [selectedBot, selectedThreadsByBot]);

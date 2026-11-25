@@ -136,6 +136,81 @@ enum BotCommand {
         #[arg(long)]
         title: Option<String>,
     },
+    /// List scheduled tasks and reminders for a Bot.
+    TaskList {
+        #[arg(long)]
+        bot: String,
+    },
+    /// Create a scheduled task or reminder for a Bot.
+    TaskCreate {
+        #[arg(long)]
+        bot: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value = "cron")]
+        kind: String,
+        #[arg(long)]
+        rrule: Option<String>,
+        #[arg(long = "run-at")]
+        run_at: Option<i64>,
+        #[arg(long, default_value = "primary_thread")]
+        delivery: String,
+        #[arg(long = "feishu-chat")]
+        feishu_chat: Option<String>,
+    },
+    /// Pause a Bot background task.
+    TaskPause {
+        #[arg(long)]
+        bot: String,
+        #[arg(long)]
+        task: String,
+    },
+    /// Resume a paused Bot background task.
+    TaskResume {
+        #[arg(long)]
+        bot: String,
+        #[arg(long)]
+        task: String,
+    },
+    /// Delete a Bot background task.
+    TaskDelete {
+        #[arg(long)]
+        bot: String,
+        #[arg(long)]
+        task: String,
+    },
+    /// Trigger a Bot background task immediately.
+    TaskRun {
+        #[arg(long)]
+        bot: String,
+        #[arg(long)]
+        task: String,
+    },
+    /// List structured Active Memory items for a Bot.
+    MemoryList {
+        #[arg(long)]
+        bot: String,
+    },
+    /// Add a structured Active Memory item for a Bot.
+    MemoryAdd {
+        #[arg(long)]
+        bot: String,
+        #[arg(long, default_value = "fact")]
+        category: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long)]
+        pinned: bool,
+    },
+    /// Soft-delete a structured Active Memory item for a Bot.
+    MemoryDelete {
+        #[arg(long)]
+        bot: String,
+        #[arg(long)]
+        item: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -924,6 +999,85 @@ fn command_request(
                     "task": require_text(task, "--task")?,
                     "threadId": thread,
                     "title": title,
+                }),
+            ),
+            BotCommand::TaskList { bot } => (
+                "bot.task.list",
+                json!({ "botId": require_text(bot, "--bot")? }),
+            ),
+            BotCommand::TaskCreate {
+                bot,
+                name,
+                prompt,
+                kind,
+                rrule,
+                run_at,
+                delivery,
+                feishu_chat,
+            } => (
+                "bot.task.create",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "name": require_text(name, "--name")?,
+                    "prompt": require_text(prompt, "--prompt")?,
+                    "kind": kind,
+                    "rrule": rrule,
+                    "runAt": run_at,
+                    "delivery": delivery,
+                    "notifyFeishuChatId": feishu_chat,
+                }),
+            ),
+            BotCommand::TaskPause { bot, task } => (
+                "bot.task.pause",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "taskId": require_text(task, "--task")?,
+                }),
+            ),
+            BotCommand::TaskResume { bot, task } => (
+                "bot.task.resume",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "taskId": require_text(task, "--task")?,
+                }),
+            ),
+            BotCommand::TaskDelete { bot, task } => (
+                "bot.task.delete",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "taskId": require_text(task, "--task")?,
+                }),
+            ),
+            BotCommand::TaskRun { bot, task } => (
+                "bot.task.run",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "taskId": require_text(task, "--task")?,
+                }),
+            ),
+            BotCommand::MemoryList { bot } => (
+                "bot.memory.list",
+                json!({ "botId": require_text(bot, "--bot")? }),
+            ),
+            BotCommand::MemoryAdd {
+                bot,
+                category,
+                content,
+                pinned,
+            } => (
+                "bot.memory.add",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "category": category,
+                    "content": require_text(content, "--content")?,
+                    "pinned": pinned,
+                }),
+            ),
+            BotCommand::MemoryDelete { bot, item } => (
+                "bot.memory.delete",
+                json!({
+                    "botId": require_text(bot, "--bot")?,
+                    "itemId": require_text(item, "--item")?,
                 }),
             ),
         },

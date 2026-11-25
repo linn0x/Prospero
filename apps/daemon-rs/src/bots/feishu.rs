@@ -255,13 +255,7 @@ impl FeishuApiClient {
     async fn fetch_chat_name(&self, chat_id: &str) -> Option<String> {
         let token = self.tenant_access_token().await.ok()?;
         let url = format!("{}/open-apis/im/v1/chats/{chat_id}", self.base_url);
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .ok()?;
+        let resp = self.http.get(&url).bearer_auth(token).send().await.ok()?;
         let body: Value = resp.json().await.ok()?;
         if body.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
             return None;
@@ -293,18 +287,16 @@ impl FeishuApiClient {
             "{}/open-apis/contact/v3/users/{user_id}?user_id_type={id_type}",
             self.base_url
         );
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .ok()?;
+        let resp = self.http.get(&url).bearer_auth(token).send().await.ok()?;
         let body: Value = resp.json().await.ok()?;
         if body.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
             return None;
         }
-        for pointer in ["/data/user/name", "/data/user/nickname", "/data/user/en_name"] {
+        for pointer in [
+            "/data/user/name",
+            "/data/user/nickname",
+            "/data/user/en_name",
+        ] {
             if let Some(name) = body
                 .pointer(pointer)
                 .and_then(Value::as_str)
@@ -423,6 +415,46 @@ impl FeishuApiClient {
             )));
         }
         Ok(())
+    }
+
+    pub async fn send_card_to_chat(&self, chat_id: &str, card: &Value) -> Result<String> {
+        let clean_chat = chat_id.trim();
+        if clean_chat.is_empty() {
+            return Err(Error::Invalid("飞书群聊/会话 ID 不能为空".into()));
+        }
+        let token = self.tenant_access_token().await?;
+        let url = format!(
+            "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
+            self.base_url
+        );
+        let payload = build_chat_card_message_payload(clean_chat, card);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| Error::Invalid(format!("主动发送飞书卡片失败：{error}")))?;
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|error| Error::Invalid(format!("解析飞书发送响应失败：{error}")))?;
+        let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code != 0 {
+            let msg = body
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("主动发送卡片失败");
+            return Err(Error::Invalid(format!(
+                "主动发送飞书卡片失败 (code={code}): {msg}"
+            )));
+        }
+        Ok(body
+            .pointer("/data/message_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
     }
 
     pub async fn reply_text(
@@ -770,6 +802,14 @@ fn strip_bot_mentions(text: &str, mentions: &[FeishuMention], bot_open_id: Optio
 
 const MAX_TABLES_PER_CARD: usize = 5;
 
+pub(crate) fn build_chat_card_message_payload(chat_id: &str, card: &Value) -> Value {
+    json!({
+        "receive_id": chat_id,
+        "msg_type": "interactive",
+        "content": card.to_string(),
+    })
+}
+
 pub(crate) fn build_card_json(title: &str, body_markdown: &str, footer: Option<&str>) -> Value {
     let truncated = truncate_chars(body_markdown, MAX_CARD_CHARS);
     let content = if truncated.trim().is_empty() {
@@ -881,7 +921,7 @@ fn markdown_to_card_elements(markdown: &str) -> Vec<Value> {
             } else {
                 elements.push(json!({
                     "tag": "markdown",
-                    "content": table.into_fallback_markdown(),
+                    "content": table.to_fallback_markdown(),
                 }));
             }
             idx = next_idx;
@@ -970,7 +1010,7 @@ impl ParsedTable {
         })
     }
 
-    fn into_fallback_markdown(&self) -> String {
+    fn to_fallback_markdown(&self) -> String {
         self.rows
             .iter()
             .map(|row| {
@@ -1018,7 +1058,13 @@ fn parse_gfm_table(lines: &[&str], start: usize) -> Option<(ParsedTable, usize)>
             break;
         }
         // Stop before a new separator line if another table immediately follows without blank line.
-        if cursor + 1 < lines.len() && parse_table_alignments(lines[cursor + 1].trim(), split_pipe_cells(candidate).map(|c| c.len()).unwrap_or(0)).is_some() {
+        if cursor + 1 < lines.len()
+            && parse_table_alignments(
+                lines[cursor + 1].trim(),
+                split_pipe_cells(candidate).map(|c| c.len()).unwrap_or(0),
+            )
+            .is_some()
+        {
             break;
         }
         let Some(mut cells) = split_pipe_cells(candidate) else {
@@ -1048,9 +1094,7 @@ fn split_pipe_cells(line: &str) -> Option<Vec<String>> {
     if !trimmed.contains('|') {
         return None;
     }
-    let stripped = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed);
+    let stripped = trimmed.strip_prefix('|').unwrap_or(trimmed);
     let stripped = stripped.strip_suffix('|').unwrap_or(stripped);
 
     let mut cells = Vec::new();
@@ -1077,11 +1121,7 @@ fn split_pipe_cells(line: &str) -> Option<Vec<String>> {
         current.push('\\');
     }
     cells.push(current.trim().to_owned());
-    if cells.is_empty() {
-        None
-    } else {
-        Some(cells)
-    }
+    if cells.is_empty() { None } else { Some(cells) }
 }
 
 fn parse_table_alignments(line: &str, expected_cols: usize) -> Option<Vec<&'static str>> {
@@ -1520,9 +1560,8 @@ async fn dispatch_feishu_message(
     msg: ParsedFeishuMessage,
 ) {
     let is_group = msg.chat_type == "group";
-    let (group_trigger, streaming_card) = supervisor
-        .live_feishu_runtime_options(&config.bot_id)
-        .await;
+    let (group_trigger, streaming_card) =
+        supervisor.live_feishu_runtime_options(&config.bot_id).await;
     if is_group && group_trigger == FeishuGroupTrigger::Mention && !msg.mentioned_bot {
         return;
     }
@@ -2026,14 +2065,8 @@ async fn stream_turn_to_feishu(
                 && last_patch_at.elapsed() >= STREAM_THROTTLE
             {
                 let footer = format!("{} · 生成中", thread_title);
-                if patch_card_with_fallback(
-                    &api,
-                    reply_id,
-                    &config.bot_name,
-                    &body,
-                    Some(&footer),
-                )
-                .await
+                if patch_card_with_fallback(&api, reply_id, &config.bot_name, &body, Some(&footer))
+                    .await
                 {
                     last_pushed_content = body;
                     last_patch_at = Instant::now();
@@ -2435,5 +2468,23 @@ mod tests {
             parsed_fallback.sender_open_id.as_deref(),
             Some("u_fallback")
         );
+    }
+
+    #[test]
+    fn builds_proactive_chat_card_message_payload() {
+        let card = build_card_json(
+            "⏰ 每日早报",
+            "今日任务一切正常",
+            Some("Prospero Bot 后台任务"),
+        );
+        let payload = build_chat_card_message_payload("oc_chat_123", &card);
+        assert_eq!(payload["receive_id"], "oc_chat_123");
+        assert_eq!(payload["msg_type"], "interactive");
+        let content_str = payload["content"]
+            .as_str()
+            .expect("content must be JSON string");
+        let parsed: Value = serde_json::from_str(content_str).unwrap();
+        assert_eq!(parsed["schema"], "2.0");
+        assert_eq!(parsed["header"]["title"]["content"], "⏰ 每日早报");
     }
 }

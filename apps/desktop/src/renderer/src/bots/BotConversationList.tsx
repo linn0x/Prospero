@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import {
   MessageSquare,
   MessageSquarePlus,
+  Pin,
   Search,
   ShieldCheck,
   Trash2,
@@ -45,31 +46,34 @@ function formatRelativeTime(
 }
 
 function channelTagLabel(
-  channel: BotThreadChannel,
+  thread: BotThread,
   t: (zh: string, en: string) => string,
 ): string {
-  switch (channel) {
+  if (thread.isPrimary) return t("主对话", "Primary");
+  switch (thread.channel) {
     case "feishu_group":
       return t("飞书群", "Group");
     case "feishu_p2p":
       return t("飞书私聊", "DM");
     case "desktop":
-      return t("桌面", "Desktop");
+      return t("分支", "Side Chat");
   }
 }
 
 function ChannelAvatar({
-  channel,
+  thread,
   running,
 }: {
-  channel: BotThreadChannel;
+  thread: BotThread;
   running: boolean;
 }) {
   return (
-    <div className="bot-conv-avatar" data-channel={channel}>
-      {channel === "feishu_group" ? (
+    <div className="bot-conv-avatar" data-channel={thread.isPrimary ? "primary" : thread.channel}>
+      {thread.isPrimary ? (
+        <Pin className="size-4" />
+      ) : thread.channel === "feishu_group" ? (
         <Users className="size-4" />
-      ) : channel === "feishu_p2p" ? (
+      ) : thread.channel === "feishu_p2p" ? (
         <UserRound className="size-4" />
       ) : (
         <MessageSquare className="size-4" />
@@ -84,6 +88,7 @@ export function BotConversationList({
   threads,
   sessions,
   adminUsers,
+  feishuEnabled = false,
   activeThreadId,
   creatingThread,
   onSelectThread,
@@ -94,6 +99,7 @@ export function BotConversationList({
   threads: BotThread[];
   sessions: SessionInfo[];
   adminUsers: BotFeishuAdmin[];
+  feishuEnabled?: boolean;
   activeThreadId: string | undefined;
   creatingThread: boolean;
   onSelectThread: (botId: string, threadId: string) => void;
@@ -132,10 +138,15 @@ export function BotConversationList({
     };
   }, [threads]);
 
+  const showFeishuFilters = feishuEnabled || counts.feishu_group > 0 || counts.feishu_p2p > 0;
+
   const sortedAndFiltered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return [...threads]
-      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .sort((a, b) => {
+        if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+        return b.updatedAt - a.updatedAt;
+      })
       .filter((thread) => {
         if (filter !== "all" && thread.channel !== filter) return false;
         if (!q) return true;
@@ -151,11 +162,11 @@ export function BotConversationList({
   }, [filter, query, threads]);
 
   return (
-    <aside className="bot-conv-sidebar" aria-label={t("IM 会话列表", "IM Conversations")}>
+    <aside className="bot-conv-sidebar" aria-label={t("对话与分支话题", "Conversations & Side Chats")}>
       <div className="bot-conv-header">
         <div className="flex items-center gap-1.5 min-w-0">
           <strong className="text-xs font-semibold text-foreground truncate">
-            {t("会话列表", "Conversations")}
+            {t("主对话与分支", "Threads & Side Chats")}
           </strong>
           <span className="bot-conv-count-pill">{threads.length}</span>
         </div>
@@ -170,7 +181,7 @@ export function BotConversationList({
           ) : (
             <MessageSquarePlus data-icon="inline-start" />
           )}
-          {t("新话题", "New")}
+          {t("新分支", "New")}
         </Button>
       </div>
 
@@ -180,7 +191,7 @@ export function BotConversationList({
           <Input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder={t("搜索群名、成员或消息…", "Search group, sender, message...")}
+            placeholder={t("搜索话题或消息…", "Search threads or messages...")}
             className="bot-conv-search-input h-7.5 pl-7.5 pr-7 text-xs"
           />
           {query && (
@@ -197,46 +208,50 @@ export function BotConversationList({
         </div>
       </div>
 
-      <div className="bot-conv-filters" role="tablist" aria-label={t("会话渠道筛选", "Channel filter")}>
-        {(
-          [
-            ["all", t("全部", "All"), counts.all],
-            ["feishu_group", t("飞书群", "Groups"), counts.feishu_group],
-            ["feishu_p2p", t("飞书私聊", "DMs"), counts.feishu_p2p],
-            ["desktop", t("桌面", "Desktop"), counts.desktop],
-          ] as const
-        ).map(([channelId, label, count]) => (
-          <button
-            key={channelId}
-            type="button"
-            role="tab"
-            data-slot="bot-control"
-            aria-selected={filter === channelId}
-            className="bot-conv-filter-btn"
-            data-active={filter === channelId}
-            onClick={() => setFilter(channelId)}
-          >
-            <span>{label}</span>
-            <span className="opacity-70 tabular-nums">{count}</span>
-          </button>
-        ))}
-      </div>
+      {showFeishuFilters && (
+        <div className="bot-conv-filters" role="tablist" aria-label={t("会话渠道筛选", "Channel filter")}>
+          {(
+            [
+              ["all", t("全部", "All"), counts.all],
+              ["desktop", t("桌面", "App"), counts.desktop],
+              ["feishu_group", t("飞书群", "Groups"), counts.feishu_group],
+              ["feishu_p2p", t("飞书私聊", "DMs"), counts.feishu_p2p],
+            ] as const
+          ).map(([channelId, label, count]) => (
+            <button
+              key={channelId}
+              type="button"
+              role="tab"
+              data-slot="bot-control"
+              aria-selected={filter === channelId}
+              className="bot-conv-filter-btn"
+              data-active={filter === channelId}
+              onClick={() => setFilter(channelId)}
+            >
+              <span>{label}</span>
+              <span className="opacity-70 tabular-nums">{count}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="bot-conv-list">
         {sortedAndFiltered.length === 0 ? (
           <div className="m-2 rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground leading-relaxed">
             {threads.length === 0
               ? t(
-                  "暂无对话。在右侧发送消息或从飞书发起对话，将自动出现在此列表中。",
-                  "No conversations yet. Start chatting here or via Feishu.",
+                  "正在初始化主对话流，你也可以随时新建分支话题处理专项事务。",
+                  "Initializing primary thread; create Side Chats anytime for focused projects.",
                 )
-              : t("当前筛选下暂无匹配会话。", "No conversations match your filter.")}
+              : t("当前筛选下暂无匹配话题。", "No conversations match your filter.")}
           </div>
         ) : (
           sortedAndFiltered.map((thread) => {
             const liveSession = sessionMap.get(thread.sessionId);
             const running = liveSession?.status === "running";
-            const primaryTitle = thread.chatName?.trim() || thread.title;
+            const primaryTitle = thread.isPrimary
+              ? t("主对话（永续）", "Primary Thread")
+              : thread.chatName?.trim() || thread.title;
             const speaker = thread.lastSenderName?.trim() || thread.lastSenderId?.trim() || "";
             const isSpeakerAdmin = Boolean(thread.lastSenderId && adminSet.has(thread.lastSenderId));
             const rawPreview =
@@ -251,6 +266,7 @@ export function BotConversationList({
                 key={thread.id}
                 className="bot-conv-item group/conv"
                 data-selected={active}
+                data-primary={thread.isPrimary ? "true" : "false"}
               >
                 <button
                   type="button"
@@ -259,23 +275,28 @@ export function BotConversationList({
                   aria-current={active ? "page" : undefined}
                   onClick={() => onSelectThread(botId, thread.id)}
                 >
-                  <ChannelAvatar channel={thread.channel} running={running} />
+                  <ChannelAvatar thread={thread} running={running} />
                   <div className="min-w-0 flex-1 grid gap-0.5">
                     <div className="flex items-center justify-between gap-1.5 min-w-0">
                       <span className="truncate text-xs font-semibold text-foreground">
                         {primaryTitle}
                       </span>
-                      <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
-                        {timeLabel}
-                      </span>
+                      <div className="flex items-center gap-1 shrink-0">
+                        {thread.unreadCount > 0 && (
+                          <span className="bot-unread-pill">{thread.unreadCount}</span>
+                        )}
+                        <span className="text-[10px] text-muted-foreground tabular-nums">
+                          {timeLabel}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="flex items-center gap-1 min-w-0 text-[11px] text-muted-foreground">
                       <span
                         className="bot-thread-channel"
-                        data-channel={thread.channel}
+                        data-channel={thread.isPrimary ? "primary" : thread.channel}
                       >
-                        {channelTagLabel(thread.channel, t)}
+                        {channelTagLabel(thread, t)}
                       </span>
                       {speaker && (
                         <span className="inline-flex items-center gap-0.5 truncate text-foreground/80">
@@ -300,20 +321,22 @@ export function BotConversationList({
                     </div>
                   </div>
                 </button>
-                <button
-                  type="button"
-                  data-slot="bot-control"
-                  className="bot-conv-delete"
-                  aria-label={t("删除对话", "Delete conversation")}
-                  title={t("删除对话", "Delete conversation")}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onArchiveThread(botId, thread.id);
-                  }}
-                >
-                  <Trash2 className="size-3" />
-                </button>
+                {!thread.isPrimary && (
+                  <button
+                    type="button"
+                    data-slot="bot-control"
+                    className="bot-conv-delete"
+                    aria-label={t("删除对话", "Delete conversation")}
+                    title={t("删除对话", "Delete conversation")}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onArchiveThread(botId, thread.id);
+                    }}
+                  >
+                    <Trash2 className="size-3" />
+                  </button>
+                )}
               </div>
             );
           })

@@ -2265,6 +2265,16 @@ export default function HostScreen() {
         onClose={() => { toolsNavigation.cancel(); setToolsOpen(false); }}
         onDismiss={() => toolsNavigation.dismiss()}
       >
+        <SheetAction
+          label="个人 Bot 助理"
+          detail="永续主对话、主动长期记忆与后台定时提醒"
+          symbol="bubble.left.and.text.bubble.right"
+          onPress={() => {
+            resetPendingCreate();
+            toolsNavigation.defer(() => router.push(`/host/${hostId}/bots`));
+            setToolsOpen(false);
+          }}
+        />
         {supportsTerminal && <SheetAction label="远程终端" detail="新建或返回电脑终端，支持 Ctrl、Option 和方向键" symbol="terminal"
           onPress={() => {
             resetPendingCreate();

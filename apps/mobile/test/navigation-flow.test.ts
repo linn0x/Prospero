@@ -10,11 +10,14 @@ const hostScreen = read("app", "host", "[hostId]", "index.tsx");
 const homeScreen = read("app", "index.tsx");
 
 describe("首页动线", () => {
-  it("标题栏可直达当前电脑的账号与模型源和任务编排", () => {
-    expect(homeScreen).toContain('accessibilityLabel="账号与模型源"');
+  it("提供工作与 Bot 模式切换，并将次级工具收进更多功能菜单", () => {
+    expect(homeScreen).toContain('accessibilityLabel="工作模式"');
+    expect(homeScreen).toContain('accessibilityLabel="Bot 模式"');
+    expect(homeScreen).toContain("<MobileBotWorkbench");
+    expect(homeScreen).toContain('accessibilityLabel="更多功能"');
     expect(homeScreen).toContain("`/host/${effectiveSelectedHostId}/accounts`");
-    expect(homeScreen).toContain('accessibilityLabel="任务编排"');
     expect(homeScreen).toContain("`/host/${effectiveSelectedHostId}/orchestration`");
+    expect(homeScreen).toContain('router.push("/settings")');
     expect(homeScreen).not.toContain("EdgeDashboard");
     expect(homeScreen).not.toContain("HomeModeTitle");
   });

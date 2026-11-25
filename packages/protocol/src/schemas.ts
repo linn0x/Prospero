@@ -656,6 +656,24 @@ export const S2CModelSourceResultSchema = z.object({
   error: AgentAccountFeatureErrorSchema.optional(),
 });
 
+export const C2SBotActionSchema = z.object({
+  type: z.literal("bot.action"),
+  requestId: z.string().min(1).max(100),
+  action: z.record(z.unknown()),
+}).strict();
+
+export const S2CBotResultSchema = z.object({
+  type: z.literal("bot.result"),
+  requestId: z.string().min(1).max(100),
+  ok: z.boolean(),
+  error: AgentAccountFeatureErrorSchema.optional(),
+}).passthrough();
+
+export const S2CBotsChangedSchema = z.object({
+  type: z.literal("bots.changed"),
+  bots: z.array(z.any()),
+});
+
 export type ModelSource = z.infer<typeof ModelSourceSchema>;
 export type ModelSourceRoute = z.infer<typeof ModelSourceRouteSchema>;
 export type ModelSourceAction = z.infer<typeof ModelSourceActionSchema>;
@@ -1536,6 +1554,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SAgentAccountConfigGetSchema,
   C2SAgentAccountConfigSetSchema,
   C2SModelSourceActionSchema,
+  C2SBotActionSchema,
   C2SAgentAccountRenameSchema,
   C2SAgentAccountSetDefaultSchema,
   C2SAgentAccountLoginSchema,
@@ -2266,6 +2285,8 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CAgentAccountApiModelsResultSchema,
   S2CAgentAccountConfigResultSchema,
   S2CModelSourceResultSchema,
+  S2CBotResultSchema,
+  S2CBotsChangedSchema,
   S2CScheduleResultSchema,
   S2CFsListingSchema,
   S2CFsContentSchema,
@@ -2460,6 +2481,9 @@ export type S2CAgentControlResult = z.infer<typeof S2CAgentControlResultSchema>;
 export type S2CPermissionRequest = z.infer<typeof S2CPermissionRequestSchema>;
 export type S2CError = z.infer<typeof S2CErrorSchema>;
 export type S2COrchestrationSnapshot = z.infer<typeof S2COrchestrationSnapshotSchema>;
+export type C2SBotAction = z.infer<typeof C2SBotActionSchema>;
+export type S2CBotResult = z.infer<typeof S2CBotResultSchema>;
+export type S2CBotsChanged = z.infer<typeof S2CBotsChangedSchema>;
 export type S2CMessage = z.infer<typeof S2CMessageSchema>;
 export type PairingPayload = z.infer<typeof PairingPayloadSchema>;
 

@@ -23,6 +23,7 @@ import {
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
   CAPABILITY_MODEL_SOURCES,
+  CAPABILITY_BOTS,
   CAPABILITY_FS_PUT_ACK,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
@@ -78,6 +79,10 @@ import {
   type S2CHelloOk,
   type S2CMessage,
   type S2CModelSourceResult,
+  type BotAction,
+  type BotActionResult,
+  type S2CBotResult,
+  type S2CBotsChanged,
   type S2COrchestrationSnapshot,
   type S2CTermOutput,
   type S2CTermSnapshot,
@@ -148,6 +153,7 @@ export interface ConnEvents extends Record<string, unknown> {
   agentEvent: S2CAgentEvent;
   toolOutput: S2CToolOutput;
   orchestrationSnapshot: S2COrchestrationSnapshot;
+  botsChanged: S2CBotsChanged;
   serverError: S2CError;
   /** 验收打点:A1 attach 上屏、A5 回前台恢复 */
   metric: { name: "attach" | "resume"; sid?: string; ms: number };
@@ -276,6 +282,10 @@ export class HostConnection {
 
   get supportsModelSources(): boolean {
     return this.supportsCapability(CAPABILITY_MODEL_SOURCES);
+  }
+
+  get supportsBots(): boolean {
+    return this.supportsCapability(CAPABILITY_BOTS);
   }
 
   get supportsAgentApiValidation(): boolean {
@@ -909,6 +919,9 @@ export class HostConnection {
       case "orchestration.snapshot":
         this.events.emit("orchestrationSnapshot", msg);
         return;
+      case "bots.changed":
+        this.events.emit("botsChanged", msg);
+        return;
       case "orchestration.operation.result":
       case "orchestration.execution.result":
       case "workspace.listing":
@@ -916,6 +929,7 @@ export class HostConnection {
       case "conversation.results":
       case "agent.accounts.result":
       case "model.source.result":
+      case "bot.result":
       case "fs.listing":
       case "fs.content":
       case "fs.written":
@@ -946,6 +960,7 @@ export class HostConnection {
         if (this.rejectFsFor("#conversations", msg.message)) return;
         if (this.rejectFsFor("#accounts", msg.message)) return;
         if (this.rejectFsFor("#model-sources", msg.message)) return;
+        if (this.rejectFsFor("#bots", msg.message)) return;
         this.events.emit("serverError", msg);
         return;
       case "hello.ok":
@@ -983,6 +998,8 @@ export class HostConnection {
             ? "#accounts"
             : msg.type === "model.source.result"
               ? "#model-sources"
+              : msg.type === "bot.result"
+                ? "#bots"
           : (msg.sid ?? "#account");
     const responsePath =
       msg.type === "workspace.listing"
@@ -1017,6 +1034,8 @@ export class HostConnection {
                 ? `#agent.accounts:${msg.requestId}`
                 : msg.type === "model.source.result"
                   ? `#model.source:${msg.requestId}`
+                  : msg.type === "bot.result"
+                    ? `#bot:${msg.requestId}`
               : msg.type === "agent.control.result"
                 ? `#agent.control:${msg.requestId}`
                 : (msg.path ?? `#${msg.type}`);
@@ -1191,6 +1210,21 @@ export class HostConnection {
       false,
     );
     if (!result.ok) throw new Error(result.error?.message ?? "模型源操作失败");
+    return result;
+  }
+
+  async botAction(action: BotAction): Promise<BotActionResult> {
+    if (!this.supportsBots) throw new Error("请先升级电脑端以使用个人 Bot 助理");
+    const requestId = this.agentRequestId();
+    const raw = await this.fsRequest<S2CBotResult>(
+      "#bots",
+      `#bot:${requestId}`,
+      { type: "bot.action", requestId, action },
+      45_000,
+      false,
+    );
+    const result = raw as unknown as BotActionResult;
+    if (!result.ok) throw new Error(result.error?.message ?? "Bot 操作失败");
     return result;
   }
 

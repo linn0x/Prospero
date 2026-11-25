@@ -374,6 +374,8 @@ export function BotEditorDialog({
         sourceBinding: nextSourceBinding,
         customWorkspace: bot?.customWorkspace ?? null,
         allowCrossWorkspace,
+        autoMemory: bot?.autoMemory ?? true,
+        proactiveNotifications: bot?.proactiveNotifications ?? true,
         feishu: {
           enabled: feishuEnabled,
           domain: feishuDomain,
@@ -427,7 +429,7 @@ export function BotEditorDialog({
     { id: "model", label: t("模型与引擎", "Agent & Model"), icon: Cpu },
     {
       id: "feishu",
-      label: t("飞书 IM", "Feishu IM"),
+      label: t("飞书外挂 (可选)", "Feishu IM (Optional)"),
       icon: MessageSquare,
       dot: feishuEnabled ? (bot?.feishuStatus.state ?? "connecting") : undefined,
     },

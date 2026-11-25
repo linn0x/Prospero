@@ -8,6 +8,7 @@ import {
   itemsForAgent,
   pendingInteractions,
   pendingPermissions,
+  stripInjectedMemoryContext,
   type AssistantItem,
   type ChatItem,
   type PermissionItem,
@@ -355,5 +356,22 @@ describe("chat-model 事件折叠", () => {
       ev({ kind: "permission.auto", reqId: "b", action: "read", summary: "b", policy: "yolo" }),
     ]);
     expect(foldChatItems(items).map((item) => item.type)).toEqual(["permission", "permission"]);
+  });
+
+  it("自动剥离注入给 Bot 的 <prospero_memory_context> 块", () => {
+    expect(
+      stripInjectedMemoryContext(
+        "帮我梳理今天的工作\n\n<prospero_memory_context>\n[个人画像] 偏好先给结论\n</prospero_memory_context>",
+      ),
+    ).toBe("帮我梳理今天的工作");
+
+    const items = applyEvents([], [
+      ev({
+        kind: "user.message",
+        msgId: "u-mem",
+        text: "总结重点\n\n<prospero_memory_context>\ninternal\n</prospero_memory_context>",
+      }),
+    ]);
+    expect(items[0]).toMatchObject({ type: "user", text: "总结重点" });
   });
 });

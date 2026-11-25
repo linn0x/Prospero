@@ -140,6 +140,7 @@ export function HomeDashboard({
   onCloseDevicePicker,
   onSelectHost,
   onOpenHost,
+  onOpenBots,
   onOpenAccounts,
   onOpenSession,
   onEditHost,
@@ -164,6 +165,7 @@ export function HomeDashboard({
   onCloseDevicePicker: () => void;
   onSelectHost: (hostId: string) => void;
   onOpenHost: (hostId: string) => void;
+  onOpenBots?: (hostId: string) => void;
   onOpenAccounts?: (hostId: string) => void;
   onOpenSession: (hostId: string, sessionId: string) => void;
   onEditHost: (hostId: string) => void;

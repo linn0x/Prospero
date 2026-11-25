@@ -848,9 +848,9 @@ const BOT_CHAT_VIEW_STORAGE_KEY = "prospero.botChatViewMode";
 function readBotChatViewMode(): "qa" | "timeline" {
   try {
     const value = typeof localStorage !== "undefined" ? localStorage.getItem(BOT_CHAT_VIEW_STORAGE_KEY) : null;
-    return value === "timeline" ? "timeline" : "qa";
+    return value === "qa" ? "qa" : "timeline";
   } catch {
-    return "qa";
+    return "timeline";
   }
 }
 
@@ -1773,25 +1773,25 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
               type="button"
               role="tab"
               data-slot="bot-control"
-              aria-selected={botViewMode === "qa"}
-              className="bot-qa-mode-btn"
-              data-active={botViewMode === "qa" ? "true" : "false"}
-              onClick={() => updateBotViewMode("qa")}
-            >
-              <ListOrdered className="size-3.5" />
-              <span>{t("问答列表", "Q&A List")}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              data-slot="bot-control"
               aria-selected={botViewMode === "timeline"}
               className="bot-qa-mode-btn"
               data-active={botViewMode === "timeline" ? "true" : "false"}
               onClick={() => updateBotViewMode("timeline")}
             >
               <AlignLeft className="size-3.5" />
-              <span>{t("完整时间线", "Timeline")}</span>
+              <span>{t("对话流", "Chat")}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              data-slot="bot-control"
+              aria-selected={botViewMode === "qa"}
+              className="bot-qa-mode-btn"
+              data-active={botViewMode === "qa" ? "true" : "false"}
+              onClick={() => updateBotViewMode("qa")}
+            >
+              <ListOrdered className="size-3.5" />
+              <span>{t("问答表格", "Q&A Table")}</span>
             </button>
           </div>
         </div>

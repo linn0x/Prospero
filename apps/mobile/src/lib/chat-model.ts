@@ -223,6 +223,10 @@ export function foldCodexTurns(items: ChatItem[], expansion: Readonly<Record<str
  * 增量归并:把一条事件应用到条目列表上,返回新列表(引用变化才触发重渲染)。
  * 同一 msgId 的文本增量合并进同一个助手条目;tool.end 回填对应的 tool 条目。
  */
+export function stripInjectedMemoryContext(raw: string): string {
+  return raw.replace(/\n*<prospero_memory_context>[\s\S]*?(?:<\/prospero_memory_context>|$)\s*/g, "").trim();
+}
+
 export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
   const eventAgentId = "agentId" in ev ? ev.agentId : undefined;
   const scopedKey = (prefix: string, id: string): string =>
@@ -236,7 +240,7 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
           type: "user",
           key: scopedKey("u", ev.msgId),
           msgId: ev.msgId,
-          text: ev.text,
+          text: stripInjectedMemoryContext(ev.text),
           ...(ev.attachments?.length ? { attachments: ev.attachments } : {}),
           ...agentField,
         },

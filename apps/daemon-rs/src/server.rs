@@ -1169,6 +1169,7 @@ async fn handle_remote_ws(
         ..RemoteWsState::default()
     };
     let mut changes = api.changes.subscribe();
+    let mut bot_changes = api.bots.changes();
     let mut output_tick = tokio::time::interval(Duration::from_millis(12));
     output_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut metadata_tick = tokio::time::interval(REMOTE_METADATA_MIN_INTERVAL);
@@ -1236,6 +1237,14 @@ async fn handle_remote_ws(
                 }
                 if flush_remote_ws_changes(&api, &mut socket, &mut channel, &mut state).await.is_err() {
                     return;
+                }
+            }
+            bot_changed = bot_changes.changed() => {
+                if bot_changed.is_ok() {
+                    let bots = api.bots.list_public().await;
+                    if send_remote_json(&mut socket, &mut channel, &json!({ "type": "bots.changed", "bots": bots })).await.is_err() {
+                        return;
+                    }
                 }
             }
             _ = output_tick.tick(), if state.pty_attachments.values().any(|attachment| attachment.pending) => {
@@ -1691,6 +1700,7 @@ async fn route_remote_ws_message(
         | "agent.account.logout"
         | "agent.account.delete" => remote_accounts_control(api, socket, channel, message).await,
         "model.source.action" => remote_model_sources_control(api, socket, channel, message).await,
+        "bot.action" => remote_bots_control(api, socket, channel, message).await,
         "launch.models.get" => remote_launch_models(api, socket, channel, message).await,
         "agent.models.get" => remote_agent_models(api, socket, channel, message).await,
         "agent.modes.get" => remote_agent_modes(api, socket, channel, message).await,
@@ -1791,7 +1801,10 @@ async fn route_remote_ws_message(
                 .map(serde_json::from_value)
                 .transpose()?
                 .unwrap_or_default();
-            api.agents.send(sid, text, delivery, attachments).await?;
+            let preview_text = text.clone();
+            let effective_text = api.bots.prepare_app_turn(sid, &text).await.unwrap_or(text);
+            api.agents.send(sid, effective_text, delivery, attachments).await?;
+            api.bots.touch_session_message(sid, &preview_text).await;
             api.publish();
             Ok(())
         }
@@ -1923,6 +1936,17 @@ async fn remote_model_sources_control(
 ) -> Result<()> {
     let control: crate::accounts::sources::SourceControl = serde_json::from_value(message)?;
     let response = model_sources_route(State(api.clone()), Ok(Json(control))).await;
+    send_http_json_response(socket, channel, response).await
+}
+
+async fn remote_bots_control(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let request: BotActionRequest = serde_json::from_value(message)?;
+    let response = bots_action_route(State(api.clone()), Ok(Json(request))).await;
     send_http_json_response(socket, channel, response).await
 }
 
@@ -3376,7 +3400,8 @@ async fn remote_session_create(
                         message.get("approvalPolicy").and_then(JsonValue::as_str),
                         Some("always" | "yolo" | "auto")
                     ),
-                    approval_policy: match message.get("approvalPolicy").and_then(JsonValue::as_str) {
+                    approval_policy: match message.get("approvalPolicy").and_then(JsonValue::as_str)
+                    {
                         Some("strict") => Some(TerminalApprovalPolicy::Strict),
                         Some("standard") => Some(TerminalApprovalPolicy::Standard),
                         Some("always" | "yolo" | "auto") => Some(TerminalApprovalPolicy::Yolo),
@@ -5114,8 +5139,13 @@ async fn agent_send(
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let Json(input) = body.map_err(|_| Error::Invalid("invalid agent message".into()))?;
     let preview_text = input.text.clone();
+    let effective_text = api
+        .bots
+        .prepare_app_turn(&id, &input.text)
+        .await
+        .unwrap_or(input.text);
     api.agents
-        .send(&id, input.text, input.delivery, input.attachments)
+        .send(&id, effective_text, input.delivery, input.attachments)
         .await?;
     api.bots.touch_session_message(&id, &preview_text).await;
     api.publish();

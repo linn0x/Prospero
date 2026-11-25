@@ -484,10 +484,10 @@ impl Schedules {
             ..current
         };
         task = validate_task(task)?;
-        if rrule_changed || input.status.is_some() {
-            if let Ok(mut retries) = self.0.retry_counts.lock() {
-                retries.remove(&task.id);
-            }
+        if (rrule_changed || input.status.is_some())
+            && let Ok(mut retries) = self.0.retry_counts.lock()
+        {
+            retries.remove(&task.id);
         }
         if rrule_changed {
             task.next_run_at = next_run_after(&task.rrule, now)?;
@@ -1166,7 +1166,7 @@ impl ParsedRrule {
     }
 }
 
-fn next_run_after(rrule: &str, now: i64) -> Result<i64> {
+pub(crate) fn next_run_after(rrule: &str, now: i64) -> Result<i64> {
     let parsed = parse_rrule(rrule)?;
     if !parsed.has_calendar_selectors() {
         return Ok(now.saturating_add(parsed.interval_ms.min(MAX_TIMEOUT_MS)));

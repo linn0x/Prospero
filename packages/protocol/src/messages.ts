@@ -58,6 +58,7 @@ export const CAPABILITY_AGENT_API_ENGINE_VALIDATION = "agent.api-engine-validati
 export const CAPABILITY_AGENT_API_MODELS = "agent.account.api.models";
 export const CAPABILITY_AGENT_ACCOUNT_CONFIG = "agent.account.config";
 export const CAPABILITY_MODEL_SOURCES = "model.sources.v1";
+export const CAPABILITY_BOTS = "bots.v1";
 /** DeepSeek Harness 官方本机 RPC/SSE 结构化会话与编排 worker。 */
 export const CAPABILITY_AGENT_DEEPSEEK_HARNESS = "agent.deepseek-harness.v1";
 /** DeepSeek Harness 执行轨迹事件与移动端时间线。 */
@@ -203,10 +204,48 @@ export type {
   OrchestrationGate,
   OrchestrationSnapshot,
   S2COrchestrationSnapshot,
+  C2SBotAction,
+  S2CBotResult,
+  S2CBotsChanged,
   S2CMessage,
   PairingPayload,
   WorkspaceListing,
 } from "./schemas.js";
+export type {
+  BotAction,
+  BotActionRequest,
+  BotActionResult,
+  BotFeishuAdmin,
+  BotFeishuInput,
+  BotFeishuProbeResult,
+  BotFeishuRecentSender,
+  BotFeishuRuntimeStatus,
+  BotKind,
+  BotMemoryCategory,
+  BotMemoryEntry,
+  BotMemoryEvent,
+  BotMemoryItem,
+  BotMemoryScope,
+  BotMemorySource,
+  BotMemoryView,
+  BotProactiveNotice,
+  BotSourceBinding,
+  BotTask,
+  BotTaskDelivery,
+  BotTaskInput,
+  BotTaskKind,
+  BotTaskStatus,
+  BotTaskUpdateInput,
+  BotThread,
+  BotThreadChannel,
+  BotUpsertInput,
+  FeishuAccessPolicy,
+  FeishuConnectionState,
+  FeishuDomain,
+  FeishuGroupTrigger,
+  PublicBot,
+  PublicBotFeishuConfig,
+} from "./rust-daemon.js";
 
 /**
  * WebSocket 关闭码。断开时这是 daemon 唯一还能传达的信息,

@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Stack, router, useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { HomeDashboard } from "@/components/HomeDashboard";
+import { MobileBotWorkbench } from "@/components/MobileBotWorkbench";
 import { toast } from "@/components/Toast";
 import { Icon } from "@/components/Icon";
 import { Sheet, SheetAction } from "@/components/Sheet";
@@ -49,10 +51,34 @@ export default function HostsScreen() {
   });
   const [hosts, setLocal] = useState<StoredHost[]>([]);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  const [homeMode, setHomeMode] = useState<"work" | "bot">("work");
+  const [botUnreadCount, setBotUnreadCount] = useState(0);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [terminalPickerOpen, setTerminalPickerOpen] = useState(false);
   const [terminalNavigation] = useState(() => new DismissedModalAction());
-  useEffect(() => () => terminalNavigation.cancel(), [terminalNavigation]);
+  const [moreNavigation] = useState(() => new DismissedModalAction());
+  useEffect(() => () => {
+    terminalNavigation.cancel();
+    moreNavigation.cancel();
+  }, [moreNavigation, terminalNavigation]);
+  useEffect(() => {
+    let cancelled = false;
+    void AsyncStorage.getItem("prospero.homeMode")
+      .then((value) => {
+        if (!cancelled && (value === "work" || value === "bot")) {
+          setHomeMode(value);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const switchHomeMode = useCallback((mode: "work" | "bot"): void => {
+    setHomeMode(mode);
+    void AsyncStorage.setItem("prospero.homeMode", mode).catch(() => undefined);
+  }, []);
   const setHosts = useApp((state) => state.setHosts);
   // 首页设置只消费这三个业务字段；主题由显式上下文单独驱动，避免订阅整个
   // 设置对象时把无关配置变化也扩散到设备和工作区列表。
@@ -176,10 +202,6 @@ export default function HostsScreen() {
     }
   };
 
-  const openOrchestration = useCallback(() => {
-    if (effectiveSelectedHostId) router.push(`/host/${effectiveSelectedHostId}/orchestration`);
-  }, [effectiveSelectedHostId]);
-
   const onSelectHost = useCallback((hostId: string): void => {
     setSelectedHostId(hostId);
     setDevicePickerOpen(false);
@@ -243,80 +265,94 @@ export default function HostsScreen() {
             : {}),
           headerRight: () => (
             <View style={styles.headerActions}>
-              {effectiveSelectedHostId !== null && (
+              {effectiveSelectedHostId !== null ? (
+                <>
+                  {homeMode === "work" && (
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel="新建会话"
+                      accessibilityHint="在当前电脑新建对话或终端会话"
+                      onPress={() =>
+                        router.push({
+                          pathname: "/host/[hostId]",
+                          params: { hostId: effectiveSelectedHostId, quickCreate: "conversation" },
+                        })
+                      }
+                      style={({ pressed }) => [
+                        styles.headerPrimaryButton,
+                        pressed && styles.ctaPressed,
+                      ]}
+                    >
+                      <Icon name="plus" size={16} color={palette.bg} weight="semibold" />
+                    </Pressable>
+                  )}
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="更多功能"
+                    accessibilityHint="打开终端、账号、任务编排与设置菜单"
+                    onPress={() => setMoreMenuOpen(true)}
+                    style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
+                  >
+                    <Icon name="ellipsis.circle" size={18} color={palette.text} />
+                    {activeTerminalCount > 0 && <View style={styles.headerLiveDot} />}
+                  </Pressable>
+                </>
+              ) : (
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel="新建会话"
-                  accessibilityHint="在当前电脑新建对话或终端会话"
-                  onPress={() =>
-                    router.push({
-                      pathname: "/host/[hostId]",
-                      params: { hostId: effectiveSelectedHostId, quickCreate: "conversation" },
-                    })
-                  }
-                  style={({ pressed }) => [
-                    styles.headerPrimaryButton,
-                    pressed && styles.ctaPressed,
-                  ]}
-                >
-                  <Icon name="plus" size={16} color={palette.bg} weight="semibold" />
-                </Pressable>
-              )}
-              {effectiveSelectedHostId !== null && (
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="账号与模型源"
-                  accessibilityHint="管理当前电脑的 Agent 登录态与模型源"
-                  onPress={() => router.push(`/host/${effectiveSelectedHostId}/accounts`)}
+                  accessibilityLabel="设置"
+                  accessibilityHint="打开应用、首页和设备连接设置"
+                  onPress={() => router.push("/settings")}
                   style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
                 >
-                  <Icon name="command" size={16} color={palette.text} />
+                  <Icon name="gearshape.fill" size={17} color={palette.text} />
                 </Pressable>
               )}
-              {terminalHosts.length > 0 && (
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="远程终端"
-                  accessibilityHint={
-                    activeTerminalCount > 0
-                      ? `当前有 ${String(activeTerminalCount)} 个运行中的终端，点击打开或新建`
-                      : "打开设备的 Shell 终端，可新建或返回已有终端"
-                  }
-                  onPress={openTerminal}
-                  style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
-                >
-                  <Icon name="terminal" size={17} color={palette.text} />
-                  {activeTerminalCount > 0 && <View style={styles.headerLiveDot} />}
-                </Pressable>
-              )}
-              {effectiveSelectedHostId !== null && (
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="任务编排"
-                  accessibilityHint="打开当前电脑的任务编排页面"
-                  onPress={openOrchestration}
-                  style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
-                >
-                  <Icon
-                    name="point.3.connected.trianglepath.dotted"
-                    size={17}
-                    color={palette.text}
-                  />
-                </Pressable>
-              )}
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="设置"
-                accessibilityHint="打开应用、首页和设备连接设置"
-                onPress={() => router.push("/settings")}
-                style={({ pressed }) => [styles.headerButton, pressed && styles.headerButtonPressed]}
-              >
-                <Icon name="gearshape.fill" size={17} color={palette.text} />
-              </Pressable>
             </View>
           ),
         }}
       />
+      {hosts.length > 0 && effectiveSelectedHostId !== null && (
+        <View style={styles.modeBarWrap}>
+          <View style={styles.modeTrack} accessibilityRole="tablist">
+            <Pressable
+              accessibilityRole="tab"
+              accessibilityState={{ selected: homeMode === "work" }}
+              accessibilityLabel="工作模式"
+              onPress={() => switchHomeMode("work")}
+              style={({ pressed }) => [
+                styles.modeTab,
+                homeMode === "work" && styles.modeTabActive,
+                pressed && styles.modeTabPressed,
+              ]}
+            >
+              <Text
+                style={[styles.modeTabText, homeMode === "work" && styles.modeTabTextActive]}
+              >
+                工作
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="tab"
+              accessibilityState={{ selected: homeMode === "bot" }}
+              accessibilityLabel="Bot 模式"
+              onPress={() => switchHomeMode("bot")}
+              style={({ pressed }) => [
+                styles.modeTab,
+                homeMode === "bot" && styles.modeTabActive,
+                pressed && styles.modeTabPressed,
+              ]}
+            >
+              <Text
+                style={[styles.modeTabText, homeMode === "bot" && styles.modeTabTextActive]}
+              >
+                ⚡ Bot
+              </Text>
+              {botUnreadCount > 0 && <View style={styles.modeUnreadDot} />}
+            </Pressable>
+          </View>
+        </View>
+      )}
       {hosts.length === 0 ? (
         <ScrollView
           testID="hosts-empty-state-scroll"
@@ -348,6 +384,12 @@ export default function HostsScreen() {
             </Pressable>
           </View>
         </ScrollView>
+      ) : homeMode === "bot" && effectiveSelectedHostId !== null ? (
+        <MobileBotWorkbench
+          hostId={effectiveSelectedHostId}
+          embedded
+          onBotUnreadChange={setBotUnreadCount}
+        />
       ) : (
         <HomeDashboard
           hosts={hosts}
@@ -396,6 +438,64 @@ export default function HostsScreen() {
           onChangeHomeSettings={onChangeHomeSettings}
         />
       )}
+      <Sheet
+        visible={moreMenuOpen}
+        title={selectedHost?.name ?? "更多功能"}
+        onClose={() => {
+          moreNavigation.cancel();
+          setMoreMenuOpen(false);
+        }}
+        onDismiss={() => moreNavigation.dismiss()}
+      >
+        {terminalHosts.length > 0 && (
+          <SheetAction
+            label="远程终端"
+            detail={
+              activeTerminalCount > 0
+                ? `当前有 ${String(activeTerminalCount)} 个运行中的终端`
+                : "打开或新建远程 Shell 终端"
+            }
+            symbol="terminal"
+            onPress={() => {
+              moreNavigation.defer(openTerminal);
+              setMoreMenuOpen(false);
+            }}
+          />
+        )}
+        {effectiveSelectedHostId !== null && (
+          <SheetAction
+            label="账号与模型源"
+            detail="管理当前电脑的 Agent 登录态与模型源"
+            symbol="command"
+            onPress={() => {
+              const target = `/host/${effectiveSelectedHostId}/accounts`;
+              moreNavigation.defer(() => router.push(target));
+              setMoreMenuOpen(false);
+            }}
+          />
+        )}
+        {effectiveSelectedHostId !== null && (
+          <SheetAction
+            label="任务编排"
+            detail="查看或启动当前电脑的多 Agent 编排任务"
+            symbol="point.3.connected.trianglepath.dotted"
+            onPress={() => {
+              const target = `/host/${effectiveSelectedHostId}/orchestration`;
+              moreNavigation.defer(() => router.push(target));
+              setMoreMenuOpen(false);
+            }}
+          />
+        )}
+        <SheetAction
+          label="应用设置"
+          detail="主题、字体与连接配置"
+          symbol="gearshape.fill"
+          onPress={() => {
+            moreNavigation.defer(() => router.push("/settings"));
+            setMoreMenuOpen(false);
+          }}
+        />
+      </Sheet>
       <Sheet visible={terminalPickerOpen} title="选择终端电脑"
         onClose={() => { terminalNavigation.cancel(); setTerminalPickerOpen(false); }}
         onDismiss={() => terminalNavigation.dismiss()}>
@@ -489,5 +589,41 @@ function createStyles(palette: ThemePalette) {
   },
   ctaPressed: { opacity: 0.84 },
   ctaText: { color: palette.bg, fontSize: 15, fontWeight: "700", textAlign: "center" },
+  modeBarWrap: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: palette.border,
+    backgroundColor: palette.bg,
+  },
+  modeTrack: {
+    flexDirection: "row",
+    padding: 2.5,
+    borderRadius: radius.pill,
+    backgroundColor: palette.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.border,
+  },
+  modeTab: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    paddingVertical: 6,
+    borderRadius: radius.pill,
+  },
+  modeTabActive: {
+    backgroundColor: palette.surfaceRaised,
+  },
+  modeTabPressed: { opacity: 0.72 },
+  modeTabText: { color: palette.textDim, fontSize: 13, fontWeight: "600" },
+  modeTabTextActive: { color: palette.text, fontWeight: "700" },
+  modeUnreadDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: palette.danger,
+  },
   });
 }

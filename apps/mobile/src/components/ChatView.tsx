@@ -454,16 +454,24 @@ const ChatViewContent = memo(function ChatViewContent({
     [workingStatus, search, color.textFaint, styles],
   );
 
+  const activeWorkingStatus =
+    workingStatus === "running" ||
+    workingStatus === "starting" ||
+    workingStatus === "waiting_approval" ||
+    workingStatus === "waiting_input"
+      ? workingStatus
+      : undefined;
+
   const listHeader = useMemo(
     () =>
-      agent && workingStatus ? (
+      agent && activeWorkingStatus ? (
         <AgentWorkingIndicator
           agent={agent}
-          status={workingStatus}
+          status={activeWorkingStatus}
           onInterrupt={onInterrupt}
         />
       ) : null,
-    [agent, workingStatus, onInterrupt],
+    [agent, activeWorkingStatus, onInterrupt],
   );
   const listHeaderWithPending = useMemo(
     () => (

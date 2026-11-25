@@ -963,6 +963,141 @@ pub async fn control_method(home: &Path, method: &str, params: Value) -> Result<
                 )
                 .await
         }
+        "bot.task.list" => {
+            let bot_id = required_text(&params, "botId")?;
+            let bots: Value = client.get("/v1/bots").await?;
+            let tasks = bots
+                .as_array()
+                .and_then(|list| {
+                    list.iter()
+                        .find(|b| b.get("id").and_then(Value::as_str) == Some(bot_id.as_str()))
+                })
+                .and_then(|b| b.get("tasks").cloned())
+                .unwrap_or_else(|| json!([]));
+            Ok(tasks)
+        }
+        "bot.task.create" => {
+            let bot_id = required_text(&params, "botId")?;
+            let name = required_text(&params, "name")?;
+            let prompt = required_text(&params, "prompt")?;
+            let kind = optional_text(&params, "kind").unwrap_or_else(|| "cron".into());
+            let rrule = optional_text(&params, "rrule");
+            let run_at = params.get("runAt").and_then(Value::as_i64);
+            let delivery =
+                optional_text(&params, "delivery").unwrap_or_else(|| "primary_thread".into());
+            let notify_feishu_chat_id = optional_text(&params, "notifyFeishuChatId");
+            let req_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
+            client
+                .post(
+                    "/v1/bots",
+                    json!({
+                        "type": "bot.action",
+                        "requestId": req_id,
+                        "action": {
+                            "kind": "task.create",
+                            "botId": bot_id,
+                            "input": strip_empty(
+                                json!({
+                                    "name": name,
+                                    "prompt": prompt,
+                                    "kind": kind,
+                                    "rrule": rrule,
+                                    "runAt": run_at,
+                                    "delivery": delivery,
+                                    "notifyApp": true,
+                                    "notifyFeishuChatId": notify_feishu_chat_id,
+                                }),
+                                &[],
+                            ),
+                        },
+                    }),
+                )
+                .await
+        }
+        "bot.task.pause" | "bot.task.resume" | "bot.task.delete" | "bot.task.run" => {
+            let bot_id = required_text(&params, "botId")?;
+            let task_id = required_text(&params, "taskId")?;
+            let action_kind = match method {
+                "bot.task.pause" => "task.pause",
+                "bot.task.resume" => "task.resume",
+                "bot.task.delete" => "task.delete",
+                _ => "task.run",
+            };
+            let req_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
+            client
+                .post(
+                    "/v1/bots",
+                    json!({
+                        "type": "bot.action",
+                        "requestId": req_id,
+                        "action": {
+                            "kind": action_kind,
+                            "botId": bot_id,
+                            "taskId": task_id,
+                        },
+                    }),
+                )
+                .await
+        }
+        "bot.memory.list" => {
+            let bot_id = required_text(&params, "botId")?;
+            let bots: Value = client.get("/v1/bots").await?;
+            let items = bots
+                .as_array()
+                .and_then(|list| {
+                    list.iter()
+                        .find(|b| b.get("id").and_then(Value::as_str) == Some(bot_id.as_str()))
+                })
+                .and_then(|b| b.get("memoryItems").cloned())
+                .unwrap_or_else(|| json!([]));
+            Ok(items)
+        }
+        "bot.memory.add" => {
+            let bot_id = required_text(&params, "botId")?;
+            let category = optional_text(&params, "category").unwrap_or_else(|| "fact".into());
+            let content = required_text(&params, "content")?;
+            let pinned = params
+                .get("pinned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let req_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
+            client
+                .post(
+                    "/v1/bots",
+                    json!({
+                        "type": "bot.action",
+                        "requestId": req_id,
+                        "action": {
+                            "kind": "memory.item.add",
+                            "botId": bot_id,
+                            "category": category,
+                            "content": content,
+                            "pinned": pinned,
+                            "source": "auto",
+                        },
+                    }),
+                )
+                .await
+        }
+        "bot.memory.delete" => {
+            let bot_id = required_text(&params, "botId")?;
+            let item_id = required_text(&params, "itemId")?;
+            let req_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
+            client
+                .post(
+                    "/v1/bots",
+                    json!({
+                        "type": "bot.action",
+                        "requestId": req_id,
+                        "action": {
+                            "kind": "memory.item.delete",
+                            "botId": bot_id,
+                            "itemId": item_id,
+                        },
+                    }),
+                )
+                .await
+        }
         _ => Err(Error::Feature(
             "method_not_found".into(),
             format!("未知控制方法: {method}"),

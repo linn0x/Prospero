@@ -7,8 +7,10 @@ import type { DesktopSnapshot, PublicBot } from "../src/shared/types";
 import { botActionRequest, botActionResult, isManagedBotWorkspacePath } from "../src/shared/bots";
 import { reduceBotsCatalog } from "../src/renderer/src/bots/use-bots";
 import { BotsModePane } from "../src/renderer/src/bots/BotsModePane";
+import { BotCapabilitiesPanel } from "../src/renderer/src/bots/BotCapabilitiesPanel";
 import { BotConversationList } from "../src/renderer/src/bots/BotConversationList";
 import { BotInspectorSheet, feishuStateLabel } from "../src/renderer/src/bots/BotInspectorSheet";
+import { BotMemoryPanel } from "../src/renderer/src/bots/BotMemoryPanel";
 import {
   BotQaListView,
   extractBotQaEntries,
@@ -16,6 +18,8 @@ import {
   formatBotSpeakerDisplay,
   parseBotQuestionMessage,
 } from "../src/renderer/src/bots/BotQaListView";
+import { BotTasksPanel } from "../src/renderer/src/bots/BotTasksPanel";
+import { formatBotScheduleSummary } from "../src/renderer/src/bots/bot-helpers";
 import { FeishuAccessControlPanel, accessPolicyLabel } from "../src/renderer/src/bots/FeishuAccessControlPanel";
 import { stripInjectedMemoryContext } from "../src/renderer/src/ChatPane";
 
@@ -80,6 +84,8 @@ const sampleSubBot: PublicBot = {
   workspace: "/tmp/bots/bot-research/workspace",
   customWorkspace: null,
   allowCrossWorkspace: false,
+  autoMemory: true,
+  proactiveNotifications: true,
   feishu: {
     enabled: false,
     domain: "feishu",
@@ -100,6 +106,12 @@ const sampleSubBot: PublicBot = {
     recentSenders: [],
   },
   threads: [],
+  tasks: [],
+  memoryItems: [],
+  recentMemoryEvents: [],
+  unreadProactiveCount: 0,
+  latestProactiveNotice: null,
+  notices: [],
   createdAt: 1,
   updatedAt: 1,
 };
@@ -142,6 +154,34 @@ describe("bots IPC and UI state", () => {
         "req-acl-1",
       ).action.kind,
     ).toBe("feishu.access.update");
+    expect(botActionRequest({ kind: "thread.ensure_primary", botId: "master" }, "req-p1").action.kind).toBe(
+      "thread.ensure_primary",
+    );
+    expect(botActionRequest({ kind: "thread.mark_read", botId: "master", threadId: "thr-1" }, "req-p2").action.kind).toBe(
+      "thread.mark_read",
+    );
+    expect(
+      botActionRequest(
+        {
+          kind: "task.create",
+          botId: "master",
+          input: { name: "早报", prompt: "汇总", kind: "cron", rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0" },
+        },
+        "req-t1",
+      ).action.kind,
+    ).toBe("task.create");
+    expect(
+      botActionRequest(
+        { kind: "memory.item.add", botId: "master", category: "preference", content: "先给结论" },
+        "req-mi1",
+      ).action.kind,
+    ).toBe("memory.item.add");
+    expect(botActionRequest({ kind: "memory.item.restore", botId: "master", itemId: "mem-1" }, "req-mi2").action.kind).toBe(
+      "memory.item.restore",
+    );
+    expect(botActionRequest({ kind: "notices.ack", botId: "master", noticeId: null }, "req-n1").action.kind).toBe(
+      "notices.ack",
+    );
   });
 
   it("maintains stale-while-revalidate state across background refresh failures", () => {
@@ -175,7 +215,10 @@ describe("bots IPC and UI state", () => {
       />,
     );
     expect(html).toContain("飞书研报 Bot");
-    expect(html).toContain("配置飞书机器人 IM");
+    expect(html).toContain("对话");
+    expect(html).toContain("任务");
+    expect(html).toContain("记忆");
+    expect(html).toContain("能力");
     expect(html).toContain("claude-sonnet-4-5");
     expect(html).not.toContain("工作区");
     expect(html).not.toContain("工作目录");
@@ -191,13 +234,40 @@ describe("bots IPC and UI state", () => {
     });
     const withThreadHtml = renderToStaticMarkup(
       <BotsModePane
-        bot={sampleSubBot}
+        bot={{
+          ...sampleSubBot,
+          unreadProactiveCount: 1,
+          latestProactiveNotice: {
+            id: "ntc-1",
+            botId: sampleSubBot.id,
+            taskId: "tsk-1",
+            threadId: "thr-1",
+            title: "每日早报",
+            summary: "今天有 2 个重要会议",
+            createdAt: Date.now(),
+            read: false,
+          },
+          recentMemoryEvents: [
+            {
+              id: "mev-1",
+              itemId: "mem-1",
+              action: "added",
+              summary: "偏好先给结论再附依据",
+              category: "preference",
+              createdAt: Date.now(),
+              reverted: false,
+            },
+          ],
+        }}
         activeThread={{
           id: "thr-1",
           botId: sampleSubBot.id,
           sessionId: "sess-1",
           title: "测试话题",
           channel: "desktop",
+          isPrimary: false,
+          unreadCount: 0,
+          lastProactiveAt: null,
           feishuChatId: null,
           chatName: null,
           lastSenderId: null,
@@ -215,8 +285,13 @@ describe("bots IPC and UI state", () => {
         onBotsUpdated={() => {}}
       />,
     );
-    expect(withThreadHtml).toContain("删除话题");
+    expect(withThreadHtml).toContain("新分支");
+    expect(withThreadHtml).toContain("每日早报");
+    expect(withThreadHtml).toContain("已记住：");
+    expect(withThreadHtml).toContain("撤销");
     expect(withThreadHtml).toContain("data-chat-composer");
+    expect(withThreadHtml).toContain("对话流");
+    expect(withThreadHtml).toContain("问答表格");
     expect(withThreadHtml).not.toContain("派发工作区会话");
     expect(withThreadHtml).not.toContain("工作区");
 
@@ -229,6 +304,9 @@ describe("bots IPC and UI state", () => {
           sessionId: "sess-feishu",
           title: "示例项目群 · 看看群里都有谁",
           channel: "feishu_group",
+          isPrimary: false,
+          unreadCount: 0,
+          lastProactiveAt: null,
           feishuChatId: "oc_group_1",
           chatName: "示例项目群",
           lastSenderId: "ou_owner",
@@ -265,11 +343,32 @@ describe("bots IPC and UI state", () => {
         botId={sampleSubBot.id}
         threads={[
           {
+            id: "thr-primary",
+            botId: sampleSubBot.id,
+            sessionId: "sess-primary",
+            title: "主对话",
+            channel: "desktop",
+            isPrimary: true,
+            unreadCount: 2,
+            lastProactiveAt: 300,
+            feishuChatId: null,
+            chatName: null,
+            lastSenderId: null,
+            lastSenderName: null,
+            lastMessagePreview: "早报已送达",
+            messageCount: 8,
+            createdAt: 50,
+            updatedAt: 150,
+          },
+          {
             id: "thr-group",
             botId: sampleSubBot.id,
             sessionId: "sess-group",
             title: "核心群 · PR汇总",
             channel: "feishu_group",
+            isPrimary: false,
+            unreadCount: 0,
+            lastProactiveAt: null,
             feishuChatId: "oc_group_1",
             chatName: "核心研发群",
             lastSenderId: "ou_owner",
@@ -285,6 +384,9 @@ describe("bots IPC and UI state", () => {
             sessionId: "sess-dm",
             title: "张三 · 日报",
             channel: "feishu_p2p",
+            isPrimary: false,
+            unreadCount: 0,
+            lastProactiveAt: null,
             feishuChatId: "oc_p2p_1",
             chatName: null,
             lastSenderId: "ou_zhang",
@@ -297,14 +399,16 @@ describe("bots IPC and UI state", () => {
         ]}
         sessions={[]}
         adminUsers={[{ openId: "ou_owner", name: "管理员" }]}
-        activeThreadId="thr-group"
+        feishuEnabled
+        activeThreadId="thr-primary"
         creatingThread={false}
         onSelectThread={() => {}}
         onNewThread={() => {}}
         onArchiveThread={() => {}}
       />,
     );
-    expect(convListHtml).toContain("会话列表");
+    expect(convListHtml).toContain("主对话与分支");
+    expect(convListHtml).toContain("主对话（永续）");
     expect(convListHtml).toContain("飞书群");
     expect(convListHtml).toContain("飞书私聊");
     expect(convListHtml).toContain("核心研发群");
@@ -317,6 +421,9 @@ describe("bots IPC and UI state", () => {
     const inspectorSource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/BotInspectorSheet.tsx"), "utf8");
     const convListSource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/BotConversationList.tsx"), "utf8");
     const paneSource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/BotsModePane.tsx"), "utf8");
+    const tasksSource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/BotTasksPanel.tsx"), "utf8");
+    const memorySource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/BotMemoryPanel.tsx"), "utf8");
+    const capsSource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/BotCapabilitiesPanel.tsx"), "utf8");
     const aclSource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/FeishuAccessControlPanel.tsx"), "utf8");
     const qaListSource = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/bots/BotQaListView.tsx"), "utf8");
     for (const [name, src] of [
@@ -324,6 +431,9 @@ describe("bots IPC and UI state", () => {
       ["BotInspectorSheet", inspectorSource],
       ["BotConversationList", convListSource],
       ["BotsModePane", paneSource],
+      ["BotTasksPanel", tasksSource],
+      ["BotMemoryPanel", memorySource],
+      ["BotCapabilitiesPanel", capsSource],
       ["FeishuAccessControlPanel", aclSource],
       ["BotQaListView", qaListSource],
     ] as const) {
@@ -551,5 +661,103 @@ describe("bots IPC and UI state", () => {
     expect(html).toContain("ou_admin_1");
     expect(html).toContain("访客同学");
     expect(html).toContain("已拦截");
+  });
+
+  it("renders BotTasksPanel, BotMemoryPanel, and BotCapabilitiesPanel", () => {
+    expect(
+      formatBotScheduleSummary(
+        { kind: "cron", rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0", runAt: null },
+        (zh) => zh,
+      ),
+    ).toBe("每天 08:00");
+
+    const tasksHtml = renderToStaticMarkup(
+      <BotTasksPanel
+        bot={{
+          ...sampleSubBot,
+          tasks: [
+            {
+              id: "tsk-1",
+              botId: sampleSubBot.id,
+              name: "每日早报",
+              prompt: "整理重点事项",
+              kind: "cron",
+              status: "enabled",
+              rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0",
+              runAt: null,
+              delivery: "primary_thread",
+              notifyApp: true,
+              notifyFeishuChatId: null,
+              lastRunAt: Date.now() - 3_600_000,
+              nextRunAt: Date.now() + 3_600_000,
+              lastSessionId: "sess-1",
+              lastSummary: "一切正常",
+              lastError: null,
+              runCount: 2,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          ],
+        }}
+        onBotsUpdated={() => {}}
+      />,
+    );
+    expect(tasksHtml).toContain("后台任务与主动提醒");
+    expect(tasksHtml).toContain("每日早报");
+    expect(tasksHtml).toContain("每天 08:00");
+    expect(tasksHtml).toContain("一切正常");
+
+    const memoryHtml = renderToStaticMarkup(
+      <BotMemoryPanel
+        bot={{
+          ...sampleSubBot,
+          memoryItems: [
+            {
+              id: "mem-1",
+              category: "preference",
+              content: "回答先给结论再给步骤",
+              scope: "global",
+              pinned: true,
+              source: "auto",
+              archived: false,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+            {
+              id: "mem-2",
+              category: "fact",
+              content: "旧的已移除事实",
+              scope: "global",
+              pinned: false,
+              source: "manual",
+              archived: true,
+              createdAt: 1,
+              updatedAt: 2,
+            },
+          ],
+        }}
+        onBotsUpdated={() => {}}
+        onOpenMarkdownInspector={() => {}}
+      />,
+    );
+    expect(memoryHtml).toContain("关于你 · 主动长期记忆");
+    expect(memoryHtml).toContain("回答先给结论再给步骤");
+    expect(memoryHtml).toContain("自动记住");
+    expect(memoryHtml).toContain("最近移除的记忆");
+    expect(memoryHtml).toContain("恢复");
+
+    const capsHtml = renderToStaticMarkup(
+      <BotCapabilitiesPanel
+        bot={sampleSubBot}
+        onBotsUpdated={() => {}}
+        onEditPersona={() => {}}
+        onEditFeishu={() => {}}
+        onOpenFeishuAccess={() => {}}
+      />,
+    );
+    expect(capsHtml).toContain("主动长期记忆");
+    expect(capsHtml).toContain("后台主动提醒推送");
+    expect(capsHtml).toContain("可选外挂渠道");
+    expect(capsHtml).toContain("飞书 / Lark IM 机器人");
   });
 });
