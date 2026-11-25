@@ -490,7 +490,7 @@ export function BotInspectorSheet({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[min(84vh,720px)] w-[min(940px,calc(100vw-2rem))] flex-col gap-0 overflow-hidden p-0 sm:max-w-[940px]">
         {/* Studio Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3.5 pr-12 bg-muted/15">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3.5 pr-12 bg-[var(--surface-1)]">
           <div className="flex items-center gap-3 min-w-0">
             <span className="bots-pane-avatar" aria-hidden="true">
               {bot.avatar}
@@ -527,6 +527,7 @@ export function BotInspectorSheet({
               <button
                 type="button"
                 role="tab"
+                data-slot="bot-control"
                 aria-selected={studioTab === "memory"}
                 className="bot-studio-tab"
                 data-active={studioTab === "memory"}
@@ -539,6 +540,7 @@ export function BotInspectorSheet({
               <button
                 type="button"
                 role="tab"
+                data-slot="bot-control"
                 aria-selected={studioTab === "access"}
                 className="bot-studio-tab"
                 data-active={studioTab === "access"}
@@ -615,6 +617,7 @@ export function BotInspectorSheet({
                     key={scopeId}
                     type="button"
                     role="tab"
+                    data-slot="bot-control"
                     aria-selected={scopeFilter === scopeId}
                     className="bot-memory-tab"
                     data-active={scopeFilter === scopeId}
@@ -641,6 +644,7 @@ export function BotInspectorSheet({
                       <button
                         key={item.key}
                         type="button"
+                        data-slot="bot-control"
                         className="bot-memory-item"
                         data-selected={!createOpen && item.key === selectedKey}
                         onClick={() => void selectEntry(item.key)}
@@ -720,8 +724,9 @@ export function BotInspectorSheet({
                           </span>
                           {knownChats.length > 0 && (
                             <select
+                              data-slot="bot-control"
                               aria-label={t("选择已有群聊", "Pick existing group")}
-                              className="max-w-[140px] truncate rounded border border-border bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                              className="bot-inline-select"
                               value=""
                               onChange={(event) => {
                                 const picked = knownChats.find((c) => c.chatId === event.target.value);
@@ -926,7 +931,7 @@ export function BotInspectorSheet({
           <div className="flex-1 min-h-0 overflow-y-auto p-6">
             <div className="mx-auto max-w-2xl grid gap-6">
               {/* Connection Status Card */}
-              <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-border bg-muted/20 px-4 py-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-border bg-[var(--surface-1)] px-4 py-3.5">
                 <div className="grid gap-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
@@ -982,7 +987,7 @@ export function BotInspectorSheet({
               </div>
 
               {/* Access Control & Admins */}
-              <div className="relative rounded-xl border border-border bg-background/60 p-4">
+              <div className="relative rounded-xl border border-border bg-[var(--surface-1)] p-4">
                 {savingAccess && (
                   <div className="absolute right-4 top-4">
                     <Spinner />

@@ -13,6 +13,23 @@ export function modelSwitchSupported(session: SessionInfo, _account?: JsonObject
   return ["claude", "codex", "deepseek", "opencode", "pi", "agy"].includes(session.agent);
 }
 
+export function isApiProfileAccount(account?: JsonObject): boolean {
+  if (!account) return false;
+  const profile = account["apiProfile"];
+  const source = account["modelSource"];
+  return (profile !== null && typeof profile === "object" && !Array.isArray(profile))
+    || (source !== null && typeof source === "object" && !Array.isArray(source));
+}
+
+export function modelSourceSwitchSupported(session: SessionInfo, account?: JsonObject): boolean {
+  const supportedKind = session.kind === "structured"
+    || (session.kind === "pty" && session.agent !== "shell" && session.agent !== "custom");
+  return supportedKind
+    && isApiProfileAccount(account)
+    && typeof globalThis.window !== "undefined"
+    && typeof globalThis.window.prospero?.switchAgentModelSource === "function";
+}
+
 export function supportedModelEffort(model: AgentModel | undefined, effort: string): string | undefined {
   return effort && model?.supportedEfforts.includes(effort) ? effort : undefined;
 }

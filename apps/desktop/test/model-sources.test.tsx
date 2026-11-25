@@ -142,9 +142,26 @@ describe("model source selection and IPC", () => {
     const html = renderToStaticMarkup(<SourceSelector sources={[source]} loading={false} error={undefined} value={defaultSourceSelection([source], undefined, "codex")} agent="codex" disabled={false} onChange={() => {}} onRefresh={() => {}} />);
     expect(html).toContain('id="session-model-source"');
     expect(html).toContain('id="session-source-route"');
+    expect(html).not.toContain('id="session-source-credential"');
     expect(html).toContain("Shared key");
     expect(html).toContain("model-b");
     expect(html).not.toContain('type="password"');
+
+    const multiCredSource: ModelSource = {
+      ...source,
+      credentials: [
+        { id: "credential", name: "Account A", revision: 1 },
+        { id: "credential-b", name: "Account B", revision: 1 },
+      ],
+    };
+    const defaultMultiSel = defaultSourceSelection([multiCredSource], undefined, "codex");
+    expect(defaultMultiSel).toEqual({ sourceId: "source", routeId: "route-b", revision: 2, agent: "codex" });
+    expect(selectedSourceRoute([multiCredSource], { ...defaultMultiSel!, credentialId: "credential-b" }, "codex")?.credential.name).toBe("Account B");
+    expect(selectedSourceRoute([multiCredSource], { ...defaultMultiSel!, credentialId: "missing" }, "codex")).toBeUndefined();
+    const multiCredHtml = renderToStaticMarkup(<SourceSelector sources={[multiCredSource]} loading={false} error={undefined} value={{ ...defaultMultiSel!, credentialId: "credential-b" }} agent="codex" disabled={false} onChange={() => {}} onRefresh={() => {}} />);
+    expect(multiCredHtml).toContain('id="session-source-credential"');
+    expect(multiCredHtml).toContain("Account A (route default)");
+    expect(multiCredHtml).toContain("Key: Account B");
 
     const withEffortAndContext: ModelSource = {
       ...source,

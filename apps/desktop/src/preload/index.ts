@@ -135,6 +135,7 @@ const api: DesktopApi = {
   getLaunchModels: (agent, accountId) => ipcRenderer.invoke("launch:models", agent, accountId),
   getAgentModels: (sessionId: string) => ipcRenderer.invoke("session:models", sessionId),
   setAgentModel: (sessionId: string, model: string, effort?: string) => ipcRenderer.invoke("session:model:set", sessionId, model, effort),
+  switchAgentModelSource: (sessionId, input) => ipcRenderer.invoke("session:model-source:set", sessionId, input),
   orchestrationAction: (method: string, params: JsonObject) => ipcRenderer.invoke("orchestration:action", method, params),
   getOrchestrationTask: (taskId: string) => ipcRenderer.invoke("orchestration:task", taskId),
   getOrchestrationRunTasks: (runId: string) => ipcRenderer.invoke("orchestration:run-tasks", runId),

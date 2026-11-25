@@ -128,6 +128,9 @@ export const ModelSourceBindingSchema = z.object({
   revision: z.number().int().positive(),
   sourceName: z.string().max(80),
   routeName: z.string().max(80),
+  credentialId: z.string().min(1).max(100).optional(),
+  credentialName: z.string().max(80).optional(),
+  multiCredential: z.boolean().optional(),
   legacy: z.boolean(),
   current: z.boolean(),
 });
@@ -634,7 +637,7 @@ export const ModelSourceActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("route.remove"), ...modelSourceWrite, routeId: modelSourceId }).strict(),
   z.object({ kind: z.literal("delete"), ...modelSourceWrite }).strict(),
   z.object({ kind: z.literal("models"), ...modelSourceWrite, protocol: AgentApiProtocolSchema, credentialId: modelSourceId, refresh: z.boolean().optional() }).strict(),
-  z.object({ kind: z.literal("bind"), ...modelSourceWrite, routeId: modelSourceId, agent: CodeAgentKindSchema.optional() }).strict(),
+  z.object({ kind: z.literal("bind"), ...modelSourceWrite, routeId: modelSourceId, credentialId: modelSourceId.optional(), agent: CodeAgentKindSchema.optional() }).strict(),
   z.object({ kind: z.literal("migration.preview") }).strict(),
   z.object({ kind: z.literal("migration.apply"), migrationId: modelSourceId, name: modelSourceName, target: z.object(modelSourceWrite).strict().optional() }).strict(),
   z.object({ kind: z.literal("migration.rollback"), accountIds: z.array(modelSourceId).min(1).max(500) }).strict(),

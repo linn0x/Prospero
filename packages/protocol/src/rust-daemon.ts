@@ -81,7 +81,7 @@ accountId?: string | null,
  * Agent-native local conversation to resume at launch.
  */
 resume?: ResumeInput | null, };
-export type CreateCrossModelChild = { sourceId: string, routeId: string, revision: number, agent: AgentKind, task: string, title?: string | null, workspace?: string | null, accountId?: string | null, model?: string | null, effort?: string | null, };
+export type CreateCrossModelChild = { sourceId: string, routeId: string, revision: number, agent: AgentKind, task: string, title?: string | null, workspace?: string | null, accountId?: string | null, credentialId?: string | null, model?: string | null, effort?: string | null, };
 export type FollowUpCrossModelChild = { task: string, };
 export type MessageCrossModelChild = { text: string, };
 export type CancelCrossModelChild = { reason?: string | null, };
@@ -110,6 +110,8 @@ export type AgentPresetInfo = { id: string, name: string, description?: string |
 export type LaunchModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, currentEffort?: string | null, presets?: Array<AgentPresetInfo>, currentPreset?: string | null, };
 export type AgentModelSelection = { model: string, effort: string | null, };
 export type AgentModelSelectionResult = { currentModel: string, currentEffort: string | null, };
+export type AgentModelSourceSwitch = { sourceId: string, routeId: string, revision: number, credentialId: string | null, agent: AgentKind | null, effort: string | null, };
+export type AgentModelSourceSwitchResult = { accountId: string, agent: AgentKind, engine: AgentKind, previousEngine: AgentKind, currentModel: string, currentEffort: string | null, sourceId: string, routeId: string, sourceName: string, routeName: string, credentialId: string, credentialName: string, handoffMode: string, };
 export type AgentControlResult = { type: string, sid: string, requestId: string, action: string, ok: boolean, message: string | null, };
 export type AgentCompactRequest = { requestId: string, };
 export type ApprovalPolicySelection = { policy: string, };
@@ -290,7 +292,7 @@ export type SourceEndpoint = { protocol: string, baseUrl: string, headers?: { [k
 export type SourceCredentialInfo = { id: string, name: string, revision: number, };
 export type SourceRoute = { id: string, name: string, model: string, protocol: string, credentialId: string, enabled: boolean, modelCapabilities?: ModelCapabilities | null, defaultEffort?: string | null, };
 export type ModelSource = { id: string, name: string, revision: number, enabled: boolean, endpoints: Array<SourceEndpoint>, credentials: Array<SourceCredentialInfo>, routes: Array<SourceRoute>, defaultRouteId?: string | null, createdAt: number, updatedAt: number, };
-export type SourceBindingView = { sourceId: string, routeId: string, revision: number, sourceName: string, routeName: string, legacy: boolean, current: boolean, };
+export type SourceBindingView = { sourceId: string, routeId: string, revision: number, sourceName: string, routeName: string, credentialId?: string | null, credentialName?: string | null, multiCredential?: boolean | null, legacy: boolean, current: boolean, };
 export type SourceMigrationAccount = { id: string, name: string, model: string, };
 export type SourceMigration = { id: string, name: string, protocol: string, baseUrl: string, credentialCount: number, accounts: Array<SourceMigrationAccount>, };
 export type SourceResult = { type: string, requestId: string, ok: boolean, sources?: Array<ModelSource> | null, models?: Array<CatalogModel> | null, migrations?: Array<SourceMigration> | null, skippedAccounts?: number | null, accountId?: string | null, accounts?: Array<NativeAccount> | null, error?: FeatureError | null, };

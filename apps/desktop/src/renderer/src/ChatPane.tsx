@@ -11,12 +11,12 @@ import { supportsTrajectory } from "./workspace/dock-state";
 import { isProsperoBotSession, PROSPERO_BOT_SESSION_STORAGE_KEY, PROSPERO_BOT_TITLE } from "./workspace/session-presentation";
 import { createPortal } from "react-dom";
 import { notify } from "./notifications/notifications";
-import { AgyModelPicker, formatAgyEffortLabel } from "./workspace/AgyModelPicker";
+import { LaunchModelFields, useLaunchModels } from "./workspace/LaunchModelFields";
 import { ModelSwitcher } from "./workspace/ModelSwitcher";
 import { modelSwitchSupported } from "./workspace/model-catalog";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type RefObject, type UIEvent } from "react";
 import { AlignLeft, Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, FolderKanban, ListChecks, ListOrdered, Paperclip, Search, Send, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Target, Trash2, UserRound, X, Workflow } from "lucide-react";
-import type { AgentModeCatalog, AgentModel, DesktopSnapshot, JsonObject, SessionCreateInput, SessionInfo, SkillSuggestion } from "../../shared/types";
+import type { AgentModeCatalog, DesktopSnapshot, JsonObject, SessionCreateInput, SessionInfo, SkillSuggestion } from "../../shared/types";
 import { defaultSessionLaunchAccountId, sessionLaunchAccounts, sessionLaunchWorkspaces } from "../../shared/session-launch-options";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@/components/ui/attachment";
@@ -163,8 +163,6 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
   const [accountId, setAccountId] = useState<string | undefined>(() =>
     defaultSessionLaunchAccountId(independentAccounts, "codex"),
   );
-  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
-  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
   const [model, setModel] = useState<string | undefined>();
   const [effort, setEffort] = useState<string | undefined>();
   const [selection, setSelection] = useState<SourceSelection>();
@@ -198,52 +196,17 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
     }
   }, [accountId, agent, independentAccounts, launchAccounts, open, useSource]);
 
-  useEffect(() => {
-    if (!open || useSource || typeof window.prospero.getLaunchModels !== "function") {
-      setLaunchModels([]);
-      setLaunchModelsLoading(false);
-      return;
-    }
-    if (agent === "opencode") {
-      setLaunchModels([]);
-      return;
-    }
-    let cancelled = false;
-    setLaunchModelsLoading(true);
-    void window.prospero
-      .getLaunchModels(agent, accountId)
-      .then((catalog) => {
-        if (cancelled) return;
-        setLaunchModels(catalog.models);
-        setModel((current) => {
-          const matched = catalog.models.find((item) => item.id === current);
-          const fallback =
-            matched ??
-            catalog.models.find((item) => item.id === catalog.currentModel) ??
-            catalog.models.find((item) => item.isDefault) ??
-            catalog.models[0];
-          setEffort(
-            (fallback?.id === catalog.currentModel &&
-            catalog.currentEffort &&
-            fallback?.supportedEfforts.includes(catalog.currentEffort)
-              ? catalog.currentEffort
-              : undefined) ??
-              fallback?.defaultEffort ??
-              fallback?.supportedEfforts[0],
-          );
-          return fallback?.id;
-        });
-      })
-      .catch(() => {
-        if (!cancelled) setLaunchModels([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLaunchModelsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [accountId, agent, open, useSource]);
+  const { models: launchModels, loading: launchModelsLoading } = useLaunchModels({
+    enabled: open && !useSource,
+    agent,
+    accountId,
+    model,
+    effort,
+    onResolved: (resolved) => {
+      setModel(resolved.model);
+      setEffort(resolved.effort);
+    },
+  });
 
   const choice = selectedSourceRoute(sourceState.sources, selection, sourceAgent);
   const selectedLaunchModel = launchModels.find((item) => item.id === model);
@@ -265,6 +228,7 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
             sourceId: selection.sourceId,
             routeId: selection.routeId,
             revision: selection.revision,
+            ...(selection.credentialId ? { credentialId: selection.credentialId } : {}),
             agent: sourceAgent,
             task: task.trim(),
             ...(targetWorkspace ? { workspace: targetWorkspace } : {}),
@@ -418,67 +382,21 @@ function CrossModelChildLauncher({ session, snapshot, onCreated, onError }: { se
               disabled={busy}
             />
           ) : (
-            (launchModels.length > 0 || (agent === "agy" && launchModelsLoading)) && (
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="grid gap-1.5">
-                  <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-model">
-                    {t("模型", "Model")}
-                  </label>
-                  {agent === "agy" ? (
-                    <AgyModelPicker
-                      id="child-dispatch-model"
-                      models={launchModels}
-                      value={model}
-                      effort={effort}
-                      loading={launchModelsLoading}
-                      disabled={busy || launchModelsLoading || launchModels.length === 0}
-                      onChange={(nextModel, nextEffort) => {
-                        setModel(nextModel);
-                        setEffort(nextEffort);
-                      }}
-                    />
-                  ) : (
-                    <NativeSelect
-                      id="child-dispatch-model"
-                      value={model ?? ""}
-                      disabled={busy || launchModelsLoading}
-                      aria-label={t("模型", "Model")}
-                      onChange={(event) => {
-                        const nextModel = launchModels.find((item) => item.id === event.target.value);
-                        setModel(nextModel?.id);
-                        setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
-                      }}
-                    >
-                      {launchModels.map((item) => (
-                        <NativeSelectOption key={item.id} value={item.id}>
-                          {item.label}
-                        </NativeSelectOption>
-                      ))}
-                    </NativeSelect>
-                  )}
-                </div>
-                {Boolean(selectedLaunchModel?.supportedEfforts.length) && (
-                  <div className="grid gap-1.5">
-                    <label className="text-xs font-medium text-muted-foreground" htmlFor="child-dispatch-effort">
-                      {t("推理强度", "Reasoning effort")}
-                    </label>
-                    <NativeSelect
-                      id="child-dispatch-effort"
-                      value={effort ?? ""}
-                      disabled={busy}
-                      aria-label={t("推理强度", "Reasoning effort")}
-                      onChange={(event) => setEffort(event.target.value || undefined)}
-                    >
-                      {selectedLaunchModel?.supportedEfforts.map((level) => (
-                        <NativeSelectOption key={level} value={level}>
-                          {agent === "agy" ? formatAgyEffortLabel(level) : level}
-                        </NativeSelectOption>
-                      ))}
-                    </NativeSelect>
-                  </div>
-                )}
-              </div>
-            )
+            <LaunchModelFields
+              agent={agent}
+              models={launchModels}
+              model={model}
+              effort={effort}
+              loading={launchModelsLoading}
+              disabled={busy}
+              modelSelectId="child-dispatch-model"
+              effortSelectId="child-dispatch-effort"
+              onModelChange={(nextModel, nextEffort) => {
+                setModel(nextModel);
+                setEffort(nextEffort);
+              }}
+              onEffortChange={setEffort}
+            />
           )}
           <InputGroup>
             <InputGroupTextarea
@@ -544,10 +462,8 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
   const [accountId, setAccountId] = useState<string | undefined>(
     session.accountId ?? defaultSessionLaunchAccountId(independentAccounts, initialAgent),
   );
-  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
-  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
   const [model, setModel] = useState<string | undefined>(
-    session.agentControls?.currentModel ?? session.model ?? (initialAgent === "codex" ? "gpt-6-astra" : undefined),
+    session.agentControls?.currentModel ?? session.model,
   );
   const [customModel, setCustomModel] = useState("");
   const [effort, setEffort] = useState<string | undefined>(
@@ -566,7 +482,7 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
     setUseSource(Boolean(account?.["modelSource"]));
     setWorkspace(session.cwd);
     setAccountId(session.accountId ?? defaultSessionLaunchAccountId(independentAccounts, nextAgent));
-    setModel(session.agentControls?.currentModel ?? session.model ?? (nextAgent === "codex" ? "gpt-6-astra" : undefined));
+    setModel(session.agentControls?.currentModel ?? session.model);
     setCustomModel("");
     setEffort(session.agentControls?.currentEffort ?? session.effort);
   }, [account, independentAccounts, open, session.accountId, session.agent, session.agentControls?.currentEffort, session.agentControls?.currentModel, session.cwd, session.effort, session.model]);
@@ -592,74 +508,19 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
     }
   }, [accountId, agent, independentAccounts, launchAccounts, open, useSource]);
 
-  useEffect(() => {
-    if (!open || useSource || typeof window.prospero.getLaunchModels !== "function") {
-      setLaunchModels([]);
-      setLaunchModelsLoading(false);
-      return;
-    }
-    if (agent === "opencode") {
-      setLaunchModels([]);
-      return;
-    }
-    let cancelled = false;
-    setLaunchModelsLoading(true);
-    void window.prospero
-      .getLaunchModels(agent, accountId)
-      .then((catalog) => {
-        if (cancelled) return;
-        const astraPresent = catalog.models.some((item) => item.id === "gpt-6-astra");
-        const models =
-          agent === "codex" && !astraPresent
-            ? [
-                {
-                  id: "gpt-6-astra",
-                  label: "GPT-6-Astra",
-                  description: "Codex Astra model",
-                  isDefault: false,
-                  supportedEfforts: ["low", "medium", "high", "xhigh"],
-                  defaultEffort: "high",
-                },
-                ...catalog.models,
-              ]
-            : catalog.models;
-        setLaunchModels(models);
-        setModel((current) => {
-          const matched = models.find((item) => item.id === current);
-          const fallback =
-            matched ??
-            (agent === "codex" ? models.find((item) => item.id === "gpt-6-astra") : undefined) ??
-            models.find((item) => item.id === catalog.currentModel) ??
-            models.find((item) => item.isDefault) ??
-            models[0];
-          setEffort((currentEffort) =>
-            (currentEffort && fallback?.supportedEfforts.includes(currentEffort)
-              ? currentEffort
-              : undefined) ??
-            (fallback?.id === catalog.currentModel &&
-            catalog.currentEffort &&
-            fallback?.supportedEfforts.includes(catalog.currentEffort)
-              ? catalog.currentEffort
-              : undefined) ??
-            fallback?.defaultEffort ??
-            fallback?.supportedEfforts[0],
-          );
-          return fallback?.id;
-        });
-      })
-      .catch(() => {
-        if (!cancelled) setLaunchModels([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLaunchModelsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [accountId, agent, open, useSource]);
+  const { models: launchModels, loading: launchModelsLoading } = useLaunchModels({
+    enabled: open && !useSource,
+    agent,
+    accountId,
+    model,
+    effort,
+    onResolved: (resolved) => {
+      setModel(resolved.model);
+      setEffort(resolved.effort);
+    },
+  });
 
   const choice = selectedSourceRoute(sourceState.sources, selection, sourceAgent);
-  const selectedLaunchModel = launchModels.find((item) => item.id === model);
   const effectiveModel = customModel.trim() || model;
   const canApply = Boolean(
     !busy &&
@@ -708,6 +569,7 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
           sourceId: choice.source.id,
           routeId: choice.route.id,
           revision: choice.source.revision,
+          ...(selection.credentialId ? { credentialId: selection.credentialId } : {}),
           agent: sourceAgent,
         });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
@@ -827,7 +689,7 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
                   setSelection(undefined);
                   if (!useSource) {
                     setAccountId(defaultSessionLaunchAccountId(independentAccounts, next));
-                    setModel(next === "codex" ? "gpt-6-astra" : undefined);
+                    setModel(undefined);
                     setCustomModel("");
                     setEffort(undefined);
                   }
@@ -874,83 +736,27 @@ function MasterHarnessConfigDialog({ session, account, snapshot, onSwitched, onE
               disabled={busy}
             />
           ) : (
-            <div className="grid gap-3">
-              {(launchModels.length > 0 || (agent === "agy" && launchModelsLoading)) && (
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="grid gap-1.5">
-                    <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-model">
-                      {t("模型", "Model")}
-                    </label>
-                    {agent === "agy" ? (
-                      <AgyModelPicker
-                        id="master-config-model"
-                        models={launchModels}
-                        value={model}
-                        effort={effort}
-                        loading={launchModelsLoading}
-                        disabled={busy || launchModelsLoading || launchModels.length === 0}
-                        onChange={(nextModel, nextEffort) => {
-                          setModel(nextModel);
-                          setCustomModel("");
-                          setEffort(nextEffort);
-                        }}
-                      />
-                    ) : (
-                      <NativeSelect
-                        id="master-config-model"
-                        value={model ?? ""}
-                        disabled={busy || launchModelsLoading}
-                        aria-label={t("模型", "Model")}
-                        onChange={(event) => {
-                          const nextModel = launchModels.find((item) => item.id === event.target.value);
-                          setModel(nextModel?.id ?? event.target.value);
-                          setCustomModel("");
-                          setEffort(nextModel?.defaultEffort ?? nextModel?.supportedEfforts[0]);
-                        }}
-                      >
-                        {launchModels.map((item) => (
-                          <NativeSelectOption key={item.id} value={item.id}>
-                            {item.label} ({item.id})
-                          </NativeSelectOption>
-                        ))}
-                      </NativeSelect>
-                    )}
-                  </div>
-                  {Boolean(selectedLaunchModel?.supportedEfforts.length) && (
-                    <div className="grid gap-1.5">
-                      <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-effort">
-                        {t("推理强度", "Reasoning Effort")}
-                      </label>
-                      <NativeSelect
-                        id="master-config-effort"
-                        value={effort ?? ""}
-                        disabled={busy}
-                        aria-label={t("推理强度", "Reasoning Effort")}
-                        onChange={(event) => setEffort(event.target.value || undefined)}
-                      >
-                        {selectedLaunchModel?.supportedEfforts.map((level) => (
-                          <NativeSelectOption key={level} value={level}>
-                            {agent === "agy" ? formatAgyEffortLabel(level) : level}
-                          </NativeSelectOption>
-                        ))}
-                      </NativeSelect>
-                    </div>
-                  )}
-                </div>
-              )}
-              <div className="grid gap-1.5">
-                <label className="text-xs font-medium text-muted-foreground" htmlFor="master-config-custom-model">
-                  {t("自定义模型 ID（可选，如 gpt-6-astra / gpt-daybreak-blue-latest）", "Custom Model ID (optional, e.g. gpt-6-astra / gpt-daybreak-blue-latest)")}
-                </label>
-                <Input
-                  id="master-config-custom-model"
-                  value={customModel}
-                  disabled={busy}
-                  placeholder={model ?? "gpt-6-astra"}
-                  onChange={(event) => setCustomModel(event.target.value)}
-                />
-              </div>
-            </div>
+            <LaunchModelFields
+              agent={agent}
+              models={launchModels}
+              model={model}
+              effort={effort}
+              loading={launchModelsLoading}
+              disabled={busy}
+              modelSelectId="master-config-model"
+              effortSelectId="master-config-effort"
+              showModelIdInOption
+              customModel={customModel}
+              onCustomModelChange={setCustomModel}
+              customModelIdAttr="master-config-custom-model"
+              customModelPlaceholder={model ?? t("留空则使用上方所选模型", "Leave empty to use selected model")}
+              onModelChange={(nextModel, nextEffort) => {
+                setModel(nextModel);
+                setCustomModel("");
+                setEffort(nextEffort);
+              }}
+              onEffortChange={setEffort}
+            />
           )}
         </div>
         <DialogFooter>
@@ -1367,6 +1173,57 @@ export function clearChatSessionDraftCache(): void {
   sessionDraftCache.clear();
 }
 
+export type PastedClipboardDataLike = {
+  readonly files?: ArrayLike<File> | null | undefined;
+  readonly items?: ArrayLike<{ readonly kind: string; readonly type: string; getAsFile(): File | null }> | null | undefined;
+  getData?(format: string): string;
+};
+
+/**
+ * Extract pasted image files from clipboard data: supports direct screenshots
+ * (`files` or `items` fallback) and macOS Finder image file copies where
+ * `text/plain` mirrors the filename(s), while leaving text+thumbnail rich pastes alone.
+ */
+export function extractPastedImageFiles(
+  clipboardData: PastedClipboardDataLike | null | undefined,
+): File[] {
+  if (!clipboardData) return [];
+  const directFiles = Array.from(clipboardData.files ?? []).filter((file) =>
+    file.type.startsWith("image/"),
+  );
+  const imageFiles =
+    directFiles.length > 0
+      ? directFiles
+      : Array.from(clipboardData.items ?? [])
+          .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+          .map((item) => item.getAsFile())
+          .filter((file): file is File => file !== null);
+  if (!imageFiles.length) return [];
+
+  const plainText = (clipboardData.getData?.("text/plain") ?? "").trim();
+  if (!plainText) return imageFiles;
+
+  const fileNames = new Set(
+    imageFiles.map((file) => file.name.trim()).filter((name) => name.length > 0),
+  );
+  if (!fileNames.size) return [];
+  const lines = plainText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (
+    lines.length > 0 &&
+    lines.every((line) => {
+      const normalized = line.replace(/^['"]|['"]$/g, "");
+      const base = normalized.split(/[\\/]/).filter(Boolean).at(-1) ?? "";
+      return fileNames.has(normalized) || (base.length > 0 && fileNames.has(base));
+    })
+  ) {
+    return imageFiles;
+  }
+  return [];
+}
+
 async function fileToAttachment(file: File): Promise<PendingAttachment> {
   const bytes = new Uint8Array(await file.arrayBuffer()); let binary = "";
   for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
@@ -1453,7 +1310,7 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
   const isBotSession = !inBotMode && isProsperoBotSession(session);
   const isFeishuBotThread =
     inBotMode && (botContext?.channel === "feishu_group" || botContext?.channel === "feishu_p2p");
-  const hasComposerOptions = !inBotMode || Boolean(modes?.modes.length) || Boolean(onOpenGoal);
+  const hasComposerOptions = (!inBotMode && !isBotSession) || Boolean(modes?.modes.length) || Boolean(onOpenGoal);
   const displayItems = useMemo(() => conversationTurns(timeline.items, timeline.resolutions), [timeline]);
   const [botViewMode, setBotViewMode] = useState<"qa" | "timeline">(() => readBotChatViewMode());
   const [qaSearch, setQaSearch] = useState("");
@@ -1646,7 +1503,7 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
       setSending(false);
     }
   };
-  const attach = async (files: FileList | null): Promise<void> => {
+  const attach = async (files: FileList | readonly File[] | null): Promise<void> => {
     if (!files?.length) return;
     if (sending || attachingRef.current) {
       setOperationError(t("请等待当前操作完成后再添加附件", "Wait for the current operation to finish before attaching files"));
@@ -1796,10 +1653,10 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
     [openOutput, openSessionHandler, openSubagent, session.id],
   );
   const handleComposerPaste = (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
-    const files = event.clipboardData?.files;
-    if (!files?.length || event.clipboardData.getData("text/plain")) return;
+    const imageFiles = extractPastedImageFiles(event.clipboardData);
+    if (!imageFiles.length) return;
     event.preventDefault();
-    void attach(files);
+    void attach(imageFiles);
   };
   const handleComposerKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
     const native = event.nativeEvent;
@@ -1828,7 +1685,6 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
           <Badge variant="secondary">{session.agent}</Badge>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
-          <ModelSwitcher key={`${session.id}:header`} session={session} account={account} />
           <MasterHarnessConfigDialog
             session={session}
             account={account}
@@ -1857,7 +1713,7 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
     {inBotMode && botContext && (
       <div className="bot-qa-toolbar" data-testid="bot-chat-view-toolbar">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium text-muted-foreground">
+          <span className="bot-qa-count-pill">
             {qaCount > 0
               ? t(`共 ${String(qaCount)} 组问答`, `${String(qaCount)} Q&A turns`)
               : t("问答视图", "Q&A view")}
@@ -1869,14 +1725,15 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
                 value={qaSearch}
                 onChange={(event) => setQaSearch(event.target.value)}
                 placeholder={t("筛选提问或回答…", "Filter Q&A…")}
-                className="h-7 pl-7 pr-6 text-xs"
+                className="bot-qa-search-input h-7 pl-7.5 pr-6 text-xs"
                 aria-label={t("筛选问答", "Filter Q&A")}
               />
               {qaSearch && (
                 <button
                   type="button"
+                  data-slot="bot-control"
                   aria-label={t("清空筛选", "Clear filter")}
-                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                  className="bot-qa-search-clear"
                   onClick={() => setQaSearch("")}
                 >
                   <X className="size-3" />
@@ -1915,6 +1772,7 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
             <button
               type="button"
               role="tab"
+              data-slot="bot-control"
               aria-selected={botViewMode === "qa"}
               className="bot-qa-mode-btn"
               data-active={botViewMode === "qa" ? "true" : "false"}
@@ -1926,6 +1784,7 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
             <button
               type="button"
               role="tab"
+              data-slot="bot-control"
               aria-selected={botViewMode === "timeline"}
               className="bot-qa-mode-btn"
               data-active={botViewMode === "timeline" ? "true" : "false"}
@@ -2000,7 +1859,7 @@ export function ChatPane({ session, account, snapshot, botContext, onOpenSession
     ) : (
       <div className="chat-composer-shell"><div className="chat-composer-inner flex flex-col gap-2">{connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}{operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}{messageQueue.length > 0 && <section className="grid gap-2 rounded-xl border bg-muted/35 p-3" aria-label={t("待发送消息", "Queued messages")} aria-live="polite"><header className="flex flex-wrap items-center justify-between gap-2"><strong className="flex items-center gap-2 text-sm"><Clock3 className="size-4" />{t("待发送", "Queued")} · {messageQueue.length}</strong><span className="text-xs text-muted-foreground">{t("当前轮结束后依次发送", "Sent in order after the current turn")}</span></header><div className="grid max-h-52 gap-1.5 overflow-y-auto">{messageQueue.map((item) => <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background/80 px-2.5 py-2" key={item.id}><Badge variant="outline">{item.kind === "guide" ? t("引导", "Guide") : t("排队", "Queue")}</Badge><span className="min-w-0 flex-1 truncate text-sm" title={item.text}>{item.text || t(`${String(item.attachmentCount)} 张图片`, `${String(item.attachmentCount)} images`)}</span>{item.attachmentCount > 0 && <span className="flex items-center gap-1 text-xs text-muted-foreground"><FileImage className="size-3.5" />{item.attachmentCount}</span>}{item.kind !== "guide" && <Button variant="ghost" size="xs" aria-busy={queueBusy[item.id] === "guide"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "guide")}>{queueBusy[item.id] === "guide" ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{t("现在引导", "Guide now")}</Button>}<Button variant="ghost" size="icon-xs" aria-label={t("取消待发送消息", "Cancel queued message")} aria-busy={queueBusy[item.id] === "remove"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "remove")}>{queueBusy[item.id] === "remove" ? <Spinner /> : <Trash2 />}</Button></div>)}</div></section>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t(`图片 · ${(item.size / 1024 / 1024).toFixed(1)} MB · 等待发送`, `Image · ${(item.size / 1024 / 1024).toFixed(1)} MB · waiting to send`)}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
         {attachmentProgress && <div className="flex items-center gap-2 text-xs text-muted-foreground" role="status"><Spinner />{t(`正在处理图片 ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`, `Processing image ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`)}</div>}
-        {hasComposerOptions && <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}>{!inBotMode && <CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) openSessionHandler?.(id); }} onError={setOperationError} />}{isBotSession && <MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} />}{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{!inBotMode && !isBotSession && session.kind === "structured" && !session.archived && <ToggleGroup value={[sessionApprovalPolicy]} onValueChange={(values) => { const next = values[0]; if (next === "strict" || next === "standard" || next === "yolo") void setApprovalPolicy(next); }} disabled={approvalBusy} variant="outline" size="sm" aria-label={t("审批策略", "Approval policy")}><ToggleGroupItem value="strict" title={t("严格审批：所有工具与命令均需确认（含只读）", "Strict: ask before all tools and commands, including read-only")}><Shield />{t("严格审批", "Strict")}</ToggleGroupItem><ToggleGroupItem value="standard" title={t("分级审批：工作区只读免批，修改/敏感/高危命令才批", "Tiered: auto-allow safe read-only workspace actions; confirm edits, sensitive paths, and risky commands")}><ShieldCheck />{t("只读免批", "Tiered")}</ToggleGroupItem><ToggleGroupItem value="yolo" title={t("全自动（高风险）：跳过所有审批弹窗", "Auto (high risk): approve all tool calls automatically")}><ShieldAlert />{t("全自动", "Auto")}</ToggleGroupItem></ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>}{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onPaste={handleComposerPaste} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={botContext ? t(`向 ${botContext.name} 发送消息；输入 $ 可调用技能…`, `Message ${botContext.name}; type $ to use a skill…`) : isBotSession ? t("向 Prospero Bot 发送全局指令，如“在某工作区派发会话完成某任务”…", "Ask Prospero Bot to dispatch tasks to any workspace…") : t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} />{isBotSession && !composerOptionsOpen && <><MasterHarnessConfigDialog session={session} account={account} snapshot={snapshot} onSwitched={onSwitchBotSession} onError={setOperationError} /><CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) openSessionHandler?.(id); }} onError={setOperationError} /></>}{hasComposerOptions && <Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}{!inBotMode && !isBotSession && session.kind === "structured" && sessionApprovalPolicy !== "standard" && <span> · {sessionApprovalPolicy === "strict" ? t("严格", "Strict") : t("全自动", "Auto")}</span>}<ChevronDown /></Button>}{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片（支持粘贴或拖拽，最多 6 张，单张 5 MB / 共 10 MB）", "Upload images (paste or drag, up to 6 images, 5 MB each / 10 MB total)")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send title={t("发送 (Enter 发送 · Shift + Enter 换行)", "Send (Enter to send · Shift + Enter for new line)")} onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup></div></div>
+        {hasComposerOptions && <div id={composerOptionsId} className="chat-composer-options" hidden={!composerOptionsOpen}>{!inBotMode && !isBotSession && <CrossModelChildLauncher session={session} snapshot={snapshot} onCreated={(id, jump) => { if (jump) openSessionHandler?.(id); }} onError={setOperationError} />}{Boolean(modes?.modes.length) && modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{!inBotMode && !isBotSession && session.kind === "structured" && !session.archived && <ToggleGroup value={[sessionApprovalPolicy]} onValueChange={(values) => { const next = values[0]; if (next === "strict" || next === "standard" || next === "yolo") void setApprovalPolicy(next); }} disabled={approvalBusy} variant="outline" size="sm" aria-label={t("审批策略", "Approval policy")}><ToggleGroupItem value="strict" title={t("严格审批：所有工具与命令均需确认（含只读）", "Strict: ask before all tools and commands, including read-only")}><Shield />{t("严格审批", "Strict")}</ToggleGroupItem><ToggleGroupItem value="standard" title={t("分级审批：工作区只读免批，修改/敏感/高危命令才批", "Tiered: auto-allow safe read-only workspace actions; confirm edits, sensitive paths, and risky commands")}><ShieldCheck />{t("只读免批", "Tiered")}</ToggleGroupItem><ToggleGroupItem value="yolo" title={t("全自动（高风险）：跳过所有审批弹窗", "Auto (high risk): approve all tool calls automatically")}><ShieldAlert />{t("全自动", "Auto")}</ToggleGroupItem></ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}</div>}{session.archived && <Button variant="outline" disabled={resumingArchive || sending} onClick={() => { setResumingArchive(true); void window.prospero.setSessionArchived(session.id, false).catch(error => setOperationError(reportError(error))).finally(() => setResumingArchive(false)); }}>{t("已归档 · 继续对话", "Archived · Resume chat")}</Button>}<InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea data-chat-composer disabled={session.archived} value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onPaste={handleComposerPaste} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={botContext ? t(`向 ${botContext.name} 发送消息；输入 $ 可调用技能…`, `Message ${botContext.name}; type $ to use a skill…`) : isBotSession ? t("向 Prospero Bot 发送全局指令，如“在某工作区派发会话完成某任务”…", "Ask Prospero Bot to dispatch tasks to any workspace…") : t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="chat-composer-actions flex min-w-0 flex-wrap items-center gap-2"><ModelSwitcher key={session.id} session={session} account={account} />{hasComposerOptions && <Button variant="ghost" size="sm" aria-expanded={composerOptionsOpen} aria-controls={composerOptionsId} onClick={() => setComposerOptionsOpen(value => !value)}>{t("选项", "Options")}{modes?.currentMode && modes.currentMode !== "default" && <span> · {modes.modes.find(mode => mode.id === modes.currentMode)?.label ?? modes.currentMode}</span>}{!inBotMode && !isBotSession && session.kind === "structured" && sessionApprovalPolicy !== "standard" && <span> · {sessionApprovalPolicy === "strict" ? t("严格", "Strict") : t("全自动", "Auto")}</span>}<ChevronDown /></Button>}{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片（支持粘贴或拖拽，最多 6 张，单张 5 MB / 共 10 MB）", "Upload images (paste or drag, up to 6 images, 5 MB each / 10 MB total)")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button data-chat-send title={t("发送 (Enter 发送 · Shift + Enter 换行)", "Send (Enter to send · Shift + Enter for new line)")} onClick={() => void send()} disabled={session.archived || (!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup></div></div>
     )}
     <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open) closeDetail(); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{detail?.title}</DialogTitle><DialogDescription>{t("可选择部分内容，或复制全部已显示内容。", "Select part of the output, or copy all displayed content.")}</DialogDescription></DialogHeader>{detail?.loading ? <div className="flex items-center justify-center gap-2 py-16 text-muted-foreground"><Spinner />{t("正在读取…", "Loading…")}</div> : <>{detail?.truncated && <Alert><CircleAlert /><AlertTitle>{t("输出已截断", "Output truncated")}</AlertTitle><AlertDescription>{t("daemon 仅保留了这次工具输出的前 200,000 个字符。", "The daemon retained only the first 200,000 characters of this tool output.")}</AlertDescription></Alert>}<pre className="terminal-output-text max-h-[60vh] overflow-auto rounded-lg bg-muted p-4 text-xs leading-relaxed">{detail?.content}</pre></>}<DialogFooter>{detail?.content && <Button variant="outline" onClick={() => void window.prospero.writeClipboard(detail.content)}><Copy data-icon="inline-start" />{t("复制", "Copy")}</Button>}<Button variant="outline" onClick={closeDetail}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
   </div>;

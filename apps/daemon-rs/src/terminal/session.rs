@@ -52,7 +52,7 @@ pub fn validate_native_id(id: &str) -> Result<()> {
 }
 
 impl Store {
-    pub(crate) fn set_native_session(
+    pub fn set_native_session(
         &mut self,
         id: &str,
         native: NativeSession,
@@ -149,6 +149,69 @@ impl Store {
             return Err(Error::Invalid("所选原生对话已绑定其他活动会话".into()));
         }
         Ok(())
+    }
+
+    pub(crate) fn prepare_terminal_model_source_switch(
+        &mut self,
+        id: &str,
+        agent: crate::protocol::AgentKind,
+        account_id: &str,
+        model: &str,
+        effort: Option<&str>,
+        native_id: Option<&str>,
+    ) -> Result<SessionHead> {
+        validate_id(id)?;
+        validate_id(account_id)?;
+        if let Some(native_id) = native_id {
+            validate_native_id(native_id)?;
+        }
+        let head = self.session(id)?;
+        if head.kind != crate::protocol::SessionKind::Pty
+            || head.lifecycle != SessionLifecycle::Archived
+        {
+            return Err(Error::Conflict);
+        }
+        let runtime_id = head
+            .native_session
+            .as_ref()
+            .map(|native| native.runtime_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let output_start_seq = head
+            .native_session
+            .as_ref()
+            .and_then(|native| native.output_start_seq);
+        let managed = head
+            .native_session
+            .as_ref()
+            .is_some_and(|native| native.managed);
+        let native = NativeSession {
+            output_start_seq,
+            runtime_id,
+            native_id: native_id.map(str::to_owned),
+            managed,
+            state: "archived".into(),
+            error: None,
+        };
+        let account_id_owned = account_id.to_owned();
+        let model_owned = model.to_owned();
+        let effort_owned = effort.map(str::to_owned);
+        self.update_session_metadata_with(
+            id,
+            |session| {
+                session.agent = agent;
+                session.account_id = Some(account_id_owned);
+                session.model = Some(model_owned);
+                session.effort = effort_owned;
+                session.native_session = Some(native);
+            },
+            |tx| {
+                tx.execute(
+                    "UPDATE terminal_runs SET account_id=?1 WHERE session_id=?2",
+                    params![account_id, id],
+                )?;
+                Ok(())
+            },
+        )
     }
 }
 

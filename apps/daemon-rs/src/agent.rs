@@ -1,6 +1,6 @@
 pub(crate) mod agy;
 pub(crate) mod approval;
-mod claude;
+pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod conversations;
 mod deepseek;
@@ -95,6 +95,8 @@ pub struct CreateCrossModelChild {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -607,6 +609,45 @@ pub struct AgentModelSelectionResult {
     pub current_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_effort: Option<String>,
+}
+
+/// Request to switch a structured API-profile/model-source session to another
+/// model source route (same-engine or cross-engine).
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct AgentModelSourceSwitch {
+    pub source_id: String,
+    pub route_id: String,
+    #[ts(type = "number")]
+    pub revision: i64,
+    #[serde(default)]
+    pub credential_id: Option<String>,
+    #[serde(default)]
+    pub agent: Option<crate::protocol::AgentKind>,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// Result of switching a structured session's bound API model source/route.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentModelSourceSwitchResult {
+    pub account_id: String,
+    pub agent: crate::protocol::AgentKind,
+    pub engine: crate::protocol::AgentKind,
+    pub previous_engine: crate::protocol::AgentKind,
+    pub current_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_effort: Option<String>,
+    pub source_id: String,
+    pub route_id: String,
+    pub source_name: String,
+    pub route_name: String,
+    pub credential_id: String,
+    pub credential_name: String,
+    pub handoff_mode: String,
 }
 
 #[derive(Debug, Serialize, TS)]

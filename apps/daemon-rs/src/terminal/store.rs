@@ -267,6 +267,18 @@ impl Store {
             .transpose()?)
     }
 
+    pub(crate) fn terminal_size(&self, id: &str) -> Result<TerminalSize> {
+        validate_id(id)?;
+        let row: Option<(u16, u16)> = self
+            .connection
+            .prepare_cached("SELECT cols,rows FROM terminal_runs WHERE session_id=?")?
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        Ok(row.map_or(TerminalSize { cols: 120, rows: 36 }, |(cols, rows)| {
+            TerminalSize { cols, rows }
+        }))
+    }
+
     pub(crate) fn prune_terminal_storage(&mut self) -> Result<usize> {
         let tx = self.connection.transaction()?;
         let mut deleted = tx.execute("DELETE FROM terminal_instance_output", [])?;

@@ -1078,7 +1078,7 @@ impl Terminals {
             )
             .await
             .map(Handle::Hosted),
-            None => tokio::task::spawn_blocking(move || spawn(command, size))
+            None => tokio::task::spawn_blocking(move || super::native::spawn_at(command, size, base_seq))
                 .await
                 .map_err(|_| Error::Closed)?
                 .map(Handle::Local),
@@ -1425,7 +1425,7 @@ impl Terminals {
                 loop {
                     changes.borrow_and_update();
                     if self.terminal(id).is_err() {
-                        return Ok(());
+                        return Ok::<(), Error>(());
                     }
                     changes.changed().await.map_err(|_| Error::Closed)?;
                 }
@@ -2334,6 +2334,428 @@ impl Terminals {
                 Ok((env, Some(record.id), Some(profile)))
             }
         }
+    }
+
+    /// Switch an API-profile/model-source TUI (PTY) session to another model
+    /// source route (same-engine or cross-engine) and restart the PTY in-place.
+    pub async fn switch_model_source(
+        &self,
+        id: &str,
+        input: crate::agent::AgentModelSourceSwitch,
+    ) -> Result<crate::agent::AgentModelSourceSwitchResult> {
+        let _guard = self.0.lifecycle.try_lock().map_err(|_| Error::Busy)?;
+        crate::database::validate_id(id)?;
+        crate::accounts::sources::validate_source_id(&input.source_id)?;
+        crate::accounts::sources::validate_source_id(&input.route_id)?;
+        if input.revision <= 0 {
+            return Err(Error::Invalid("模型源版本无效".into()));
+        }
+        let requested_effort = match input.effort {
+            Some(raw) => {
+                if raw.chars().count() > 80 || raw.chars().any(char::is_control) {
+                    return Err(Error::Invalid("思考强度无效".into()));
+                }
+                let trimmed = raw.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            }
+            None => None,
+        };
+
+        let head = self.sync_native_binding(id).await?;
+        if head.kind != crate::protocol::SessionKind::Pty
+            || !matches!(
+                head.agent,
+                crate::protocol::AgentKind::Claude
+                    | crate::protocol::AgentKind::Codex
+                    | crate::protocol::AgentKind::Pi
+                    | crate::protocol::AgentKind::Agy
+            )
+        {
+            return Err(Error::Conflict);
+        }
+
+        let old_account_id = head.account_id.clone();
+        let old_profile = match old_account_id.as_deref() {
+            Some(acct_id)
+                if !matches!(
+                    acct_id,
+                    crate::accounts::NATIVE_CLAUDE_ID
+                        | NATIVE_CODEX_ID
+                        | crate::accounts::NATIVE_PI_ID
+                        | crate::accounts::NATIVE_AGY_ID
+                ) =>
+            {
+                let data = self.0.database.directory().to_owned();
+                let acct_id = acct_id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.managed_snapshot_row(&data, &acct_id)?.api_profile))
+                    .await?
+            }
+            _ => None,
+        };
+        let Some(old_profile) = old_profile else {
+            return Err(Error::Invalid(
+                "仅 API 模型源会话支持会话内切换模型源".into(),
+            ));
+        };
+        let previous_engine = head.agent;
+
+        if input.agent == Some(crate::protocol::AgentKind::Opencode) {
+            return Err(Error::Invalid(
+                "OpenCode 仅支持结构化对话，TUI 终端请选择 Pi 或 Antigravity (agy)".into(),
+            ));
+        }
+
+        let data = self.0.database.directory().to_owned();
+        let source_id = input.source_id.clone();
+        let route_id = input.route_id.clone();
+        let revision = input.revision;
+        let requested_credential_id = input
+            .credential_id
+            .clone()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let requested_agent = input.agent;
+        let current_agent = head.agent;
+
+        let (
+            target_account_id,
+            target_agent,
+            target_profile,
+            source_name,
+            route_name,
+            resolved_credential_id,
+            resolved_credential_name,
+            route_default_effort,
+        ) = self
+            .0
+            .database
+            .call(move |store| {
+                let accounts = store.list_managed_accounts(&data)?;
+                let known = accounts
+                    .iter()
+                    .map(|account| account.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let account_agents = accounts
+                    .into_iter()
+                    .map(|account| (account.id, account.agent))
+                    .collect::<HashMap<_, _>>();
+                let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                let details = sources.route_details(
+                    &source_id,
+                    &route_id,
+                    revision,
+                    requested_credential_id.as_deref(),
+                )?;
+                let resolved_profile = details.profile;
+                if resolved_profile
+                    .model_capabilities
+                    .as_ref()
+                    .is_some_and(|caps| caps.tools == Some(false))
+                {
+                    return Err(Error::Invalid("此模型未启用 Agent 所需的工具调用".into()));
+                }
+                let target_agent = if let Some(agent) = requested_agent {
+                    agent
+                } else if crate::accounts::managed::validate_profile_agent(
+                    current_agent,
+                    &resolved_profile,
+                )
+                .is_ok()
+                {
+                    current_agent
+                } else {
+                    match resolved_profile.protocol() {
+                        "anthropic" => crate::protocol::AgentKind::Claude,
+                        "openai_responses" => crate::protocol::AgentKind::Codex,
+                        "openai_chat_completions" => crate::protocol::AgentKind::Pi,
+                        _ => crate::protocol::AgentKind::Codex,
+                    }
+                };
+                if !matches!(
+                    target_agent,
+                    crate::protocol::AgentKind::Claude
+                        | crate::protocol::AgentKind::Codex
+                        | crate::protocol::AgentKind::Pi
+                        | crate::protocol::AgentKind::Agy
+                ) {
+                    return Err(Error::Invalid("所选执行引擎不支持 TUI 终端会话".into()));
+                }
+                let outcome = sources.bind(
+                    &source_id,
+                    &route_id,
+                    revision,
+                    requested_credential_id.as_deref(),
+                    Some(target_agent),
+                    &known,
+                    &account_agents,
+                )?;
+                let account_id = match outcome {
+                    crate::accounts::sources::BindOutcome::Existing(id) => id,
+                    crate::accounts::sources::BindOutcome::Created {
+                        account_id,
+                        agent,
+                        profile,
+                        name,
+                        secret,
+                    } => {
+                        store.insert_api_profile_account_with_id(
+                            &data,
+                            &account_id,
+                            &name,
+                            agent,
+                            &profile,
+                            &secret,
+                        )?;
+                        account_id
+                    }
+                };
+                let record = store.managed_snapshot_row(&data, &account_id)?;
+                let target_profile = record.api_profile.ok_or_else(|| {
+                    Error::Invalid("目标模型源未绑定有效的 API Profile".into())
+                })?;
+                Ok((
+                    account_id,
+                    target_agent,
+                    target_profile,
+                    details.source_name,
+                    details.route_name,
+                    details.credential_id,
+                    details.credential_name,
+                    details.default_effort,
+                ))
+            })
+            .await?;
+
+        let target_effort = if target_agent == crate::protocol::AgentKind::Agy {
+            None
+        } else {
+            crate::accounts::profile::normalize_profile_effort(
+                &target_profile,
+                requested_effort
+                    .as_deref()
+                    .or(route_default_effort.as_deref()),
+            )
+        };
+
+        let sid = id.to_owned();
+        let size = self
+            .0
+            .database
+            .call(move |store| store.terminal_size(&sid))
+            .await?;
+        let mut launch_input = CreateTerminal {
+            title: head.title.clone(),
+            workspace: head.workspace.clone(),
+            agent: Some(target_agent),
+            command: None,
+            size,
+            account_id: Some(target_account_id.clone()),
+            model: Some(target_profile.model.clone()),
+            effort: target_effort.clone(),
+            approval_policy: head.approval_policy,
+        };
+        // Validate and prepare the target command before stopping the live PTY.
+        let spec = self.pty_program_for(&mut launch_input).await?;
+
+        if self.terminal(id).is_ok() {
+            self.terminal(id)?.stop().await?;
+            let mut changes = self.0.changed.subscribe();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    changes.borrow_and_update();
+                    if self.terminal(id).is_err() {
+                        return Ok::<(), Error>(());
+                    }
+                    changes.changed().await.map_err(|_| Error::Closed)?;
+                }
+            })
+            .await
+            .map_err(|_| Error::Timeout)??;
+        }
+
+        let old_runtime_id = head
+            .native_session
+            .as_ref()
+            .map(|native| native.runtime_id.as_str())
+            .unwrap_or(&head.id);
+        let old_directory = self
+            .0
+            .database
+            .directory()
+            .join("terminal-hosts")
+            .join(old_runtime_id);
+        if host::owner_alive(&old_directory)? {
+            if let Ok(host) = host::Host::attach(old_directory.clone()).await {
+                let _ = Handle::Hosted(host).release().await;
+            }
+            for _ in 0..50 {
+                if !host::owner_alive(&old_directory)? {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if host::owner_alive(&old_directory)? {
+                return Err(Error::Busy);
+            }
+        }
+
+        let latest_head = self.sync_native_binding(id).await?;
+        if latest_head.lifecycle != crate::protocol::SessionLifecycle::Archived {
+            let sid = id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.archive_terminal_head(&sid))
+                .await?;
+        }
+
+        let old_native_id = latest_head
+            .native_session
+            .as_ref()
+            .and_then(|native| native.native_id.clone());
+        let same_account = old_account_id.as_deref() == Some(target_account_id.as_str());
+        let (next_native_id, handoff_mode) = if same_account {
+            let mode = if old_native_id.is_some() {
+                "native"
+            } else {
+                "fresh"
+            };
+            (old_native_id, mode.to_owned())
+        } else if previous_engine == target_agent
+            && let Some(old_id) = old_native_id
+        {
+            let migrated = match target_agent {
+                crate::protocol::AgentKind::Claude => {
+                    if let (Some(old_acct), Some(new_env)) = (
+                        old_account_id.clone(),
+                        spec.as_ref().map(|item| item.environment.clone()),
+                    ) {
+                        let data = self.0.database.directory().to_owned();
+                        let old_env = tokio::task::spawn_blocking(move || {
+                            crate::accounts::managed::profile_account_environment(
+                                &data,
+                                &old_acct,
+                                crate::protocol::AgentKind::Claude,
+                                &old_profile,
+                            )
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                        if let Some((old_dir, new_dir)) = old_env.and_then(|env| {
+                            Some((
+                                crate::agent::claude::resolve_claude_config_dir(&env)?,
+                                crate::agent::claude::resolve_claude_config_dir(&new_env)?,
+                            ))
+                        }) {
+                            let workspace = latest_head.workspace.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::agent::claude::migrate_session_file_to_config_dir(
+                                    &old_dir, &new_dir, &workspace, &old_id, true,
+                                )
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                crate::protocol::AgentKind::Pi => {
+                    if let (Some(old_acct), Some(new_env)) = (
+                        old_account_id.clone(),
+                        spec.as_ref().map(|item| item.environment.clone()),
+                    ) {
+                        let data = self.0.database.directory().to_owned();
+                        let old_env = tokio::task::spawn_blocking(move || {
+                            crate::accounts::managed::profile_account_environment(
+                                &data,
+                                &old_acct,
+                                crate::protocol::AgentKind::Pi,
+                                &old_profile,
+                            )
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                        if let Some(old_env) = old_env {
+                            let workspace = latest_head.workspace.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::agent::pi::migrate_session_file(
+                                    &old_env, &new_env, &workspace, &old_id,
+                                )
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                crate::protocol::AgentKind::Agy => Some(old_id),
+                _ => None,
+            };
+            match migrated {
+                Some(new_id) => (Some(new_id), "native".to_owned()),
+                None => (None, "fresh".to_owned()),
+            }
+        } else {
+            (None, "fresh".to_owned())
+        };
+
+        let sid = id.to_owned();
+        let target_acct_for_prepare = target_account_id.clone();
+        let target_model_for_prepare = target_profile.model.clone();
+        let target_effort_for_prepare = target_effort.clone();
+        let prepared_head = self
+            .0
+            .database
+            .call(move |store| {
+                store.prepare_terminal_model_source_switch(
+                    &sid,
+                    target_agent,
+                    &target_acct_for_prepare,
+                    &target_model_for_prepare,
+                    target_effort_for_prepare.as_deref(),
+                    next_native_id.as_deref(),
+                )
+            })
+            .await?;
+
+        let permit = self
+            .0
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        let (started_head, terminal) = self.start(launch_input, spec, Some(prepared_head)).await?;
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.track(started_head, terminal, permit).await;
+        });
+
+        Ok(crate::agent::AgentModelSourceSwitchResult {
+            account_id: target_account_id,
+            agent: target_agent,
+            engine: target_agent,
+            previous_engine,
+            current_model: target_profile.model,
+            current_effort: target_effort,
+            source_id: input.source_id,
+            route_id: input.route_id,
+            source_name,
+            route_name,
+            credential_id: resolved_credential_id,
+            credential_name: resolved_credential_name,
+            handoff_mode,
+        })
     }
 }
 

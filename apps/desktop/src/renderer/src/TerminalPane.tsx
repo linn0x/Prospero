@@ -18,7 +18,7 @@ import { displayError, isMissingSessionError, isUnrecoverableTerminalError, repo
 import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
 import { terminalBinaryBase64, terminalBytes } from "./terminal-bytes";
-import { terminalAgentImageReference, terminalAgentNewline } from "./terminal-agent-input";
+import { supportsTerminalImagePaste, terminalAgentImageReference, terminalAgentNewline } from "./terminal-agent-input";
 import { configureRustTerminalUnicode } from "./terminal-unicode";
 import { TerminalInputBuffer, TerminalInputQueue } from "./terminal-input-buffer";
 import { suppressDaemonTerminalQueries, writeTerminalEvents } from "./terminal-events";
@@ -582,7 +582,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, foc
       void inputBuffer.flush();
     };
     const pasteImage = (): void => {
-      if (session.agent !== "claude" && session.agent !== "codex" && session.agent !== "pi") { showNotice(tRef.current("此终端暂不支持图片粘贴，请保存图片后使用文件路径", "Image paste is unavailable in this terminal; save the image and use its file path")); return; }
+      if (!supportsTerminalImagePaste(session.agent)) { showNotice(tRef.current("此终端暂不支持图片粘贴，请保存图片后使用文件路径", "Image paste is unavailable in this terminal; save the image and use its file path")); return; }
       void window.prospero.saveTerminalClipboardImage(session.id).then(({ path }) => {
         if (terminalRef.current !== terminal) return;
         if (!focusedRef.current || !host.current?.contains(document.activeElement)) { showNotice(tRef.current("图片已保存；回到此终端后可重新粘贴", "Image saved; return to this terminal and paste again")); return; }

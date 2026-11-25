@@ -7,6 +7,7 @@ import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQue
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, AttachmentChunk, CreateAgentSession, CreateCrossModelChild, CrossModelChild, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, ConversationSearchResult, LaunchModelCatalog, ResumableConversation, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
+import type { AgentModelSourceSwitchInput, AgentModelSourceSwitchResult } from "../shared/types";
 import type { BotActionResult } from "../shared/bots";
 import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, SearchResult as RustProjectSearchResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
@@ -216,6 +217,13 @@ export class RustClient {
       method: "POST", signal, timeoutMs,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model, ...(effort !== undefined ? { effort } : {}) }),
+    });
+  }
+  switchAgentModelSource(value: string, input: AgentModelSourceSwitchInput, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<AgentModelSourceSwitchResult> {
+    return this.json(`/v1/agent-sessions/${id(value)}/model-source`, {
+      method: "POST", signal, timeoutMs,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
     });
   }
   agentControls(signal: AbortSignal | null = null): Promise<AgentControlsProjection> {

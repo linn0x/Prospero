@@ -486,6 +486,10 @@ impl Api {
                 "/v1/agent-sessions/{id}/models",
                 get(agent_models).post(set_agent_model),
             )
+            .route(
+                "/v1/agent-sessions/{id}/model-source",
+                post(switch_agent_model_source),
+            )
             .route("/v1/agent-sessions/controls", get(agent_controls))
             .route(
                 "/v1/agent-sessions/{id}/subagents/{subagent}/events",
@@ -5496,6 +5500,7 @@ async fn model_sources_route(
             source_id,
             route_id,
             revision,
+            credential_id,
             agent,
         } => {
             let data = api.database.directory().to_owned();
@@ -5516,6 +5521,7 @@ async fn model_sources_route(
                         &source_id,
                         &route_id,
                         revision,
+                        credential_id.as_deref(),
                         agent,
                         &known,
                         &account_agents,
@@ -6822,6 +6828,42 @@ async fn set_agent_model(
         .set_model(&id, selection.model, selection.effort)
         .await
         .map_err(ApiError)?;
+    Ok(Json(result))
+}
+
+async fn switch_agent_model_source(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<
+        Json<crate::agent::AgentModelSourceSwitch>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> std::result::Result<Json<crate::agent::AgentModelSourceSwitchResult>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid model source switch".into()))?;
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    let sid = id.clone();
+    let kind = api
+        .database
+        .read("session.switch_model_source_kind", move |store| {
+            Ok(store.session(&sid)?.kind)
+        })
+        .await
+        .map_err(ApiError)?;
+    let result = if kind == crate::protocol::SessionKind::Pty {
+        let switched = api
+            .terminals
+            .switch_model_source(&id, input)
+            .await
+            .map_err(ApiError)?;
+        api.publish();
+        switched
+    } else {
+        api.agents
+            .switch_model_source(&id, input)
+            .await
+            .map_err(ApiError)?
+    };
     Ok(Json(result))
 }
 

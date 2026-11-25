@@ -139,6 +139,7 @@ export function FeishuAccessControlPanel({
                 key={option.id}
                 type="button"
                 role="radio"
+                data-slot="bot-control"
                 aria-checked={active}
                 disabled={disabled}
                 className="bot-policy-card"
@@ -159,7 +160,7 @@ export function FeishuAccessControlPanel({
           })}
         </div>
 
-        <div className="flex items-start gap-2.5 rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2.5 text-xs">
+        <div className="flex items-start gap-2.5 rounded-lg border border-[color-mix(in_srgb,var(--success)_32%,transparent)] bg-[var(--success-soft)] px-3 py-2.5 text-xs">
           <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
           <div className="grid gap-0.5">
             <strong className="font-medium text-foreground">

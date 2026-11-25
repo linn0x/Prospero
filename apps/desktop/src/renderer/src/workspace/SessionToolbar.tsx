@@ -9,9 +9,11 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem,
 import { useLocale } from "../locale";
 import { reportError, shortPath } from "../state";
 
+import { ApiModelSourceSwitcher } from "./ApiModelSourceSwitcher";
+import { modelSourceSwitchSupported } from "./model-catalog";
 import { sessionLabel, StatusMark } from "./session-presentation";
 
-export function SessionToolbar({ session, account: _account, unread = false, contextVisible, onToggleContext, onToggleFocus, localSelection, onLocalSelectionChange, nativeTerminal = false, nativeTerminalState, onNativeTerminalAction, onSplit, variant, actionsHost }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void; localSelection: boolean; onLocalSelectionChange: (value: boolean) => void; onSplit?: (() => void) | undefined; nativeTerminal?: boolean; nativeTerminalState?: NativeTerminalState; onNativeTerminalAction?: (action: "acquire" | "takeover" | "release" | "reconnect") => void; variant?: "pane" | "topbar"; actionsHost?: HTMLDivElement | null | undefined }) {
+export function SessionToolbar({ session, account, unread = false, contextVisible, onToggleContext, onToggleFocus, localSelection, onLocalSelectionChange, nativeTerminal = false, nativeTerminalState, onNativeTerminalAction, onSplit, variant, actionsHost }: { session: SessionInfo; account: JsonObject | undefined; unread?: boolean; contextVisible: boolean; onToggleContext: () => void; onToggleFocus: () => void; localSelection: boolean; onLocalSelectionChange: (value: boolean) => void; onSplit?: (() => void) | undefined; nativeTerminal?: boolean; nativeTerminalState?: NativeTerminalState; onNativeTerminalAction?: (action: "acquire" | "takeover" | "release" | "reconnect") => void; variant?: "pane" | "topbar"; actionsHost?: HTMLDivElement | null | undefined }) {
   const { t } = useLocale();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -38,9 +40,11 @@ export function SessionToolbar({ session, account: _account, unread = false, con
   const kindBadge = session.kind === "pty" ? (session.agent === "shell" ? "Shell" : "TUI") : "Chat";
   const rawModel = session.agentControls?.currentModel || session.model;
   const modelName = rawModel ? rawModel.split("/").at(-1) : undefined;
+  const showPtySourceSwitcher = session.kind === "pty" && modelSourceSwitchSupported(session, account);
   const focusTitle = isMac ? t("进入专注模式 (⌥⌘F)", "Enter focus mode (⌥⌘F)") : t("进入专注模式 (Ctrl+Alt+F)", "Enter focus mode (Ctrl+Alt+F)");
   const actions = (
     <div className="pane-toolbar-actions">
+      {showPtySourceSwitcher && <ApiModelSourceSwitcher key={session.id} session={session} account={account} triggerSize="xs" />}
       {["running", "starting", "waiting_input", "waiting_approval"].includes(session.status) && <Button variant="ghost" size="xs" disabled={busy} aria-label={t("停止当前轮次", "Stop current turn")} title={t("停止当前轮次", "Stop current turn")} onClick={() => void action(() => window.prospero.interruptSession(session.id))}><DesktopIcon name="stop" /><span className="session-toolbar-action-label">{t("停止", "Stop")}</span></Button>}
       {(session.archived || (session.kind === "pty" && ["completed", "done", "died", "failed", "stopped", "cancelled", "exited", "killed"].includes(session.status))) && <Button variant="ghost" size="xs" disabled={busy} aria-label={t("继续对话", "Resume chat")} title={t("继续对话", "Resume chat")} onClick={() => void action(() => window.prospero.setSessionArchived(session.id, false))}><RotateCcw /><span className="session-toolbar-action-label">{t("继续对话", "Resume")}</span></Button>}
       <Button variant="ghost" size="xs" aria-label={t("切换工具栏", "Toggle tools")} title={t("文件、搜索、Git 与会话工具", "Files, search, Git and session tools")} aria-pressed={contextVisible} onClick={onToggleContext}><DesktopIcon name="sidebar" /><span className="session-toolbar-action-label">{t("工具", "Tools")}</span></Button>
@@ -76,7 +80,7 @@ export function SessionToolbar({ session, account: _account, unread = false, con
         <span className="session-toolbar-path">{shortPath(session.cwd)}</span>
         <span className="session-toolbar-sep" aria-hidden="true">·</span>
         <span className="session-toolbar-chip">{session.agent} · {kindBadge}</span>
-        {session.kind === "pty" && modelName && <>
+        {session.kind === "pty" && !showPtySourceSwitcher && modelName && <>
           <span className="session-toolbar-sep" aria-hidden="true">·</span>
           <span className="session-toolbar-chip session-toolbar-model" title={rawModel}>{modelName}</span>
         </>}

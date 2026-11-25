@@ -442,18 +442,20 @@ const BotQaTableRow = memo(function BotQaTableRow({
 
         <div className="bot-qa-cell" role="cell" data-col="question">
           <div className="bot-qa-cell-speaker">
-            {entry.question.channel === "feishu_group" ? (
-              <Users className="size-3 shrink-0 text-muted-foreground" />
-            ) : (
-              <UserRound className="size-3 shrink-0 text-muted-foreground" />
-            )}
-            <span className="truncate font-medium text-muted-foreground" title={speakerDisplay.title}>
+            <span className="bot-qa-speaker-icon" aria-hidden="true">
+              {entry.question.channel === "feishu_group" ? (
+                <Users className="size-3" />
+              ) : (
+                <UserRound className="size-3" />
+              )}
+            </span>
+            <span className="truncate font-medium text-foreground/85" title={speakerDisplay.title}>
               {speakerDisplay.label}
             </span>
             {speakerDisplay.showAdminBadge && (
               <Badge
                 variant="secondary"
-                className="h-4 shrink-0 gap-0.5 bg-emerald-500/15 px-1.5 text-[10px] text-emerald-700 dark:text-emerald-300"
+                className="h-4 shrink-0 gap-0.5 border border-emerald-500/25 bg-emerald-500/12 px-1.5 text-[10px] text-emerald-700 dark:text-emerald-300"
               >
                 <ShieldCheck className="size-2.5" />
                 {t("管理员", "Admin")}
@@ -594,22 +596,24 @@ const BotQaTableRow = memo(function BotQaTableRow({
           <div className="bot-qa-meta-stack">
             <div className="bot-qa-meta-status">
               {!entry.completed ? (
-                <span className="inline-flex items-center gap-1.5 font-medium text-primary">
+                <span className="bot-qa-status-pill" data-state="running">
                   <Spinner className="size-3" />
-                  {t("处理中", "Running")}
+                  <span>{t("处理中", "Running")}</span>
                 </span>
               ) : failed ? (
-                <Badge variant="destructive" className="h-4 px-1.5 text-[10px]">
-                  {t("失败", "Failed")}
-                </Badge>
+                <span className="bot-qa-status-pill" data-state="failed">
+                  <span className="bot-qa-row-dot" data-state="failed" aria-hidden="true" />
+                  <span>{t("失败", "Failed")}</span>
+                </span>
               ) : stopped ? (
-                <Badge variant="outline" className="h-4 px-1.5 text-[10px]">
-                  {t("已停止", "Stopped")}
-                </Badge>
+                <span className="bot-qa-status-pill" data-state="stopped">
+                  <span className="bot-qa-row-dot" data-state="stopped" aria-hidden="true" />
+                  <span>{t("已停止", "Stopped")}</span>
+                </span>
               ) : (
-                <span className="inline-flex items-center gap-1.5 font-medium text-emerald-600 dark:text-emerald-400">
+                <span className="bot-qa-status-pill" data-state="done">
                   <span className="bot-qa-row-dot" data-state="done" aria-hidden="true" />
-                  {t("已完成", "Done")}
+                  <span>{t("已完成", "Done")}</span>
                 </span>
               )}
               <span className="bot-qa-meta-channel truncate" title={channelBadgeText}>

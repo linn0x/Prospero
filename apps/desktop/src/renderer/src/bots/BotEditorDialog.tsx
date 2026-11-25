@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CheckCircle2,
   CircleAlert,
@@ -9,13 +9,12 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
-import { AgyModelPicker, formatAgyEffortLabel } from "../workspace/AgyModelPicker";
+import { LaunchModelFields, useLaunchModels } from "../workspace/LaunchModelFields";
 import {
   defaultSessionLaunchAccountId,
   sessionLaunchAccounts,
 } from "../../../shared/session-launch-options";
 import type {
-  AgentModel,
   BotFeishuAdmin,
   BotFeishuProbeResult,
   BotSourceBinding,
@@ -171,15 +170,11 @@ export function BotEditorDialog({
   const [feishuAccessPolicy, setFeishuAccessPolicy] = useState<FeishuAccessPolicy>("admins_only");
   const [feishuAdmins, setFeishuAdmins] = useState<BotFeishuAdmin[]>([]);
 
-  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
-  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
   const [probeBusy, setProbeBusy] = useState(false);
   const [probeResult, setProbeResult] = useState<BotFeishuProbeResult | undefined>(undefined);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
-  const modelRef = useRef(model);
-  modelRef.current = model;
 
   const sourceState = useModelSources(open && useSource);
   const independentAccounts = useMemo(
@@ -244,7 +239,7 @@ export function BotEditorDialog({
       setAgent("codex");
       setUseSource(false);
       setAccountId(defaultSessionLaunchAccountId(independentAccounts, "codex"));
-      setModel("gpt-6-astra");
+      setModel(undefined);
       setCustomModel("");
       setEffort(undefined);
       setSelection(undefined);
@@ -267,56 +262,19 @@ export function BotEditorDialog({
     }
   }, [accountId, agent, independentAccounts, launchAccounts, open, useSource]);
 
-  useEffect(() => {
-    if (!open || useSource || typeof window.prospero?.getLaunchModels !== "function") {
-      setLaunchModels([]);
-      setLaunchModelsLoading(false);
-      return;
-    }
-    if (agent === "opencode") {
-      setLaunchModels([]);
-      return;
-    }
-    let cancelled = false;
-    setLaunchModelsLoading(true);
-    void window.prospero
-      .getLaunchModels(agent, accountId)
-      .then((catalog) => {
-        if (cancelled) return;
-        const models = catalog.models ?? [];
-        setLaunchModels(models);
-        const matched = models.find((item) => item.id === modelRef.current);
-        const fallback =
-          matched ??
-          models.find((item) => item.id === catalog.currentModel) ??
-          models.find((item) => item.isDefault) ??
-          models[0];
-        setModel(fallback?.id ?? modelRef.current);
-        if (fallback) {
-          setEffort((currentEffort) =>
-            (currentEffort && fallback.supportedEfforts.includes(currentEffort)
-              ? currentEffort
-              : undefined) ??
-            (fallback.id === catalog.currentModel &&
-            catalog.currentEffort &&
-            fallback.supportedEfforts.includes(catalog.currentEffort)
-              ? catalog.currentEffort
-              : undefined) ??
-            fallback.defaultEffort ??
-            fallback.supportedEfforts[0],
-          );
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setLaunchModels([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLaunchModelsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [accountId, agent, open, useSource]);
+  const { models: launchModels, loading: launchModelsLoading } = useLaunchModels({
+    enabled: open && !useSource,
+    agent,
+    accountId,
+    model,
+    effort,
+    onResolved: (resolved) => {
+      setModel((current) => resolved.model ?? current);
+      if (resolved.model) {
+        setEffort(resolved.effort);
+      }
+    },
+  });
 
   useEffect(() => {
     if (!open || !useSource) return;
@@ -344,7 +302,6 @@ export function BotEditorDialog({
   }, [effort, open, selection, sourceAgent, sourceState.sources, useSource]);
 
   const choice = selectedSourceRoute(sourceState.sources, selection, sourceAgent);
-  const selectedLaunchModel = launchModels.find((item) => item.id === model);
   const effectiveModel = customModel.trim() || model;
 
   const testFeishu = async (): Promise<void> => {
@@ -386,6 +343,7 @@ export function BotEditorDialog({
           sourceId: choice.source.id,
           routeId: choice.route.id,
           revision: choice.source.revision,
+          ...(selection?.credentialId ? { credentialId: selection.credentialId } : {}),
           agent: sourceAgent,
         });
         if (!bound.accountId) {
@@ -485,7 +443,7 @@ export function BotEditorDialog({
     <Dialog open={open} onOpenChange={(next) => { if (!saving) onOpenChange(next); }}>
       <DialogContent className="flex h-[min(84vh,670px)] w-[min(860px,calc(100vw-2rem))] flex-col gap-0 overflow-hidden p-0 sm:max-w-[860px]">
         {/* Header */}
-        <div className="flex items-center gap-3 border-b border-border px-5 py-3.5 pr-12 bg-muted/15">
+        <div className="flex items-center gap-3 border-b border-border px-5 py-3.5 pr-12 bg-[var(--surface-1)]">
           <span className="bots-pane-avatar" aria-hidden="true">
             {avatar || "🤖"}
           </span>
@@ -523,6 +481,7 @@ export function BotEditorDialog({
                 <button
                   key={item.id}
                   type="button"
+                  data-slot="bot-control"
                   className="bot-editor-nav-btn"
                   data-active={active}
                   onClick={() => setSection(item.id)}
@@ -531,7 +490,7 @@ export function BotEditorDialog({
                   <span className="truncate flex-1 text-left">{item.label}</span>
                   {item.dot && <span className="bot-feishu-dot" data-state={item.dot} />}
                   {item.badge && (
-                    <span className="text-[10px] rounded-full bg-muted px-1.5 py-0 text-muted-foreground tabular-nums">
+                    <span className="bot-editor-nav-badge">
                       {item.badge}
                     </span>
                   )}
@@ -606,6 +565,8 @@ export function BotEditorDialog({
                       type="button"
                       size="xs"
                       variant={avatar === emoji ? "secondary" : "ghost"}
+                      className="bot-avatar-preset-btn"
+                      data-active={avatar === emoji ? "true" : undefined}
                       disabled={saving}
                       onClick={() => setAvatar(emoji)}
                     >
@@ -702,7 +663,7 @@ export function BotEditorDialog({
                         const next = normalizeBotAgent(event.target.value);
                         setAgent(next);
                         setAccountId(defaultSessionLaunchAccountId(independentAccounts, next));
-                        setModel(next === "codex" ? "gpt-6-astra" : undefined);
+                        setModel(undefined);
                         setCustomModel("");
                         setEffort(undefined);
                       }}
@@ -758,83 +719,28 @@ export function BotEditorDialog({
                     disabled={saving}
                   />
                 ) : (
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <div className="grid gap-1.5">
-                      <label className="text-xs font-medium text-muted-foreground" htmlFor="bot-model-select">
-                        {t("模型", "Model")}
-                      </label>
-                      {agent === "agy" ? (
-                        <AgyModelPicker
-                          id="bot-model-select"
-                          models={launchModels}
-                          value={model}
-                          effort={effort}
-                          loading={launchModelsLoading}
-                          disabled={saving || launchModelsLoading || launchModels.length === 0}
-                          onChange={(nextModel, nextEffort) => {
-                            setModel(nextModel);
-                            setEffort(nextEffort);
-                          }}
-                        />
-                      ) : (
-                        <NativeSelect
-                          id="bot-model-select"
-                          value={model ?? ""}
-                          disabled={saving || launchModelsLoading || launchModels.length === 0}
-                          onChange={(event) => {
-                            const next = launchModels.find((item) => item.id === event.target.value);
-                            setModel(next?.id);
-                            setEffort(next?.defaultEffort ?? next?.supportedEfforts[0]);
-                          }}
-                        >
-                          {launchModels.length === 0 ? (
-                            <NativeSelectOption value={model ?? ""}>
-                              {launchModelsLoading ? t("读取目录中…", "Loading catalog…") : model || t("默认模型", "Default model")}
-                            </NativeSelectOption>
-                          ) : (
-                            launchModels.map((item) => (
-                              <NativeSelectOption key={item.id} value={item.id}>
-                                {item.label}
-                              </NativeSelectOption>
-                            ))
-                          )}
-                        </NativeSelect>
-                      )}
-                    </div>
-
-                    <div className="grid gap-1.5">
-                      <label className="text-xs font-medium text-muted-foreground" htmlFor="bot-custom-model-input">
-                        {t("自定义模型 ID（可选覆盖）", "Custom model ID (optional)")}
-                      </label>
-                      <Input
-                        id="bot-custom-model-input"
-                        value={customModel}
-                        disabled={saving}
-                        placeholder={model ?? t("留空则使用左侧所选模型", "Leave empty to use selected model")}
-                        onChange={(event) => setCustomModel(event.target.value)}
-                      />
-                    </div>
-
-                    {Boolean(selectedLaunchModel?.supportedEfforts.length) && (
-                      <div className="grid gap-1.5">
-                        <label className="text-xs font-medium text-muted-foreground" htmlFor="bot-effort-select">
-                          {t("推理强度", "Reasoning effort")}
-                        </label>
-                        <NativeSelect
-                          id="bot-effort-select"
-                          value={effort ?? ""}
-                          disabled={saving}
-                          onChange={(event) => setEffort(event.target.value || undefined)}
-                        >
-                          {selectedLaunchModel?.supportedEfforts.map((level) => (
-                            <NativeSelectOption key={level} value={level}>
-                              {agent === "agy" ? formatAgyEffortLabel(level) : level}
-                            </NativeSelectOption>
-                          ))}
-                        </NativeSelect>
-                      </div>
-                    )}
-                  </div>
+                  <LaunchModelFields
+                    agent={agent}
+                    models={launchModels}
+                    model={model}
+                    effort={effort}
+                    loading={launchModelsLoading}
+                    disabled={saving}
+                    modelSelectId="bot-model-select"
+                    effortSelectId="bot-effort-select"
+                    alwaysShowModelField={agent !== "opencode"}
+                    emptyOptionLabel={model || t("默认模型", "Default model")}
+                    customModel={customModel}
+                    onCustomModelChange={setCustomModel}
+                    customModelIdAttr="bot-custom-model-input"
+                    customModelPlaceholder={model ?? t("留空则使用上方所选模型", "Leave empty to use selected model")}
+                    onModelChange={(nextModel, nextEffort) => {
+                      setModel(nextModel);
+                      setCustomModel("");
+                      setEffort(nextEffort);
+                    }}
+                    onEffortChange={setEffort}
+                  />
                 )}
               </div>
             )}
@@ -958,7 +864,7 @@ export function BotEditorDialog({
                   </Alert>
                 )}
 
-                <details className="rounded-lg border border-border bg-muted/20 px-3.5 py-2.5 text-xs text-muted-foreground">
+                <details className="rounded-lg border border-border bg-[var(--surface-1)] px-3.5 py-2.5 text-xs text-muted-foreground">
                   <summary className="cursor-pointer font-medium text-foreground">
                     {t("飞书开放平台 3 步配置指南", "3-Step Feishu Open Platform Setup")}
                   </summary>
@@ -999,7 +905,7 @@ export function BotEditorDialog({
         )}
 
         {/* Footer */}
-        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border bg-muted/20 px-5 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border bg-[var(--surface-1)] px-5 py-3">
           <div>
             {bot && !isMaster && (
               confirmDelete ? (

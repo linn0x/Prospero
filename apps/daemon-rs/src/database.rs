@@ -450,6 +450,14 @@ impl Store {
                 END;",
             )?;
         }
+        let has_handoff_context: i64 = transaction.query_row(
+            "SELECT count(*) FROM pragma_table_info('agent_runs') WHERE name='handoff_context'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_handoff_context == 0 {
+            transaction.execute_batch("ALTER TABLE agent_runs ADD COLUMN handoff_context TEXT;")?;
+        }
         let has_updated_seq: i64 = transaction.query_row(
             "SELECT count(*) FROM pragma_table_info('timeline_records') WHERE name='updated_seq'",
             [],

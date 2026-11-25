@@ -494,6 +494,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn migrates_claude_transcript_across_config_dirs_and_strips_thinking() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let src_config = root.path().join("claude-src");
+        let dst_config = root.path().join("claude-dst");
+        let project_key: String = workspace
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let project = src_config.join("projects").join(&project_key);
+        std::fs::create_dir_all(&project).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let assistant_id = uuid::Uuid::new_v4().to_string();
+        let records = [
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "isSidechain": false,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "version": "2.1.0",
+                "type": "user",
+                "uuid": user_id,
+                "parentUuid": null,
+                "message": { "role": "user", "content": "Inspect bug" }
+            }),
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "isSidechain": false,
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "version": "2.1.0",
+                "type": "assistant",
+                "uuid": assistant_id,
+                "parentUuid": user_id,
+                "message": {
+                    "role": "assistant",
+                    "type": "message",
+                    "id": "msg_thinking",
+                    "model": "claude-opus-4-6",
+                    "content": [
+                        { "type": "thinking", "thinking": "secret chain", "signature": "sig_abc" },
+                        { "type": "redacted_thinking", "data": "encrypted" },
+                        { "type": "text", "text": "Found it" },
+                        { "type": "tool_use", "id": "tool_1", "name": "Read", "input": { "file_path": "a.rs" } }
+                    ],
+                    "stop_reason": "end_turn"
+                }
+            }),
+        ];
+        let source_path = project.join(format!("{session_id}.jsonl"));
+        let raw = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&records[0]).unwrap(),
+            serde_json::to_string(&records[1]).unwrap()
+        );
+        std::fs::write(&source_path, raw).unwrap();
+
+        let migrated_id = migrate_session_file_to_config_dir(
+            &src_config,
+            &dst_config,
+            &workspace.to_string_lossy(),
+            &session_id,
+            true,
+        )
+        .unwrap();
+        assert_ne!(migrated_id, session_id);
+        let dest_path = dst_config
+            .join("projects")
+            .join(&project_key)
+            .join(format!("{migrated_id}.jsonl"));
+        let copied = std::fs::read_to_string(&dest_path).unwrap();
+        assert!(copied.contains("Inspect bug"));
+        assert!(copied.contains("Found it"));
+        assert!(copied.contains("tool_use"));
+        assert!(!copied.contains("sig_abc"));
+        assert!(!copied.contains("redacted_thinking"));
+    }
+
     #[tokio::test]
     async fn ask_user_question_is_denied_when_interactive_questions_disabled() {
         let control_request = serde_json::json!({
@@ -623,7 +705,9 @@ pub(super) struct TurnOptions {
     pub(super) disable_interactive_questions: bool,
 }
 
-fn resolve_claude_config_dir(environment: &[(String, String)]) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_claude_config_dir(
+    environment: &[(String, String)],
+) -> Option<std::path::PathBuf> {
     if let Some((_, value)) = environment.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
         && !value.trim().is_empty()
     {
@@ -674,12 +758,35 @@ fn find_claude_session_file(
     None
 }
 
-fn fork_session_file_in_config_dir(
-    config_dir: &std::path::Path,
+fn strip_thinking_blocks(row: &mut Value) {
+    let Some(content) = row
+        .get_mut("message")
+        .and_then(Value::as_object_mut)
+        .and_then(|msg| msg.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    content.retain(|block| {
+        !matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    });
+    if content.is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": "" }));
+    }
+}
+
+fn fork_or_migrate_session_file(
+    source_config_dir: &std::path::Path,
+    target_config_dir: &std::path::Path,
     workspace: &str,
     source: &str,
+    strip_thinking: bool,
+    title_suffix: Option<&str>,
 ) -> Result<String> {
-    let source_path = find_claude_session_file(config_dir, workspace, source)
+    let source_path = find_claude_session_file(source_config_dir, workspace, source)
         .ok_or_else(|| Error::Invalid(format!("未找到 Claude 原生会话文件: {source}")))?;
     let raw = std::fs::read_to_string(&source_path)?;
     let mut all_rows = Vec::new();
@@ -795,6 +902,10 @@ fn fork_session_file_in_config_dir(
         let is_refusal_fallback = row.get("type").and_then(Value::as_str) == Some("system")
             && row.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback");
 
+        if strip_thinking && row.get("type").and_then(Value::as_str) == Some("assistant") {
+            strip_thinking_blocks(&mut row);
+        }
+
         if let Some(obj) = row.as_object_mut() {
             if is_refusal_fallback {
                 obj.insert("neutralizedByFork".into(), Value::Bool(true));
@@ -847,25 +958,77 @@ fn fork_session_file_in_config_dir(
             "relocatedCwd": cwd,
         }))?);
     }
-    let title = custom_title
-        .or(ai_title)
-        .unwrap_or_else(|| "Forked session".into());
-    out_lines.push(serde_json::to_string(&serde_json::json!({
-        "type": "custom-title",
-        "sessionId": forked_id,
-        "customTitle": format!("{title} (fork)"),
-        "uuid": uuid::Uuid::new_v4().to_string(),
-        "timestamp": now_iso,
-    }))?);
+    if let Some(suffix) = title_suffix {
+        let title = custom_title
+            .or(ai_title)
+            .unwrap_or_else(|| "Forked session".into());
+        out_lines.push(serde_json::to_string(&serde_json::json!({
+            "type": "custom-title",
+            "sessionId": forked_id,
+            "customTitle": format!("{title}{suffix}"),
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "timestamp": now_iso,
+        }))?);
+    } else if let Some(title) = custom_title.or(ai_title) {
+        out_lines.push(serde_json::to_string(&serde_json::json!({
+            "type": "custom-title",
+            "sessionId": forked_id,
+            "customTitle": title,
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "timestamp": now_iso,
+        }))?);
+    }
 
-    let parent_dir = source_path
+    let source_parent_dir = source_path
         .parent()
         .ok_or_else(|| Error::Invalid("Claude 会话目录无效".into()))?;
-    let dest_path = parent_dir.join(format!("{forked_id}.jsonl"));
+    let target_parent_dir = if source_config_dir == target_config_dir {
+        source_parent_dir.to_path_buf()
+    } else {
+        let project_dir_name = source_parent_dir
+            .file_name()
+            .ok_or_else(|| Error::Invalid("Claude 会话目录无效".into()))?;
+        let dir = target_config_dir.join("projects").join(project_dir_name);
+        std::fs::create_dir_all(&dir)?;
+        dir
+    };
+    let dest_path = target_parent_dir.join(format!("{forked_id}.jsonl"));
     let mut output = out_lines.join("\n");
     output.push('\n');
     std::fs::write(&dest_path, output)?;
     Ok(forked_id)
+}
+
+fn fork_session_file_in_config_dir(
+    config_dir: &std::path::Path,
+    workspace: &str,
+    source: &str,
+) -> Result<String> {
+    fork_or_migrate_session_file(
+        config_dir,
+        config_dir,
+        workspace,
+        source,
+        false,
+        Some(" (fork)"),
+    )
+}
+
+pub(crate) fn migrate_session_file_to_config_dir(
+    source_config_dir: &std::path::Path,
+    target_config_dir: &std::path::Path,
+    workspace: &str,
+    source: &str,
+    strip_thinking: bool,
+) -> Result<String> {
+    fork_or_migrate_session_file(
+        source_config_dir,
+        target_config_dir,
+        workspace,
+        source,
+        strip_thinking,
+        None,
+    )
 }
 
 /// Fork the persisted transcript without starting an inference turn.

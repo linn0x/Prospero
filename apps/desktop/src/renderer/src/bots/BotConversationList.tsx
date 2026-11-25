@@ -7,6 +7,7 @@ import {
   Trash2,
   UserRound,
   Users,
+  X,
 } from "lucide-react";
 import type {
   BotFeishuAdmin,
@@ -14,7 +15,6 @@ import type {
   BotThreadChannel,
   SessionInfo,
 } from "../../../shared/types";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
@@ -157,9 +157,7 @@ export function BotConversationList({
           <strong className="text-xs font-semibold text-foreground truncate">
             {t("会话列表", "Conversations")}
           </strong>
-          <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-            {threads.length}
-          </Badge>
+          <span className="bot-conv-count-pill">{threads.length}</span>
         </div>
         <Button
           variant="ghost"
@@ -178,13 +176,24 @@ export function BotConversationList({
 
       <div className="px-2.5 pb-2">
         <div className="relative">
-          <Search className="pointer-events-none absolute left-2.5 top-2 size-3.5 text-muted-foreground" />
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground" />
           <Input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder={t("搜索群名、成员或消息…", "Search group, sender, message...")}
-            className="h-7.5 pl-7.5 text-xs"
+            className="bot-conv-search-input h-7.5 pl-7.5 pr-7 text-xs"
           />
+          {query && (
+            <button
+              type="button"
+              data-slot="bot-control"
+              className="bot-conv-search-clear"
+              aria-label={t("清空搜索", "Clear search")}
+              onClick={() => setQuery("")}
+            >
+              <X className="size-3" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -201,20 +210,21 @@ export function BotConversationList({
             key={channelId}
             type="button"
             role="tab"
+            data-slot="bot-control"
             aria-selected={filter === channelId}
             className="bot-conv-filter-btn"
             data-active={filter === channelId}
             onClick={() => setFilter(channelId)}
           >
             <span>{label}</span>
-            <span className="opacity-70">{count}</span>
+            <span className="opacity-70 tabular-nums">{count}</span>
           </button>
         ))}
       </div>
 
       <div className="bot-conv-list">
         {sortedAndFiltered.length === 0 ? (
-          <div className="m-2.5 rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground">
+          <div className="m-2 rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground leading-relaxed">
             {threads.length === 0
               ? t(
                   "暂无对话。在右侧发送消息或从飞书发起对话，将自动出现在此列表中。",
@@ -244,6 +254,7 @@ export function BotConversationList({
               >
                 <button
                   type="button"
+                  data-slot="bot-control"
                   className="bot-conv-item-btn"
                   aria-current={active ? "page" : undefined}
                   onClick={() => onSelectThread(botId, thread.id)}
@@ -278,19 +289,20 @@ export function BotConversationList({
                         </span>
                       )}
                       {thread.messageCount > 0 && (
-                        <span className="ml-auto shrink-0 text-[10px] opacity-75">
+                        <span className="bot-conv-msg-count ml-auto shrink-0 text-[10px] tabular-nums">
                           {t(`${thread.messageCount}条`, `${thread.messageCount}`)}
                         </span>
                       )}
                     </div>
 
-                    <div className="line-clamp-1 text-[11px] text-muted-foreground">
+                    <div className="line-clamp-1 text-[11px] text-muted-foreground/90">
                       {rawPreview}
                     </div>
                   </div>
                 </button>
                 <button
                   type="button"
+                  data-slot="bot-control"
                   className="bot-conv-delete"
                   aria-label={t("删除对话", "Delete conversation")}
                   title={t("删除对话", "Delete conversation")}

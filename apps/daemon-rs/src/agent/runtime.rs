@@ -1996,6 +1996,11 @@ impl Agents {
         let source_id = input.source_id.clone();
         let route_id = input.route_id.clone();
         let revision = input.revision;
+        let requested_credential_id = input
+            .credential_id
+            .clone()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         let agent = input.agent;
         let requested_account = input
             .account_id
@@ -2062,6 +2067,7 @@ impl Agents {
                         &source_id,
                         &route_id,
                         revision,
+                        requested_credential_id.as_deref(),
                         Some(agent),
                         &known,
                         &account_agents,
@@ -3072,6 +3078,15 @@ impl Agents {
             },
         );
         let disable_interactive_questions = self.is_interactive_questions_disabled(id, &workspace);
+        let driver_prompt = match run
+            .handoff_context
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(handoff) => format!("{handoff}\n\n[User's New Message]\n{expanded}"),
+            None => expanded,
+        };
         let options = TurnOptions {
             policy: run.policy,
             mode: run.mode,
@@ -3088,7 +3103,7 @@ impl Agents {
         let driver = match match engine {
             AgentKind::Claude => spawn_turn(
                 &workspace,
-                &expanded,
+                &driver_prompt,
                 &attachments,
                 native_id.as_deref(),
                 &options,
@@ -3103,7 +3118,7 @@ impl Agents {
                     super::codex::spawn_turn(
                         self.0.database.directory(),
                         &workspace,
-                        &expanded,
+                        &driver_prompt,
                         native_id.as_deref(),
                         &options,
                     )
@@ -3113,7 +3128,7 @@ impl Agents {
             }
             AgentKind::Deepseek => super::deepseek::spawn_turn(
                 &workspace,
-                &expanded,
+                &driver_prompt,
                 &attachments,
                 native_id.as_deref(),
                 &options,
@@ -3122,7 +3137,7 @@ impl Agents {
             .map(Driver::Deepseek),
             AgentKind::Opencode => super::opencode::spawn_turn(
                 &workspace,
-                &expanded,
+                &driver_prompt,
                 &attachments,
                 native_id.as_deref(),
                 &options,
@@ -3131,7 +3146,7 @@ impl Agents {
             .map(Driver::Opencode),
             AgentKind::Pi => super::pi::spawn_turn(
                 &workspace,
-                &expanded,
+                &driver_prompt,
                 &attachments,
                 native_id.as_deref(),
                 &options,
@@ -3140,7 +3155,7 @@ impl Agents {
             .map(Driver::Pi),
             AgentKind::Agy => super::agy::spawn_turn(
                 &workspace,
-                &expanded,
+                &driver_prompt,
                 &attachments,
                 native_id.as_deref(),
                 &options,
@@ -3151,7 +3166,19 @@ impl Agents {
                 "Agent 暂未接入 Rust structured runtime".into(),
             )),
         } {
-            Ok(driver) => driver,
+            Ok(driver) => {
+                if run.handoff_context.is_some() {
+                    let session_id = id.to_owned();
+                    let _ = self
+                        .0
+                        .database
+                        .call_control("agent.clear_handoff", move |store| {
+                            store.clear_agent_handoff_context(&session_id)
+                        })
+                        .await;
+                }
+                driver
+            }
             Err(error) => {
                 if let Ok(session) = self.session_entry(id).await {
                     let mut usage = session.usage.lock().await;
@@ -5626,6 +5653,366 @@ impl Agents {
         Ok(AgentModelSelectionResult {
             current_model: model,
             current_effort: effort,
+        })
+    }
+
+    /// Switch an API-profile/model-source structured session to another model
+    /// source route (same-engine or cross-engine).
+    pub async fn switch_model_source(
+        &self,
+        id: &str,
+        input: AgentModelSourceSwitch,
+    ) -> Result<AgentModelSourceSwitchResult> {
+        crate::database::validate_id(id)?;
+        crate::accounts::sources::validate_source_id(&input.source_id)?;
+        crate::accounts::sources::validate_source_id(&input.route_id)?;
+        if input.revision <= 0 {
+            return Err(Error::Invalid("模型源版本无效".into()));
+        }
+        let requested_effort = match input.effort {
+            Some(raw) => {
+                if raw.chars().count() > 80 || raw.chars().any(char::is_control) {
+                    return Err(Error::Invalid("思考强度无效".into()));
+                }
+                let trimmed = raw.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            }
+            None => None,
+        };
+        if let Ok(entry) = self.session_entry(id).await
+            && entry.handle.lock().await.is_some()
+        {
+            return Err(Error::Invalid(
+                "当前轮仍在运行，请等待当前轮结束或中断后再切换模型源".into(),
+            ));
+        }
+
+        let id_owned = id.to_owned();
+        let (head, run, old_profile) = self
+            .0
+            .database
+            .call_control("session.switch_model_source_read", {
+                let data = self.0.database.directory().to_owned();
+                move |store| {
+                    let head = store.session(&id_owned)?;
+                    let run = store.agent_run(&id_owned)?;
+                    if head.kind != SessionKind::Structured
+                        || !run.active
+                        || store.agent_execution_unknown(&id_owned)?
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    if matches!(
+                        head.status,
+                        SessionStatus::Starting
+                            | SessionStatus::Running
+                            | SessionStatus::WaitingPermission
+                            | SessionStatus::WaitingInput
+                    ) {
+                        return Err(Error::Invalid(
+                            "当前轮仍在运行，请等待当前轮结束或中断后再切换模型源".into(),
+                        ));
+                    }
+                    let old_profile = match run.account_id.as_deref() {
+                        Some(acct_id)
+                            if !matches!(
+                                acct_id,
+                                crate::accounts::NATIVE_CLAUDE_ID
+                                    | crate::agent::NATIVE_CODEX_ID
+                                    | crate::accounts::NATIVE_PI_ID
+                                    | crate::accounts::NATIVE_AGY_ID
+                            ) =>
+                        {
+                            store.managed_snapshot_row(&data, acct_id)?.api_profile
+                        }
+                        _ => None,
+                    };
+                    Ok((head, run, old_profile))
+                }
+            })
+            .await?;
+
+        let Some(old_profile_ref) = old_profile.as_ref() else {
+            return Err(Error::Invalid(
+                "仅 API 模型源会话支持会话内切换模型源".into(),
+            ));
+        };
+        let previous_engine = engine_agent(run.agent, Some(old_profile_ref));
+
+        let data = self.0.database.directory().to_owned();
+        let source_id = input.source_id.clone();
+        let route_id = input.route_id.clone();
+        let revision = input.revision;
+        let requested_credential_id = input
+            .credential_id
+            .clone()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let requested_agent = input.agent;
+        let current_run_agent = run.agent;
+
+        let (
+            target_account_id,
+            target_agent,
+            target_profile,
+            source_name,
+            route_name,
+            resolved_credential_id,
+            resolved_credential_name,
+            route_default_effort,
+        ) = self
+            .0
+            .database
+            .call(move |store| {
+                let accounts = store.list_managed_accounts(&data)?;
+                let known = accounts
+                    .iter()
+                    .map(|account| account.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let account_agents = accounts
+                    .into_iter()
+                    .map(|account| (account.id, account.agent))
+                    .collect::<HashMap<_, _>>();
+                let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                let details = sources.route_details(
+                    &source_id,
+                    &route_id,
+                    revision,
+                    requested_credential_id.as_deref(),
+                )?;
+                let resolved_profile = details.profile;
+                if resolved_profile
+                    .model_capabilities
+                    .as_ref()
+                    .is_some_and(|caps| caps.tools == Some(false))
+                {
+                    return Err(Error::Invalid("此模型未启用 Agent 所需的工具调用".into()));
+                }
+                let target_agent = if let Some(agent) = requested_agent {
+                    agent
+                } else if crate::accounts::managed::validate_profile_agent(
+                    current_run_agent,
+                    &resolved_profile,
+                )
+                .is_ok()
+                    && engine_agent(current_run_agent, Some(&resolved_profile)) == previous_engine
+                {
+                    current_run_agent
+                } else {
+                    match resolved_profile.protocol() {
+                        "anthropic" => AgentKind::Claude,
+                        "openai_responses" => AgentKind::Codex,
+                        "openai_chat_completions" => AgentKind::Opencode,
+                        _ => AgentKind::Codex,
+                    }
+                };
+                let outcome = sources.bind(
+                    &source_id,
+                    &route_id,
+                    revision,
+                    requested_credential_id.as_deref(),
+                    Some(target_agent),
+                    &known,
+                    &account_agents,
+                )?;
+                let account_id = match outcome {
+                    crate::accounts::sources::BindOutcome::Existing(id) => id,
+                    crate::accounts::sources::BindOutcome::Created {
+                        account_id,
+                        agent,
+                        profile,
+                        name,
+                        secret,
+                    } => {
+                        store.insert_api_profile_account_with_id(
+                            &data,
+                            &account_id,
+                            &name,
+                            agent,
+                            &profile,
+                            &secret,
+                        )?;
+                        account_id
+                    }
+                };
+                let record = store.managed_snapshot_row(&data, &account_id)?;
+                let target_profile = record.api_profile.ok_or_else(|| {
+                    Error::Invalid("目标模型源未绑定有效的 API Profile".into())
+                })?;
+                Ok((
+                    account_id,
+                    target_agent,
+                    target_profile,
+                    details.source_name,
+                    details.route_name,
+                    details.credential_id,
+                    details.credential_name,
+                    details.default_effort,
+                ))
+            })
+            .await?;
+
+        let new_engine = engine_agent(target_agent, Some(&target_profile));
+        let target_effort = if matches!(new_engine, AgentKind::Opencode | AgentKind::Agy) {
+            None
+        } else {
+            crate::accounts::profile::normalize_profile_effort(
+                &target_profile,
+                requested_effort
+                    .as_deref()
+                    .or(route_default_effort.as_deref()),
+            )
+        };
+        let target_mode = if run.mode == PermissionMode::Plan
+            && matches!(new_engine, AgentKind::Opencode | AgentKind::Pi | AgentKind::Agy)
+        {
+            PermissionMode::Default
+        } else {
+            run.mode
+        };
+
+        let same_account = run.account_id.as_deref() == Some(target_account_id.as_str());
+        let (next_native_id, next_handoff_context, handoff_mode) = if same_account {
+            let mode_str = if run.handoff_context.is_some() {
+                "timeline_handoff"
+            } else if run.native_id.is_some() {
+                "native"
+            } else {
+                "fresh"
+            };
+            (
+                run.native_id.clone(),
+                run.handoff_context.clone(),
+                mode_str.to_owned(),
+            )
+        } else {
+            let mut migrated_native_id: Option<String> = None;
+            if previous_engine == new_engine
+                && run.handoff_context.is_none()
+                && let Some(old_native_id) = run.native_id.as_deref()
+            {
+                match new_engine {
+                    AgentKind::Claude => {
+                        let old_env =
+                            Self::account_environment(&self.0.database, run.account_id.clone())
+                                .await?;
+                        let new_env = Self::account_environment(
+                            &self.0.database,
+                            Some(target_account_id.clone()),
+                        )
+                        .await?;
+                        if let (Some(old_dir), Some(new_dir)) = (
+                            super::claude::resolve_claude_config_dir(&old_env),
+                            super::claude::resolve_claude_config_dir(&new_env),
+                        ) {
+                            let workspace = head.workspace.clone();
+                            let old_id = old_native_id.to_owned();
+                            if let Ok(Ok(new_id)) = tokio::task::spawn_blocking(move || {
+                                super::claude::migrate_session_file_to_config_dir(
+                                    &old_dir, &new_dir, &workspace, &old_id, true,
+                                )
+                            })
+                            .await
+                            {
+                                migrated_native_id = Some(new_id);
+                            }
+                        }
+                    }
+                    AgentKind::Pi => {
+                        let old_env =
+                            Self::account_environment(&self.0.database, run.account_id.clone())
+                                .await?;
+                        let new_env = Self::account_environment(
+                            &self.0.database,
+                            Some(target_account_id.clone()),
+                        )
+                        .await?;
+                        let workspace = head.workspace.clone();
+                        let old_id = old_native_id.to_owned();
+                        if let Ok(Ok(new_id)) = tokio::task::spawn_blocking(move || {
+                            super::pi::migrate_session_file(
+                                &old_env, &new_env, &workspace, &old_id,
+                            )
+                        })
+                        .await
+                        {
+                            migrated_native_id = Some(new_id);
+                        }
+                    }
+                    AgentKind::Agy => {
+                        migrated_native_id = Some(old_native_id.to_owned());
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(new_id) = migrated_native_id {
+                (Some(new_id), None, "native".to_owned())
+            } else if let Some(existing_handoff) = run.handoff_context.clone() {
+                (None, Some(existing_handoff), "timeline_handoff".to_owned())
+            } else {
+                let id_for_handoff = id.to_owned();
+                let from_engine = crate::database::label(previous_engine)?.to_owned();
+                let to_engine = crate::database::label(new_engine)?.to_owned();
+                let from_model = run.model.clone();
+                let to_model = target_profile.model.clone();
+                let handoff = self
+                    .0
+                    .database
+                    .call_control("session.build_handoff", move |store| {
+                        store.build_timeline_handoff_context(
+                            &id_for_handoff,
+                            &from_engine,
+                            from_model.as_deref(),
+                            &to_engine,
+                            &to_model,
+                        )
+                    })
+                    .await?;
+                if let Some(ctx) = handoff {
+                    (None, Some(ctx), "timeline_handoff".to_owned())
+                } else {
+                    (None, None, "fresh".to_owned())
+                }
+            }
+        };
+
+        let id_for_update = id.to_owned();
+        let target_account_for_update = target_account_id.clone();
+        let target_model_for_update = target_profile.model.clone();
+        let target_effort_for_update = target_effort.clone();
+        self.0
+            .database
+            .call_control("session.switch_model_source", move |store| {
+                store.switch_agent_model_source(
+                    &id_for_update,
+                    target_agent,
+                    &target_account_for_update,
+                    &target_model_for_update,
+                    target_effort_for_update.as_deref(),
+                    next_native_id.as_deref(),
+                    target_mode,
+                    next_handoff_context.as_deref(),
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        self.publish();
+        Ok(AgentModelSourceSwitchResult {
+            account_id: target_account_id,
+            agent: target_agent,
+            engine: new_engine,
+            previous_engine,
+            current_model: target_profile.model,
+            current_effort: target_effort,
+            source_id: input.source_id,
+            route_id: input.route_id,
+            source_name,
+            route_name,
+            credential_id: resolved_credential_id,
+            credential_name: resolved_credential_name,
+            handoff_mode,
         })
     }
 

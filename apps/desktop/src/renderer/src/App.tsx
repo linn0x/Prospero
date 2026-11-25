@@ -61,7 +61,6 @@ import {
   X,
 } from "lucide-react";
 import type {
-  AgentModel,
   DesktopSnapshot,
   PublicBot,
   SessionCreateInput,
@@ -71,7 +70,7 @@ import type {
   RemoteWorkspace,
 } from "../../shared/types";
 import { AgentLogo } from "./AgentLogo";
-import { AgyModelPicker, formatAgyEffortLabel } from "./workspace/AgyModelPicker";
+import { LaunchModelFields, useLaunchModels } from "./workspace/LaunchModelFields";
 import {
   getCachedAccountUsage,
   loadAccountUsage,
@@ -1565,6 +1564,7 @@ const ShellSidebar = memo(function ShellSidebar({
             <button
               type="button"
               role="tab"
+              data-slot="bot-control"
               aria-selected={shellMode === "workspace"}
               data-active={shellMode === "workspace" ? "true" : "false"}
               className="shell-mode-switch-btn"
@@ -1580,6 +1580,7 @@ const ShellSidebar = memo(function ShellSidebar({
             <button
               type="button"
               role="tab"
+              data-slot="bot-control"
               aria-selected={shellMode === "bots"}
               data-active={shellMode === "bots" ? "true" : "false"}
               className="shell-mode-switch-btn"
@@ -1625,6 +1626,8 @@ const ShellSidebar = memo(function ShellSidebar({
                     return (
                       <SidebarMenuItem key={bot.id}>
                         <SidebarMenuButton
+                          size="lg"
+                          className="bot-roster-button"
                           isActive={isSelected}
                           tooltip={`${bot.name} · ${bot.agent}${bot.model ? ` / ${bot.model}` : ""}`}
                           onClick={() => {
@@ -1643,7 +1646,8 @@ const ShellSidebar = memo(function ShellSidebar({
                                 )}
                               </span>
                               <span className="bot-roster-meta truncate">
-                                {bot.agent}{bot.model ? ` · ${bot.model}` : ""}
+                                <AgentLogo agent={bot.agent} size={11} decorative />
+                                <span className="truncate">{bot.agent}{bot.model ? ` · ${bot.model}` : ""}</span>
                               </span>
                             </span>
                           </span>
@@ -1697,6 +1701,8 @@ const ShellSidebar = memo(function ShellSidebar({
                     return (
                       <SidebarMenuItem key={bot.id}>
                         <SidebarMenuButton
+                          size="lg"
+                          className="bot-roster-button"
                           isActive={isSelected}
                           tooltip={`${bot.name} · ${bot.agent}${bot.model ? ` / ${bot.model}` : ""}`}
                           onClick={() => {
@@ -1715,7 +1721,8 @@ const ShellSidebar = memo(function ShellSidebar({
                                 )}
                               </span>
                               <span className="bot-roster-meta truncate">
-                                {bot.agent}{bot.model ? ` · ${bot.model}` : ""}
+                                <AgentLogo agent={bot.agent} size={11} decorative />
+                                <span className="truncate">{bot.agent}{bot.model ? ` · ${bot.model}` : ""}</span>
                               </span>
                             </span>
                           </span>
@@ -2482,11 +2489,6 @@ function NewSessionDialog({
   const [remoteId, setRemoteId] = useState<string>();
   const remoteTarget = remoteWorkspaces.find(workspace => workspace.id === remoteId);
   const [error, setError] = useState<string>();
-  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
-  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
-  const [launchModelsError, setLaunchModelsError] = useState<string>();
-  const [launchModelsRetry, setLaunchModelsRetry] = useState(0);
-  const launchCatalogKey = useRef<string | undefined>(undefined);
   const workspaceSelectRef = useRef<HTMLSelectElement>(null);
   const launchWorkspaces = useMemo(
     () => sessionLaunchWorkspaces(snapshot),
@@ -2507,9 +2509,6 @@ function NewSessionDialog({
   const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? (input.agent !== "opencode" || selectedKind === "pty"));
   const selectedWorkspace = launchWorkspaces.find(
     (workspace) => workspace.path === input.cwd,
-  );
-  const selectedLaunchModel = launchModels.find(
-    (model) => model.id === input.model,
   );
   // 对话框打开时刷新一次账号。主进程在 daemon 就绪时已经灌过一份,但 daemon
   // 可能是后启动的,账号也可能在别处刚被创建/删除 —— 这里兜住那些情况。
@@ -2565,66 +2564,38 @@ function NewSessionDialog({
     if (!useSource || sourceState.loading || sourceState.sources.length === 0) return;
     setSourceSelection((current) => selectedSourceRoute(sourceState.sources, current, sourceRuntimeAgent) ? current : defaultSourceSelection(sourceState.sources, current, sourceRuntimeAgent));
   }, [sourceRuntimeAgent, sourceState.sources, sourceState.loading, useSource]);
-  useEffect(() => {
-    if (!open || !supportsLaunchModels) {
-      launchCatalogKey.current = undefined;
-      setLaunchModels([]);
-      setLaunchModelsLoading(false);
-      setLaunchModelsError(undefined);
-      return;
-    }
-    if (tab !== "session") return;
-    const catalogKey = JSON.stringify([input.agent, input.accountId, input.kind, launchModelsRetry]);
-    if (launchCatalogKey.current === catalogKey) return;
-    let cancelled = false;
-    const agent = input.agent as "codex" | "claude" | "agy" | "deepseek" | "opencode" | "pi";
-    const accountId = input.accountId;
-    const kind = input.kind;
-    setLaunchModels([]);
-    setLaunchModelsLoading(true);
-    setLaunchModelsError(undefined);
-    void window.prospero
-      .getLaunchModels(agent, accountId)
-      .then((catalog) => {
-        if (cancelled) return;
-        launchCatalogKey.current = catalogKey;
-        setLaunchModels(catalog.models);
-        setInput((current) => {
-          if (
-            current.agent !== agent ||
-            current.kind !== kind ||
-            current.accountId !== accountId
-          ) return current;
-          const preferred = catalog.models.find(candidate => candidate.id === current.model);
-          const model = preferred ?? catalog.models.find(candidate => candidate.id === catalog.currentModel)
-            ?? catalog.models.find(candidate => candidate.isDefault) ?? catalog.models[0];
-          return {
-            ...current,
-            model: model?.id,
-            effort:
-              (preferred && current.effort && preferred.supportedEfforts.includes(current.effort) ? current.effort : undefined) ??
-              (model && model.id === catalog.currentModel && catalog.currentEffort && model.supportedEfforts.includes(catalog.currentEffort) ? catalog.currentEffort : undefined) ??
-              model?.defaultEffort ??
-              model?.supportedEfforts[0],
-          };
-        });
-      })
-      .catch((reason) => {
-        if (cancelled) return;
-        setLaunchModelsError(reportError(reason));
-        setInput((current) =>
-          current.agent === agent && current.accountId === accountId
-            ? { ...current, model: undefined, effort: undefined }
-            : current,
-        );
-      })
-      .finally(() => {
-        if (!cancelled) setLaunchModelsLoading(false);
+  const {
+    models: launchModels,
+    loading: launchModelsLoading,
+    error: launchModelsError,
+    retry: retryLaunchModels,
+  } = useLaunchModels({
+    enabled: open && tab === "session" && supportsLaunchModels,
+    agent: input.agent,
+    accountId: input.accountId,
+    model: input.model,
+    effort: input.effort,
+    cacheKeyExtra: input.kind,
+    onResolved: (resolved, _catalog, meta) => {
+      setInput((current) => {
+        if (current.agent !== meta.agent || current.accountId !== meta.accountId) {
+          return current;
+        }
+        return {
+          ...current,
+          model: resolved.model,
+          effort: resolved.effort,
+        };
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [input.accountId, input.agent, input.kind, launchModelsRetry, open, supportsLaunchModels, tab]);
+    },
+    onError: (_message, meta) => {
+      setInput((current) =>
+        current.agent === meta.agent && current.accountId === meta.accountId
+          ? { ...current, model: undefined, effort: undefined }
+          : current,
+      );
+    },
+  });
   const creationBlocker = choosingWorkspace
     ? t("请先完成工作区选择。", "Finish choosing a workspace first.")
     : remoteId
@@ -2650,12 +2621,12 @@ function NewSessionDialog({
       let created: SessionInfo;
       if (useSource) {
         if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
-        const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
+        const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, ...(sourceSelection.credentialId ? { credentialId: sourceSelection.credentialId } : {}), agent: sourceRuntimeAgent });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
         const routeEfforts = sourceChoice.route.protocol !== "openai_chat_completions" ? (sourceChoice.route.modelCapabilities?.supportedEfforts ?? []) : [];
         const sessionEffort = (input.effort && routeEfforts.some(level => level === input.effort) ? input.effort : undefined) ?? sourceChoice.route.defaultEffort;
         created = await window.prospero.createSession({ cwd: input.cwd, agent: sourceRuntimeAgent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, ...(sessionEffort ? { effort: sessionEffort as SessionCreateInput["effort"] } : {}) });
-        rememberSourceSelection({ sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, agent: sourceRuntimeAgent });
+        rememberSourceSelection({ sourceId: sourceChoice.source.id, routeId: sourceChoice.route.id, revision: sourceChoice.source.revision, ...(sourceSelection.credentialId ? { credentialId: sourceSelection.credentialId } : {}), agent: sourceRuntimeAgent });
       } else {
         created = await window.prospero.createSession({ ...input, kind: selectedKind, approvalPolicy: selectedApprovalPolicy, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort });
         rememberSourceSelection(undefined);
@@ -2900,109 +2871,28 @@ function NewSessionDialog({
                     </Field>
                   )}
                   {supportsLaunchModels && (
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <Field>
-                        <FieldLabel htmlFor="session-model">
-                          {t("模型", "Model")}
-                        </FieldLabel>
-                        {input.agent === "agy" ? (
-                          <AgyModelPicker
-                            id="session-model"
-                            models={launchModels}
-                            value={input.model}
-                            effort={input.effort}
-                            loading={launchModelsLoading}
-                            disabled={busy || launchModelsLoading || launchModels.length === 0}
-                            ariaInvalid={Boolean(launchModelsError)}
-                            ariaDescribedBy={launchModelsError ? "session-model-error" : undefined}
-                            onChange={(modelId, nextEffort) =>
-                              setInput({
-                                ...input,
-                                model: modelId,
-                                effort: nextEffort,
-                              })
-                            }
-                          />
-                        ) : (
-                          <NativeSelect
-                            id="session-model"
-                            value={input.model ?? ""}
-                            disabled={launchModelsLoading || launchModels.length === 0}
-                            aria-busy={launchModelsLoading}
-                            aria-describedby={launchModelsError ? "session-model-error" : undefined}
-                            aria-invalid={Boolean(launchModelsError)}
-                            onChange={(event) => {
-                              const model = launchModels.find(
-                                (candidate) => candidate.id === event.target.value,
-                              );
-                              setInput({
-                                ...input,
-                                model: model?.id,
-                                effort:
-                                  model?.defaultEffort ?? model?.supportedEfforts[0],
-                              });
-                            }}
-                          >
-                            {(launchModelsLoading || launchModels.length === 0) && (
-                              <NativeSelectOption value="" disabled>
-                                {launchModelsLoading
-                                  ? t("读取模型中…", "Loading models…")
-                                  : t("没有可用模型", "No models available")}
-                              </NativeSelectOption>
-                            )}
-                            {launchModels.map((model) => (
-                              <NativeSelectOption value={model.id} key={model.id}>
-                                {model.label}
-                              </NativeSelectOption>
-                            ))}
-                          </NativeSelect>
-                        )}
-                        <FieldDescription
-                          id={launchModelsError ? "session-model-error" : undefined}
-                          role={launchModelsError ? "alert" : undefined}
-                        >
-                          {launchModelsError ??
-                            selectedLaunchModel?.description ??
-                            t("目录随所选订阅账号实时读取。", "Catalog loaded for the selected subscription.")}
-                        </FieldDescription>
-                        {!launchModelsLoading && (launchModelsError || launchModels.length === 0) && <Button
-                          className="session-retry-models w-fit" variant="ghost" size="sm"
-                          onClick={() => setLaunchModelsRetry(value => value + 1)}
-                        ><RefreshCw />{launchModelsError ? t("重试读取模型", "Retry loading models") : t("刷新模型列表", "Refresh model list")}</Button>}
-                      </Field>
-                      <Field>
-                        <FieldLabel htmlFor="session-effort">
-                          {t("推理强度", "Reasoning effort")}
-                        </FieldLabel>
-                        <NativeSelect
-                          id="session-effort"
-                          value={input.effort ?? ""}
-                          disabled={selectedAccount?.capabilities?.reasoningEffort === false || !selectedLaunchModel?.supportedEfforts.length}
-                          onChange={(event) =>
-                            setInput({
-                              ...input,
-                              effort: event.target.value || undefined,
-                            })
-                          }
-                        >
-                          {(!selectedLaunchModel?.supportedEfforts.length || !input.effort) && (
-                            <NativeSelectOption value="" disabled>
-                              {t("使用模型默认值", "Use model default")}
-                            </NativeSelectOption>
-                          )}
-                          {selectedLaunchModel?.supportedEfforts.map((effort) => (
-                            <NativeSelectOption value={effort} key={effort}>
-                              {input.agent === "agy" ? formatAgyEffortLabel(effort) : effort}
-                            </NativeSelectOption>
-                          ))}
-                        </NativeSelect>
-                        <FieldDescription>
-                          {selectedLaunchModel?.supportedEfforts.length
-                            ? t("只显示该模型支持的档位。", "Only efforts supported by this model are shown.")
-                            : t("当前模型没有可选档位。", "This model has no selectable effort levels.")}
-                        </FieldDescription>
-                      </Field>
-                    </div>
+                    <LaunchModelFields
+                      agent={input.agent}
+                      models={launchModels}
+                      model={input.model}
+                      effort={input.effort}
+                      loading={launchModelsLoading}
+                      disabled={busy}
+                      effortDisabled={selectedAccount?.capabilities?.reasoningEffort === false}
+                      error={launchModelsError}
+                      onRetry={retryLaunchModels}
+                      modelSelectId="session-model"
+                      effortSelectId="session-effort"
+                      alwaysShowModelField
+                      showDescriptions
+                      showEmptyEffortPlaceholder
+                      onModelChange={(modelId, nextEffort) =>
+                        setInput({ ...input, model: modelId, effort: nextEffort })
+                      }
+                      onEffortChange={(nextEffort) =>
+                        setInput({ ...input, effort: nextEffort })
+                      }
+                    />
                   )}
                 </>
               )}

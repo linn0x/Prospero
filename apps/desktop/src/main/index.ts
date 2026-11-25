@@ -15,6 +15,7 @@ import { accountModelsRequest, accountModelsResult, accountConfigRequest, accoun
 import { windowAppearance } from "../shared/window-appearance";
 import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
 import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
+import { supportsTerminalImagePaste } from "../shared/terminal-image-paste";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import { DaemonRuntime } from "./daemon-runtime";
 import { RustRuntime, TIMELINE_LONG_POLL_WAIT_MS } from "./rust-runtime";
@@ -1160,7 +1161,7 @@ function installIpc(): void {
     if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
     const id = requireId(rawId, "终端会话");
     const session = store.snapshot().daemon.sessions.find(item => item.id === id);
-    if (!session || session.kind !== "pty" || !["codex", "claude", "pi"].includes(session.agent)) throw new Error("此会话不支持图片粘贴 / Image paste is unavailable for this session");
+    if (!session || session.kind !== "pty" || !supportsTerminalImagePaste(session.agent)) throw new Error("此会话不支持图片粘贴 / Image paste is unavailable for this session");
     const copiedFiles = readClipboardFilePaths();
     if (copiedFiles.length > 0) {
       return { path: copiedFiles[0]! };
@@ -1528,6 +1529,29 @@ function installIpc(): void {
     return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/models`, {
       method: "POST",
       body: { model, ...(effort ? { effort } : {}) },
+    });
+  });
+  ipcMain.handle("session:model-source:set", (_event, rawId: unknown, rawInput: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    const input = requireObject(rawInput);
+    const sourceId = requireId(input["sourceId"], "模型源");
+    const routeId = requireId(input["routeId"], "模型路由");
+    const revision = typeof input["revision"] === "number" && Number.isInteger(input["revision"]) && input["revision"] > 0 ? input["revision"] : undefined;
+    if (revision === undefined) throw new Error("模型源版本无效");
+    const agent = input["agent"];
+    if (agent !== undefined && agent !== "claude" && agent !== "codex" && agent !== "opencode" && agent !== "pi" && agent !== "agy") {
+      throw new Error("执行引擎无效");
+    }
+    const effort = input["effort"] === undefined ? undefined : requireSelection(input["effort"], "推理强度", 80);
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/model-source`, {
+      method: "POST",
+      body: {
+        sourceId,
+        routeId,
+        revision,
+        ...(agent ? { agent } : {}),
+        ...(effort ? { effort } : {}),
+      },
     });
   });
   ipcMain.handle("orchestration:action", async (_event, rawMethod: unknown, rawParams: unknown) => {

@@ -1238,6 +1238,7 @@ mod tests {
                     &source.id,
                     &source.routes[0].id,
                     source.revision,
+                    None,
                     Some(AgentKind::Codex),
                     &std::collections::HashSet::new(),
                     &std::collections::HashMap::new(),

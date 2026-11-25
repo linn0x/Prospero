@@ -122,7 +122,16 @@ pub(crate) fn fork_session_file(
     workspace: &str,
     source_native_id: &str,
 ) -> Result<String> {
-    let source_path = find_session_file(environment, source_native_id)
+    migrate_session_file(environment, environment, workspace, source_native_id)
+}
+
+pub(crate) fn migrate_session_file(
+    source_env: &[(String, String)],
+    target_env: &[(String, String)],
+    workspace: &str,
+    source_native_id: &str,
+) -> Result<String> {
+    let source_path = find_session_file(source_env, source_native_id)
         .ok_or_else(|| Error::Invalid(format!("未找到 Pi 原生会话文件: {source_native_id}")))?;
     let raw = std::fs::read_to_string(&source_path)?;
     let mut lines = raw.lines();
@@ -131,14 +140,14 @@ pub(crate) fn fork_session_file(
         .ok_or_else(|| Error::Invalid("Pi 原生会话文件为空".into()))?;
     let mut header: Value = serde_json::from_str(header_line)
         .map_err(|_| Error::Invalid("Pi 原生会话头格式无效".into()))?;
-    let forked_id = uuid::Uuid::new_v4().to_string();
+    let migrated_id = uuid::Uuid::new_v4().to_string();
     let now_ms = crate::database::now();
     let secs = (now_ms / 1000).max(0);
     let millis = (now_ms % 1000).max(0);
     let timestamp = format!("{secs}.{millis:03}Z");
     if let Some(obj) = header.as_object_mut() {
         obj.insert("type".into(), json!("session"));
-        obj.insert("id".into(), json!(forked_id));
+        obj.insert("id".into(), json!(migrated_id));
         obj.insert("timestamp".into(), json!(timestamp));
         obj.insert("cwd".into(), json!(workspace));
         obj.insert(
@@ -146,10 +155,22 @@ pub(crate) fn fork_session_file(
             json!(source_path.to_string_lossy().as_ref()),
         );
     }
-    let parent_dir = source_path
+    let source_parent = source_path
         .parent()
         .ok_or_else(|| Error::Invalid("Pi 会话目录无效".into()))?;
-    let dest_path = parent_dir.join(format!("{now_ms}_{forked_id}.jsonl"));
+    let dest_dir = if source_env == target_env {
+        source_parent.to_path_buf()
+    } else {
+        let source_root = pi_sessions_dir(source_env);
+        let target_root = pi_sessions_dir(target_env);
+        let dir = match source_parent.strip_prefix(&source_root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => target_root.join(rel),
+            _ => target_root,
+        };
+        std::fs::create_dir_all(&dir)?;
+        dir
+    };
+    let dest_path = dest_dir.join(format!("{now_ms}_{migrated_id}.jsonl"));
     let mut output = serde_json::to_string(&header)?;
     output.push('\n');
     for line in lines {
@@ -159,7 +180,7 @@ pub(crate) fn fork_session_file(
         }
     }
     std::fs::write(&dest_path, output)?;
-    Ok(forked_id)
+    Ok(migrated_id)
 }
 
 fn normalize_thinking_level(effort: &str) -> Option<&'static str> {
@@ -1272,5 +1293,48 @@ impl PiTurn {
 
     pub(super) fn lifecycle(&self) -> ProcessLifecycle {
         self.lifecycle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_pi_session_file_across_agent_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let src_dir = root.path().join("pi-src");
+        let dst_dir = root.path().join("pi-dst");
+        let sessions_sub = src_dir.join("sessions").join("project-a");
+        std::fs::create_dir_all(&sessions_sub).unwrap();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let src_file = sessions_sub.join(format!("1000_{source_id}.jsonl"));
+        let header = serde_json::json!({
+            "type": "session",
+            "id": source_id,
+            "timestamp": "1000.000Z",
+            "cwd": "/old"
+        });
+        let msg = serde_json::json!({
+            "type": "message",
+            "message": { "role": "user", "content": "hello pi" }
+        });
+        std::fs::write(&src_file, format!("{header}\n{msg}\n")).unwrap();
+
+        let src_env = vec![(
+            "PI_CODING_AGENT_DIR".into(),
+            src_dir.to_string_lossy().into_owned(),
+        )];
+        let dst_env = vec![(
+            "PI_CODING_AGENT_DIR".into(),
+            dst_dir.to_string_lossy().into_owned(),
+        )];
+        let migrated_id = migrate_session_file(&src_env, &dst_env, "/repo/new", &source_id).unwrap();
+        assert_ne!(migrated_id, source_id);
+        let found = find_session_file(&dst_env, &migrated_id).unwrap();
+        assert!(found.starts_with(dst_dir.join("sessions").join("project-a")));
+        let body = std::fs::read_to_string(&found).unwrap();
+        assert!(body.contains("hello pi"));
+        assert!(body.contains("/repo/new"));
     }
 }

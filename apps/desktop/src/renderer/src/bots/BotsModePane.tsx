@@ -211,13 +211,23 @@ export function BotsModePane({
     <div className="bots-pane" data-testid="bots-mode-pane">
       <header className="bots-pane-header">
         <div className="bots-pane-identity">
+          <Button
+            variant={listOpen ? "secondary" : "ghost"}
+            size="icon-sm"
+            aria-pressed={listOpen}
+            aria-label={t("会话列表", "Chats")}
+            title={t("收起/展开会话列表", "Toggle conversations")}
+            onClick={() => setListOpen((prev) => !prev)}
+          >
+            <PanelLeft />
+          </Button>
           <span className="bots-pane-avatar" aria-hidden="true">
             {bot.avatar}
           </span>
           <div className="bots-pane-titles">
             <div className="bots-pane-title-row">
               <h2>{bot.name}</h2>
-              <Badge variant={bot.kind === "master" ? "default" : "secondary"}>
+              <Badge variant={bot.kind === "master" ? "default" : "secondary"} className="h-4.5 px-1.5 text-[10px]">
                 {bot.kind === "master" ? t("主控 Bot", "Master") : t("子 Bot", "Sub-Bot")}
               </Badge>
               {activeThread && (
@@ -227,38 +237,37 @@ export function BotsModePane({
               )}
             </div>
             <div className="bots-pane-subtitle">
-              <AgentLogo agent={bot.agent} size={13} decorative />
-              <span>{bot.agent}</span>
-              {bot.model && (
-                <>
-                  <span>·</span>
-                  <code>{bot.model}</code>
-                </>
-              )}
-              <span>·</span>
-              <span className="inline-flex items-center gap-1">
+              <span className="bots-meta-chip">
+                <AgentLogo agent={bot.agent} size={12} decorative />
+                <span>{bot.agent}</span>
+                {bot.model && (
+                  <>
+                    <span className="opacity-45">·</span>
+                    <code>{bot.model}</code>
+                  </>
+                )}
+              </span>
+              <span className="bots-meta-chip">
                 <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
-                {feishuStateLabel(bot.feishuStatus.state, t)}
+                <span>{feishuStateLabel(bot.feishuStatus.state, t)}</span>
               </span>
               {bot.feishu.enabled && (
-                <>
-                  <span>·</span>
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-1 rounded px-1 py-0.5 text-[11px] hover:bg-muted transition-colors"
-                    title={t("点击配置飞书权限与管理员", "Configure Feishu permissions & admins")}
-                    onClick={() => {
-                      setInspectorTab("access");
-                      setInspectorOpen(true);
-                    }}
-                  >
-                    <ShieldCheck className="size-3 text-emerald-600 dark:text-emerald-400" />
-                    <span>
-                      {accessPolicyLabel(bot.feishu.accessPolicy, t)}
-                      {bot.feishu.adminUsers.length > 0 ? ` (${bot.feishu.adminUsers.length})` : ""}
-                    </span>
-                  </button>
-                </>
+                <button
+                  type="button"
+                  data-slot="bot-control"
+                  className="bots-acl-pill"
+                  title={t("点击配置飞书权限与管理员", "Configure Feishu permissions & admins")}
+                  onClick={() => {
+                    setInspectorTab("access");
+                    setInspectorOpen(true);
+                  }}
+                >
+                  <ShieldCheck className="size-3 text-emerald-600 dark:text-emerald-400" />
+                  <span>
+                    {accessPolicyLabel(bot.feishu.accessPolicy, t)}
+                    {bot.feishu.adminUsers.length > 0 ? ` (${bot.feishu.adminUsers.length})` : ""}
+                  </span>
+                </button>
               )}
             </div>
           </div>
@@ -266,19 +275,23 @@ export function BotsModePane({
 
         <div className="bots-pane-actions">
           <Button
-            variant={listOpen ? "secondary" : "outline"}
+            variant="ghost"
             size="sm"
-            aria-pressed={listOpen}
-            onClick={() => setListOpen((prev) => !prev)}
+            onClick={() => {
+              setInspectorTab("memory");
+              setInspectorOpen(true);
+            }}
           >
-            <PanelLeft data-icon="inline-start" />
-            {t("会话列表", "Chats")}
-            {bot.threads.length > 0 && (
-              <span className="ml-0.5 text-[11px] opacity-75">({bot.threads.length})</span>
-            )}
+            <BookMarked data-icon="inline-start" />
+            {t("记忆与权限", "Memory & ACL")}
           </Button>
+          <Button variant="ghost" size="sm" onClick={() => onEditBot(bot)}>
+            <Settings data-icon="inline-start" />
+            {t("配置 Bot", "Configure")}
+          </Button>
+          <span className="bots-header-divider" aria-hidden="true" />
           <Button
-            variant="outline"
+            variant="secondary"
             size="sm"
             disabled={creatingThread}
             onClick={() => void startNewThread()}
@@ -290,6 +303,7 @@ export function BotsModePane({
             <Button
               variant="ghost"
               size="sm"
+              className="bots-header-delete-btn"
               title={t("删除当前话题", "Delete current thread")}
               onClick={() => onArchiveThread(bot.id, activeThread.id)}
             >
@@ -297,21 +311,6 @@ export function BotsModePane({
               {t("删除话题", "Delete")}
             </Button>
           )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              setInspectorTab("memory");
-              setInspectorOpen(true);
-            }}
-          >
-            <BookMarked data-icon="inline-start" />
-            {t("记忆与权限", "Memory & ACL")}
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => onEditBot(bot)}>
-            <Settings data-icon="inline-start" />
-            {t("配置 Bot", "Configure")}
-          </Button>
         </div>
       </header>
 
@@ -350,10 +349,12 @@ export function BotsModePane({
             />
           ) : (
             <div className="bots-hero">
-              <div className="bots-hero-avatar">{bot.avatar}</div>
+              <div className="bots-hero-avatar-wrap">
+                <div className="bots-hero-avatar">{bot.avatar}</div>
+              </div>
               <div className="grid gap-1.5">
-                <h3 className="text-lg font-semibold">{bot.name}</h3>
-                <p className="text-sm text-muted-foreground">
+                <h3 className="text-lg font-semibold tracking-tight">{bot.name}</h3>
+                <p className="text-sm text-muted-foreground max-w-md mx-auto">
                   {bot.description ||
                     t(
                       "类似 GrokBot / Muse 的常驻个人智能体：发送一条消息开启新话题，或绑定飞书随时对话。",
@@ -362,14 +363,31 @@ export function BotsModePane({
                 </p>
               </div>
 
+              <div className="bots-hero-meta-strip">
+                <span className="bots-meta-chip">
+                  <AgentLogo agent={bot.agent} size={12} decorative />
+                  <span>{bot.agent}</span>
+                  {bot.model && (
+                    <>
+                      <span className="opacity-45">·</span>
+                      <code>{bot.model}</code>
+                    </>
+                  )}
+                </span>
+                <span className="bots-meta-chip">
+                  <span className="bot-feishu-dot" data-state={bot.feishuStatus.state} />
+                  <span>{feishuStateLabel(bot.feishuStatus.state, t)}</span>
+                </span>
+              </div>
+
               {heroError && (
                 <p className="text-xs text-destructive" role="alert">
                   {heroError}
                 </p>
               )}
 
-              <div className="w-full max-w-xl grid gap-2">
-                <InputGroup className="h-auto rounded-xl bg-card shadow-sm">
+              <div className="w-full max-w-xl grid gap-2.5">
+                <InputGroup className="h-auto rounded-2xl border-border/90 bg-card shadow-sm transition-shadow focus-within:border-ring focus-within:shadow-md">
                   <InputGroupTextarea
                     rows={3}
                     value={heroPrompt}
@@ -387,7 +405,7 @@ export function BotsModePane({
                     }}
                   />
                 </InputGroup>
-                <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
                   {bot.kind === "sub" && !bot.feishu.enabled ? (
                     <Button variant="ghost" size="sm" onClick={() => onEditBot(bot)}>
                       {t("配置飞书机器人 IM", "Connect Feishu Bot IM")}
@@ -411,15 +429,17 @@ export function BotsModePane({
 
               <div className="bots-hero-prompts">
                 {starters.map((prompt) => (
-                  <Button
+                  <button
                     key={prompt}
-                    variant="outline"
-                    size="sm"
+                    type="button"
+                    data-slot="bot-control"
+                    className="bots-hero-prompt-card"
                     disabled={creatingThread}
                     onClick={() => void startNewThread(prompt)}
                   >
-                    {prompt}
-                  </Button>
+                    <Sparkles className="size-3.5 shrink-0 text-primary" aria-hidden="true" />
+                    <span className="text-left leading-snug">{prompt}</span>
+                  </button>
                 ))}
               </div>
             </div>

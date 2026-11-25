@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import { parseFontFamilies } from "../src/main/native-ghostty";
+import { supportsTerminalImagePaste as sharedSupportsTerminalImagePaste } from "../src/shared/terminal-image-paste";
 import { supportsTerminalImagePaste, terminalAgentImageReference, terminalAgentNewline } from "../src/renderer/src/terminal-agent-input";
 
 const key = { type: "keydown", code: "Enter", metaKey: false, ctrlKey: false, altKey: false, shiftKey: true };
@@ -21,6 +22,7 @@ it("preserves supported agents' modified Enter identities without remapping shel
 
 it("formats escaped pasted image paths across CLI agents and shell without sending Enter", () => {
   for (const agent of ["codex", "claude", "pi", "agy", "opencode", "grok", "trae", "deepseek"]) {
+    expect(sharedSupportsTerminalImagePaste(agent)).toBe(true);
     expect(supportsTerminalImagePaste(agent)).toBe(true);
     expect(terminalAgentImageReference(agent, "/tmp/My screenshot.png")).toBe('"/tmp/My screenshot.png"');
     expect(terminalAgentImageReference(agent, "/tmp/截屏.png")).toBe('"/tmp/截屏.png"');
@@ -30,11 +32,13 @@ it("formats escaped pasted image paths across CLI agents and shell without sendi
     expect(terminalAgentImageReference(agent, "/tmp/back\\slash.png")).toBe('"/tmp/back\\\\slash.png"');
     expect(terminalAgentImageReference(agent, "/tmp/line\nimage.png")).toBe('"/tmp/line\nimage.png"');
   }
+  expect(sharedSupportsTerminalImagePaste("shell")).toBe(true);
   expect(supportsTerminalImagePaste("shell")).toBe(true);
   expect(terminalAgentImageReference("shell", "/tmp/My screenshot.png")).toBe("'/tmp/My screenshot.png'");
   expect(terminalAgentImageReference("shell", "/tmp/截屏'1.png")).toBe("'/tmp/截屏'\\''1.png'");
   expect(terminalAgentImageReference("shell", "/tmp/$(whoami)`id`.png")).toBe("'/tmp/$(whoami)`id`.png'");
   expect(terminalAgentImageReference("shell", "C:\\Users\\Jane Doe\\shot.png")).toBe('"C:\\Users\\Jane Doe\\shot.png"');
+  expect(sharedSupportsTerminalImagePaste("unknown")).toBe(false);
   expect(supportsTerminalImagePaste("unknown")).toBe(false);
   expect(terminalAgentImageReference("unknown", "/tmp/image.png")).toBeUndefined();
   expect(terminalAgentImageReference("codex", "")).toBeUndefined();

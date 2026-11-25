@@ -375,6 +375,31 @@ export type AgentPreset = { id: string; name: string; description?: string; isDe
 export type AgentModelCatalog = { models: AgentModel[]; currentModel?: string; currentEffort?: string; presets?: AgentPreset[]; currentPreset?: string };
 export type SkillSuggestion = { value: string; label?: string; detail?: string };
 
+export type AgentModelSourceSwitchInput = {
+  sourceId: string;
+  routeId: string;
+  revision: number;
+  credentialId?: string;
+  agent?: "codex" | "claude" | "opencode" | "pi" | "agy";
+  effort?: string;
+};
+
+export type AgentModelSourceSwitchResult = {
+  accountId: string;
+  agent: string;
+  engine: string;
+  previousEngine: string;
+  currentModel: string;
+  currentEffort?: string;
+  sourceId: string;
+  routeId: string;
+  sourceName: string;
+  routeName: string;
+  credentialId: string;
+  credentialName: string;
+  handoffMode: "native" | "timeline_handoff" | "fresh";
+};
+
 export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   nativeTerminal: {
     available(): Promise<{ available: boolean; reason?: string }>;
@@ -433,6 +458,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
       sourceId?: string;
       routeId?: string;
       revision?: number;
+      credentialId?: string;
       agent: "codex" | "claude" | "opencode" | "pi" | "deepseek" | "agy";
       task: string;
       title?: string;
@@ -465,6 +491,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   getLaunchModels(agent: "codex" | "claude" | "deepseek" | "opencode" | "pi" | "agy", accountId?: string): Promise<AgentModelCatalog>;
   getAgentModels(sessionId: string): Promise<AgentModelCatalog>;
   setAgentModel(sessionId: string, model: string, effort?: string): Promise<{ currentModel: string; currentEffort?: string }>;
+  switchAgentModelSource(sessionId: string, input: AgentModelSourceSwitchInput): Promise<AgentModelSourceSwitchResult>;
   orchestrationAction(method: string, params: JsonObject): Promise<JsonObject>;
   getOrchestrationTask(taskId: string): Promise<JsonObject>;
   getOrchestrationRunTasks(runId: string): Promise<JsonObject[]>;

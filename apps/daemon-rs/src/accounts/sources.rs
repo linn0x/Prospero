@@ -245,6 +245,24 @@ pub struct SourceBindingView {
     pub revision: i64,
     pub source_name: String,
     pub route_name: String,
+    #[serde(
+        rename = "credentialId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credential_id: Option<String>,
+    #[serde(
+        rename = "credentialName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credential_name: Option<String>,
+    #[serde(
+        rename = "multiCredential",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub multi_credential: Option<bool>,
     pub legacy: bool,
     pub current: bool,
 }
@@ -460,6 +478,8 @@ pub(crate) enum SourceAction {
         #[serde(rename = "routeId")]
         route_id: String,
         revision: i64,
+        #[serde(rename = "credentialId", default)]
+        credential_id: Option<String>,
         agent: Option<AgentKind>,
     },
     #[serde(rename = "migration.preview")]
@@ -548,8 +568,19 @@ pub(crate) struct BoundRoute {
     pub profile: ApiProfile,
     pub account_name: String,
     pub credential_id: String,
+    pub credential_name: String,
     pub credential_revision: i64,
     pub secret: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RouteDetails {
+    pub source_name: String,
+    pub route_name: String,
+    pub credential_id: String,
+    pub credential_name: String,
+    pub profile: ApiProfile,
+    pub default_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -615,18 +646,31 @@ impl ModelSources {
             .bindings
             .iter()
             .find(|binding| binding.account_id == account_id)?;
-        let current = self
+        let source = self
             .registry
             .sources
             .iter()
-            .find(|source| source.id == binding.source_id)
-            .is_some_and(|source| source.revision == binding.revision);
+            .find(|source| source.id == binding.source_id);
+        let current = source.is_some_and(|source| source.revision == binding.revision);
+        let credential_name = source.and_then(|source| {
+            source
+                .credentials
+                .iter()
+                .find(|credential| credential.id == binding.credential_id)
+                .map(|credential| credential.name.clone())
+        });
+        let multi_credential = source
+            .filter(|source| source.credentials.len() > 1)
+            .map(|_| true);
         Some(SourceBindingView {
             source_id: binding.source_id.clone(),
             route_id: binding.route_id.clone(),
             revision: binding.revision,
             source_name: binding.source_name.clone(),
             route_name: binding.route_name.clone(),
+            credential_id: Some(binding.credential_id.clone()),
+            credential_name,
+            multi_credential,
             legacy: binding.legacy,
             current,
         })
@@ -737,7 +781,13 @@ impl ModelSources {
             .ok_or_else(|| Error::Invalid("模型源凭据缺失，已停止连接".into()))
     }
 
-    fn resolve_route(&self, source_id: &str, route_id: &str, revision: i64) -> Result<BoundRoute> {
+    fn resolve_route(
+        &self,
+        source_id: &str,
+        route_id: &str,
+        revision: i64,
+        credential_id: Option<&str>,
+    ) -> Result<BoundRoute> {
         let source = self.require_source(source_id, revision)?;
         let route = source
             .routes
@@ -752,17 +802,27 @@ impl ModelSources {
             .iter()
             .find(|endpoint| endpoint.protocol == route.protocol)
             .ok_or_else(|| Error::Invalid("模型协议缺少连接地址".into()))?;
+        if let Some(cid) = credential_id {
+            validate_source_id(cid)?;
+        }
+        let effective_credential_id = credential_id.unwrap_or(&route.credential_id);
         let info = source
             .credentials
             .iter()
-            .find(|credential| credential.id == route.credential_id)
+            .find(|credential| credential.id == effective_credential_id)
             .ok_or_else(|| Error::Invalid("模型凭据不存在".into()))?;
         let secret = self.credential_secret(source_id, &info.id, info.revision)?;
         let profile = route_profile(endpoint, route)?;
+        let account_name = if effective_credential_id != route.credential_id {
+            format!("{} / {} ({})", source.name, route.name, info.name)
+        } else {
+            format!("{} / {}", source.name, route.name)
+        };
         Ok(BoundRoute {
             profile,
-            account_name: format!("{} / {}", source.name, route.name),
+            account_name,
             credential_id: info.id.clone(),
+            credential_name: info.name.clone(),
             credential_revision: info.revision,
             secret: secret.to_owned(),
         })
@@ -1032,6 +1092,11 @@ impl ModelSources {
                     .retain(|credential| credential.id != credential_id);
                 self.registry.credentials.retain(|record| {
                     !(record.source_id == source_id && record.id == credential_id)
+                        || self.registry.bindings.iter().any(|binding| {
+                            binding.source_id == record.source_id
+                                && binding.credential_id == record.id
+                                && binding.credential_revision == record.revision
+                        })
                 });
             }
             SourceAction::RoutesSet { routes, .. } => {
@@ -1136,7 +1201,7 @@ impl ModelSources {
             let Some(info) = source
                 .credentials
                 .iter()
-                .find(|credential| credential.id == route.credential_id)
+                .find(|credential| credential.id == binding.credential_id)
             else {
                 continue;
             };
@@ -1192,8 +1257,37 @@ impl ModelSources {
             ) else {
                 continue;
             };
+            let source = self
+                .registry
+                .sources
+                .iter()
+                .find(|source| source.id == binding.source_id);
+            let route_default_credential = source.and_then(|source| {
+                source
+                    .routes
+                    .iter()
+                    .find(|route| route.id == binding.route_id)
+                    .map(|route| route.credential_id.as_str())
+            });
+            let credential_name = source.and_then(|source| {
+                source
+                    .credentials
+                    .iter()
+                    .find(|credential| credential.id == binding.credential_id)
+                    .map(|credential| credential.name.as_str())
+            });
             let account_name = if binding.legacy {
                 binding.route_name.chars().take(80).collect()
+            } else if matches!(route_default_credential, Some(default_cid) if default_cid != binding.credential_id.as_str())
+                && let Some(cred_name) = credential_name
+            {
+                format!(
+                    "{} / {} ({cred_name})",
+                    binding.source_name, binding.route_name
+                )
+                .chars()
+                .take(80)
+                .collect()
             } else {
                 format!("{} / {}", binding.source_name, binding.route_name)
                     .chars()
@@ -1210,11 +1304,37 @@ impl ModelSources {
         synced
     }
 
+    pub(crate) fn route_details(
+        &self,
+        source_id: &str,
+        route_id: &str,
+        revision: i64,
+        credential_id: Option<&str>,
+    ) -> Result<RouteDetails> {
+        let source = self.require_source(source_id, revision)?;
+        let route = source
+            .routes
+            .iter()
+            .find(|route| route.id == route_id)
+            .ok_or(Error::NotFound)?;
+        let resolved = self.resolve_route(source_id, route_id, revision, credential_id)?;
+        Ok(RouteDetails {
+            source_name: source.name.clone(),
+            route_name: route.name.clone(),
+            credential_id: resolved.credential_id,
+            credential_name: resolved.credential_name,
+            profile: resolved.profile,
+            default_effort: route.default_effort.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind(
         &mut self,
         source_id: &str,
         route_id: &str,
         revision: i64,
+        credential_id: Option<&str>,
         agent: Option<AgentKind>,
         known_accounts: &std::collections::HashSet<String>,
         account_agents: &std::collections::HashMap<String, AgentKind>,
@@ -1229,12 +1349,14 @@ impl ModelSources {
             .find(|route| route.id == route_id)
             .ok_or(Error::NotFound)?;
         let agent = agent.unwrap_or_else(|| agent_for_route(route));
-        let resolved = self.resolve_route(source_id, route_id, revision)?;
+        let resolved = self.resolve_route(source_id, route_id, revision, credential_id)?;
         super::managed::validate_profile_agent(agent, &resolved.profile)?;
         if let Some(binding) = self.registry.bindings.iter().find(|binding| {
             binding.source_id == source_id
                 && binding.route_id == route_id
                 && binding.revision == revision
+                && binding.credential_id == resolved.credential_id
+                && binding.credential_revision == resolved.credential_revision
                 && known_accounts.contains(&binding.account_id)
                 && account_agents.get(&binding.account_id) == Some(&agent)
         }) {

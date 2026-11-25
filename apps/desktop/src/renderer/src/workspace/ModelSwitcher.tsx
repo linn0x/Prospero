@@ -8,10 +8,18 @@ import { NativeSelect, NativeSelectOption } from "../components/ui/native-select
 import { useLocale } from "../locale";
 import { reportError } from "../state";
 
-import { agySelectionDisplay, formatAgyEffortLabel } from "./AgyModelPicker";
-import { cachedModelCatalog, loadModelCatalog, modelSwitchSupported, saveModelCatalog, supportedModelEffort } from "./model-catalog";
+import { AgyModelPicker } from "./AgyModelPicker";
+import { ApiModelSourceSwitcher } from "./ApiModelSourceSwitcher";
+import { cachedModelCatalog, loadModelCatalog, modelSourceSwitchSupported, modelSwitchSupported, saveModelCatalog, supportedModelEffort } from "./model-catalog";
 
 export function ModelSwitcher({ session, account }: { session: SessionInfo; account: JsonObject | undefined }) {
+  if (modelSourceSwitchSupported(session, account)) {
+    return <ApiModelSourceSwitcher session={session} account={account} />;
+  }
+  return <NativeModelSwitcher session={session} account={account} />;
+}
+
+function NativeModelSwitcher({ session, account }: { session: SessionInfo; account: JsonObject | undefined }) {
   const { t } = useLocale();
   const [open, setOpen] = useState(false);
   const [catalog, setCatalog] = useState<AgentModelCatalog | undefined>(() => cachedModelCatalog(session.id));
@@ -37,17 +45,10 @@ export function ModelSwitcher({ session, account }: { session: SessionInfo; acco
   }, [controls?.currentModel, controls?.currentEffort]);
   const current = catalog?.currentModel || controls?.currentModel || session.model;
   const activeEffort = catalog?.currentEffort || controls?.currentEffort || session.effort;
-  const chipLabel = useMemo(() => {
-    if (session.agent === "agy" && catalog?.models.length) {
-      const display = agySelectionDisplay(catalog.models, current, activeEffort);
-      if (display.primary) {
-        return display.primary === "Orchestrator" && display.secondary
-          ? `Orchestrator · ${display.secondary}`
-          : display.primary;
-      }
-    }
-    return current?.split("/").at(-1) || t("模型", "Model");
-  }, [activeEffort, catalog?.models, current, session.agent, t]);
+  const chipLabel = useMemo(
+    () => current?.split("/").at(-1) || t("模型", "Model"),
+    [current, t],
+  );
   const model = catalog?.models.find((entry) => entry.id === modelId);
   const models = useMemo(() => catalog?.models.filter((entry) => `${entry.label} ${entry.id} ${entry.description ?? ""}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())).slice(0, 200) ?? [], [catalog, query]);
   const unavailable = !supported || session.status === "starting" || ["failed", "cancelled", "exited", "stopped"].includes(session.status);
@@ -68,14 +69,15 @@ export function ModelSwitcher({ session, account }: { session: SessionInfo; acco
       if (mounted.current && token === request.current) setLoading(false);
     }
   };
-  const save = async (): Promise<void> => {
-    if (busy.current || !model || unavailable || loading) return;
+  const applyModelSelection = async (nextModelId: string, nextEffort: string | undefined): Promise<void> => {
+    if (busy.current || unavailable || loading) return;
+    const targetModel = catalog?.models.find((entry) => entry.id === nextModelId);
+    const selectedEffort = nextEffort ? supportedModelEffort(targetModel, nextEffort) : undefined;
     busy.current = true;
     setSaving(true);
     setError(undefined);
     try {
-      const selectedEffort = supportedModelEffort(model, effort);
-      const selection = await window.prospero.setAgentModel(session.id, model.id, selectedEffort);
+      const selection = await window.prospero.setAgentModel(session.id, nextModelId, selectedEffort);
       const next: AgentModelCatalog = { models: catalog?.models ?? [], ...selection };
       saveModelCatalog(session.id, next);
       if (!mounted.current) return;
@@ -89,7 +91,39 @@ export function ModelSwitcher({ session, account }: { session: SessionInfo; acco
       if (mounted.current) setSaving(false);
     }
   };
+  const save = async (): Promise<void> => {
+    if (!model) return;
+    await applyModelSelection(model.id, effort);
+  };
   if (!supported) return null;
+  if (session.agent === "agy") {
+    return <>
+      <AgyModelPicker
+        className="session-model-chip"
+        triggerSize="sm"
+        allowEmptyOpen
+        models={catalog?.models ?? []}
+        value={current}
+        effort={activeEffort}
+        loading={loading}
+        saving={saving}
+        disabled={unavailable}
+        error={error}
+        triggerAriaLabel={t("切换模型", "Switch model")}
+        triggerTitle={current || t("切换模型", "Switch model")}
+        onOpenChange={(nextOpen) => {
+          setOpen(nextOpen);
+          if (nextOpen) {
+            setNotice(undefined);
+            void load(false);
+          }
+        }}
+        onRefresh={() => void load(true)}
+        onChange={(nextModelId, nextEffort) => void applyModelSelection(nextModelId, nextEffort)}
+      />
+      {notice && <span className="sr-only" role="status">{notice}</span>}
+    </>;
+  }
   return <>
     <Button className="session-model-chip" variant="outline" size="sm" disabled={unavailable} aria-label={t("切换模型", "Switch model")} title={current || t("切换模型", "Switch model")} onClick={() => { setOpen(true); setQuery(""); setNotice(undefined); void load(); }}>
       <span>{chipLabel}</span><ChevronDown />
@@ -103,7 +137,7 @@ export function ModelSwitcher({ session, account }: { session: SessionInfo; acco
         <div className="model-options" role="group" aria-label={t("可用模型", "Available models")}>
           {loading ? <p role="status">{t("正在加载模型…", "Loading models…")}</p> : models.length === 0 ? <p>{t("没有匹配的模型，可刷新目录后重试。", "No matching models. Refresh the catalog to retry.")}</p> : models.map((entry) => <button type="button" key={entry.id} className="model-option" data-slot="session-model-option" aria-pressed={entry.id === modelId} disabled={saving} onClick={() => { setModelId(entry.id); setEffort(entry.defaultEffort ?? ""); }}><span><strong>{entry.label || entry.id}</strong><small>{entry.description || entry.id}</small></span>{entry.id === modelId && <Check />}</button>)}
         </div>
-        {Boolean(model?.supportedEfforts.length) && <label className="model-effort-field"><span>{t("推理强度", "Reasoning effort")}</span><NativeSelect aria-label={t("推理强度", "Reasoning effort")} value={supportedModelEffort(model, effort) ?? ""} onChange={(event) => setEffort(event.target.value)} disabled={saving || loading || !model?.supportedEfforts.length}><NativeSelectOption value="">{t("使用模型默认值", "Use model default")}</NativeSelectOption>{model?.supportedEfforts.map((value) => <NativeSelectOption key={value} value={value}>{session.agent === "agy" ? formatAgyEffortLabel(value) : value}</NativeSelectOption>)}</NativeSelect></label>}
+        {Boolean(model?.supportedEfforts.length) && <label className="model-effort-field"><span>{t("推理强度", "Reasoning effort")}</span><NativeSelect aria-label={t("推理强度", "Reasoning effort")} value={supportedModelEffort(model, effort) ?? ""} onChange={(event) => setEffort(event.target.value)} disabled={saving || loading || !model?.supportedEfforts.length}><NativeSelectOption value="">{t("使用模型默认值", "Use model default")}</NativeSelectOption>{model?.supportedEfforts.map((value) => <NativeSelectOption key={value} value={value}>{value}</NativeSelectOption>)}</NativeSelect></label>}
         <DialogFooter><Button variant="outline" disabled={saving} onClick={() => setOpen(false)}>{t("取消", "Cancel")}</Button><Button disabled={saving || loading || !model || unavailable} onClick={() => void save()}>{saving ? t("正在切换…", "Switching…") : t("应用到下一轮", "Apply to next turn")}</Button></DialogFooter>
       </DialogContent>
     </Dialog>

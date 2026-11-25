@@ -670,3 +670,186 @@ async fn source_binds_agy_for_openai_chat_completions_only() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
 }
+
+#[tokio::test]
+async fn source_supports_binding_multiple_credentials_on_single_route() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = spawn_server();
+
+    let (status, created) = harness
+        .post(envelope(json!({
+            "kind":"create",
+            "operationId":"op-multi-cred-create",
+            "name":"GLM Gateway",
+            "endpoints":[{"protocol":"anthropic","baseUrl":server.base_url}],
+            "credential":{"name":"Account A","apiKey":"sk-glm-account-a-0123456789"},
+            "routes":[{"name":"GLM 5.4","model":"glm-5.4","protocol":"anthropic","enabled":true}]
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let source = &created["sources"][0];
+    let source_id = source["id"].as_str().unwrap().to_owned();
+    let cred_a_id = source["credentials"][0]["id"].as_str().unwrap().to_owned();
+    let route_id = source["routes"][0]["id"].as_str().unwrap().to_owned();
+    let revision = source["revision"].as_i64().unwrap();
+
+    // Add a second credential to the same GLM source (only 1 route needed).
+    let (status, added_cred) = harness
+        .post(envelope(json!({
+            "kind":"credential.set",
+            "sourceId":source_id,
+            "revision":revision,
+            "name":"Account B",
+            "apiKey":"sk-glm-account-b-0123456789"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{added_cred}");
+    let updated_source = added_cred["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == source_id)
+        .unwrap();
+    let revision_2 = updated_source["revision"].as_i64().unwrap();
+    let cred_b_id = updated_source["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Account B")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Bind default credential (omitted) and explicit Account B credential.
+    let (status, bind_a) = harness
+        .post(envelope(json!({
+            "kind":"bind",
+            "sourceId":source_id,
+            "routeId":route_id,
+            "revision":revision_2,
+            "agent":"claude"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{bind_a}");
+    let acct_a = bind_a["accountId"].as_str().unwrap().to_owned();
+
+    let (status, bind_b) = harness
+        .post(envelope(json!({
+            "kind":"bind",
+            "sourceId":source_id,
+            "routeId":route_id,
+            "revision":revision_2,
+            "credentialId":cred_b_id,
+            "agent":"claude"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{bind_b}");
+    let acct_b = bind_b["accountId"].as_str().unwrap().to_owned();
+    assert_ne!(acct_a, acct_b);
+
+    let accounts = bind_b["accounts"].as_array().unwrap();
+    let row_a = accounts.iter().find(|row| row["id"] == acct_a).unwrap();
+    let row_b = accounts.iter().find(|row| row["id"] == acct_b).unwrap();
+    assert_eq!(row_a["name"], "GLM Gateway / GLM 5.4");
+    assert_eq!(row_a["modelSource"]["credentialId"], cred_a_id);
+    assert_eq!(row_a["modelSource"]["credentialName"], "Account A");
+    assert_eq!(row_a["modelSource"]["multiCredential"], true);
+    assert_eq!(row_b["name"], "GLM Gateway / GLM 5.4 (Account B)");
+    assert_eq!(row_b["modelSource"]["credentialId"], cred_b_id);
+    assert_eq!(row_b["modelSource"]["credentialName"], "Account B");
+    assert_eq!(row_b["modelSource"]["multiCredential"], true);
+
+    // Updating source metadata preserves each binding's distinct credential & account name.
+    let (status, renamed) = harness
+        .post(envelope(json!({
+            "kind":"update",
+            "sourceId":source_id,
+            "revision":revision_2,
+            "name":"GLM Coding"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    let revision_3 = renamed["sources"][0]["revision"].as_i64().unwrap();
+    let (status, rebind_b) = harness
+        .post(envelope(json!({
+            "kind":"bind",
+            "sourceId":source_id,
+            "routeId":route_id,
+            "revision":revision_3,
+            "credentialId":cred_b_id,
+            "agent":"claude"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rebind_b}");
+    assert_eq!(rebind_b["accountId"], acct_b);
+    let row_b_after = rebind_b["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == acct_b)
+        .unwrap();
+    assert_eq!(row_b_after["name"], "GLM Coding / GLM 5.4 (Account B)");
+    assert_eq!(row_b_after["modelSource"]["credentialId"], cred_b_id);
+
+    // Credential from another source cannot be used here.
+    let (status, other) = harness
+        .post(envelope(json!({
+            "kind":"create",
+            "operationId":"op-other-src-cred",
+            "name":"Other Source",
+            "endpoints":[{"protocol":"anthropic","baseUrl":server.base_url}],
+            "credential":{"name":"Foreign Key","apiKey":"sk-foreign-0123456789"},
+            "routes":[{"name":"Other","model":"other-model","protocol":"anthropic","enabled":true}]
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    let foreign_cred_id = other["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Other Source")
+        .unwrap()["credentials"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, foreign_bind) = harness
+        .post(envelope(json!({
+            "kind":"bind",
+            "sourceId":source_id,
+            "routeId":route_id,
+            "revision":revision_3,
+            "credentialId":foreign_cred_id,
+            "agent":"claude"
+        })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{foreign_bind}");
+
+    // Removing the non-default Account B credential succeeds while retaining the pinned historical secret.
+    let (status, removed) = harness
+        .post(envelope(json!({
+            "kind":"credential.remove",
+            "sourceId":source_id,
+            "revision":revision_3,
+            "credentialId":cred_b_id
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["ok"], true, "{removed}");
+    let (status, listed_after) = harness.post(envelope(json!({"kind":"list"}))).await;
+    assert_eq!(status, StatusCode::OK, "{listed_after}");
+    let registry_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            harness
+                .directory
+                .path()
+                .join("daemon/model-sources/.registry.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(registry_json["credentials"].as_array().unwrap().iter().any(|row| {
+        row["id"] == cred_b_id && row["secret"] == "sk-glm-account-b-0123456789"
+    }));
+}

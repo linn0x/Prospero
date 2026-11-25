@@ -94,6 +94,8 @@ pub(crate) struct AgentRun {
     pub agent_preset: Option<String>,
     /// Managed account bound to the run; None for the native environment.
     pub account_id: Option<String>,
+    /// Pending timeline handoff context to inject into the next turn after switching.
+    pub handoff_context: Option<String>,
 }
 
 /// Maximum number of messages that may wait for the current turn to finish
@@ -1402,11 +1404,12 @@ impl Store {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         );
         let row: Row = self
             .connection
             .query_row(
-                "SELECT agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id,agent_preset FROM agent_runs WHERE session_id=?",
+                "SELECT agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id,agent_preset,handoff_context FROM agent_runs WHERE session_id=?",
                 [id],
                 |row| {
                     Ok((
@@ -1420,6 +1423,7 @@ impl Store {
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -1460,6 +1464,7 @@ impl Store {
             effort: row.7,
             account_id: row.8,
             agent_preset: row.9,
+            handoff_context: row.10,
         })
     }
 
@@ -1529,6 +1534,218 @@ impl Store {
             },
         )?;
         Ok((model, effort))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn switch_agent_model_source(
+        &mut self,
+        id: &str,
+        agent: AgentKind,
+        account_id: &str,
+        model: &str,
+        effort: Option<&str>,
+        native_id: Option<&str>,
+        mode: PermissionMode,
+        handoff_context: Option<&str>,
+    ) -> Result<SessionHead> {
+        crate::database::validate_id(id)?;
+        crate::database::validate_id(account_id)?;
+        let model = normalize_selection(Some(model.to_owned()), 300, "模型无效")?.unwrap();
+        let effort = normalize_selection(effort.map(str::to_owned), 80, "思考强度无效")?;
+        let agent_label = crate::database::label(agent)?;
+        let head = self.session(id)?;
+        let run = self.agent_run(id)?;
+        if head.kind != SessionKind::Structured || !run.active || self.agent_execution_unknown(id)?
+        {
+            return Err(Error::Conflict);
+        }
+        if matches!(
+            head.status,
+            SessionStatus::Starting
+                | SessionStatus::Running
+                | SessionStatus::WaitingPermission
+                | SessionStatus::WaitingInput
+        ) {
+            return Err(Error::Invalid(
+                "当前轮仍在运行，请等待当前轮结束或中断后再切换模型源".into(),
+            ));
+        }
+        let mode_label = mode.label();
+        let account_id_owned = account_id.to_owned();
+        let model_owned = model.clone();
+        let effort_owned = effort.clone();
+        self.update_session_metadata_with(
+            id,
+            |session| {
+                session.agent = agent;
+                session.account_id = Some(account_id_owned);
+                session.model = Some(model_owned);
+                session.effort = effort_owned;
+            },
+            |transaction| {
+                transaction.execute(
+                    "UPDATE agent_runs SET agent=?1, account_id=?2, model=?3, effort=?4, native_id=?5, permission_mode=?6, handoff_context=?7 WHERE session_id=?8",
+                    params![
+                        agent_label,
+                        account_id,
+                        model,
+                        effort,
+                        native_id,
+                        mode_label,
+                        handoff_context,
+                        id
+                    ],
+                )?;
+                Ok(())
+            },
+        )
+    }
+
+    pub(crate) fn clear_agent_handoff_context(&mut self, id: &str) -> Result<()> {
+        crate::database::validate_id(id)?;
+        self.connection.execute(
+            "UPDATE agent_runs SET handoff_context=NULL WHERE session_id=?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn build_timeline_handoff_context(
+        &self,
+        session_id: &str,
+        from_engine: &str,
+        from_model: Option<&str>,
+        to_engine: &str,
+        to_model: &str,
+    ) -> Result<Option<String>> {
+        const MAX_USER_BYTES: usize = 6 * 1024;
+        const MAX_ASSISTANT_BYTES: usize = 8 * 1024;
+        const MAX_TOOL_BYTES: usize = 300;
+        const MAX_HANDOFF_BYTES: usize = 48 * 1024;
+
+        crate::database::validate_id(session_id)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = self.connection.prepare_cached(
+                "SELECT id, body FROM timeline_records WHERE session_id=?1 AND subagent_id IS NULL ORDER BY position ASC",
+            )?;
+            stmt.query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut entries: Vec<(bool, String)> = Vec::new();
+        let mut has_message = false;
+        let mut first_user_idx: Option<usize> = None;
+
+        for (record_id, body_json) in rows {
+            let Ok(body) = serde_json::from_str::<TimelineBody>(&body_json) else {
+                continue;
+            };
+            match body {
+                TimelineBody::Message { role, .. } => {
+                    let page =
+                        self.timeline_text(session_id, &record_id, TimelineTextQuery::default())?;
+                    let trimmed = page.text.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    has_message = true;
+                    match role {
+                        MessageRole::User => {
+                            if first_user_idx.is_none() {
+                                first_user_idx = Some(entries.len());
+                            }
+                            let text = truncate_utf8_bytes(trimmed, MAX_USER_BYTES);
+                            entries.push((true, format!("[User]\n{text}")));
+                        }
+                        MessageRole::Assistant => {
+                            let text = truncate_utf8_bytes(trimmed, MAX_ASSISTANT_BYTES);
+                            entries.push((false, format!("[Assistant]\n{text}")));
+                        }
+                    }
+                }
+                TimelineBody::Tool {
+                    name,
+                    state,
+                    summary,
+                    ..
+                } => {
+                    let line = format!("[Tool: {name} ({state:?})] {}", summary.trim());
+                    entries.push((false, truncate_utf8_bytes(&line, MAX_TOOL_BYTES)));
+                }
+                _ => {}
+            }
+        }
+
+        if !has_message {
+            return Ok(None);
+        }
+
+        let joined = entries
+            .iter()
+            .map(|(_, entry)| entry.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let transcript = if joined.len() <= MAX_HANDOFF_BYTES {
+            joined
+        } else {
+            let marker = "\n\n[... earlier conversation entries omitted ...]\n\n";
+            let mut prefix = String::new();
+            let mut tail_start = 0usize;
+            if let Some(idx) = first_user_idx {
+                prefix = truncate_utf8_bytes(&entries[idx].1, 8 * 1024);
+                tail_start = idx + 1;
+            }
+            let budget_for_tail = MAX_HANDOFF_BYTES
+                .saturating_sub(prefix.len())
+                .saturating_sub(marker.len());
+            let mut tail_rev: Vec<&str> = Vec::new();
+            let mut used = 0usize;
+            for (_, entry) in entries[tail_start..].iter().rev() {
+                let extra = if tail_rev.is_empty() {
+                    entry.len()
+                } else {
+                    entry.len() + 2
+                };
+                if used + extra > budget_for_tail {
+                    break;
+                }
+                used += extra;
+                tail_rev.push(entry.as_str());
+            }
+            if tail_rev.is_empty()
+                && let Some((_, last)) = entries[tail_start..].last()
+                && budget_for_tail > 0
+            {
+                let truncated = truncate_utf8_bytes(last, budget_for_tail);
+                if prefix.is_empty() {
+                    truncated
+                } else {
+                    format!("{prefix}{marker}{truncated}")
+                }
+            } else {
+                tail_rev.reverse();
+                let tail = tail_rev.join("\n\n");
+                if prefix.is_empty() {
+                    format!("[... earlier conversation entries omitted ...]\n\n{tail}")
+                } else if tail.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix}{marker}{tail}")
+                }
+            }
+        };
+
+        let from_model_display = from_model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown");
+        Ok(Some(format!(
+            "[Prospero Session Handoff]\n\
+             This session switched from {from_engine} ({from_model_display}) to {to_engine} ({to_model}).\n\
+             Below is the prior conversation history from this session so you can continue seamlessly:\n\n\
+             {transcript}\n\n\
+             [End of Handoff]\n\
+             Respond directly to the user's new message below without repeating this handoff notice."
+        )))
     }
 
     /// Active structured sessions' persisted selections, for the desktop
@@ -3798,5 +4015,165 @@ mod tests {
             .unwrap();
         assert!(!bound_controls.model);
         assert!(!bound_controls.mode);
+    }
+
+    #[test]
+    fn switch_agent_model_source_updates_head_and_run_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let now = crate::database::now();
+        store
+            .connection
+            .execute(
+                "INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at,api_profile)
+                 VALUES('acct-1','claude','Source 1',0,?1,?1,'{\"protocol\":\"anthropic\",\"baseUrl\":\"https://a.invalid\",\"model\":\"claude-old\"}'),
+                       ('acct-2','codex','Source 2',0,?1,?1,'{\"protocol\":\"openai_responses\",\"baseUrl\":\"https://b.invalid\",\"model\":\"gpt-new\"}')",
+                params![now],
+            )
+            .unwrap();
+        let head = store
+            .create_agent_session(
+                CreateAgentSession {
+                    agent: AgentKind::Claude,
+                    title: "api-source-switch".into(),
+                    workspace: "/synthetic".into(),
+                    auto_approve: false,
+                    approval_policy: Some(TerminalApprovalPolicy::Standard),
+                    mode: Some("plan".into()),
+                    model: Some("claude-old".into()),
+                    effort: Some("high".into()),
+                    agent_preset: None,
+                    account_id: Some("acct-1".into()),
+                    resume: None,
+                },
+                ApprovalPolicy::Standard,
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .build_timeline_handoff_context(
+                    &head.id,
+                    "claude",
+                    Some("claude-old"),
+                    "codex",
+                    "gpt-new",
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = store.begin_agent_turn(&head.id).unwrap();
+        store
+            .append_agent_records(
+                &head.id,
+                vec![
+                    TimelineWrite {
+                        id: "turn1-user".into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::User,
+                            final_answer: false,
+                            attachments: Vec::new(),
+                        },
+                        text: "Check auth bug".into(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                    TimelineWrite {
+                        id: "turn1-assistant".into(),
+                        turn_id: "turn1".into(),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::Assistant,
+                            final_answer: true,
+                            attachments: Vec::new(),
+                        },
+                        text: "Auth middleware checks wrong header.".into(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        store
+            .update_session(
+                &head.id,
+                UpdateSession {
+                    revision: head.revision,
+                    title: None,
+                    lifecycle: None,
+                    status: Some(SessionStatus::Running),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .switch_agent_model_source(
+                    &head.id,
+                    AgentKind::Codex,
+                    "acct-2",
+                    "gpt-new",
+                    Some("medium"),
+                    None,
+                    PermissionMode::Plan,
+                    Some("handoff"),
+                )
+                .is_err()
+        );
+
+        let current_head = store.session(&head.id).unwrap();
+        store
+            .update_session(
+                &head.id,
+                UpdateSession {
+                    revision: current_head.revision,
+                    title: None,
+                    lifecycle: None,
+                    status: Some(SessionStatus::Idle),
+                },
+            )
+            .unwrap();
+
+        let handoff = store
+            .build_timeline_handoff_context(
+                &head.id,
+                "claude",
+                Some("claude-old"),
+                "codex",
+                "gpt-new",
+            )
+            .unwrap()
+            .unwrap();
+        assert!(handoff.contains("Check auth bug"));
+        assert!(handoff.contains("Auth middleware checks wrong header."));
+
+        let updated = store
+            .switch_agent_model_source(
+                &head.id,
+                AgentKind::Codex,
+                "acct-2",
+                "gpt-new",
+                Some("medium"),
+                None,
+                PermissionMode::Plan,
+                Some(&handoff),
+            )
+            .unwrap();
+        assert_eq!(updated.agent, AgentKind::Codex);
+        assert_eq!(updated.account_id.as_deref(), Some("acct-2"));
+        assert_eq!(updated.model.as_deref(), Some("gpt-new"));
+        assert_eq!(updated.effort.as_deref(), Some("medium"));
+
+        let run = store.agent_run(&head.id).unwrap();
+        assert_eq!(run.agent, AgentKind::Codex);
+        assert_eq!(run.account_id.as_deref(), Some("acct-2"));
+        assert_eq!(run.native_id, None);
+        assert_eq!(run.handoff_context.as_deref(), Some(handoff.as_str()));
+
+        store.clear_agent_handoff_context(&head.id).unwrap();
+        assert_eq!(store.agent_run(&head.id).unwrap().handoff_context, None);
     }
 }

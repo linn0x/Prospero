@@ -6,6 +6,7 @@ import {
   CHAT_SESSION_DRAFT_CACHE_LIMIT,
   ConversationTimelineSection,
   clearChatSessionDraftCache,
+  extractPastedImageFiles,
   getChatSessionDraftCacheSize,
   loadChatSessionDraft,
   saveChatSessionDraft,
@@ -122,5 +123,46 @@ describe("ChatPane per-session draft & pending attachment persistence", () => {
   it("memoizes ConversationTimelineSection so composer draft updates do not invalidate timeline props", () => {
     // React.memo wraps ConversationTimelineSection ($$typeof === Symbol.for('react.memo'))
     expect((ConversationTimelineSection as unknown as { $$typeof?: symbol }).$$typeof).toBe(Symbol.for("react.memo"));
+  });
+
+  it("extracts pasted screenshots, items-only images, and Finder copies while preserving rich-text pastes", () => {
+    const shot = new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" });
+    const thumb = new File([new Uint8Array([4, 5, 6])], "thumb.png", { type: "image/png" });
+
+    // 1. Direct screenshot paste (files non-empty, empty plain text)
+    expect(
+      extractPastedImageFiles({
+        files: [shot],
+        items: [],
+        getData: () => "",
+      }),
+    ).toEqual([shot]);
+
+    // 2. Clipboard items fallback when files is empty
+    expect(
+      extractPastedImageFiles({
+        files: [],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      }),
+    ).toEqual([shot]);
+
+    // 3. macOS Finder Cmd+C on an image file includes filename in text/plain
+    expect(
+      extractPastedImageFiles({
+        files: [shot],
+        items: [],
+        getData: (format) => (format === "text/plain" ? "shot.png" : ""),
+      }),
+    ).toEqual([shot]);
+
+    // 4. Rich text copy alongside thumbnail image prefers text paste
+    expect(
+      extractPastedImageFiles({
+        files: [thumb],
+        items: [],
+        getData: (format) => (format === "text/plain" ? "hello world" : ""),
+      }),
+    ).toEqual([]);
   });
 });

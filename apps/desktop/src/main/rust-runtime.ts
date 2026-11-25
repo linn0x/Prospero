@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { basename, extname, isAbsolute, resolve as resolvePath } from "node:path";
 import type { ChangeEvent, SessionHead, TimelineQuery, TimelineTextQuery, AttachmentInput, ScheduleCreate, ScheduleUpdate } from "@prospero/protocol/rust-daemon";
 import type { QueuedMessage, SessionAgentControls } from "@prospero/protocol/rust-daemon";
-import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
+import type { AgentModelSourceSwitchInput, DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import type { FilePreview, GitHistoryEntry, GitMutation, ProjectFile, ProjectGitStatus } from "../shared/project-tools";
 import { StateStore } from "./state-store";
 import { TerminalRecovery } from "./terminal-recovery";
@@ -1426,6 +1426,7 @@ export class RustRuntime {
       }
       const model = normalizeLaunchSelection(input["model"], 300, "模型无效");
       const effort = normalizeLaunchSelection(input["effort"], 80, "推理强度无效");
+      const credentialId = normalizeLaunchSelection(input["credentialId"], 100, "模型凭据 ID 无效");
       const task = String(input["task"] ?? "").trim();
       if (!task || task.length > 65_536 || /[\r\0]/.test(task)) throw new Error("子任务内容无效");
       const title = input["title"] === undefined ? undefined : String(input["title"] ?? "").trim();
@@ -1436,6 +1437,7 @@ export class RustRuntime {
           sourceId: sourceId ?? "",
           routeId: routeId ?? "",
           revision: revision ?? 0,
+          ...(credentialId ? { credentialId } : {}),
           agent,
           task,
           ...(title ? { title } : {}),
@@ -1606,6 +1608,35 @@ export class RustRuntime {
         const catalog = await this.current().client.agentModels(sessionId, signal, init?.timeoutMs);
         return catalog as unknown as JsonObject;
       }
+    }
+    const modelSourceRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/model-source$/.exec(path);
+    if (modelSourceRoute && init?.method === "POST" && input) {
+      const sessionId = modelSourceRoute[1]!;
+      const sourceId = normalizeLaunchSelection(input["sourceId"], 100, "模型源 ID 无效");
+      const routeId = normalizeLaunchSelection(input["routeId"], 100, "模型路由 ID 无效");
+      const revision = typeof input["revision"] === "number" && Number.isInteger(input["revision"]) && input["revision"] > 0 ? input["revision"] : undefined;
+      if (!sourceId || !routeId || revision === undefined) throw new Error("模型源参数无效");
+      const rawAgent = input["agent"];
+      if (rawAgent !== undefined && rawAgent !== "claude" && rawAgent !== "codex" && rawAgent !== "opencode" && rawAgent !== "pi" && rawAgent !== "agy") {
+        throw new Error("执行引擎无效");
+      }
+      const effort = normalizeLaunchSelection(input["effort"], 80, "推理强度无效");
+      const credentialId = normalizeLaunchSelection(input["credentialId"], 100, "模型凭据 ID 无效");
+      const payload: AgentModelSourceSwitchInput = {
+        sourceId,
+        routeId,
+        revision,
+        ...(credentialId ? { credentialId } : {}),
+        ...(rawAgent ? { agent: rawAgent } : {}),
+        ...(effort ? { effort } : {}),
+      };
+      const result = await this.current().client.switchAgentModelSource(sessionId, payload, signal, init?.timeoutMs);
+      try {
+        const accounts = await this.current().client.listAccounts(randomUUID(), signal);
+        if (accounts.accounts) this.store.setAccounts(accounts.accounts as unknown as DesktopSnapshot["accounts"]);
+      } catch {}
+      await this.refresh(true);
+      return result as unknown as JsonObject;
     }
     const subagentEventsRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/subagent\/([A-Za-z0-9_-]{1,128})\/events$/.exec(path);
     if (subagentEventsRoute && (!init?.method || init.method === "GET")) {

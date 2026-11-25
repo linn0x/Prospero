@@ -3,7 +3,7 @@
 //! Runs `agy -p <prompt> --output-format stream-json` per turn using the local
 //! Antigravity subscription session (`~/.gemini/antigravity-cli` / Keychain).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -886,6 +886,26 @@ impl AgyTurn {
     }
 }
 
+fn build_prompt_with_attachments(prompt: &str, temp_files: &[PathBuf]) -> String {
+    if temp_files.is_empty() {
+        return prompt.to_owned();
+    }
+    let trimmed = prompt.trim();
+    let base = if trimmed.is_empty() {
+        "Please inspect the attached image(s)."
+    } else {
+        trimmed
+    };
+    let mut out = String::from(base);
+    out.push_str("\n\n[Attached image files — inspect with read_file before answering]\n");
+    for path in temp_files {
+        out.push_str("- ");
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+    out
+}
+
 pub(super) async fn spawn_turn(
     workspace: &str,
     prompt: &str,
@@ -893,30 +913,34 @@ pub(super) async fn spawn_turn(
     native_id: Option<&str>,
     options: &TurnOptions,
 ) -> Result<AgyTurn> {
+    let mut temp_dir: Option<PathBuf> = None;
     let mut temp_files = Vec::new();
-    for (idx, attachment) in attachments.iter().enumerate() {
-        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&attachment.data_b64) {
-            let ext = match attachment.mime_type.as_str() {
-                "image/png" => "png",
-                "image/gif" => "gif",
-                "image/webp" => "webp",
-                _ => "jpg",
-            };
-            let file_path = std::env::temp_dir().join(format!(
-                "prospero-agy-att-{}-{idx}.{ext}",
-                uuid::Uuid::new_v4()
-            ));
-            if tokio::fs::write(&file_path, bytes).await.is_ok() {
-                temp_files.push(file_path);
+    if !attachments.is_empty() {
+        let dir = std::env::temp_dir().join(format!("prospero-agy-att-{}", uuid::Uuid::new_v4()));
+        if tokio::fs::create_dir_all(&dir).await.is_ok() {
+            for (idx, attachment) in attachments.iter().enumerate() {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(attachment.data_b64.trim()) {
+                    let ext = match attachment.mime_type.as_str() {
+                        "image/png" => "png",
+                        "image/gif" => "gif",
+                        "image/webp" => "webp",
+                        _ => "jpg",
+                    };
+                    let file_path = dir.join(format!("image-{}.{ext}", idx + 1));
+                    if tokio::fs::write(&file_path, bytes).await.is_ok() {
+                        temp_files.push(file_path);
+                    }
+                }
+            }
+            if temp_files.is_empty() {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+            } else {
+                temp_dir = Some(dir);
             }
         }
     }
 
-    let effective_prompt = if prompt.trim().is_empty() && !temp_files.is_empty() {
-        "Please inspect the attached image(s)."
-    } else {
-        prompt
-    };
+    let effective_prompt = build_prompt_with_attachments(prompt, &temp_files);
 
     let mut command = Command::new(binary());
     command
@@ -962,18 +986,40 @@ pub(super) async fn spawn_turn(
         // block indefinitely waiting for terminal approval.
         command.arg("--dangerously-skip-permissions");
     }
-    for file_path in &temp_files {
-        command.arg("-f").arg(file_path);
+    if let Some(dir) = temp_dir.as_ref() {
+        command.arg("--add-dir").arg(dir);
     }
 
     super::lifecycle::configure_process_group(&mut command);
-    let child = command
-        .spawn()
-        .map_err(|err| Error::Invalid(format!("无法启动 Antigravity CLI (agy): {err}")))?;
-    let mut guard = ChildGuard::new(child)?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            cleanup_temp_dir(temp_dir.as_deref()).await;
+            return Err(Error::Invalid(format!("无法启动 Antigravity CLI (agy): {err}")));
+        }
+    };
+    let mut guard = match ChildGuard::new(child) {
+        Ok(guard) => guard,
+        Err(err) => {
+            cleanup_temp_dir(temp_dir.as_deref()).await;
+            return Err(err);
+        }
+    };
     let lifecycle = guard.lifecycle();
-    let stdout = guard.child_mut().stdout.take().ok_or(Error::Closed)?;
-    let stderr = guard.child_mut().stderr.take().ok_or(Error::Closed)?;
+    let stdout = match guard.child_mut().stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            cleanup_temp_dir(temp_dir.as_deref()).await;
+            return Err(Error::Closed);
+        }
+    };
+    let stderr = match guard.child_mut().stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            cleanup_temp_dir(temp_dir.as_deref()).await;
+            return Err(Error::Closed);
+        }
+    };
 
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
     let reader_lifecycle = lifecycle.clone();
@@ -1007,7 +1053,7 @@ pub(super) async fn spawn_turn(
                 if events_tx.send(outgoing).await.is_err() {
                     reader_lifecycle.request_termination().await;
                     await_child_exit(&mut child, &reader_lifecycle).await;
-                    cleanup_temp_files(&temp_files).await;
+                    cleanup_temp_dir(temp_dir.as_deref()).await;
                     return;
                 }
             }
@@ -1022,7 +1068,7 @@ pub(super) async fn spawn_turn(
         }
         let quiescence = await_child_exit(&mut child, &reader_lifecycle).await;
         let stderr_text = stderr_task.await.unwrap_or_default();
-        cleanup_temp_files(&temp_files).await;
+        cleanup_temp_dir(temp_dir.as_deref()).await;
 
         let interrupted = reader_interrupted.load(std::sync::atomic::Ordering::Acquire)
             && !translator.is_result_received();
@@ -1057,9 +1103,9 @@ pub(super) async fn spawn_turn(
     })
 }
 
-async fn cleanup_temp_files(files: &[PathBuf]) {
-    for path in files {
-        let _ = tokio::fs::remove_file(path).await;
+async fn cleanup_temp_dir(dir: Option<&Path>) {
+    if let Some(dir) = dir {
+        let _ = tokio::fs::remove_dir_all(dir).await;
     }
 }
 
@@ -1870,5 +1916,24 @@ Usage: agy --model <id> [prompt]
             events.as_slice(),
             [AdapterEvent::Text { subagent: None, text }] if text == "OK"
         ));
+    }
+
+    #[test]
+    fn builds_prompt_with_attached_image_paths() {
+        assert_eq!(build_prompt_with_attachments("hello", &[]), "hello");
+
+        let paths = vec![
+            PathBuf::from("/tmp/prospero-agy-att-1/image-1.png"),
+            PathBuf::from("/tmp/prospero-agy-att-1/image-2.jpg"),
+        ];
+        let with_text = build_prompt_with_attachments("What is in these screenshots?", &paths);
+        assert!(with_text.starts_with("What is in these screenshots?"));
+        assert!(with_text.contains("[Attached image files — inspect with read_file before answering]"));
+        assert!(with_text.contains("- /tmp/prospero-agy-att-1/image-1.png"));
+        assert!(with_text.contains("- /tmp/prospero-agy-att-1/image-2.jpg"));
+
+        let empty_prompt = build_prompt_with_attachments("   ", &paths[..1]);
+        assert!(empty_prompt.starts_with("Please inspect the attached image(s)."));
+        assert!(empty_prompt.contains("- /tmp/prospero-agy-att-1/image-1.png"));
     }
 }
