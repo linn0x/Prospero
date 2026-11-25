@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -42,6 +42,14 @@ describe("runtime packaging guard", () => {
       expect(source).toContain("com.apple.security.cs.allow-jit");
       expect(source).toContain("com.apple.security.cs.disable-library-validation");
     }
+  });
+
+  it("configures afterSign manifest finalization and DMG signing", () => {
+    const root = join(import.meta.dirname, "..");
+    const { build } = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    expect(build.afterSign).toBe("scripts/after-sign-mac.cjs");
+    expect(existsSync(join(root, build.afterSign))).toBe(true);
+    expect(build.dmg?.sign).toBe(true);
   });
 
   it("rejects packaged Rust backend when the Rust binary is missing", () => {

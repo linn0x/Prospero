@@ -30,6 +30,7 @@
     "install:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh install",
     "uninstall:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh uninstall",
     "dist:mac": "npm run build:native:mac && npm run prepare:runtime:mac && npm run build && electron-builder --mac",
+    "dist:mac:signed": "node scripts/dist-mac.mjs",
     "build:native:mac": "node scripts/build-native-ghostty.mjs",
     "check:native:scroll": "electron scripts/check-native-scroll.cjs",
     "check:native:mac": "electron scripts/check-native-ghostty.cjs",
@@ -89,6 +90,7 @@
     "productName": "Prospero",
     "asar": true,
     "beforePack": "scripts/check-runtime-architecture.cjs",
+    "afterSign": "scripts/after-sign-mac.cjs",
     "npmRebuild": false,
     "electronLanguages": [
       "zh-CN",
@@ -174,6 +176,7 @@
       "artifactName": "Prospero-${version}-mac-${arch}.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
+      "notarize": false,
       "entitlements": "assets/entitlements.mac.plist",
       "entitlementsInherit": "assets/entitlements.mac.plist",
       "extendInfo": {
@@ -189,6 +192,9 @@
           "to": "native-ghostty"
         }
       ]
+    },
+    "dmg": {
+      "sign": true
     }
   }
 }

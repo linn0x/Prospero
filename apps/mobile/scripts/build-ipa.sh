@@ -37,10 +37,12 @@ die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 # Team ID 在 X.509 的 OU 字段里。只按名字匹配,自己的账号就永远找不到。
 find_identity_for_team() {
   local team="$1"
+  local identities
+  identities="$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -E '"(Apple Development|iPhone Developer|Apple Distribution|iPhone Distribution):' || true)"
   # 先试名字里带 team 的(第三方证书是这种)
   local byname
-  byname="$(security find-identity -v -p codesigning 2>/dev/null \
-    | sed -n "s/.*\"\(.*(${team})\)\".*/\1/p" | head -1)"
+  byname="$(sed -n "s/.*\"\(.*(${team})\)\".*/\1/p" <<<"$identities" | head -1)"
   if [[ -n "$byname" ]]; then printf '%s' "$byname"; return; fi
   # 再按证书 OU 找
   local sha name
@@ -50,8 +52,7 @@ find_identity_for_team() {
        | openssl x509 -noout -subject 2>/dev/null | grep -q "OU=${team}"; then
       printf '%s' "$name"; return
     fi
-  done < <(security find-identity -v -p codesigning 2>/dev/null \
-    | sed -n 's/^ *[0-9]*) *\([0-9A-F]*\) *"\(.*\)"$/\1 \2/p')
+  done < <(sed -n 's/^ *[0-9]*) *\([0-9A-F]*\) *"\(.*\)"$/\1 \2/p' <<<"$identities")
 }
 step() { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
